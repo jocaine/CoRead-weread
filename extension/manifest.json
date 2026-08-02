@@ -10,7 +10,7 @@
   "host_permissions": [
     "https://weread.qq.com/*",
     "https://*.weread.qq.com/*",
-    "http://localhost:7239/*"
+    "http://127.0.0.1:7239/*"
   ],
   "background": {
     "service_worker": "service_worker.js",

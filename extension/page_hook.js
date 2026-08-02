@@ -6,7 +6,7 @@
 
   function shouldDiscoverUrl(url) {
     var text = String(url || '')
-    return text.indexOf('/web/') !== -1 && text.indexOf('localhost:7239') === -1
+    return text.indexOf('/web/') !== -1 && text.indexOf('127.0.0.1:7239') === -1
   }
 
   function shouldCaptureChapterUrl(url) {

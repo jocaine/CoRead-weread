@@ -110,24 +110,35 @@ function baseBookId(bookId) {
 function bookDirNames(bookId, bookTitle = '') {
   if (!bookId) return []
   const baseId = baseBookId(bookId)
-  const names = [bookId]
-  if (baseId && baseId !== bookId) names.push(baseId)
+  // 归一化后的 baseId 是权威目录，排在第一位
+  const names = [baseId]
   const targetTitle = normalizeText(bookTitle)
 
   try {
-    const siblings = fs.readdirSync(BOOKS_DIR)
+    // 向后兼容：扫描已有的 k-suffix 历史目录（迁移前的遗留数据）
+    const legacyDirs = fs.readdirSync(BOOKS_DIR)
+      .filter(name => name !== baseId && name.startsWith(`${baseId}k`))
       .map(name => {
-        const progress = readJsonIfExists(path.join(BOOKS_DIR, name, 'progress.json')) || {}
         const meta = readJsonIfExists(path.join(BOOKS_DIR, name, 'meta.json')) || {}
-        const sameId = name === baseId || name.startsWith(`${baseId}k`)
-        const sameTitle = targetTitle && normalizeText(meta.bookTitle || progress.bookTitle) === targetTitle
-        return { name, sameId, sameTitle, updatedAt: meta.updatedAt || progress.updatedAt || 0 }
+        return { name, updatedAt: meta.updatedAt || 0 }
       })
-      .filter(item => item.sameId || item.sameTitle)
       .sort((a, b) => b.updatedAt - a.updatedAt)
-      .map(item => item.name)
-    names.push(...siblings)
+      .map(s => s.name)
+    names.push(...legacyDirs)
   } catch {}
+
+  // 书名模糊匹配（用于 bookId 未知但知道书名的场景）
+  if (targetTitle) {
+    try {
+      const titleMatches = fs.readdirSync(BOOKS_DIR)
+        .filter(name => !names.includes(name))
+        .filter(name => {
+          const meta = readJsonIfExists(path.join(BOOKS_DIR, name, 'meta.json')) || {}
+          return normalizeText(meta.bookTitle) === targetTitle
+        })
+      names.push(...titleMatches)
+    } catch {}
+  }
 
   return [...new Set(names)]
 }
@@ -190,24 +201,13 @@ function chapterTexts(bookId, chapter, bookTitle = '') {
 
 function readProgress(bookId, bookTitle = '') {
   if (!bookId) return null
-  const direct = readJsonIfExists(path.join(BOOKS_DIR, bookId, 'progress.json'))
-  if (direct) return direct
 
-  const baseId = baseBookId(bookId)
-  if (baseId && baseId !== bookId) {
-    const baseProgress = readJsonIfExists(path.join(BOOKS_DIR, baseId, 'progress.json'))
-    if (baseProgress) return baseProgress
+  let best = null
+  for (const name of bookDirNames(bookId, bookTitle)) {
+    const p = readJsonIfExists(path.join(BOOKS_DIR, name, 'progress.json'))
+    if (p && (!best || (p.updatedAt || 0) > (best.updatedAt || 0))) best = p
   }
-
-  try {
-    const matches = bookDirNames(bookId, bookTitle)
-      .map(name => readJsonIfExists(path.join(BOOKS_DIR, name, 'progress.json')))
-      .filter(Boolean)
-      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
-    return matches[0] || null
-  } catch {
-    return null
-  }
+  return best
 }
 
 function normalizeText(text) {
@@ -306,7 +306,7 @@ function readProgressContext(bookId, chapter, selectedText, bookTitle = '') {
 
 function bookSummaries(bookId) {
   if (!bookId) return ''
-  return readIfExists(path.join(BOOKS_DIR, bookId, 'summaries.md'))
+  return readIfExists(path.join(BOOKS_DIR, baseBookId(bookId), 'summaries.md'))
 }
 
 // ── LLM API ──────────────────────────────────────────────────────────────────
@@ -322,22 +322,32 @@ function htmlTitle(text) {
   return match ? match[1].replace(/<[^>]+>/g, '').trim() : ''
 }
 
-async function callLLMOnce(maxTokens = 1024) {
+async function callLLMOnce(maxTokens = 8192) {
   const body = JSON.stringify({
     model: MODEL,
     messages: [{ role: 'system', content: SYSTEM }, ...history],
     max_tokens: maxTokens,
     tool_choice: 'none',
-    enable_thinking: true,
   })
-  const resp = await fetch(`${API_BASE}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'authorization': `Bearer ${API_KEY}`,
-    },
-    body,
-  })
+
+  // 防止 fetch 永久挂起导致 agent 卡死
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 120_000)
+
+  let resp
+  try {
+    resp = await fetch(`${API_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${API_KEY}`,
+      },
+      body,
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timeout)
+  }
 
   const raw = await resp.text()
   let data
@@ -351,26 +361,25 @@ async function callLLMOnce(maxTokens = 1024) {
   }
   if (data.error) throw new Error(data.error.message || JSON.stringify(data.error))
   const msg = data.choices?.[0]?.message
-  // reasoning_content = chain-of-thought (不显示给用户)
-  // content = 最终回复 (显示给用户)
-  // 如果 content 是空的说明模型把回复放进了 reasoning_content，反向使用
-  const content = msg?.content?.trim()
-  const reasoning = msg?.reasoning_content?.trim()
-  const looksLikeThinking = content && /^(\*\*理解|1\.\s*\*\*|##\s*分析)/.test(content)
-  const text = looksLikeThinking ? reasoning : (content || reasoning)
+  // content 优先作为回复；若为空则回退到 reasoning_content（少数推理模型会把回复放这里）
+  const text = msg?.content?.trim() || msg?.reasoning_content?.trim()
   if (!text) throw new Error('模型无回应：' + JSON.stringify(data).slice(0, 200))
   return text
 }
 
-async function callLLM(maxTokens = 1024) {
+async function callLLM(maxTokens = 8192) {
   let lastErr
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       return await callLLMOnce(maxTokens)
     } catch (e) {
       lastErr = e
-      if (![429, 500, 502, 503, 504].includes(e.status) || attempt === 3) break
-      await sleep(800 * attempt)
+      // 超时、网络错误、服务端错误均可重试
+      const canRetry = e.name === 'AbortError'
+        || [429, 500, 502, 503, 504].includes(e.status)
+      if (!canRetry || attempt === 3) break
+      console.log(`  ⚠️ API 调用失败 (attempt ${attempt}/3): ${e.message}`)
+      await sleep(1500 * attempt)
     }
   }
   throw lastErr
@@ -384,7 +393,7 @@ async function say(userText, options = {}) {
   history.push({ role: 'user', content: userText })
   let reply
   try {
-    reply = await callLLM(options.maxTokens || 1024)
+    reply = await callLLM(options.maxTokens || 8192)
   } catch (e) {
     history.pop()
     return `⚠️ ${e.message}`
@@ -395,7 +404,7 @@ async function say(userText, options = {}) {
 
 // ── 持久化 ───────────────────────────────────────────────────────────────────
 function ensureBookDir(bookId) {
-  const d = path.join(BOOKS_DIR, bookId)
+  const d = path.join(BOOKS_DIR, baseBookId(bookId))
   fs.mkdirSync(d, { recursive: true })
   return d
 }
@@ -424,52 +433,58 @@ async function saveSessionMemory() {
   if (history.length < 4) return
   console.log('\n正在固化本次会话记忆...')
 
-  const currentProfile = readIfExists(path.join(AGENT_DIR, 'profile.md'))
-  const currentSoul = readIfExists(path.join(AGENT_DIR, 'soul.md'))
+  const specs = [
+    { type: 'profile', file: 'profile.md', maxChars: 400 },
+    { type: 'soul', file: 'soul.md', maxChars: 250 },
+  ]
 
-  const prompt = `会话即将结束。请将原内容与本次讨论的新认知合并，输出完整的重写版本（删去被覆盖的旧条目，保持精简）：
+  for (const { type, file, maxChars } of specs) {
+    const filePath = path.join(AGENT_DIR, file)
+    const oldContent = readIfExists(filePath)
 
-【PROFILE_REWRITE】
-（合并后的完整 profile.md，≤400字；无新认知则原样输出）
+    // 备份旧文件
+    if (oldContent) {
+      try { fs.copyFileSync(filePath, filePath + '.bak') } catch {}
+    }
+
+    const prompt = `会话即将结束。请将原内容与本次讨论的新认知合并，输出完整的重写版本（删去被覆盖的旧条目，保持精简）。
+
+只输出合并后的完整 ${file} 内容（≤${maxChars}字），不要输出任何其他文字、标记或说明。
+无新认知则原样输出原内容。
+
 原内容：
-${currentProfile}
+${oldContent || '（尚无记录）'}`
 
-【SOUL_REWRITE】
-（合并后的完整 soul.md，≤250字；无变化则原样输出）
-原内容：
-${currentSoul}`
+    let content = await rewriteWithRetry(type, prompt)
+    if (content) {
+      fs.writeFileSync(filePath, content + '\n')
+      console.log(`  ✓ ${file} 已合并重写`)
+    } else {
+      console.log(`  ⚠️ ${file} 重试后仍未通过校验，保留旧文件`)
+    }
+  }
+}
 
-  const resp = await say(prompt, { maxTokens: 1800 })
-  console.log('[debug saveSessionMemory 原始回应]:\n' + resp.slice(0, 300) + (resp.length > 300 ? '...' : ''))
+async function rewriteWithRetry(type, prompt) {
+  const MIN_LEN = 30  // 去空白后最少 30 字
 
-  // 宽松匹配：允许标记前后有任意空白
-  const profileMatch =
-    resp.match(/【PROFILE_REWRITE】\s*([\s\S]+?)(?=\s*【SOUL_REWRITE】)/) ||
-    resp.match(/【PROFILE_REWRITE】\s*([\s\S]+)$/)
-  const soulMatch = resp.match(/【SOUL_REWRITE】\s*([\s\S]+)$/)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const resp = await say(prompt, { maxTokens: 1200 })
+    // say() 已经把 {role:'assistant', content:resp} 推入了 history
+    // 下面是 LLM 对单任务的回复，整段即是目标内容，无需正则切割
 
-  function looksValid(content) {
-    // 必须有 ## 标题且超过 80 字，避免写入模型的推理碎片
-    return content && content.includes('##') && content.replace(/\s/g, '').length > 80
+    const content = resp.trim()
+    const stripped = content.replace(/\s/g, '')
+    if (stripped.length >= MIN_LEN) return content
+
+    // 校验失败：从 history 里摘掉坏回复，追加纠正指令重试
+    console.log(`  ⚠️ ${type} 第 ${attempt + 1} 次校验未通过（去空白 ${stripped.length} 字），重试...`)
+    history.pop()  // 移除坏的 assistant 回复
+    history.pop()  // 移除触发它的 user 消息
+    prompt = `上一次的输出太短或为空（去空白仅 ${stripped.length} 字）。请重新输出合并后的完整内容，不要省略。`
   }
 
-  const profileContent = profileMatch?.[1]?.trim()
-  if (looksValid(profileContent)) {
-    fs.writeFileSync(path.join(AGENT_DIR, 'profile.md'), profileContent + '\n')
-    console.log('  ✓ profile.md 已合并重写')
-  } else {
-    console.log('  ⚠️ profile.md 校验未通过，跳过写入（原文件保留）')
-    if (profileContent) console.log('    内容预览：' + profileContent.slice(0, 80))
-  }
-
-  const soulContent = soulMatch?.[1]?.trim()
-  if (looksValid(soulContent)) {
-    fs.writeFileSync(path.join(AGENT_DIR, 'soul.md'), soulContent + '\n')
-    console.log('  ✓ soul.md 已合并重写')
-  } else {
-    console.log('  ⚠️ soul.md 校验未通过，跳过写入（原文件保留）')
-    if (soulContent) console.log('    内容预览：' + soulContent.slice(0, 80))
-  }
+  return null
 }
 
 // ── 跨书记忆检索 ─────────────────────────────────────────────────────────────
@@ -483,6 +498,22 @@ function runRecall(selectedText) {
   return ''
 }
 
+// ── 书藉上下文组装（公共） ───────────────────────────────────────────────────
+function assembleBookContext(bookId, bookTitle, chapter, chapterUid, selectedText) {
+  let ctx = ''
+  const progressCtx = readProgressContext(bookId, chapter, selectedText, bookTitle)
+  if (progressCtx) ctx += `\n${progressCtx}\n`
+  const win = chapterWindow(bookId, chapterUid, selectedText, chapter, bookTitle)
+  if (win) {
+    ctx += `\n${win}\n`
+  } else {
+    ctx += `\n（暂无这本书的原文足迹。如果作者在后文对这个问题有新的回应，我们到时再一起讨论。）\n`
+  }
+  const sum = bookSummaries(bookId)
+  if (sum) ctx += `\n${sum}\n`
+  return ctx
+}
+
 // ── 标注 prompt 构建 ─────────────────────────────────────────────────────────
 function buildAnnotationPrompt(ann, turnHint = '') {
   const { bookTitle, chapter, selectedText, userNote, bookId, chapterUid } = ann
@@ -492,25 +523,27 @@ function buildAnnotationPrompt(ann, turnHint = '') {
     p += `\n用户的第一反应："${userNote}"\n`
   }
 
-  const recall = runRecall(selectedText)
-  if (recall) p += `\n[阅读记忆检索]\n${recall}\n`
+  // TODO: 跨书检索暂时禁用，中文分词方案待重新设计
+  // const recall = runRecall(selectedText)
+  // if (recall) p += `\n[阅读记忆检索]\n${recall}\n`
 
-  const progressCtx = readProgressContext(bookId, chapter, selectedText, bookTitle)
-  if (progressCtx) p += `\n${progressCtx}\n`
-
-  const win = chapterWindow(bookId, chapterUid, selectedText, chapter, bookTitle)
-  if (win) {
-    p += `\n[这段话所在的原文上下文]\n${win}\n`
-  } else {
-    p += `\n（暂无这本书的原文足迹。如果作者在后文对这个问题有新的回应，我们到时再一起讨论。）\n`
-  }
-
-  const sum = bookSummaries(bookId)
-  if (sum) p += `\n[本书已读章节摘要]\n${sum}\n`
-
+  p += assembleBookContext(bookId, bookTitle, chapter, chapterUid, selectedText)
   p += `\n请按行为规则开始讨论这条划线。`
   if (turnHint) p += turnHint
   return p
+}
+
+// 为带书籍元数据的聊天消息补全上下文（章节窗口、摘要等）
+// 来自共读弹窗的消息已包含引文，这里只补全书级的上下文信息
+function enrichChatMessage(msg) {
+  if (!msg.bookId || !msg.selectedText) return msg.content
+
+  const { bookId, bookTitle, chapter, chapterUid, selectedText } = msg
+  const ctx = assembleBookContext(bookId, bookTitle, chapter, chapterUid, selectedText)
+  if (ctx.trim()) {
+    return `[正在共读]《${bookTitle}》${chapter || ''}\n${ctx}\n${msg.content}`
+  }
+  return msg.content
 }
 
 // ── 首次启动：引导冷启动 ─────────────────────────────────────────────────────
@@ -573,6 +606,8 @@ async function processNewAnnotations() {
 
   for (let i = cursor; i < anns.length; i++) {
     const ann = anns[i]
+    // silent 标注只存档不触发讨论（用户已通过 /chat 发送了聊天消息）
+    if (ann.silent) continue
     currentAnn = ann
     annTurnCount = 0
     console.log(`\n── 新划线 · 《${ann.bookTitle}》${ann.chapter || ''} ──`)
@@ -627,8 +662,17 @@ async function main() {
     try {
       for (let i = chatCursor; i < inputs.length; i++) {
         const msg = inputs[i]
+        // 带书籍元数据的消息：补全章节上下文，设置标注状态用于 takeaway
+        if (msg.bookId && msg.selectedText) {
+          currentAnn = {
+            bookId: msg.bookId, bookTitle: msg.bookTitle,
+            chapter: msg.chapter, chapterUid: msg.chapterUid,
+            selectedText: msg.selectedText, userNote: msg.content,
+          }
+          annTurnCount = 0
+        }
         annTurnCount++
-        let userMsg = msg.content
+        let userMsg = enrichChatMessage(msg)
         if (annTurnCount >= 3 && currentAnn) {
           userMsg += '\n\n（请在这轮回应结尾加一行：【TAKEAWAY】你的一句收口总结，15-30字）'
         }

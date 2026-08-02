@@ -8,7 +8,7 @@
  * - 无 WebSocket
  */
 
-const RECEIVER = 'http://localhost:7239'
+const RECEIVER = 'http://127.0.0.1:7239'
 
 self.addEventListener('fetch', event => {
   const url = event.request.url

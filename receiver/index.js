@@ -58,7 +58,9 @@ setInterval(() => {
 }, 1000)
 
 function bookDir(bookId) {
-  const d = path.join(BOOKS_DIR, bookId)
+  // 归一化：去掉微信读书的 k-suffix 会话变体，一本书只对应一个目录
+  const normalized = baseBookId(bookId)
+  const d = path.join(BOOKS_DIR, normalized)
   fs.mkdirSync(path.join(d, 'chapters'), { recursive: true })
   return d
 }
@@ -149,7 +151,10 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
 
   // OPTIONS 预检直接放行
-  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return }
+  if (req.method === 'OPTIONS') {
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    res.writeHead(204); res.end(); return
+  }
 
   // 历史记录（GET /history）
   if (req.method === 'GET' && req.url === '/history') {
@@ -162,6 +167,8 @@ const server = http.createServer(async (req, res) => {
     for (const d of readJsonl(path.join(INBOX_DIR, 'annotations.jsonl'))) {
       items.push({ role: 'annotation', content: `《${d.bookTitle}》${d.chapter || ''}`,
         selectedText: d.selectedText, userNote: d.userNote || '',
+        bookId: d.bookId, bookTitle: d.bookTitle,
+        chapter: d.chapter || '', chapterUid: d.chapterUid || '',
         _ts: d.receivedAt || d.timestamp * 1000 })
     }
     for (const d of readJsonl(path.join(INBOX_DIR, 'chat_input.jsonl'))) {
@@ -217,24 +224,35 @@ const server = http.createServer(async (req, res) => {
       const line = JSON.stringify({ ...data, receivedAt: Date.now() })
       fs.appendFileSync(path.join(INBOX_DIR, 'annotations.jsonl'), line + '\n')
       writeBookMeta(data.bookId, data)
-      const annotationBaseId = baseBookId(data.bookId)
-      if (annotationBaseId && annotationBaseId !== data.bookId) writeBookMeta(annotationBaseId, data)
       console.log(`[annotation] ${data.bookTitle} · ${data.chapter} · "${data.selectedText?.slice(0, 20)}..."`)
-      triggerInject(`【新划线】《${data.bookTitle}》${data.chapter}`)
+      // 静默标注不触发 agent 自动讨论，只存档和推送侧栏
+      if (!data.silent) triggerInject(`【新划线】《${data.bookTitle}》${data.chapter}`)
       // 推送标注事件到侧栏（含用户批注）
       pushSSE('message', {
         role: 'annotation',
         content: `《${data.bookTitle}》${data.chapter || ''}`,
         selectedText: data.selectedText,
         userNote: data.userNote || '',
+        bookId: data.bookId,
+        bookTitle: data.bookTitle,
+        chapter: data.chapter || '',
+        chapterUid: data.chapterUid || '',
       })
 
     } else if (url === '/chat') {
-      // 来自侧栏的用户消息
-      const { content } = data
+      // 来自侧栏或共读弹窗的用户消息
+      const { content, bookId, bookTitle, chapter, chapterUid, selectedText } = data
       if (!content) { res.writeHead(400); res.end(); return }
+      const entry = { role: 'user', content, timestamp: Date.now() }
+      if (bookId) {
+        entry.bookId = bookId
+        entry.bookTitle = bookTitle || ''
+        entry.chapter = chapter || ''
+        entry.chapterUid = chapterUid || ''
+        entry.selectedText = selectedText || ''
+      }
       fs.appendFileSync(path.join(INBOX_DIR, 'chat_input.jsonl'),
-        JSON.stringify({ role: 'user', content, timestamp: Date.now() }) + '\n')
+        JSON.stringify(entry) + '\n')
       console.log(`[chat] ${content.slice(0, 50)}`)
 
     } else if (url === '/content') {
@@ -244,16 +262,9 @@ const server = http.createServer(async (req, res) => {
         console.warn(`[content] 400 missing fields: bookId=${bookId} chapterUid=${chapterUid} textLen=${text?.length}`)
         res.writeHead(400); res.end(); return
       }
-      const ids = [bookId]
-      const normalized = data.baseBookId || baseBookId(bookId)
-      if (normalized && normalized !== bookId) ids.push(normalized)
-
-      const results = {}
-      for (const id of [...new Set(ids)]) {
-        results[id] = safeWriteContent(id, chapterUid, text, selectedText)
-        writeBookMeta(id, data)
-      }
-      console.log(`[content] bookId=${bookId} chapterUid=${chapterUid} (${text.length} chars) ${JSON.stringify(results)}`)
+      const result = safeWriteContent(bookId, chapterUid, text, selectedText)
+      writeBookMeta(bookId, data)
+      console.log(`[content] bookId=${bookId} chapterUid=${chapterUid} (${text.length} chars) ${result}`)
 
     } else if (url === '/debug') {
       const line = JSON.stringify({ ...data, receivedAt: Date.now() })
@@ -278,11 +289,6 @@ const server = http.createServer(async (req, res) => {
         const payload = JSON.stringify({ ...data, updatedAt: Date.now() })
         fs.writeFileSync(path.join(bookDir(bookId), 'progress.json'), payload)
         writeBookMeta(bookId, data)
-        const baseId = baseBookId(bookId)
-        if (baseId && baseId !== bookId) {
-          fs.writeFileSync(path.join(bookDir(baseId), 'progress.json'), payload)
-          writeBookMeta(baseId, data)
-        }
       }
 
     } else {

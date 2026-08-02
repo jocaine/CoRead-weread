@@ -2,7 +2,7 @@
  * CoRead content script — 运行于 weread.qq.com/web/reader/*
  */
 
-const RECEIVER = 'http://localhost:7239'
+const RECEIVER = 'http://127.0.0.1:7239'
 const DEBUG_VERSION = 'selection-context-v1'
 
 // ── 1. 允许文字选中 ──────────────────────────────────────────────────────────
@@ -196,11 +196,13 @@ function showAnnotationPopup(selectedText, x, y) {
   })
 
   popup.innerHTML = `
-    <div style="color:#555;margin-bottom:8px;font-size:12px;line-height:1.4;max-height:60px;overflow:hidden;">
-      "${selectedText.slice(0, 80)}${selectedText.length > 80 ? '…' : ''}"
+    <div style="color:#888;margin-bottom:4px;font-size:11px;">引文</div>
+    <div style="color:#555;margin-bottom:10px;font-size:12px;line-height:1.5;max-height:72px;overflow-y:auto;
+                padding:6px 8px;background:#f8f8f8;border-left:3px solid #07c160;border-radius:4px;">
+      ${escHtml(selectedText)}
     </div>
-    <textarea id="coread-note" placeholder="共读话题（可留空直接发送）"
-      style="width:100%;box-sizing:border-box;height:64px;border:1px solid #ddd;
+    <textarea id="coread-note" placeholder="你对这段话的想法…"
+      style="width:100%;box-sizing:border-box;height:56px;border:1px solid #ddd;
              border-radius:4px;padding:6px;font-size:13px;resize:none;outline:none;"></textarea>
     <div style="display:flex;gap:8px;margin-top:8px;justify-content:flex-end;">
       <button id="coread-cancel"
@@ -215,10 +217,26 @@ function showAnnotationPopup(selectedText, x, y) {
   setTimeout(() => popup?.querySelector('#coread-note')?.focus(), 50)
 
   popup.querySelector('#coread-cancel').addEventListener('click', removePopup)
-  popup.querySelector('#coread-send').addEventListener('click', () => {
-    const userNote = popup.querySelector('#coread-note').value.trim()
-    sendAnnotation(selectedText, userNote)
-    removePopup()
+  popup.querySelector('#coread-send').addEventListener('click', async () => {
+    const sendBtn = popup.querySelector('#coread-send')
+    const noteArea = popup.querySelector('#coread-note')
+    const userNote = noteArea.value.trim()
+
+    // 显示发送状态
+    sendBtn.disabled = true
+    sendBtn.textContent = '发送中...'
+    noteArea.disabled = true
+
+    const ok = await sendAnnotation(selectedText, userNote)
+
+    if (ok) {
+      sendBtn.textContent = '已发送 ✓'
+      sendBtn.style.background = '#576b95'
+    } else {
+      sendBtn.textContent = '发送失败'
+      sendBtn.style.background = '#e74c3c'
+    }
+    setTimeout(() => removePopup(), 1200)
   })
   popup.addEventListener('mousedown', e => e.stopPropagation())
 }
@@ -235,20 +253,50 @@ function getDirectSelectionText() {
   return ''
 }
 
+function escHtml(t) {
+  return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
 async function sendAnnotation(selectedText, userNote) {
   const ctx = getReadingContext()
-  await trySendSelectionContent(ctx.chapterUid, ctx, selectedText, _copySelection)
-  await trySendDomContent(ctx.chapterUid, ctx, selectedText)
-  const payload = { ...ctx, selectedText, userNote, timestamp: Math.floor(Date.now() / 1000) }
+
+  // 后台静默发送：正文缓存、标注存档（不影响主流程）
+  trySendSelectionContent(ctx.chapterUid, ctx, selectedText, _copySelection)
+  trySendDomContent(ctx.chapterUid, ctx, selectedText)
+  fetch(`${RECEIVER}/annotation`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...ctx, selectedText, userNote, silent: true, timestamp: Math.floor(Date.now() / 1000) }),
+  }).catch(() => {})
+
+  // 主流程：发送聊天消息，等待结果
+  const chatContent = `[引用]《${ctx.bookTitle}》${ctx.chapter || ''}\n> "${selectedText}"\n\n${userNote || '对这段话感兴趣，想听听你的想法'}`
+
   try {
-    await fetch(`${RECEIVER}/annotation`, {
+    // 带超时的 fetch，避免因网络问题永久卡在"发送中"
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 10_000)
+    const resp = await fetch(`${RECEIVER}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        content: chatContent,
+        bookId: ctx.bookId,
+        bookTitle: ctx.bookTitle,
+        chapter: ctx.chapter || '',
+        chapterUid: ctx.chapterUid || '',
+        selectedText,
+      }),
+      signal: ctrl.signal,
     })
-    console.log('[CoRead] annotation sent', payload)
+    clearTimeout(timer)
+    console.log('[CoRead] chat sent', { selectedText: selectedText.slice(0, 30), userNote, ok: resp.ok })
+    // 自动打开侧栏，让用户看到 agent 的回复
+    try { chrome.runtime?.sendMessage({ action: 'openPanel' }) } catch {}
+    return resp.ok
   } catch (e) {
     console.warn('[CoRead] receiver not reachable:', e.message)
+    return false
   }
 }
 
