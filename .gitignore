@@ -18,6 +18,10 @@ agent/.coldstart_skipped
 node_modules/
 npm-debug.log*
 
+# 调试/运行产物
+*.out
+.playwright-mcp/
+
 # macOS
 .DS_Store
 

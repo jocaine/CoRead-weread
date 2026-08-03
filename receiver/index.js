@@ -24,16 +24,18 @@ fs.mkdirSync(INBOX_DIR, { recursive: true })
 // ── SSE ──────────────────────────────────────────────────────────────────────
 const sseClients = new Set()
 
-// 内存缓冲：新客户端连上时回放最近 2 分钟的事件
-const recentEvents = []
-const REPLAY_WINDOW_MS = 120_000
+// 事件缓冲区：带递增 ID，用于断点续传
+let _eventSeq = 0
+const recentEvents = []  // [{ id, type, ...data }]
+const MAX_RECENT = 100
 
 function pushSSE(type, data) {
-  const event = { type, ...data, _ts: Date.now() }
+  _eventSeq++
+  const event = { id: _eventSeq, type, ...data }
   recentEvents.push(event)
-  if (recentEvents.length > 50) recentEvents.shift()
+  if (recentEvents.length > MAX_RECENT) recentEvents.shift()
   if (sseClients.size === 0) return
-  const payload = `data: ${JSON.stringify({ type, ...data })}\n\n`
+  const payload = `id: ${_eventSeq}\ndata: ${JSON.stringify({ type, ...data })}\n\n`
   for (const client of sseClients) {
     try { client.write(payload) } catch { sseClients.delete(client) }
   }
@@ -44,18 +46,21 @@ let chatOutputLastLine = (() => {
   try { return fs.readFileSync(CHAT_OUTPUT, 'utf8').trim().split('\n').filter(Boolean).length } catch { return 0 }
 })()
 
-// 每秒轮询 chat_output.jsonl，有新行就推送给所有 SSE 客户端
+// 每 100ms 轮询 chat_output.jsonl，有新行就推送给所有 SSE 客户端。
+// 流式中间记录（_stream）也原样推送，侧栏据此渲染打字机效果；/history 仍过滤它们。
 setInterval(() => {
-  if (sseClients.size === 0) return
   try {
     const lines = fs.readFileSync(CHAT_OUTPUT, 'utf8').trim().split('\n').filter(Boolean)
     if (lines.length <= chatOutputLastLine) return
-    for (const line of lines.slice(chatOutputLastLine)) {
+    const fresh = lines.slice(chatOutputLastLine)
+    chatOutputLastLine = lines.length  // 无论有无客户端都推进游标：
+    // 否则侧栏关闭期间积累的回复会在重开时被 /history 加载后又推一遍，造成重复气泡
+    if (sseClients.size === 0) return
+    for (const line of fresh) {
       try { pushSSE('message', JSON.parse(line)) } catch {}
     }
-    chatOutputLastLine = lines.length
   } catch {}
-}, 1000)
+}, 100)
 
 function bookDir(bookId) {
   // 归一化：去掉微信读书的 k-suffix 会话变体，一本书只对应一个目录
@@ -70,11 +75,14 @@ function baseBookId(bookId) {
 }
 
 function readBody(req) {
+  // 必须收集全部 Buffer 后再一次性 toString('utf8') 解码：
+  // 逐个 chunk 做 body += chunk 时，若一个多字节 UTF-8 字符跨 chunk 边界，
+  // 每次转换都会把不完整的字节解码成 U+FFFD（�），选中文字里就会混入乱码。
   return new Promise((resolve, reject) => {
-    let body = ''
-    req.on('data', chunk => body += chunk)
+    const chunks = []
+    req.on('data', chunk => chunks.push(chunk))
     req.on('end', () => {
-      try { resolve(JSON.parse(body)) }
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))) }
       catch (e) { reject(e) }
     })
     req.on('error', reject)
@@ -158,28 +166,96 @@ const server = http.createServer(async (req, res) => {
 
   // 历史记录（GET /history）
   if (req.method === 'GET' && req.url === '/history') {
-    const items = []
     const readJsonl = (file) => {
       try {
         return fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l))
       } catch { return [] }
     }
+    // 标注全部保留，聊天消息截最近 200 条
+    const annItems = []
     for (const d of readJsonl(path.join(INBOX_DIR, 'annotations.jsonl'))) {
-      items.push({ role: 'annotation', content: `《${d.bookTitle}》${d.chapter || ''}`,
+      annItems.push({ role: 'annotation', content: `《${d.bookTitle}》${d.chapter || ''}`,
         selectedText: d.selectedText, userNote: d.userNote || '',
         bookId: d.bookId, bookTitle: d.bookTitle,
         chapter: d.chapter || '', chapterUid: d.chapterUid || '',
         _ts: d.receivedAt || d.timestamp * 1000 })
     }
+    const chatItems = []
     for (const d of readJsonl(path.join(INBOX_DIR, 'chat_input.jsonl'))) {
-      items.push({ role: 'user', content: d.content, _ts: d.timestamp })
+      chatItems.push({ role: 'user', content: d.content, _ts: d.timestamp })
     }
     for (const d of readJsonl(CHAT_OUTPUT)) {
-      items.push({ role: 'assistant', content: d.content, _ts: d.timestamp || 0 })
+      if ('_stream' in d) continue  // 过滤流式中间分片
+      chatItems.push({ role: 'assistant', content: d.content, _ts: d.timestamp || 0 })
     }
-    items.sort((a, b) => a._ts - b._ts)
+    chatItems.sort((a, b) => a._ts - b._ts)
+    const allItems = [...annItems, ...chatItems.slice(-200)]
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify(items.slice(-100)))
+    res.end(JSON.stringify(allItems))
+    return
+  }
+
+  // 反查章节（GET /find-chapter?bookId=..&text=..）
+  // 用引用文字在本地正文缓存里找到对应章节文件，返回可跳转的原生槽位（e_0 / t_1）。
+  // 用于旧标注 chapterUid 为空、或 chapterUid 是拼接名无法直接用于跳转时的兜底。
+  if (req.method === 'GET' && req.url.startsWith('/find-chapter?')) {
+    const u = new URL(req.url, 'http://localhost')
+    const bookId = u.searchParams.get('bookId') || ''
+    const text = u.searchParams.get('text') || ''
+    if (!bookId || !text) { res.writeHead(400); res.end('{}'); return }
+    const chaptersDir = path.join(bookDir(bookId), 'chapters')
+    const needle = normalizeText(text).slice(0, 60)
+    let best = null
+    let bestLen = 0
+    try {
+      for (const name of fs.readdirSync(chaptersDir)) {
+        if (!name.endsWith('.txt')) continue
+        const t = fs.readFileSync(path.join(chaptersDir, name), 'utf8')
+        if (!t) continue
+        if (normalizeText(t).indexOf(needle) !== -1 && t.length > bestLen) {
+          bestLen = t.length
+          const base = name.replace(/\.txt$/, '')
+          let slot = ''
+          if (/^[te]_\d+$/.test(base)) slot = base
+          else { const m = base.match(/(?:^|_)([te]_\d+)$/); slot = m ? m[1] : '' }
+          best = { filename: name, slot, title: base }
+        }
+      }
+    } catch {}
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(best || { slot: '' }))
+    return
+  }
+
+  // 共读标注列表（GET /annotations?bookId=..）
+  // 返回该书所有已共读标注（selectedText 等），供内容脚本在书页里标记共读段落。
+  if (req.method === 'GET' && req.url.startsWith('/annotations?')) {
+    const u = new URL(req.url, 'http://localhost')
+    const bookId = u.searchParams.get('bookId') || ''
+    const base = baseBookId(bookId)
+    const out = []
+    if (base) {
+      try {
+        const lines = fs.readFileSync(path.join(INBOX_DIR, 'annotations.jsonl'), 'utf8').trim().split('\n')
+        for (const line of lines) {
+          if (!line) continue
+          let d
+          try { d = JSON.parse(line) } catch { continue }
+          if (!d.selectedText) continue
+          if (d.bookId && baseBookId(d.bookId) === base) {
+            out.push({
+              selectedText: d.selectedText,
+              chapter: d.chapter || '',
+              chapterUid: d.chapterUid || '',
+              userNote: d.userNote || '',
+              timestamp: d.receivedAt || (d.timestamp ? d.timestamp * 1000 : 0),
+            })
+          }
+        }
+      } catch {}
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(out))
     return
   }
 
@@ -191,12 +267,15 @@ const server = http.createServer(async (req, res) => {
       'Connection': 'keep-alive',
     })
     res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`)
-    // 回放最近 2 分钟的事件，避免 sidebar 打开时错过已发送的标注
-    const cutoff = Date.now() - REPLAY_WINDOW_MS
-    for (const evt of recentEvents) {
-      if (evt._ts >= cutoff) {
-        const { _ts, ...rest } = evt
-        res.write(`data: ${JSON.stringify(rest)}\n\n`)
+    // 断点续传：EventSource 重连时自动带上 Last-Event-ID，只回放客户端没收到的事件。
+    // 首次连接（lastId=0）不回放——侧栏已通过 /history 加载历史，2 分钟回放既冗余
+    // 又会与历史重复（此前该分支因事件不带 _ts 而永久失效，现直接移除）。
+    const lastId = parseInt(req.headers['last-event-id'], 10) || 0
+    if (lastId > 0) {
+      for (const evt of recentEvents) {
+        if (evt.id > lastId) {
+          res.write(`id: ${evt.id}\ndata: ${JSON.stringify({ type: evt.type, ...evt })}\n\n`)
+        }
       }
     }
     sseClients.add(res)
@@ -225,19 +304,58 @@ const server = http.createServer(async (req, res) => {
       fs.appendFileSync(path.join(INBOX_DIR, 'annotations.jsonl'), line + '\n')
       writeBookMeta(data.bookId, data)
       console.log(`[annotation] ${data.bookTitle} · ${data.chapter} · "${data.selectedText?.slice(0, 20)}..."`)
-      // 静默标注不触发 agent 自动讨论，只存档和推送侧栏
-      if (!data.silent) triggerInject(`【新划线】《${data.bookTitle}》${data.chapter}`)
-      // 推送标注事件到侧栏（含用户批注）
-      pushSSE('message', {
-        role: 'annotation',
-        content: `《${data.bookTitle}》${data.chapter || ''}`,
-        selectedText: data.selectedText,
-        userNote: data.userNote || '',
-        bookId: data.bookId,
-        bookTitle: data.bookTitle,
-        chapter: data.chapter || '',
-        chapterUid: data.chapterUid || '',
-      })
+      // 静默标注不触发 agent 自动讨论，也不推送侧栏（用户已通过 /chat 发送）
+      if (!data.silent) {
+        triggerInject(`【新划线】《${data.bookTitle}》${data.chapter}`)
+        // 推送标注事件到侧栏（含用户批注）
+        pushSSE('message', {
+          role: 'annotation',
+          content: `《${data.bookTitle}》${data.chapter || ''}`,
+          selectedText: data.selectedText,
+          userNote: data.userNote || '',
+          bookId: data.bookId,
+          bookTitle: data.bookTitle,
+          chapter: data.chapter || '',
+          chapterUid: data.chapterUid || '',
+        })
+      } else if (data.setRef) {
+        // 划线共读弹窗只"设为当前引用"，不触发 agent 讨论：推送 annotation-select 事件，
+        // 侧栏收到后把该标注加入引用列表并选中为当前引用
+        pushSSE('message', {
+          role: 'annotation-select',
+          selectedText: data.selectedText,
+          bookId: data.bookId,
+          bookTitle: data.bookTitle,
+          chapter: data.chapter || '',
+          chapterUid: data.chapterUid || '',
+        })
+      }
+
+    } else if (url === '/annotation-delete') {
+      // 删除引用：按 bookId + selectedText 精确匹配，从 annotations.jsonl 移除所有匹配行
+      const { bookId, selectedText } = data
+      if (!bookId || !selectedText) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing fields' })); return }
+      const base = baseBookId(bookId)
+      const needle = normalizeText(selectedText)
+      const file = path.join(INBOX_DIR, 'annotations.jsonl')
+      let lines = []
+      try { lines = fs.readFileSync(file, 'utf8').split('\n') } catch { lines = [] }
+      const kept = []
+      let deleted = 0
+      for (const line of lines) {
+        if (!line.trim()) continue
+        let d
+        try { d = JSON.parse(line) } catch { kept.push(line); continue }
+        const isMatch = d.bookId && baseBookId(d.bookId) === base
+          && normalizeText(d.selectedText || '') === needle
+        if (isMatch) deleted++
+        else kept.push(line)
+      }
+      fs.writeFileSync(file, kept.join('\n') + (kept.length ? '\n' : ''))
+      console.log(`[annotation-delete] book=${base.slice(0, 12)}… deleted=${deleted}`)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ deleted }))
+      return  // 必须 return：否则会落到底部公共 res.writeHead(200)，对已结束的响应二次 writeHead 抛 ERR_HTTP_HEADERS_SENT，导致进程崩溃
 
     } else if (url === '/chat') {
       // 来自侧栏或共读弹窗的用户消息
@@ -253,6 +371,20 @@ const server = http.createServer(async (req, res) => {
       }
       fs.appendFileSync(path.join(INBOX_DIR, 'chat_input.jsonl'),
         JSON.stringify(entry) + '\n')
+
+      // 来自共读弹窗的消息（不是侧栏）：推送用户消息到侧栏 + 显示思考状态
+      if (bookId && selectedText && !origin.startsWith('chrome-extension://')) {
+        pushSSE('message', {
+          role: 'user-popup',
+          content: content,
+          bookId: bookId,
+          bookTitle: bookTitle || '',
+          chapter: chapter || '',
+          chapterUid: chapterUid || '',
+          selectedText: selectedText,
+        })
+      }
+
       console.log(`[chat] ${content.slice(0, 50)}`)
 
     } else if (url === '/content') {

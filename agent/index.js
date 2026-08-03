@@ -23,9 +23,11 @@ const INBOX_DIR = path.join(RECEIVER_DIR, 'inbox')
 const BOOKS_DIR = path.join(RECEIVER_DIR, 'books')
 const ANNOTATIONS = path.join(INBOX_DIR, 'annotations.jsonl')
 const CURSOR_FILE = path.join(INBOX_DIR, '.agent_cursor')
+const PROCESSED_ANN_FILE = path.join(INBOX_DIR, '.agent_processed_anns')  // 已处理标注指纹，防删除后游标归零重放
 const CHAT_INPUT = path.join(INBOX_DIR, 'chat_input.jsonl')
 const CHAT_INPUT_CURSOR = path.join(INBOX_DIR, '.chat_input_cursor')
 const CHAT_OUTPUT = path.join(INBOX_DIR, 'chat_output.jsonl')
+const _repliedFingerprints = new Set()  // 去重：防止同一消息被重复回复
 
 const API_KEY = process.env.COREAD_API_KEY
 const API_BASE = (process.env.COREAD_API_BASE || '').replace(/\/$/, '')
@@ -65,6 +67,27 @@ function appendChatOutput(role, content) {
   try { fs.appendFileSync(CHAT_OUTPUT, JSON.stringify({ role, content: stripCodeBlocks(content), timestamp: Date.now() }) + '\n') } catch {}
 }
 
+// 流式记录：content 存累计文本，侧栏据此渲染打字机（_stream 存在即流式中间记录）
+let _streamSeq = 0
+function appendChatOutputStream(content) {
+  try {
+    fs.appendFileSync(CHAT_OUTPUT, JSON.stringify({
+      role: 'assistant',
+      content: stripCodeBlocks(content),
+      _stream: _streamSeq++,
+      timestamp: Date.now(),
+    }) + '\n')
+  } catch {}
+}
+// 流结束标记：侧栏收到 _stream === -1 后把该条流标记为完成
+function appendChatOutputStreamEnd() {
+  try {
+    fs.appendFileSync(CHAT_OUTPUT, JSON.stringify({
+      role: 'assistant', content: '', _stream: -1, timestamp: Date.now(),
+    }) + '\n')
+  } catch {}
+}
+
 function readChatInputs() {
   const raw = readIfExists(CHAT_INPUT)
   if (!raw) return []
@@ -93,6 +116,29 @@ function getCursor() {
 }
 
 function setCursor(n) { fs.writeFileSync(CURSOR_FILE, String(n)) }
+
+// ── 已处理标注指纹（防重放） ─────────────────────────────────────────────────
+// 侧栏删除引用会通过 /annotation-delete 重写 annotations.jsonl，使其行数小于游标，
+// 从而触发游标归零。若没有这层指纹去重，归零后所有旧标注会被重新走 LLM 讨论一遍
+// （重复调用、重复历史）。指纹持久化到文件，重启后依然生效。
+function annFingerprint(ann) {
+  if (!ann || !ann.selectedText) return ''
+  return `${baseBookId(ann.bookId || '')}|${ann.selectedText}|${ann.chapter || ''}`
+}
+
+const processedAnnFps = new Set()
+try {
+  for (const l of readIfExists(PROCESSED_ANN_FILE).split('\n')) {
+    if (l.trim()) processedAnnFps.add(l.trim())
+  }
+} catch {}
+
+function markAnnProcessed(ann) {
+  const fp = annFingerprint(ann)
+  if (!fp || processedAnnFps.has(fp)) return
+  processedAnnFps.add(fp)
+  try { fs.appendFileSync(PROCESSED_ANN_FILE, fp + '\n') } catch {}
+}
 
 // ── 章节原文上下文 ───────────────────────────────────────────────────────────
 function chapterFileName(chapter) {
@@ -367,6 +413,102 @@ async function callLLMOnce(maxTokens = 8192) {
   return text
 }
 
+// ── 流式调用 LLM ────────────────────────────────────────────────────────────
+async function* callLLMStream(maxTokens = 8192) {
+  const body = JSON.stringify({
+    model: MODEL,
+    messages: [{ role: 'system', content: SYSTEM }, ...history],
+    max_tokens: maxTokens,
+    stream: true,
+    stream_options: { include_usage: true },
+  })
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 180_000)
+
+  let resp
+  try {
+    resp = await fetch(`${API_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'authorization': `Bearer ${API_KEY}`,
+      },
+      body,
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timeout)
+  }
+
+  if (!resp.ok) {
+    const raw = await resp.text()
+    let data
+    try { data = JSON.parse(raw) } catch { data = null }
+    const brief = data?.error?.message || raw.slice(0, 120)
+    const err = new Error(`LLM API ${resp.status}: ${brief}`)
+    err.status = resp.status
+    throw err
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let fullContent = ''
+  let fullReasoning = ''
+
+  // 流中途停滞保护：长时间没有新 chunk（推理模型静默思考 / 连接卡死）就 abort，
+  // 避免侧栏永远停在"思考中"。上面的 180s 超时只覆盖响应头阶段，管不到 body 流。
+  let stallTimer = null
+  const STALL_TIMEOUT = 150_000
+  const resetStall = () => {
+    clearTimeout(stallTimer)
+    stallTimer = setTimeout(() => controller.abort(), STALL_TIMEOUT)
+  }
+  resetStall()
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      resetStall()
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        const s = line.trim()
+        if (!s.startsWith('data: ')) continue
+        const json = s.slice(6)
+        if (json === '[DONE]') continue
+
+        try {
+          const parsed = JSON.parse(json)
+          const delta = parsed.choices?.[0]?.delta
+          if (delta?.content) {
+            fullContent += delta.content
+            yield { chunk: delta.content, accumulated: fullContent }
+          } else if (delta?.reasoning_content) {
+            // 推理模型把思考过程放在 reasoning_content：先累积，content 为空时回退使用
+            fullReasoning += delta.reasoning_content
+          }
+        } catch {}
+      }
+    }
+  } finally {
+    clearTimeout(stallTimer)
+  }
+
+  if (!fullContent.trim()) {
+    // 部分推理模型可能只输出 reasoning_content 而 content 为空
+    if (fullReasoning.trim()) return fullReasoning
+    throw new Error('模型无回应（空流）')
+  }
+
+  return fullContent
+}
+
 async function callLLM(maxTokens = 8192) {
   let lastErr
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -389,17 +531,86 @@ function stripCodeBlocks(text) {
   return text.replace(/```[\s\S]*?```/g, '').replace(/^\s*\n/gm, '\n').trim()
 }
 
+// 带重试的流式调用：只在「一个 chunk 都没产出」前重试（429/5xx/超时/空流），
+// 已经吐出部分内容后的失败不重试（重发会造成内容错乱），直接向上抛。
+async function* callLLMStreamWithRetry(maxTokens) {
+  let lastErr
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const it = callLLMStream(maxTokens)
+    let yielded = false
+    try {
+      while (true) {
+        const { done, value } = await it.next()
+        if (done) {
+          // 生成器以 return 结束：已 yield 过 → 返回累计结果；
+          // 未 yield 过但有返回值（纯推理模型把回复放在 return 的 fullReasoning）→ 也返回，
+          // 否则会被当成空流重试 3 次后丢弃。只有既无 chunk 也无返回值（真·空流）才重试。
+          if (yielded || value) return value
+          break
+        }
+        yielded = true
+        yield value
+      }
+    } catch (e) {
+      lastErr = e
+      if (yielded) throw e  // 中途失败：不重试
+      const canRetry = e.name === 'AbortError'
+        || [429, 500, 502, 503, 504].includes(e.status)
+        || /空流|模型无回应/.test(e.message || '')
+      if (!canRetry || attempt === 3) throw e
+      console.log(`  ⚠️ 流式调用失败 (attempt ${attempt}/3): ${e.message}`)
+      await sleep(1500 * attempt)
+      continue
+    }
+    lastErr = lastErr || new Error('模型无回应（空流）')
+    if (attempt === 3) throw lastErr
+    console.log(`  ⚠️ 空流重试 (attempt ${attempt}/3)`)
+    await sleep(1500 * attempt)
+  }
+  throw lastErr
+}
+
+// 产出最终完整回复的流式入口：边收边把累计文本写进 chat_output（~100ms 节流），
+// 收尾写 -1 结束标记 + 最终完整记录。chat_output 的写入由本函数独占，
+// 调用方不再各自 appendChatOutput，保证每条回复只产生一组流记录 + 一条最终记录。
 async function say(userText, options = {}) {
   history.push({ role: 'user', content: userText })
-  let reply
+  let fullContent = ''
+  let started = false  // 是否已写过流式记录
+
   try {
-    reply = await callLLM(options.maxTokens || 8192)
+    const stream = callLLMStreamWithRetry(options.maxTokens || 8192)
+    let lastWrite = 0
+    let result
+    while (true) {
+      result = await stream.next()
+      if (result.done) {
+        fullContent = result.value || fullContent
+        break
+      }
+      const now = Date.now()
+      const accumulated = (result.value && result.value.accumulated) || ''
+      fullContent = accumulated
+      // 节流：约 100ms 一条（content 是累计文本，中间跳过的写会在下一条覆盖）
+      if (!started || now - lastWrite >= 100) {
+        appendChatOutputStream(accumulated)
+        started = true
+        lastWrite = now
+      }
+    }
+    // 收尾：流结束标记 + 最终完整记录（供 /history 与去重用）
+    appendChatOutputStreamEnd()
+    appendChatOutput('assistant', fullContent)
   } catch (e) {
+    // 出错也要收尾：流已吐过一部分时补 -1 + 错误记录，避免侧栏气泡卡在思考动画
+    if (started) appendChatOutputStreamEnd()
+    appendChatOutput('assistant', `⚠️ ${e.message}`)
     history.pop()
     return `⚠️ ${e.message}`
   }
-  history.push({ role: 'assistant', content: reply })
-  return reply
+
+  history.push({ role: 'assistant', content: fullContent })
+  return stripCodeBlocks(fullContent)
 }
 
 // ── 持久化 ───────────────────────────────────────────────────────────────────
@@ -470,17 +681,26 @@ async function rewriteWithRetry(type, prompt) {
 
   for (let attempt = 0; attempt < 2; attempt++) {
     const resp = await say(prompt, { maxTokens: 1200 })
-    // say() 已经把 {role:'assistant', content:resp} 推入了 history
-    // 下面是 LLM 对单任务的回复，整段即是目标内容，无需正则切割
+    // say() 成功时把 {role:'user'} + {role:'assistant'} 推入了 history；
+    // say() 失败时返回 "⚠️ ..." 且已自行 pop 掉它 push 的 user 消息（净变化 0）。
+    // 下面是 LLM 对单任务的回复，整段即是目标内容，无需正则切割。
 
     const content = resp.trim()
+    // LLM 调用失败：错误串绝不能写进 profile/soul（会覆盖长期记忆），只重试不写入
+    if (/^⚠️/.test(content)) {
+      console.log(`  ⚠️ ${type} 第 ${attempt + 1} 次 LLM 调用失败（${content.slice(0, 40)}），重试...`)
+      continue  // history 已被 say() 平衡，无需清理
+    }
+
     const stripped = content.replace(/\s/g, '')
     if (stripped.length >= MIN_LEN) return content
 
-    // 校验失败：从 history 里摘掉坏回复，追加纠正指令重试
+    // 校验失败（成功但太短）：从 history 里摘掉这次的 user+assistant 再重试。
+    // 只有 say() 成功时 history 才多了这两条；失败路径已在 say() 内平衡，不能 pop，
+    // 否则会删掉上一轮真实对话。
     console.log(`  ⚠️ ${type} 第 ${attempt + 1} 次校验未通过（去空白 ${stripped.length} 字），重试...`)
-    history.pop()  // 移除坏的 assistant 回复
-    history.pop()  // 移除触发它的 user 消息
+    history.pop()  // 移除这次的 assistant 回复
+    history.pop()  // 移除这次的 user 消息
     prompt = `上一次的输出太短或为空（去空白仅 ${stripped.length} 字）。请重新输出合并后的完整内容，不要省略。`
   }
 
@@ -601,11 +821,23 @@ let annTurnCount = 0
 
 async function processNewAnnotations() {
   const anns = readAnnotations()
-  const cursor = getCursor()
+  let cursor = getCursor()
+  // 游标超出实际行数（文件被清空/截断过，如删除操作或手动清理）：重置游标，
+  // 否则之后新增的标注会被 cursor >= anns.length 永久跳过。
+  // 注意：删除任意一行都会使「游标(=旧行数) > 新行数」成立并触发归零，这是正常的；
+  // 重复讨论旧标注由下方 processedAnnFps 指纹去重拦截，重置本身不会导致重放。
+  if (cursor > anns.length || (anns.length === 0 && cursor > 0)) {
+    setCursor(0)
+    cursor = 0
+  }
   if (cursor >= anns.length) return false
 
   for (let i = cursor; i < anns.length; i++) {
     const ann = anns[i]
+    // 已处理过的标注跳过（含 silent 与旧标注）：防止删除引用导致的游标归零
+    // 后把旧标注重新走 LLM 讨论一遍。指纹 = baseBookId + selectedText + chapter。
+    if (processedAnnFps.has(annFingerprint(ann))) continue
+    markAnnProcessed(ann)
     // silent 标注只存档不触发讨论（用户已通过 /chat 发送了聊天消息）
     if (ann.silent) continue
     currentAnn = ann
@@ -613,7 +845,6 @@ async function processNewAnnotations() {
     console.log(`\n── 新划线 · 《${ann.bookTitle}》${ann.chapter || ''} ──`)
     const reply = await say(buildAnnotationPrompt(ann))
     console.log('\n' + stripCodeBlocks(reply) + '\n')
-    appendChatOutput('assistant', reply)
   }
   setCursor(anns.length)
   return true
@@ -641,9 +872,11 @@ async function main() {
   const poller = setInterval(async () => {
     if (busy) return
 
-    // 优先处理新标注
+    // 优先处理新标注：游标与当前行数不一致（新增 / 删除 / 截断）时交给
+    // processNewAnnotations 统一处理——它内部会做游标重置 + 指纹去重，
+    // 避免重复讨论旧标注（见 processNewAnnotations 注释）
     const anns = readAnnotations()
-    if (getCursor() < anns.length) {
+    if (getCursor() !== anns.length) {
       busy = true
       rl.pause()
       try { await processNewAnnotations() } catch (e) { console.log(`⚠️ ${e.message}\n`) }
@@ -655,6 +888,7 @@ async function main() {
 
     // 处理来自侧栏的用户消息
     const inputs = readChatInputs()
+    if (getChatInputCursor() > inputs.length) setChatInputCursor(0)  // 文件清空/截断后重置游标，避免新消息被永久跳过
     const chatCursor = getChatInputCursor()
     if (chatCursor >= inputs.length) return
     busy = true
@@ -662,8 +896,16 @@ async function main() {
     try {
       for (let i = chatCursor; i < inputs.length; i++) {
         const msg = inputs[i]
-        // 带书籍元数据的消息：补全章节上下文，设置标注状态用于 takeaway
-        if (msg.bookId && msg.selectedText) {
+        // 去重：指纹 = 时间戳+内容前80字，防止同一消息被重复回复
+        const fp = `${msg.timestamp || 0}|${(msg.content || '').slice(0, 80)}`
+        if (_repliedFingerprints.has(fp)) { console.log(`  [dedup] skip: ${fp.slice(0,50)}`); continue }
+        _repliedFingerprints.add(fp)
+        if (_repliedFingerprints.size > 200) _repliedFingerprints.clear()
+        // 带书籍元数据的消息：绑定到该书讨论（重置轮次、补全书上下文）。
+        // 不带书上下文的消息是自由提问，不绑定任何书，也不参与书级 TAKEAWAY——
+        // 否则 currentAnn 会残留上一本书，自由提问第 3 轮时把总结写进错误的书。
+        const bookScoped = msg.bookId && msg.selectedText
+        if (bookScoped) {
           currentAnn = {
             bookId: msg.bookId, bookTitle: msg.bookTitle,
             chapter: msg.chapter, chapterUid: msg.chapterUid,
@@ -671,23 +913,25 @@ async function main() {
           }
           annTurnCount = 0
         }
-        annTurnCount++
         let userMsg = enrichChatMessage(msg)
-        if (annTurnCount >= 3 && currentAnn) {
-          userMsg += '\n\n（请在这轮回应结尾加一行：【TAKEAWAY】你的一句收口总结，15-30字）'
+        if (bookScoped) {
+          annTurnCount++
+          if (annTurnCount >= 3 && currentAnn) {
+            userMsg += '\n\n（请在这轮回应结尾加一行：【TAKEAWAY】你的一句收口总结，15-30字）'
+          }
         }
         const reply = await say(userMsg)
         const takeaway = extractTakeaway(reply)
-        if (takeaway && currentAnn) { saveTakeaway(currentAnn, takeaway) }
+        // TAKEAWAY 只归属书级讨论；自由提问不写书级总结
+        if (bookScoped && takeaway && currentAnn) { saveTakeaway(currentAnn, takeaway) }
         console.log('\n[侧栏] ' + stripCodeBlocks(reply) + '\n')
-        appendChatOutput('assistant', reply)
       }
       setChatInputCursor(inputs.length)
     } catch (e) { console.log(`⚠️ ${e.message}\n`) }
     busy = false
     rl.resume()
     rl.prompt()
-  }, 3000)
+  }, 300)
 
   rl.on('line', async (raw) => {
     const line = raw.trim()
@@ -708,7 +952,6 @@ async function main() {
       } else if (line.startsWith('【章节完成】')) {
         const reply = await say(line)
         console.log('\n' + stripCodeBlocks(reply) + '\n')
-        appendChatOutput('assistant', reply)
       } else {
         // 普通用户回复：追踪轮次，第 3 轮起附 takeaway 请求
         annTurnCount++
@@ -722,10 +965,12 @@ async function main() {
         if (takeaway && currentAnn) {
           saveTakeaway(currentAnn, takeaway)
           console.log(`\n  [takeaway 已保存]\n`)
+          // 收口总结已保存，关闭本轮讨论周期：后续 REPL 输入不再绑定到这本书，
+          // 避免用户切到别的书继续输入时把总结写进旧书（下次标注会重新锚定）
+          currentAnn = null
         }
 
         console.log('\n' + stripCodeBlocks(reply) + '\n')
-        appendChatOutput('assistant', reply)
       }
     } catch (e) {
       console.log(`⚠️ ${e.message}\n`)

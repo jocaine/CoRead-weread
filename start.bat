@@ -3,7 +3,7 @@ cd /d "%~dp0"
 
 :: Kill leftovers from previous runs
 for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":7239.*LISTENING"') do taskkill /PID %%a /F >nul 2>&1
-powershell -c "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*agent*index.js*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
+powershell -c "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*index.js*' -and $_.CommandLine -notlike '*receiver*' -and $_.CommandLine -notlike '*playwright*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
 
 :: Start receiver in background (hidden)
 start "CoRead Receiver" /MIN cmd /c "cd /d %~dp0 && node receiver\index.js"

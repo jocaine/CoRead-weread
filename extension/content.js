@@ -5,6 +5,37 @@
 const RECEIVER = 'http://127.0.0.1:7239'
 const DEBUG_VERSION = 'selection-context-v1'
 
+// ── 1.5 章节槽位跟踪 ──────────────────────────────────────────────────────────
+// WeRead 阅读时顶层 URL hash 恒为空，无法作为章节标识。
+// 章节 API 的路径（/web/book/chapter/e_0）是唯一可靠的章节标识，这里跟踪它，
+// 供标注 / 引用 / 跳转使用。前缀（t_/e_）也从中学习。
+let _chapterSlot = ''        // 原始章节槽位，如 "e_20"
+let _chapterTitle = ''       // 最近一次捕获到的章节标题
+let _chapterPrefix = 'e'     // 章节前缀，默认 'e'（本项目的 epub 书）
+
+// 跨 frame 共享最近章节（标注可能发生在与网络捕获不同的 frame）
+// 带 bookId 归一化，避免切书后误用上一本书的章节槽位
+async function persistSharedChapter(bookId, slot, title) {
+  try {
+    await chrome.storage.session.set({ coreadChapter: { bookId: baseBookId(bookId), slot, title, ts: Date.now() } })
+  } catch {}
+}
+async function readSharedChapter() {
+  try {
+    const { coreadChapter } = await chrome.storage.session.get('coreadChapter')
+    return coreadChapter || null
+  } catch { return null }
+}
+
+// 从存储的 chapterUid 提取 WeRead 认识的原生 hash 槽位（e_0 / t_1）
+// 兼容两种存储格式：原始槽位 "e_0"，或拼接名 "中文版前言_e_0"
+function toWereadHashSlot(chapterUid) {
+  const s = String(chapterUid || '')
+  if (/^[te]_\d+$/.test(s)) return s
+  const m = s.match(/(?:^|_)([te]_\d+)$/)
+  return m ? m[1] : ''
+}
+
 // ── 1. 允许文字选中 ──────────────────────────────────────────────────────────
 const styleEl = document.createElement('style')
 styleEl.textContent = '* { user-select: text !important; -webkit-user-select: text !important; }'
@@ -43,8 +74,11 @@ function getReadingContext() {
   const chapter =
     topDoc.querySelector('.readerChapterTitleWrap_title')?.textContent?.trim() ||
     topDoc.querySelector('[class*="chapterTitle"]')?.textContent?.trim() ||
+    _chapterTitle ||
     ''
-  const chapterUid = (() => { try { return window.top.location.hash.replace('#', '') } catch { return '' } })()
+  // URL hash 只在跳转/手动导航时出现，正常阅读为空；用跟踪的网络槽位兜底
+  const hashSlot = (() => { try { return window.top.location.hash.replace('#', '') } catch { return '' } })()
+  const chapterUid = (/^[te]_\d+$/.test(hashSlot) ? hashSlot : _chapterSlot) || ''
   return { bookId, bookTitle, chapter, chapterUid }
 }
 
@@ -58,6 +92,15 @@ function normalizeText(text) {
 
 function baseBookId(bookId) {
   return String(bookId || '').replace(/k[0-9a-f]{16,}$/i, '')
+}
+
+// 乱码/损坏文本检测：含替换字符 �（传输/解码损坏的明确标记），
+// 或 WeRead 的加密章节 blob（32 位 hex 前缀 + 一长串 base64）。这类文本存成引用
+// 会成为侧栏里删不掉的乱码引用（jsonl 里通常没有对应记录，删除永远返回 deleted:0）。
+function isGarbledText(text) {
+  const s = String(text || '')
+  if (/[\uFFFD]/.test(s)) return true
+  return /^[0-9A-Fa-f]{32}[A-Za-z0-9+/=]{100,}$/.test(s.trim())
 }
 
 function getQueryParam(queryText, name) {
@@ -137,6 +180,21 @@ async function handleProgressContent(url, raw) {
   try { data = JSON.parse(raw) } catch { return }
   const ctx = getReadingContext()
   const book = data.book || {}
+  // 进度 API 兜底：网络章节拦截缺位时补上槽位。
+  // 进度响应里的 chapterUid 是纯数字索引（如 20），不带 e_/t_ 前缀，
+  // 所以前缀只能来自真实章节捕获：本 frame 的 _chapterSlot（已被 !_chapterSlot 排除），
+  // 或跨 frame 共享的 coreadChapter.slot。有真实前缀才构造槽位，否则不伪造——
+  // 用默认 'e' 给 txt 书会造出错误的 e_N，污染标注和跳转（比留空更糟：留空走 /find-chapter 检索兜底）。
+  if (!_chapterSlot && Number.isFinite(book.chapterIdx)) {
+    const shared = await readSharedChapter()
+    const sharedSlot = shared && (!shared.bookId || shared.bookId === baseBookId(ctx.bookId)) ? shared.slot : ''
+    const prefix = /^[te]_\d+$/.test(sharedSlot) ? sharedSlot.split('_')[0] : ''
+    if (prefix) {
+      const slot = `${prefix}_${book.chapterIdx}`
+      _chapterSlot = slot
+      persistSharedChapter(ctx.bookId, slot, book.chapterTitle || ctx.chapter || '')
+    }
+  }
   const payload = {
     bookId: ctx.bookId,
     bookTitle: ctx.bookTitle,
@@ -196,44 +254,38 @@ function showAnnotationPopup(selectedText, x, y) {
   })
 
   popup.innerHTML = `
-    <div style="color:#888;margin-bottom:4px;font-size:11px;">引文</div>
+    <div style="color:#888;margin-bottom:4px;font-size:11px;">设为当前引用</div>
     <div style="color:#555;margin-bottom:10px;font-size:12px;line-height:1.5;max-height:72px;overflow-y:auto;
                 padding:6px 8px;background:#f8f8f8;border-left:3px solid #07c160;border-radius:4px;">
       ${escHtml(selectedText)}
     </div>
-    <textarea id="coread-note" placeholder="你对这段话的想法…"
-      style="width:100%;box-sizing:border-box;height:56px;border:1px solid #ddd;
-             border-radius:4px;padding:6px;font-size:13px;resize:none;outline:none;"></textarea>
     <div style="display:flex;gap:8px;margin-top:8px;justify-content:flex-end;">
       <button id="coread-cancel"
         style="padding:4px 12px;border:1px solid #ddd;border-radius:4px;
                background:#f5f5f5;cursor:pointer;font-size:13px;">取消</button>
       <button id="coread-send"
         style="padding:4px 12px;border:none;border-radius:4px;
-               background:#07c160;color:#fff;cursor:pointer;font-size:13px;">发送</button>
+               background:#07c160;color:#fff;cursor:pointer;font-size:13px;">设为引用</button>
     </div>
   `
   document.documentElement.appendChild(popup)
-  setTimeout(() => popup?.querySelector('#coread-note')?.focus(), 50)
+  setTimeout(() => popup?.querySelector('#coread-send')?.focus(), 50)
 
   popup.querySelector('#coread-cancel').addEventListener('click', removePopup)
   popup.querySelector('#coread-send').addEventListener('click', async () => {
     const sendBtn = popup.querySelector('#coread-send')
-    const noteArea = popup.querySelector('#coread-note')
-    const userNote = noteArea.value.trim()
 
-    // 显示发送状态
+    // 显示设置状态
     sendBtn.disabled = true
-    sendBtn.textContent = '发送中...'
-    noteArea.disabled = true
+    sendBtn.textContent = '设置中...'
 
-    const ok = await sendAnnotation(selectedText, userNote)
+    const ok = await setCurrentRef(selectedText)
 
     if (ok) {
-      sendBtn.textContent = '已发送 ✓'
+      sendBtn.textContent = '已设为引用 ✓'
       sendBtn.style.background = '#576b95'
     } else {
-      sendBtn.textContent = '发送失败'
+      sendBtn.textContent = '设置失败'
       sendBtn.style.background = '#e74c3c'
     }
     setTimeout(() => removePopup(), 1200)
@@ -257,47 +309,73 @@ function escHtml(t) {
   return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
-async function sendAnnotation(selectedText, userNote) {
+async function setCurrentRef(selectedText) {
+  // 乱码防护：损坏/编码文本不存为引用，弹窗会显示「设置失败」
+  if (isGarbledText(selectedText)) {
+    console.warn('[CoRead] 拒绝乱码引用：', String(selectedText).slice(0, 30))
+    return false
+  }
   const ctx = getReadingContext()
+  // 本 frame 拿不到章节信息时，用跨 frame 共享的最新章节兜底（仅限同一本书）
+  if (!ctx.chapterUid || !ctx.chapter) {
+    const shared = await readSharedChapter()
+    if (shared && (!shared.bookId || shared.bookId === baseBookId(ctx.bookId))) {
+      if (!ctx.chapterUid && shared.slot) ctx.chapterUid = shared.slot
+      if (!ctx.chapter && shared.title) ctx.chapter = shared.title
+    }
+  }
 
-  // 后台静默发送：正文缓存、标注存档（不影响主流程）
+  // 后台静默发送：正文缓存（保留，为侧栏后续提问提供上下文）
   trySendSelectionContent(ctx.chapterUid, ctx, selectedText, _copySelection)
   trySendDomContent(ctx.chapterUid, ctx, selectedText)
-  fetch(`${RECEIVER}/annotation`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...ctx, selectedText, userNote, silent: true, timestamp: Math.floor(Date.now() / 1000) }),
-  }).catch(() => {})
 
-  // 主流程：发送聊天消息，等待结果
-  const chatContent = `[引用]《${ctx.bookTitle}》${ctx.chapter || ''}\n> "${selectedText}"\n\n${userNote || '对这段话感兴趣，想听听你的想法'}`
-
+  // 存为引用：等待入库结果，成功才走后续。setRef:true 让 receiver 推送
+  // annotation-select 事件，侧栏实时设为"当前引用"，不再向 agent 发送提问。
+  // 失败时如实返回 false（弹窗显示「设置失败」），避免出现提示成功但标注
+  // 从未入库的假象（共读标记 / 历史恢复 / 删除同步全部依赖 annotations.jsonl）。
+  let ok = false
   try {
-    // 带超时的 fetch，避免因网络问题永久卡在"发送中"
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), 10_000)
-    const resp = await fetch(`${RECEIVER}/chat`, {
+    const resp = await fetch(`${RECEIVER}/annotation`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        content: chatContent,
-        bookId: ctx.bookId,
-        bookTitle: ctx.bookTitle,
-        chapter: ctx.chapter || '',
-        chapterUid: ctx.chapterUid || '',
-        selectedText,
-      }),
+      body: JSON.stringify({ ...ctx, selectedText, userNote: '', silent: true, setRef: true, timestamp: Math.floor(Date.now() / 1000) }),
       signal: ctrl.signal,
     })
     clearTimeout(timer)
-    console.log('[CoRead] chat sent', { selectedText: selectedText.slice(0, 30), userNote, ok: resp.ok })
-    // 自动打开侧栏，让用户看到 agent 的回复
-    try { chrome.runtime?.sendMessage({ action: 'openPanel' }) } catch {}
-    return resp.ok
-  } catch (e) {
-    console.warn('[CoRead] receiver not reachable:', e.message)
+    ok = resp.ok
+  } catch { ok = false }
+  if (!ok) {
+    console.warn('[CoRead] 设为引用失败：receiver 不可达')
     return false
   }
+
+  console.log('[CoRead] set current ref', selectedText.slice(0, 30))
+  // 入库成功后：记录待选引用（侧栏本次才打开时加载并选中）、通知侧栏实时选中、
+  // 自动打开侧栏、刷新共读标记。
+  try {
+    await chrome.storage.local.set({
+      pendingSelectRef: {
+        bookId: ctx.bookId, bookTitle: ctx.bookTitle, chapter: ctx.chapter || '',
+        chapterUid: ctx.chapterUid || '', selectedText,
+      },
+    })
+  } catch {}
+  try {
+    chrome.runtime?.sendMessage({
+      action: 'coreadSetRefApply',
+      ref: { bookId: ctx.bookId, bookTitle: ctx.bookTitle, chapter: ctx.chapter || '',
+        chapterUid: ctx.chapterUid || '', selectedText },
+    }).catch(() => {})
+  } catch {}
+  // 自动打开侧栏，让用户看到当前引用，之后在侧栏里提问
+  try { chrome.runtime?.sendMessage({ action: 'openPanel' }) } catch {}
+
+  // 新标注已入库：清空共读标注缓存，下次 observer 触发时重新拉取，让刚共读的段落被标上
+  _coReadAnns = null
+  scheduleCoReadMarking()
+  return true
 }
 
 // ── 5. 注入 CoRead 按钮到 weread 工具栏 ───────────────────────────────────
@@ -353,8 +431,16 @@ async function handleChapterContent(url, raw) {
   const ctx = getReadingContext()
   const bookId = getQueryParam(queryText, 'bookId') || ctx.bookId || ''
   const slotUid = getQueryParam(queryText, 'chapterUid') || pathText.split('/').filter(Boolean).pop()
+  if (/^[te]_\d+$/.test(slotUid)) {
+    _chapterSlot = slotUid
+    _chapterPrefix = slotUid.split('_')[0] || _chapterPrefix
+    if (ctx.chapter) _chapterTitle = ctx.chapter
+    persistSharedChapter(bookId, slotUid, ctx.chapter)
+  }
   const chapterUid = /^[te]_\d+$/.test(slotUid) && ctx.chapter
-    ? `${chapterFileName(ctx, '')}_${slotUid}`
+    // 前缀用当前章节标题，而不是 chapterFileName(ctx,'')：ctx 在 _chapterSlot 更新前
+    // 捕获，其 chapterUid 仍是上一章的槽位，直接引用会把文件名拼成 e_0_e_1 这种污染名
+    ? `${sanitizeChapterTitle(ctx.chapter)}_${slotUid}`
     : slotUid
   if (!bookId || !chapterUid) return
 
@@ -423,9 +509,13 @@ function captureCurrentChapterText() {
     .join('\n\n')
 }
 
+function sanitizeChapterTitle(title) {
+  return title ? String(title).replace(/[^\w一-龥]/g, '_').slice(0, 40) : ''
+}
+
 function chapterFileName(ctx, chapterUid) {
   return chapterUid || ctx.chapterUid
-    || (ctx.chapter ? ctx.chapter.replace(/[^\w一-龥]/g, '_').slice(0, 40) : '')
+    || sanitizeChapterTitle(ctx.chapter)
     || `t${Date.now()}`
 }
 
@@ -534,11 +624,205 @@ async function reportChapterComplete(chapterUid, chapterTitle) {
 }
 
 
+// ── 8.5 共读段落标记 ─────────────────────────────────────────────────────────
+// 在书页里把已经共读/讨论过的段落标出来：匹配文字绿色下划线 + 段落首「共」徽标，
+// 与微信读书自带的黄色划线区分。数据来自 receiver 的 GET /annotations。
+const CO_READ_CLASS = 'coread-codread'
+let _coReadAnns = null      // 当前书的标注缓存
+let _coReadBookId = ''      // 缓存归属的 baseBookId
+let _coReadTimer = null     // 防抖定时器
+
+function normalizeCoRead(text) {
+  return String(text || '').replace(/[\s\u200b\u200c\u200d\ufeff\u2028\u2029]/g, '')
+}
+
+async function fetchCoReadAnns(bookId) {
+  const base = baseBookId(bookId)
+  if (_coReadBookId === base && _coReadAnns !== null) return _coReadAnns
+  try {
+    const r = await fetch(`${RECEIVER}/annotations?bookId=${encodeURIComponent(bookId)}`)
+    const list = await r.json()
+    _coReadAnns = Array.isArray(list) ? list.filter(a => a && a.selectedText) : []
+  } catch {
+    _coReadAnns = null   // 失败不缓存，observer 下次触发时重试
+  }
+  _coReadBookId = base
+  return _coReadAnns || []
+}
+
+// 把规范化（去空白/零宽）后的子串范围映射回原始字符串偏移
+function mapNormOffset(raw, norm, normIdx) {
+  let seen = 0
+  for (let i = 0; i < raw.length; i++) {
+    if (/[\s\u200b\u200c\u200d\ufeff\u2028\u2029]/.test(raw[i])) continue
+    if (seen === normIdx) return i
+    seen++
+  }
+  return seen === normIdx ? raw.length : -1
+}
+
+// 精确包住文本节点里匹配的子串，加绿色下划线
+function wrapMatchedText(node, ann) {
+  try {
+    const raw = node.textContent || ''
+    const needle = normalizeCoRead(ann.selectedText)
+    const idx = normalizeCoRead(raw).indexOf(needle)
+    if (idx === -1) return false
+    const start = mapNormOffset(raw, normalizeCoRead(raw), idx)
+    const end = mapNormOffset(raw, normalizeCoRead(raw), idx + needle.length)
+    if (start < 0 || end <= start) return false
+    const range = node.ownerDocument.createRange()
+    range.setStart(node, start)
+    range.setEnd(node, end)
+    const span = node.ownerDocument.createElement('span')
+    span.className = CO_READ_CLASS
+    span.title = (ann.selectedText || '').slice(0, 120)
+    span.style.cssText =
+      'text-decoration: underline;text-decoration-color:#07c160;text-decoration-thickness:2px;cursor:default;'
+    range.surroundContents(span)
+    return true
+  } catch { return false }
+}
+
+// 收集文档内所有文本节点（穿透 shadow root，适配 WeRead 可能用 shadow DOM / 子 frame 渲染正文）
+function collectAllTextNodes(root, out) {
+  // root 为 document 时 ownerDocument 是 null，需回退到 root 本身（见评审发现 1）
+  const doc = root.ownerDocument || root
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false)
+  let n
+  while ((n = walker.nextNode())) out.push(n)
+  const hosts = root.querySelectorAll('*')
+  for (const h of hosts) {
+    if (h.shadowRoot) collectAllTextNodes(h.shadowRoot, out)
+  }
+}
+
+// 文本节点最近的"段落级"锚点元素（用于放「共」徽标）
+function nearestParagraphEl(node) {
+  let el = node.parentElement
+  while (el && el !== node.ownerDocument.body) {
+    const tag = el.tagName
+    if (['P', 'SECTION', 'LI', 'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6'].includes(tag)) return el
+    if (el.shadowRoot || el.tagName === 'BODY') return el
+    el = el.parentElement
+  }
+  return node.parentElement || node.ownerDocument.body
+}
+
+// 给段落锚点加「共」徽标（一个段落最多一个）
+function addCoReadBadge(anchor, ann) {
+  if (anchor.querySelector('.coread-codread-badge')) return
+  const badge = document.createElement('span')
+  badge.className = 'coread-codread-badge'
+  badge.textContent = '共'
+  const note = ann.userNote ? '\n批注：' + String(ann.userNote).slice(0, 80) : ''
+  badge.title = (ann.selectedText || '').slice(0, 80) + note
+  Object.assign(badge.style, {
+    display: 'inline-block',
+    marginRight: '4px',
+    padding: '0 4px',
+    borderRadius: '3px',
+    background: '#07c160',
+    color: '#fff',
+    fontSize: '10px',
+    lineHeight: '1.4',
+    verticalAlign: 'super',
+    cursor: 'default',
+  })
+  anchor.insertBefore(badge, anchor.firstChild)
+}
+
+// 清除当前 frame 内所有共读标记（绿色下划线 + 「共」徽标），把被包住的文字还原。
+// 递归穿透 shadow root，与 collectAllTextNodes 的标记范围保持一致。
+// 用于删除引用后的 refresh：先清后画，否则被删的引用会一直留在书页上。
+function clearCoReadMarks(root) {
+  root = root || document
+  const doc = root.ownerDocument || root
+  const unwrap = []
+  const badges = []
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false)
+  let n
+  while ((n = walker.nextNode())) {
+    if (n.classList.contains(CO_READ_CLASS)) unwrap.push(n)
+    else if (n.classList.contains('coread-codread-badge')) badges.push(n)
+  }
+  for (const s of unwrap) {
+    try { s.replaceWith(...s.childNodes) } catch { try { s.remove() } catch {} }
+  }
+  for (const b of badges) b.remove()
+  const hosts = root.querySelectorAll('*')
+  for (const h of hosts) {
+    if (h.shadowRoot) clearCoReadMarks(h.shadowRoot)
+  }
+}
+
+// 标记当前可见章节中的共读段落（幂等：已标记文本节点直接跳过，防 observer 循环）。
+// 按文本节点搜索而非依赖 .wr_readerPage p 容器，兼容 WeRead 各版本文本渲染结构。
+async function markCoReadPassages() {
+  // bookId：顶层路径优先，其次当前路径，最后用跨 frame 共享的章节 bookId 兜底
+  // （正文可能在子 frame，顶层才持有 bookId）
+  const ctx = getReadingContext()
+  const pathBook = (location.pathname.match(/\/web\/reader\/([^/]+)/) || [])[1] || ''
+  let bookId = ctx.bookId || pathBook || ''
+  if (!bookId) {
+    const shared = await readSharedChapter()
+    if (shared && shared.bookId) bookId = shared.bookId
+  }
+  if (!bookId) return
+  await fetchCoReadAnns(bookId)
+  if (!_coReadAnns || !_coReadAnns.length) return
+
+  const textNodes = []
+  collectAllTextNodes(document, textNodes)
+  for (const n of textNodes) {
+    const parent = n.parentElement
+    if (parent && parent.closest('.' + CO_READ_CLASS)) continue  // 已加下划线
+    const nText = normalizeCoRead(n.textContent)
+    if (nText.length < 8) continue
+    for (const ann of _coReadAnns) {
+      const needle = normalizeCoRead(ann.selectedText)
+      if (needle.length < 8) continue
+      if (nText.includes(needle)) {
+        wrapMatchedText(n, ann)
+        addCoReadBadge(nearestParagraphEl(n), ann)
+        break
+      }
+    }
+  }
+}
+
+function scheduleCoReadMarking() {
+  if (_coReadTimer) return
+  _coReadTimer = setTimeout(async () => {
+    _coReadTimer = null
+    try { await markCoReadPassages() } catch {}
+  }, 600)
+}
+
+// 诊断：记录当前 frame 的阅读 DOM 结构，用于定位正文所在 frame/结构（排查共读标记不显示）
+function postReaderStructure() {
+  const sentinel = '逃课'  // 用一条真实标注词探测正文是否在本 frame 的可见 DOM 里
+  postDebug({
+    source: 'structure',
+    stage: 'reader-dom',
+    isTop: (() => { try { return window.top === window } catch { return false } })(),
+    frameUrl: location.href.slice(0, 140),
+    bodyTextLen: (document.body.innerText || '').length,
+    pCount: document.querySelectorAll('p').length,
+    wrReaderPage: !!document.querySelector('.wr_readerPage'),
+    wrPageReader: !!document.querySelector('.wr_page_reader'),
+    anyReader: !!document.querySelector('[class*="reader"]'),
+    shadowHosts: (() => { let c = 0; try { document.querySelectorAll('*').forEach(el => { if (el.shadowRoot) c++ }) } catch {} return c })(),
+    hasSentinelInBody: normalizeCoRead(document.body.innerText || '').includes(sentinel),
+  })
+}
+
 // ── 9. MutationObserver：章节切换 + 工具栏检测 ─────────────────────────────
 const observer = new MutationObserver(() => {
   const ctx = getReadingContext()
   if (ctx.chapter !== lastChapterTitle) onChapterChange(ctx)
   injectToolbarButton()
+  scheduleCoReadMarking()
 })
 observer.observe(document.body, { childList: true, subtree: true })
 
@@ -547,9 +831,99 @@ document.addEventListener('mousedown', e => {
   if (popup && !popup.contains(e.target)) removePopup()
 }, true)
 
+// ── 10. 接收侧栏跳转请求 ──────────────────────────────────────────────────
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // 引用删除后刷新共读标记：先清掉页面上所有旧标记再重新标记，
+  // 否则被删的引用会一直留在书页上（只加不减的 markCoReadPassages 不会自己清）。
+  if (msg.action === 'refreshCoReadMarks') {
+    try { clearCoReadMarks() } catch {}
+    _coReadAnns = null
+    scheduleCoReadMarking()
+    return
+  }
+  if (msg.action !== 'jumpToAnnotation') return
+  const ctx = getReadingContext()
+  sendResponse({ bookId: ctx.bookId, chapterUid: ctx.chapterUid, chapter: ctx.chapter, bookTitle: ctx.bookTitle })
+  jumpToChapterAndHighlight(msg.bookId, msg.chapterUid, msg.selectedText)
+  return true
+})
+
+async function jumpToChapterAndHighlight(bookId, chapterUid, selectedText) {
+  const ctx = getReadingContext()
+  const currentBase = baseBookId(ctx.bookId)
+  const targetBase = baseBookId(bookId)
+  // 存储的 chapterUid 可能是拼接名（中文版前言_e_0），WeRead 只认原生槽位
+  const slot = toWereadHashSlot(chapterUid)
+
+  // 不同书 → 跳转整个页面
+  if (targetBase && currentBase !== targetBase) {
+    const url = slot
+      ? `https://weread.qq.com/web/reader/${targetBase}#${slot}`
+      : `https://weread.qq.com/web/reader/${targetBase}`
+    try { window.top.location.href = url } catch { location.href = url }
+    return
+  }
+
+  // 同书不同章节 → 修改 hash（weread 的 reader iframe 通过 hash 切换章节）
+  if (slot) {
+    try { window.top.location.hash = '#' + slot } catch {}
+    try { location.hash = '#' + slot } catch {}
+    // 等页面渲染
+    await new Promise(r => setTimeout(r, 2000))
+  }
+
+  // 在当前可见的 DOM 中查找并高亮文字
+  if (selectedText) findAndHighlight(selectedText)
+}
+
+function findAndHighlight(text) {
+  if (!text) return
+  // 清除旧高亮
+  document.querySelectorAll('.coread-highlight').forEach(el => {
+    const p = el.parentNode
+    if (p) p.replaceChild(document.createTextNode(el.textContent), el)
+  })
+
+  // 缩短搜索词提高命中率
+  const needle = text.replace(/\s+/g, '').slice(0, 30)
+  if (!needle) return
+
+  // 在 DOM 中搜索文本节点
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false)
+  let bestNode = null, bestLen = 0
+  while (walker.nextNode()) {
+    const compact = walker.currentNode.textContent.replace(/\s+/g, '')
+    const idx = compact.indexOf(needle)
+    if (idx !== -1 && compact.length > bestLen) {
+      bestNode = walker.currentNode
+      bestLen = compact.length
+    }
+  }
+
+  if (bestNode) {
+    try {
+      const parent = bestNode.parentNode
+      const span = document.createElement('span')
+      span.className = 'coread-highlight'
+      span.style.cssText = 'background:#ffeb3b;border-radius:2px;padding:1px 0;'
+      // 把整个文本节点包进高亮 span
+      parent.insertBefore(span, bestNode)
+      span.appendChild(bestNode)
+      span.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    } catch {}
+  }
+}
+
 // 初始化
 const initCtx = getReadingContext()
 lastChapterUid = initCtx.chapterUid
 lastChapterTitle = initCtx.chapter
 postDebug({ source: 'lifecycle', stage: 'content-loaded' })
 console.log('[CoRead] content script loaded', initCtx)
+
+// 首屏章节的共读标记（DOM 渐进渲染时 observer 会继续补标）
+scheduleCoReadMarking()
+
+// 结构诊断：加载时 + 内容渲染后各记录一次
+postReaderStructure()
+setTimeout(postReaderStructure, 2500)

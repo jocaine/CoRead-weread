@@ -1,0 +1,9 @@
+{
+  "name": "coread",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bash -c \"node receiver/index.js & node --env-file-if-exists=agent/.env agent/index.js & wait\""
+  }
+}
