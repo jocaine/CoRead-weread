@@ -91,17 +91,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.sidePanel.open({ tabId: sender.tab.id }).catch(() => {})
   }
 
-  // 侧栏跳转请求 → 转发到微信读书 tab 的 content script
-  if (msg.action === 'jumpToAnnotation') {
-    chrome.tabs.query({ url: 'https://weread.qq.com/*' }).then(([tab]) => {
-      if (!tab?.id) return
-      chrome.tabs.sendMessage(tab.id, msg).then(reply => {
-        sendResponse(reply)
-      }).catch(() => sendResponse(null))
-    })
-    return true  // 保持通道开启等待异步 sendResponse
-  }
-
   // 引用删除后 → 通知微信读书 tab 刷新共读标记
   if (msg.action === 'refreshCoReadMarks') {
     chrome.tabs.query({ url: 'https://weread.qq.com/*' }).then(([tab]) => {
@@ -110,4 +99,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })
     return false
   }
+  // getReadingContext 已改为侧栏直接定向查询活动 tab（AI-008），不再走 SW 转发，
+  // 此前的转发分支已删除。
 })

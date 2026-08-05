@@ -1,6 +1,10 @@
 @echo off
 cd /d "%~dp0"
 
+:: Clear any stale stop sentinel from a previous forced kill, so a fresh agent
+:: never auto-triggers shutdown on startup
+del "%~dp0agent\.stop" 2>nul
+
 :: Kill leftovers from previous runs
 for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":7239.*LISTENING"') do taskkill /PID %%a /F >nul 2>&1
 powershell -c "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*index.js*' -and $_.CommandLine -notlike '*receiver*' -and $_.CommandLine -notlike '*playwright*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1

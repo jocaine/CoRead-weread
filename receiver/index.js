@@ -24,18 +24,20 @@ fs.mkdirSync(INBOX_DIR, { recursive: true })
 // ── SSE ──────────────────────────────────────────────────────────────────────
 const sseClients = new Set()
 
-// 事件缓冲区：带递增 ID，用于断点续传
+// 事件缓冲区：带递增 _seq，用于断点续传
 let _eventSeq = 0
-const recentEvents = []  // [{ id, type, ...data }]
+const recentEvents = []  // [{ type, ...data, _seq }]
 const MAX_RECENT = 100
 
 function pushSSE(type, data) {
   _eventSeq++
-  const event = { id: _eventSeq, type, ...data }
-  recentEvents.push(event)
+  // payloadData 同时作为断点续传缓冲条目：含 _seq，客户端据此记录进度，
+  // 重连后只重放 _seq > lastId 的事件（AI-006）。
+  const payloadData = { type, ...data, _seq: _eventSeq }
+  recentEvents.push(payloadData)
   if (recentEvents.length > MAX_RECENT) recentEvents.shift()
   if (sseClients.size === 0) return
-  const payload = `id: ${_eventSeq}\ndata: ${JSON.stringify({ type, ...data })}\n\n`
+  const payload = `id: ${_eventSeq}\ndata: ${JSON.stringify(payloadData)}\n\n`
   for (const client of sseClients) {
     try { client.write(payload) } catch { sseClients.delete(client) }
   }
@@ -53,9 +55,10 @@ setInterval(() => {
     const lines = fs.readFileSync(CHAT_OUTPUT, 'utf8').trim().split('\n').filter(Boolean)
     if (lines.length <= chatOutputLastLine) return
     const fresh = lines.slice(chatOutputLastLine)
-    chatOutputLastLine = lines.length  // 无论有无客户端都推进游标：
-    // 否则侧栏关闭期间积累的回复会在重开时被 /history 加载后又推一遍，造成重复气泡
-    if (sseClients.size === 0) return
+    chatOutputLastLine = lines.length
+    // 无论有无客户端都经 pushSSE 缓冲进 recentEvents（AI-006）：
+    // 断线重连时按 Last-Event-ID 只重放没收到的事件。首次连接（lastId=0）不回放，
+    // 侧栏已通过 /history 加载历史；重复再由侧栏 _seenMsgs 去重。
     for (const line of fresh) {
       try { pushSSE('message', JSON.parse(line)) } catch {}
     }
@@ -177,27 +180,41 @@ const server = http.createServer(async (req, res) => {
       annItems.push({ role: 'annotation', content: `《${d.bookTitle}》${d.chapter || ''}`,
         selectedText: d.selectedText, userNote: d.userNote || '',
         bookId: d.bookId, bookTitle: d.bookTitle,
-        chapter: d.chapter || '', chapterUid: d.chapterUid || '',
+        chapter: d.chapter || '', chapterUid: d.chapterUid || '', chapterUidInt: d.chapterUidInt || 0,
+        bookmarkRange: d.bookmarkRange || '', bookmarkId: d.bookmarkId || '',
         _ts: d.receivedAt || d.timestamp * 1000 })
     }
     const chatItems = []
     for (const d of readJsonl(path.join(INBOX_DIR, 'chat_input.jsonl'))) {
-      chatItems.push({ role: 'user', content: d.content, _ts: d.timestamp })
+      // 带书上下文的消息保留 bookId，供侧栏按书隔离引用与对话（AI-001）
+      const item = { role: 'user', content: d.content, _ts: d.timestamp }
+      if (d.bookId) {
+        item.bookId = d.bookId
+        item.bookTitle = d.bookTitle || ''
+        item.chapter = d.chapter || ''
+        item.chapterUid = d.chapterUid || ''
+        item.chapterUidInt = d.chapterUidInt || 0
+        item.selectedText = d.selectedText || ''
+      }
+      chatItems.push(item)
     }
     for (const d of readJsonl(CHAT_OUTPUT)) {
       if ('_stream' in d) continue  // 过滤流式中间分片
       chatItems.push({ role: 'assistant', content: d.content, _ts: d.timestamp || 0 })
     }
-    chatItems.sort((a, b) => a._ts - b._ts)
+    // 标注 + 最近 200 条聊天按时间戳交错排序：让标注与其自动回复相邻，
+    // 侧栏既按时间顺序展示，也能据此为回复继承正确的书籍书签（AI-001）
     const allItems = [...annItems, ...chatItems.slice(-200)]
+      .sort((a, b) => (a._ts || 0) - (b._ts || 0))
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify(allItems))
     return
   }
 
   // 反查章节（GET /find-chapter?bookId=..&text=..）
-  // 用引用文字在本地正文缓存里找到对应章节文件，返回可跳转的原生槽位（e_0 / t_1）。
-  // 用于旧标注 chapterUid 为空、或 chapterUid 是拼接名无法直接用于跳转时的兜底。
+  // 用引用文字在本地正文缓存里找到对应章节文件，返回可跳转的章节定位：
+  //   chapterUid（数字文件名，可用 k-suffix URL）或 slot（e_0/t_1 原生 hash 槽位）。
+  // 用于旧标注 chapterUidInt 为空、无法直接用 k-suffix 跳转时的兜底（AI-006）。
   if (req.method === 'GET' && req.url.startsWith('/find-chapter?')) {
     const u = new URL(req.url, 'http://localhost')
     const bookId = u.searchParams.get('bookId') || ''
@@ -215,15 +232,17 @@ const server = http.createServer(async (req, res) => {
         if (normalizeText(t).indexOf(needle) !== -1 && t.length > bestLen) {
           bestLen = t.length
           const base = name.replace(/\.txt$/, '')
+          let chapterUid = ''
           let slot = ''
           if (/^[te]_\d+$/.test(base)) slot = base
+          else if (/^\d+$/.test(base)) chapterUid = base
           else { const m = base.match(/(?:^|_)([te]_\d+)$/); slot = m ? m[1] : '' }
-          best = { filename: name, slot, title: base }
+          best = { filename: name, chapterUid, slot }
         }
       }
     } catch {}
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify(best || { slot: '' }))
+    res.end(JSON.stringify(best || { chapterUid: '', slot: '' }))
     return
   }
 
@@ -247,6 +266,7 @@ const server = http.createServer(async (req, res) => {
               selectedText: d.selectedText,
               chapter: d.chapter || '',
               chapterUid: d.chapterUid || '',
+              chapterUidInt: d.chapterUidInt || 0,
               userNote: d.userNote || '',
               timestamp: d.receivedAt || (d.timestamp ? d.timestamp * 1000 : 0),
             })
@@ -259,22 +279,24 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  // SSE 订阅（GET /events）
-  if (req.method === 'GET' && req.url === '/events') {
+  // SSE 订阅（GET /events[?lastId=..]）
+  if (req.method === 'GET' && req.url.split('?')[0] === '/events') {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
     })
     res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`)
-    // 断点续传：EventSource 重连时自动带上 Last-Event-ID，只回放客户端没收到的事件。
-    // 首次连接（lastId=0）不回放——侧栏已通过 /history 加载历史，2 分钟回放既冗余
-    // 又会与历史重复（此前该分支因事件不带 _ts 而永久失效，现直接移除）。
-    const lastId = parseInt(req.headers['last-event-id'], 10) || 0
+    // 断点续传：只重放客户端没收到的事件（_seq > lastId）。lastId 来自 EventSource
+    // 自动重连时的 Last-Event-ID 头，或侧栏重建连接时通过 ?lastId= 传入（AI-006）。
+    // 首次连接（lastId=0）不回放——侧栏已通过 /history 加载历史。
+    const u = new URL(req.url, 'http://localhost')
+    const queryLastId = parseInt(u.searchParams.get('lastId'), 10) || 0
+    const lastId = parseInt(req.headers['last-event-id'], 10) || queryLastId || 0
     if (lastId > 0) {
       for (const evt of recentEvents) {
-        if (evt.id > lastId) {
-          res.write(`id: ${evt.id}\ndata: ${JSON.stringify({ type: evt.type, ...evt })}\n\n`)
+        if (evt._seq > lastId) {
+          res.write(`id: ${evt._seq}\ndata: ${JSON.stringify(evt)}\n\n`)
         }
       }
     }
@@ -317,6 +339,7 @@ const server = http.createServer(async (req, res) => {
           bookTitle: data.bookTitle,
           chapter: data.chapter || '',
           chapterUid: data.chapterUid || '',
+          chapterUidInt: data.chapterUidInt || 0,
         })
       } else if (data.setRef) {
         // 划线共读弹窗只"设为当前引用"，不触发 agent 讨论：推送 annotation-select 事件，
@@ -328,30 +351,66 @@ const server = http.createServer(async (req, res) => {
           bookTitle: data.bookTitle,
           chapter: data.chapter || '',
           chapterUid: data.chapterUid || '',
+          chapterUidInt: data.chapterUidInt || 0,
+        })
+      } else if (data.source === 'bookmark-sync') {
+        // 微信读书划线同步：静默入库（不触发 agent），推送轻量事件让侧栏实时把
+        // 划线加进引用列表（不弹气泡、不强制选中），便于看到同步生效。
+        pushSSE('message', {
+          role: 'annotation-sync',
+          selectedText: data.selectedText,
+          bookId: data.bookId,
+          bookTitle: data.bookTitle,
+          chapter: data.chapter || '',
+          chapterUidInt: data.chapterUidInt || 0,
+          bookmarkRange: data.bookmarkRange || '',
+          bookmarkId: data.bookmarkId || '',
         })
       }
 
     } else if (url === '/annotation-delete') {
-      // 删除引用：按 bookId + selectedText 精确匹配，从 annotations.jsonl 移除所有匹配行
-      const { bookId, selectedText } = data
-      if (!bookId || !selectedText) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing fields' })); return }
-      const base = baseBookId(bookId)
-      const needle = normalizeText(selectedText)
+      // 删除引用：优先按 bookmarkId 精确匹配（划线同步来的引用，能区分同文本的多条划线）；
+      // 其次按 chapterUidInt + bookmarkRange；兜底按 bookId + selectedText。
+      // 从 annotations.jsonl 移除所有匹配行，并推送 annotation-removed 事件让侧栏同步移除。
+      const { bookId, selectedText, bookmarkId, chapterUidInt, bookmarkRange } = data
+      if ((!bookId || !selectedText) && !bookmarkId) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing fields' })); return }
+      const base = baseBookId(bookId || '')
+      const needle = normalizeText(selectedText || '')
+      const uidInt = Number(chapterUidInt) || 0
       const file = path.join(INBOX_DIR, 'annotations.jsonl')
       let lines = []
       try { lines = fs.readFileSync(file, 'utf8').split('\n') } catch { lines = [] }
       const kept = []
+      const removed = []
       let deleted = 0
       for (const line of lines) {
         if (!line.trim()) continue
         let d
         try { d = JSON.parse(line) } catch { kept.push(line); continue }
-        const isMatch = d.bookId && baseBookId(d.bookId) === base
-          && normalizeText(d.selectedText || '') === needle
-        if (isMatch) deleted++
-        else kept.push(line)
+        let isMatch = false
+        if (bookmarkId) {
+          // 精确 bookmarkId 优先；旧数据没有 bookmarkId 时按章节+范围兜底
+          isMatch = (!!d.bookmarkId && String(d.bookmarkId) === String(bookmarkId))
+            || (uidInt && Number(d.chapterUidInt) === uidInt && String(d.bookmarkRange || '') === String(bookmarkRange))
+        } else if (uidInt && bookmarkRange) {
+          isMatch = Number(d.chapterUidInt) === uidInt && String(d.bookmarkRange || '') === String(bookmarkRange)
+        } else {
+          isMatch = !!d.bookId && baseBookId(d.bookId) === base && normalizeText(d.selectedText || '') === needle
+        }
+        if (isMatch) { deleted++; removed.push(d) } else kept.push(line)
       }
       fs.writeFileSync(file, kept.join('\n') + (kept.length ? '\n' : ''))
+      // 推删除事件：侧栏据此移除引用列表 + 刷新书页共读标记（微信读书内删划线时）
+      if (removed.length) {
+        pushSSE('message', {
+          role: 'annotation-removed',
+          removed: removed.map(r => ({
+            bookId: r.bookId, bookTitle: r.bookTitle || '',
+            chapter: r.chapter || '', selectedText: r.selectedText,
+            bookmarkRange: r.bookmarkRange || '', bookmarkId: r.bookmarkId || '',
+          })),
+        })
+      }
       console.log(`[annotation-delete] book=${base.slice(0, 12)}… deleted=${deleted}`)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ deleted }))

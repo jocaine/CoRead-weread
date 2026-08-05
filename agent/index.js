@@ -23,11 +23,12 @@ const INBOX_DIR = path.join(RECEIVER_DIR, 'inbox')
 const BOOKS_DIR = path.join(RECEIVER_DIR, 'books')
 const ANNOTATIONS = path.join(INBOX_DIR, 'annotations.jsonl')
 const CURSOR_FILE = path.join(INBOX_DIR, '.agent_cursor')
-const PROCESSED_ANN_FILE = path.join(INBOX_DIR, '.agent_processed_anns')  // 已处理标注指纹，防删除后游标归零重放
 const CHAT_INPUT = path.join(INBOX_DIR, 'chat_input.jsonl')
 const CHAT_INPUT_CURSOR = path.join(INBOX_DIR, '.chat_input_cursor')
 const CHAT_OUTPUT = path.join(INBOX_DIR, 'chat_output.jsonl')
 const _repliedFingerprints = new Set()  // 去重：防止同一消息被重复回复
+const STOP_FILE = path.join(AGENT_DIR, '.stop')  // stop.bat 写入哨兵 → poller 检测后优雅保存退出
+const JOURNAL_FILE = path.join(AGENT_DIR, 'session_journal.jsonl')  // 会话流水账：强杀/断电后启动时恢复记忆
 
 const API_KEY = process.env.COREAD_API_KEY
 const API_BASE = (process.env.COREAD_API_BASE || '').replace(/\/$/, '')
@@ -47,18 +48,43 @@ function readIfExists(p) {
   try { return fs.readFileSync(p, 'utf8') } catch { return '' }
 }
 
-// ── 上下文加载（启动时一次性构建） ──────────────────────────────────────────
+// ── 用户书籍足迹（跨书联动的轻量数据源） ──────────────────────────────────
+// 只统计真实微信读书的书（meta.json 里有 wereadBookId），自动排除测试书。
+// 跨书联动不依赖原文检索/分词，直接让 AI 用自身知识库对这些书名做主题关联。
+function userBookTitles() {
+  const titles = []
+  try {
+    for (const name of fs.readdirSync(BOOKS_DIR)) {
+      const meta = readJsonIfExists(path.join(BOOKS_DIR, name, 'meta.json'))
+      if (!meta || !meta.wereadBookId || !meta.bookTitle) continue
+      titles.push(String(meta.bookTitle).replace(/\s+/g, ' ').trim())
+    }
+  } catch {}
+  return [...new Set(titles)].sort()
+}
+
+// 书籍足迹签名：用于 poller 检测"新书/书签变化"后重建 SYSTEM
+function booksSignature() {
+  return userBookTitles().join('|')
+}
+
+// ── 上下文加载（启动时一次性构建；书籍足迹/记忆变化时由调用方重建） ────────
 function buildSystemInstruction() {
   const rules = readIfExists(path.join(AGENT_DIR, 'AGENT.md'))
   const profile = readIfExists(path.join(AGENT_DIR, 'profile.md'))
   const soul = readIfExists(path.join(AGENT_DIR, 'soul.md'))
   const openTopics = readIfExists(path.join(AGENT_DIR, 'open_topics.md'))
+  const bookTitles = userBookTitles()
+  const bookSection = bookTitles.length
+    ? '\n\n========\n# 用户书籍足迹（已添加引用/划线的书，用于跨书联想）\n' + bookTitles.map(t => `- 《${t}》`).join('\n')
+    : ''
   return [
     '【重要】所有必要数据已直接包含在对话内容里，不需要也不允许调用任何工具或函数。直接用中文回答。\n\n',
     rules,
     '\n\n========\n# 用户阅读画像（profile.md）\n', profile,
     '\n\n========\n# 你的自画像（soul.md）\n', soul,
     '\n\n========\n# 未明话题（open_topics.md）\n', openTopics,
+    bookSection,
   ].join('')
 }
 
@@ -116,29 +142,6 @@ function getCursor() {
 }
 
 function setCursor(n) { fs.writeFileSync(CURSOR_FILE, String(n)) }
-
-// ── 已处理标注指纹（防重放） ─────────────────────────────────────────────────
-// 侧栏删除引用会通过 /annotation-delete 重写 annotations.jsonl，使其行数小于游标，
-// 从而触发游标归零。若没有这层指纹去重，归零后所有旧标注会被重新走 LLM 讨论一遍
-// （重复调用、重复历史）。指纹持久化到文件，重启后依然生效。
-function annFingerprint(ann) {
-  if (!ann || !ann.selectedText) return ''
-  return `${baseBookId(ann.bookId || '')}|${ann.selectedText}|${ann.chapter || ''}`
-}
-
-const processedAnnFps = new Set()
-try {
-  for (const l of readIfExists(PROCESSED_ANN_FILE).split('\n')) {
-    if (l.trim()) processedAnnFps.add(l.trim())
-  }
-} catch {}
-
-function markAnnProcessed(ann) {
-  const fp = annFingerprint(ann)
-  if (!fp || processedAnnFps.has(fp)) return
-  processedAnnFps.add(fp)
-  try { fs.appendFileSync(PROCESSED_ANN_FILE, fp + '\n') } catch {}
-}
 
 // ── 章节原文上下文 ───────────────────────────────────────────────────────────
 function chapterFileName(chapter) {
@@ -357,7 +360,25 @@ function bookSummaries(bookId) {
 
 // ── LLM API ──────────────────────────────────────────────────────────────────
 let SYSTEM = buildSystemInstruction()
-const history = []  // [{ role: 'user'|'assistant', content: string }]
+let _lastBooksSig = booksSignature()  // 书籍足迹变化检测基线
+
+// 会话上下文按书隔离（AI-001）：key = baseBookId | '_common' | '_meta'
+// 读书 X 时的标注讨论、书绑定聊天、自由消息都进 history[X]；切书后互不污染。
+// 无书签消息进 '_common'；记忆重写这类元任务进 '_meta'，不进任何书的上下文。
+const histories = new Map()  // key -> [{ role: 'user'|'assistant', content: string }]
+function histFor(key) {
+  if (!histories.has(key)) histories.set(key, [])
+  return histories.get(key)
+}
+let currentBookKey = ''  // 后端跟踪的"正在读的书"（baseBookId），自由消息归属用
+
+function totalHistoryLength() {
+  let n = 0
+  for (const [k, h] of histories) {
+    if (k !== '_meta') n += h.length
+  }
+  return n
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -368,10 +389,10 @@ function htmlTitle(text) {
   return match ? match[1].replace(/<[^>]+>/g, '').trim() : ''
 }
 
-async function callLLMOnce(maxTokens = 8192) {
+async function callLLMOnce(maxTokens = 8192, hist = []) {
   const body = JSON.stringify({
     model: MODEL,
-    messages: [{ role: 'system', content: SYSTEM }, ...history],
+    messages: [{ role: 'system', content: SYSTEM }, ...hist],
     max_tokens: maxTokens,
     tool_choice: 'none',
   })
@@ -414,10 +435,10 @@ async function callLLMOnce(maxTokens = 8192) {
 }
 
 // ── 流式调用 LLM ────────────────────────────────────────────────────────────
-async function* callLLMStream(maxTokens = 8192) {
+async function* callLLMStream(maxTokens = 8192, hist = []) {
   const body = JSON.stringify({
     model: MODEL,
-    messages: [{ role: 'system', content: SYSTEM }, ...history],
+    messages: [{ role: 'system', content: SYSTEM }, ...hist],
     max_tokens: maxTokens,
     stream: true,
     stream_options: { include_usage: true },
@@ -509,11 +530,11 @@ async function* callLLMStream(maxTokens = 8192) {
   return fullContent
 }
 
-async function callLLM(maxTokens = 8192) {
+async function callLLM(maxTokens = 8192, hist = []) {
   let lastErr
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      return await callLLMOnce(maxTokens)
+      return await callLLMOnce(maxTokens, hist)
     } catch (e) {
       lastErr = e
       // 超时、网络错误、服务端错误均可重试
@@ -533,10 +554,10 @@ function stripCodeBlocks(text) {
 
 // 带重试的流式调用：只在「一个 chunk 都没产出」前重试（429/5xx/超时/空流），
 // 已经吐出部分内容后的失败不重试（重发会造成内容错乱），直接向上抛。
-async function* callLLMStreamWithRetry(maxTokens) {
+async function* callLLMStreamWithRetry(maxTokens, hist) {
   let lastErr
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const it = callLLMStream(maxTokens)
+    const it = callLLMStream(maxTokens, hist)
     let yielded = false
     try {
       while (true) {
@@ -574,12 +595,17 @@ async function* callLLMStreamWithRetry(maxTokens) {
 // 收尾写 -1 结束标记 + 最终完整记录。chat_output 的写入由本函数独占，
 // 调用方不再各自 appendChatOutput，保证每条回复只产生一组流记录 + 一条最终记录。
 async function say(userText, options = {}) {
-  history.push({ role: 'user', content: userText })
+  // AI-001：写入归属书/上下文的历史；元任务（记忆重写）由调用方显式传 _meta
+  const key = options.bookKey || currentBookKey || '_common'
+  const hist = histFor(key)
+  hist.push({ role: 'user', content: userText })
+  if (key !== '_meta') journalAppend({ kind: 'msg', bookKey: key, role: 'user', content: userText })  // 同步落盘，强杀也不丢
   let fullContent = ''
+  let displayContent = ''  // 剥掉 MEMORIZE 标记后的展示文本
   let started = false  // 是否已写过流式记录
 
   try {
-    const stream = callLLMStreamWithRetry(options.maxTokens || 8192)
+    const stream = callLLMStreamWithRetry(options.maxTokens || 8192, hist)
     let lastWrite = 0
     let result
     while (true) {
@@ -591,26 +617,52 @@ async function say(userText, options = {}) {
       const now = Date.now()
       const accumulated = (result.value && result.value.accumulated) || ''
       fullContent = accumulated
-      // 节流：约 100ms 一条（content 是累计文本，中间跳过的写会在下一条覆盖）
-      if (!started || now - lastWrite >= 100) {
-        appendChatOutputStream(accumulated)
+      // 节流：约 100ms 一条（content 是累计文本，中间跳过的写会在下一条覆盖）。
+      // 流式时就剥掉 MEMORIZE 标记，用户看不到内部协议；_meta 不写 chat_output
+      if (key !== '_meta' && (!started || now - lastWrite >= 100)) {
+        appendChatOutputStream(stripMemorize(accumulated))
         started = true
         lastWrite = now
       }
     }
-    // 收尾：流结束标记 + 最终完整记录（供 /history 与去重用）
-    appendChatOutputStreamEnd()
-    appendChatOutput('assistant', fullContent)
+
+    // 收尾展示文本：剥掉 MEMORIZE 标记
+    displayContent = stripMemorize(fullContent)
+
+    if (key !== '_meta') {
+      // 会话中实时记忆：检测【MEMORIZE】标记 → 就地合并进 profile/soul → 追加确认反馈
+      const memorize = extractMemorize(fullContent)
+      if (memorize) {
+        try {
+          const ok = await runMemoryMerge(memorize.target, memorize.content)
+          if (ok) {
+            displayContent += (displayContent ? '\n\n' : '') + '（CoRead 记住了你的话）'
+            SYSTEM = buildSystemInstruction()  // 让后续回复立即用上更新后的 soul/profile
+          }
+        } catch (e) {
+          console.log(`  ⚠️ 记忆就地合并失败: ${e.message}`)
+        }
+      }
+      // 合并完成后把最终内容（含确认反馈）作为流式末段补写进现有气泡，再 -1。
+      // 普通回复：末段直接更新气泡；引用回复：侧栏忽略流式末段，走下面最终记录。
+      if (memorize) appendChatOutputStream(displayContent)
+      appendChatOutputStreamEnd()
+      appendChatOutput('assistant', displayContent)
+    }
   } catch (e) {
-    // 出错也要收尾：流已吐过一部分时补 -1 + 错误记录，避免侧栏气泡卡在思考动画
-    if (started) appendChatOutputStreamEnd()
-    appendChatOutput('assistant', `⚠️ ${e.message}`)
-    history.pop()
+    // 出错也要收尾：流已吐过一部分时补 -1 + 错误记录，避免侧栏气泡卡在思考动画。
+    // 元任务（_meta）不写 chat_output，避免在侧栏产生记忆合并过程的伪气泡
+    if (key !== '_meta') {
+      if (started) appendChatOutputStreamEnd()
+      appendChatOutput('assistant', `⚠️ ${e.message}`)
+    }
+    hist.pop()
     return `⚠️ ${e.message}`
   }
 
-  history.push({ role: 'assistant', content: fullContent })
-  return stripCodeBlocks(fullContent)
+  hist.push({ role: 'assistant', content: displayContent })
+  if (key !== '_meta') journalAppend({ kind: 'msg', bookKey: key, role: 'assistant', content: displayContent })
+  return stripCodeBlocks(displayContent)
 }
 
 // ── 持久化 ───────────────────────────────────────────────────────────────────
@@ -639,49 +691,147 @@ function extractTakeaway(reply) {
   return match ? match[1].trim() : null
 }
 
-// 会话结束时合并重写 profile / soul，保持文件精简不膨胀
-async function saveSessionMemory() {
-  if (history.length < 4) return
-  console.log('\n正在固化本次会话记忆...')
+// ── 会话中实时记忆（MEMORIZE 协议） ─────────────────────────────────────────
+// LLM 在回复末尾发 【MEMORIZE:profile|soul】标记（见 AGENT.md），
+// 这里解析它、剥离它（不让用户看到标记）、就地合并进对应的记忆文件。
+function extractMemorize(reply) {
+  const m = String(reply || '').match(/【MEMORIZE:(profile|soul)】\s*([\s\S]+?)\s*$/)
+  return m ? { target: m[1], content: m[2].trim() } : null
+}
+
+// 从显示文本里剥掉 MEMORIZE 标记块（含未完成的部分，避免流式时闪出标记）
+function stripMemorize(text) {
+  return String(text || '').replace(/【MEMORIZE:(?:profile|soul)】[\s\S]*$/, '').trim()
+}
+
+// 把一条待记住的内容就地合并进 profile.md / soul.md（一次小 LLM 调用）
+async function runMemoryMerge(target, memory) {
+  const file = target === 'profile' ? 'profile.md' : 'soul.md'
+  const maxChars = target === 'profile' ? 400 : 250
+  const filePath = path.join(AGENT_DIR, file)
+  const oldContent = readIfExists(filePath)
+  if (oldContent) {
+    try { fs.copyFileSync(filePath, filePath + '.bak') } catch {}
+  }
+  const prompt = `用户刚刚在对话中表达了值得长期记住的内容：\n\n${memory}\n\n` +
+    `请把它合入当前的 ${file}：若有重复则合并覆盖，若无则补充进去，` +
+    `保持精简，删去被覆盖的旧条目。\n\n` +
+    `只输出合并后的完整 ${file} 内容（≤${maxChars}字），不要输出任何其他文字、标记或说明。\n\n` +
+    `原内容：\n${oldContent || '（尚无记录）'}`
+  const content = await rewriteWithRetry(target, prompt)
+  if (content) {
+    fs.writeFileSync(filePath, content + '\n')
+    console.log(`  ✓ ${file} 已就地更新（memory trigger）`)
+    return true
+  }
+  return false
+}
+
+// ── 会话流水账（session_journal.jsonl） ────────────────────────────────────
+// 每条对话同步落盘（fs.appendFileSync 为同步写，硬杀/断电也不丢）。
+// checkpoint 标记"此处之前的对话已合并进 profile/soul"，之后的即"未合并"。
+function journalAppend(entry) {
+  try { fs.appendFileSync(JOURNAL_FILE, JSON.stringify({ t: Date.now(), ...entry }) + '\n') } catch {}
+}
+
+function readJournalLines() {
+  const raw = readIfExists(JOURNAL_FILE)
+  if (!raw) return []
+  return raw.trim().split('\n').filter(Boolean)
+    .map(l => { try { return JSON.parse(l) } catch { return null } })
+    .filter(Boolean)
+}
+
+// 上一次 checkpoint 之后的全部对话消息（尚未固化进 profile/soul 的部分）
+function unmergedJournalMsgs() {
+  const lines = readJournalLines()
+  let lastCp = -1
+  for (let i = 0; i < lines.length; i++) if (lines[i].kind === 'checkpoint') lastCp = i
+  return lines.slice(lastCp + 1).filter(l => l.kind === 'msg')
+}
+
+// 把对话记录压成可喂给 LLM 的文本（取尾部，控制 token 成本）
+function transcriptText(msgs, maxChars = 6000) {
+  const txt = msgs.map(m => `[${m.bookKey || 'common'}] ${m.role}: ${m.content}`).join('\n')
+  return txt.length > maxChars
+    ? '…（对话过长，仅取最近部分）…\n' + txt.slice(txt.length - maxChars)
+    : txt
+}
+
+// 合并成功后打 checkpoint，并顺带把 journal 轮转成一行（旧对话已蒸馏进 profile/soul，可弃）
+function journalCheckpoint() {
+  try {
+    fs.writeFileSync(JOURNAL_FILE, JSON.stringify({ t: Date.now(), kind: 'checkpoint' }) + '\n')
+  } catch {}
+}
+
+// 会话结束 / 启动恢复时，把"尚未固化"的对话合并重写进 profile / soul。
+// 对话来源是 session_journal.jsonl（比内存 history 更稳：强杀后启动也能恢复，
+// 也顺带修复了 AI-001 把记忆重写隔离进空 _meta 历史、导致模型看不到本次讨论的问题）。
+async function saveSessionMemory({ minMsgs = 2 } = {}) {
+  const msgs = unmergedJournalMsgs()
+  if (msgs.length < minMsgs) {
+    console.log(`（待固化对话 ${msgs.length} 条 < ${minMsgs}，跳过记忆合并）`)
+    return
+  }
+  console.log(`\n正在固化本次会话记忆（${msgs.length} 条对话）...`)
+  const transcript = transcriptText(msgs)
 
   const specs = [
     { type: 'profile', file: 'profile.md', maxChars: 400 },
     { type: 'soul', file: 'soul.md', maxChars: 250 },
   ]
+  let anyWritten = false
 
   for (const { type, file, maxChars } of specs) {
     const filePath = path.join(AGENT_DIR, file)
     const oldContent = readIfExists(filePath)
 
-    // 备份旧文件
+    // 备份旧文件（上一份 .bak 会被覆盖，只留最近一份供人工恢复）
     if (oldContent) {
       try { fs.copyFileSync(filePath, filePath + '.bak') } catch {}
     }
 
-    const prompt = `会话即将结束。请将原内容与本次讨论的新认知合并，输出完整的重写版本（删去被覆盖的旧条目，保持精简）。
-
-只输出合并后的完整 ${file} 内容（≤${maxChars}字），不要输出任何其他文字、标记或说明。
-无新认知则原样输出原内容。
-
-原内容：
-${oldContent || '（尚无记录）'}`
+    const prompt = `会话即将结束。以下是本次讨论的记录：\n\n${transcript}\n\n` +
+      `请从上面的讨论中提炼出与用户相关的新认知，与以下 ${file} 原内容合并，` +
+      `输出完整的重写版本（删去被覆盖的旧条目，保持精简）。\n\n` +
+      `只输出合并后的完整 ${file} 内容（≤${maxChars}字），不要输出任何其他文字、标记或说明。\n` +
+      `无新认知则原样输出原内容。\n\n原内容：\n${oldContent || '（尚无记录）'}`
 
     let content = await rewriteWithRetry(type, prompt)
     if (content) {
       fs.writeFileSync(filePath, content + '\n')
+      anyWritten = true
       console.log(`  ✓ ${file} 已合并重写`)
     } else {
       console.log(`  ⚠️ ${file} 重试后仍未通过校验，保留旧文件`)
     }
   }
+
+  // 至少一个文件成功合并才打 checkpoint；全失败则保留未合并记录，下次启动再试
+  if (anyWritten) {
+    journalCheckpoint()
+  } else {
+    console.log('  ⚠️ 本次未写入任何记忆，未合并对话将保留，下次启动时重试')
+  }
+}
+
+// 强杀/断电兜底：启动时若发现上次会话有未固化的对话，自动恢复合并
+async function recoverUnmergedMemory() {
+  const msgs = unmergedJournalMsgs()
+  if (msgs.length < 4) return
+  console.log(`📦 检测到上次会话有 ${msgs.length} 条未合并的对话，正在恢复记忆（请稍候）...`)
+  await saveSessionMemory({ minMsgs: 4 })
+  console.log('✅ 记忆恢复完成。\n')
 }
 
 async function rewriteWithRetry(type, prompt) {
   const MIN_LEN = 30  // 去空白后最少 30 字
+  const META = '_meta'  // AI-001：记忆重写是元任务，用独立历史，不污染任何书的上下文
 
   for (let attempt = 0; attempt < 2; attempt++) {
-    const resp = await say(prompt, { maxTokens: 1200 })
-    // say() 成功时把 {role:'user'} + {role:'assistant'} 推入了 history；
+    const resp = await say(prompt, { maxTokens: 1200, bookKey: META })
+    // say() 成功时把 {role:'user'} + {role:'assistant'} 推入了 META 历史；
     // say() 失败时返回 "⚠️ ..." 且已自行 pop 掉它 push 的 user 消息（净变化 0）。
     // 下面是 LLM 对单任务的回复，整段即是目标内容，无需正则切割。
 
@@ -689,18 +839,19 @@ async function rewriteWithRetry(type, prompt) {
     // LLM 调用失败：错误串绝不能写进 profile/soul（会覆盖长期记忆），只重试不写入
     if (/^⚠️/.test(content)) {
       console.log(`  ⚠️ ${type} 第 ${attempt + 1} 次 LLM 调用失败（${content.slice(0, 40)}），重试...`)
-      continue  // history 已被 say() 平衡，无需清理
+      continue  // META 历史已被 say() 平衡，无需清理
     }
 
     const stripped = content.replace(/\s/g, '')
     if (stripped.length >= MIN_LEN) return content
 
-    // 校验失败（成功但太短）：从 history 里摘掉这次的 user+assistant 再重试。
-    // 只有 say() 成功时 history 才多了这两条；失败路径已在 say() 内平衡，不能 pop，
+    // 校验失败（成功但太短）：从 META 历史里摘掉这次的 user+assistant 再重试。
+    // 只有 say() 成功时 META 历史才多了这两条；失败路径已在 say() 内平衡，不能 pop，
     // 否则会删掉上一轮真实对话。
     console.log(`  ⚠️ ${type} 第 ${attempt + 1} 次校验未通过（去空白 ${stripped.length} 字），重试...`)
-    history.pop()  // 移除这次的 assistant 回复
-    history.pop()  // 移除这次的 user 消息
+    const metaHist = histFor(META)
+    metaHist.pop()  // 移除这次的 assistant 回复
+    metaHist.pop()  // 移除这次的 user 消息
     prompt = `上一次的输出太短或为空（去空白仅 ${stripped.length} 字）。请重新输出合并后的完整内容，不要省略。`
   }
 
@@ -825,7 +976,7 @@ async function processNewAnnotations() {
   // 游标超出实际行数（文件被清空/截断过，如删除操作或手动清理）：重置游标，
   // 否则之后新增的标注会被 cursor >= anns.length 永久跳过。
   // 注意：删除任意一行都会使「游标(=旧行数) > 新行数」成立并触发归零，这是正常的；
-  // 重复讨论旧标注由下方 processedAnnFps 指纹去重拦截，重置本身不会导致重放。
+  // 归零后旧标注会被遍历一遍（当前全部为 silent，不触发讨论），不会重放。
   if (cursor > anns.length || (anns.length === 0 && cursor > 0)) {
     setCursor(0)
     cursor = 0
@@ -834,16 +985,15 @@ async function processNewAnnotations() {
 
   for (let i = cursor; i < anns.length; i++) {
     const ann = anns[i]
-    // 已处理过的标注跳过（含 silent 与旧标注）：防止删除引用导致的游标归零
-    // 后把旧标注重新走 LLM 讨论一遍。指纹 = baseBookId + selectedText + chapter。
-    if (processedAnnFps.has(annFingerprint(ann))) continue
-    markAnnProcessed(ann)
     // silent 标注只存档不触发讨论（用户已通过 /chat 发送了聊天消息）
     if (ann.silent) continue
     currentAnn = ann
     annTurnCount = 0
+    // AI-001：标注讨论进入所属书的历史，并更新"正在读的书"
+    const key = baseBookId(ann.bookId) || currentBookKey || '_common'
+    if (baseBookId(ann.bookId)) currentBookKey = key
     console.log(`\n── 新划线 · 《${ann.bookTitle}》${ann.chapter || ''} ──`)
-    const reply = await say(buildAnnotationPrompt(ann))
+    const reply = await say(buildAnnotationPrompt(ann), { bookKey: key })
     console.log('\n' + stripCodeBlocks(reply) + '\n')
   }
   setCursor(anns.length)
@@ -861,6 +1011,9 @@ async function main() {
   // 首次启动引导
   await maybeRunColdstart(rl)
 
+  // 强杀/断电兜底：上次会话未固化的对话在启动时恢复合并
+  await recoverUnmergedMemory()
+
   const had = await processNewAnnotations()
   if (!had) console.log('（暂无新标注。开始阅读后划线，我会接话。）\n')
 
@@ -871,6 +1024,25 @@ async function main() {
   // 每 3 秒轮询新标注 + 侧栏用户消息
   const poller = setInterval(async () => {
     if (busy) return
+
+    // 书籍足迹变化（新书 / 书签变化）→ 重建 SYSTEM，让跨书联动的书名列表保持最新
+    const sig = booksSignature()
+    if (sig !== _lastBooksSig) {
+      _lastBooksSig = sig
+      SYSTEM = buildSystemInstruction()
+    }
+
+    // 优雅停机：stop.bat 写入 .stop 哨兵 → 保存记忆后退出（"正在保存，请稍候"）。
+    // 放在 busy 判断之后：若正在调 LLM，等这条回复收尾才保存，避免并发写。
+    if (fs.existsSync(STOP_FILE)) {
+      clearInterval(poller)
+      rl.pause()
+      console.log('\n🛑 收到停止请求，正在保存记忆，请稍候…')
+      try { await saveSessionMemory({ minMsgs: 2 }) } catch (e) { console.log(`⚠️ 记忆固化失败: ${e.message}`) }
+      try { fs.unlinkSync(STOP_FILE) } catch {}
+      console.log('👋 已保存，共读会话结束。')
+      process.exit(0)
+    }
 
     // 优先处理新标注：游标与当前行数不一致（新增 / 删除 / 截断）时交给
     // processNewAnnotations 统一处理——它内部会做游标重置 + 指纹去重，
@@ -901,9 +1073,17 @@ async function main() {
         if (_repliedFingerprints.has(fp)) { console.log(`  [dedup] skip: ${fp.slice(0,50)}`); continue }
         _repliedFingerprints.add(fp)
         if (_repliedFingerprints.size > 200) _repliedFingerprints.clear()
+        // AI-001：消息归属当前书——有 bookId 用其书（自由消息也带书签，见 sidebar submit），
+        // 无 bookId 则沿用"正在读的书"（currentBookKey），否则进 _common。
+        const key = msg.bookId ? baseBookId(msg.bookId) : (currentBookKey || '_common')
+        if (msg.bookId && key !== currentBookKey) {
+          // 切书：旧书的讨论周期结束，避免 currentAnn / 轮次残留污染新书
+          currentBookKey = key
+          currentAnn = null
+          annTurnCount = 0
+        }
         // 带书籍元数据的消息：绑定到该书讨论（重置轮次、补全书上下文）。
-        // 不带书上下文的消息是自由提问，不绑定任何书，也不参与书级 TAKEAWAY——
-        // 否则 currentAnn 会残留上一本书，自由提问第 3 轮时把总结写进错误的书。
+        // 不带 selectedText 的自由消息不绑定书级 TAKEAWAY，但仍进入该书的会话上下文。
         const bookScoped = msg.bookId && msg.selectedText
         if (bookScoped) {
           currentAnn = {
@@ -920,7 +1100,7 @@ async function main() {
             userMsg += '\n\n（请在这轮回应结尾加一行：【TAKEAWAY】你的一句收口总结，15-30字）'
           }
         }
-        const reply = await say(userMsg)
+        const reply = await say(userMsg, { bookKey: key })
         const takeaway = extractTakeaway(reply)
         // TAKEAWAY 只归属书级讨论；自由提问不写书级总结
         if (bookScoped && takeaway && currentAnn) { saveTakeaway(currentAnn, takeaway) }
@@ -950,7 +1130,8 @@ async function main() {
       if (line.startsWith('【新划线】')) {
         await processNewAnnotations()
       } else if (line.startsWith('【章节完成】')) {
-        const reply = await say(line)
+        // AI-001：章节总结归属当前讨论的书，否则进通用上下文
+        const reply = await say(line, { bookKey: currentBookKey || '_common' })
         console.log('\n' + stripCodeBlocks(reply) + '\n')
       } else {
         // 普通用户回复：追踪轮次，第 3 轮起附 takeaway 请求
@@ -959,7 +1140,9 @@ async function main() {
         if (annTurnCount >= 3 && currentAnn) {
           userMsg += '\n\n（请在这轮回应结尾加一行：【TAKEAWAY】你的一句收口总结，15-30字）'
         }
-        const reply = await say(userMsg)
+        // AI-001：有当前书讨论锚点归该书，否则归"正在读的书"或通用上下文
+        const key = currentAnn ? baseBookId(currentAnn.bookId) : (currentBookKey || '_common')
+        const reply = await say(userMsg, { bookKey: key })
 
         const takeaway = extractTakeaway(reply)
         if (takeaway && currentAnn) {
@@ -982,7 +1165,10 @@ async function main() {
 
   async function shutdown() {
     clearInterval(poller)
-    try { await saveSessionMemory() } catch (e) { console.log(`⚠️ 记忆固化失败: ${e.message}`) }
+    // 若正在调 LLM，等它收尾再固化，避免并发写 profile/soul
+    let waited = 0
+    while (busy && waited < 15000) { await sleep(100); waited += 100 }
+    try { await saveSessionMemory({ minMsgs: 2 }) } catch (e) { console.log(`⚠️ 记忆固化失败: ${e.message}`) }
     console.log('👋 共读会话结束。')
     process.exit(0)
   }

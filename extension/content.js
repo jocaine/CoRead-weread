@@ -12,12 +12,21 @@ const DEBUG_VERSION = 'selection-context-v1'
 let _chapterSlot = ''        // 原始章节槽位，如 "e_20"
 let _chapterTitle = ''       // 最近一次捕获到的章节标题
 let _chapterPrefix = 'e'     // 章节前缀，默认 'e'（本项目的 epub 书）
+let _chapterUidInt = 0       // 阅读位置整数 chapterUid（getProgress 提供），跳转 URL 用
 
 // 跨 frame 共享最近章节（标注可能发生在与网络捕获不同的 frame）
 // 带 bookId 归一化，避免切书后误用上一本书的章节槽位
-async function persistSharedChapter(bookId, slot, title) {
+async function persistSharedChapter(bookId, slot, title, uidInt) {
   try {
-    await chrome.storage.session.set({ coreadChapter: { bookId: baseBookId(bookId), slot, title, ts: Date.now() } })
+    // uidInt 为 0 时不覆盖同书已有的有效值（getProgress 与章节捕获可能在不同 frame/时刻）
+    let mergedUid = uidInt || 0
+    if (!mergedUid) {
+      const prev = await readSharedChapter()
+      if (prev && prev.bookId === baseBookId(bookId) && prev.uidInt) mergedUid = prev.uidInt
+    }
+    await chrome.storage.session.set({
+      coreadChapter: { bookId: baseBookId(bookId), slot, title, uidInt: mergedUid, ts: Date.now() },
+    })
   } catch {}
 }
 async function readSharedChapter() {
@@ -25,15 +34,6 @@ async function readSharedChapter() {
     const { coreadChapter } = await chrome.storage.session.get('coreadChapter')
     return coreadChapter || null
   } catch { return null }
-}
-
-// 从存储的 chapterUid 提取 WeRead 认识的原生 hash 槽位（e_0 / t_1）
-// 兼容两种存储格式：原始槽位 "e_0"，或拼接名 "中文版前言_e_0"
-function toWereadHashSlot(chapterUid) {
-  const s = String(chapterUid || '')
-  if (/^[te]_\d+$/.test(s)) return s
-  const m = s.match(/(?:^|_)([te]_\d+)$/)
-  return m ? m[1] : ''
 }
 
 // ── 1. 允许文字选中 ──────────────────────────────────────────────────────────
@@ -51,6 +51,14 @@ window.addEventListener('message', e => {
   }
   if (e.data?.__cr === 'chapter') handleChapterContent(e.data.url, e.data.raw)
   if (e.data?.__cr === 'progress') handleProgressContent(e.data.url, e.data.raw)
+  if (e.data?.__cr === 'bookmarks') handleBookmarkContent(e.data.url, e.data.raw)
+  if (e.data?.__cr === 'add-bookmark') handleAddBookmark(e.data.url, e.data.body)
+  if (e.data?.__cr === 'add-bookmark-response') handleAddBookmarkResponse(e.data.raw)
+  if (e.data?.__cr === 'remove-bookmark-req') {
+    // 微信读书内部删划线：同步删掉对应共读引用（划线即引用，引用也一并消失）
+    postDebug({ source: 'bookmark-remove', stage: 'we-read-req-format', body: String(e.data.body || '').slice(0, 300) })
+    handleWeReadRemoveBookmark(e.data.body)
+  }
   if (e.data?.__cr === 'network-meta') {
     postDebug({
       source: 'network-discover',
@@ -63,9 +71,64 @@ window.addEventListener('message', e => {
 })
 
 // ── 3. 从 DOM / URL 读取当前阅读上下文 ────────────────────────────────────
+// 通知侧栏当前书籍上下文（AI-001 书籍隔离）。
+// 切书 = 整页导航 → content.js 重新加载 → 这里在 init 广播一次；
+// 另有 observer 监听 bookId 变化兜底（SPA 式不刷新切书）。
+function broadcastBookContext(ctx) {
+  if (!ctx) return
+  try {
+    chrome.runtime.sendMessage({
+      action: 'coreadBookContext',
+      bookId: ctx.bookId || '',
+      bookTitle: ctx.bookTitle || '',
+      chapter: ctx.chapter || '',
+      chapterUid: ctx.chapterUid || '',
+      chapterUidInt: ctx.chapterUidInt || 0,
+    })
+  } catch {}
+}
+
+// 微信读书 reader URL 的 k 后缀解码（逆向自阅读器 JS，已验证）：
+// "06432b4029e064096632ab8" → "158"（整数 chapterUid）
+function weReadDecode(enc) {
+  if (typeof enc !== 'string' || enc.length <= 3) return ''
+  const type = enc.charAt(3)
+  let i = 5 + parseInt(enc.charAt(4))
+  const end = enc.length - 3
+  let out = ''
+  for (; i < end && (i === 5 + parseInt(enc.charAt(4)) || enc.charAt(i) === 'g');) {
+    if (i !== 5 + parseInt(enc.charAt(4)) && enc.charAt(i) === 'g') i++
+    if (i + 2 > end) return ''
+    const chunkLen = parseInt(enc.substr(i, 2), 16)
+    if (i + 2 + chunkLen > end) return ''
+    const chunk = enc.substr(i + 2, chunkLen)
+    let seg = ''
+    if (type === '3') { const n = parseInt(chunk, 16); if (isNaN(n)) return ''; seg = '' + n }
+    else { for (let k = 0; k < chunk.length; k += 2) seg += String.fromCharCode(parseInt(chunk.substr(k, 2), 16)) }
+    out += seg; i = i + 2 + chunkLen
+  }
+  return out
+}
+
+// 从顶层 reader URL 的 k 后缀解码当前章节整数 chapterUid。
+// frame 无关（读 window.top.location），比依赖本 frame 的 getProgress 更可靠。
+function chapterUidIntFromUrl() {
+  try {
+    const path = (() => { try { return window.top.location.pathname } catch { return location.pathname } })()
+    const m = String(path).match(/k([0-9a-f]+)$/i)
+    if (!m) return 0
+    const n = Number(weReadDecode(m[1]))
+    return Number.isFinite(n) && n > 0 ? n : 0
+  } catch { return 0 }
+}
+
 function getReadingContext() {
   const topPath = (() => { try { return window.top.location.pathname } catch { return location.pathname } })()
-  const bookId = topPath.split('/').pop() || ''
+  // AI-001 书籍隔离：只有阅读器页（/web/reader/…）的路径段才是书 ID。
+  // 书架/首页/书籍详情等页面的路径段是 "shelf"、"web" 等非书 ID，若误当 bookId
+  // 广播给侧栏，会把侧栏"当前书"设成垃圾值，导致切换引用栏的按书隔离失效。
+  const readerMatch = /^\/web\/reader\/([^/]+)$/.exec(topPath)
+  const bookId = readerMatch ? readerMatch[1] : ''
   const topDoc = (() => { try { return window.top.document } catch { return document } })()
   const bookTitle =
     topDoc.querySelector('.readerTopBar_title')?.textContent?.trim() ||
@@ -79,7 +142,10 @@ function getReadingContext() {
   // URL hash 只在跳转/手动导航时出现，正常阅读为空；用跟踪的网络槽位兜底
   const hashSlot = (() => { try { return window.top.location.hash.replace('#', '') } catch { return '' } })()
   const chapterUid = (/^[te]_\d+$/.test(hashSlot) ? hashSlot : _chapterSlot) || ''
-  return { bookId, bookTitle, chapter, chapterUid }
+  // 整数 chapterUid：跳转 URL 用（k{encode(chapterUidInt)}）。
+  // 优先 URL k 后缀解码（frame 无关、反映当前章节），回退本 frame 的 getProgress 追踪。
+  const uidInt = chapterUidIntFromUrl() || _chapterUidInt || 0
+  return { bookId, bookTitle, chapter, chapterUid, chapterUidInt: uidInt }
 }
 
 function previewText(text) {
@@ -180,11 +246,16 @@ async function handleProgressContent(url, raw) {
   try { data = JSON.parse(raw) } catch { return }
   const ctx = getReadingContext()
   const book = data.book || {}
+  // 追踪整数 chapterUid（阅读位置），供跳转 URL 使用（k{encode(chapterUidInt)}）
+  if (Number.isFinite(book.chapterUid)) _chapterUidInt = book.chapterUid
+  // getProgress 响应含微信读书内部书 ID（CB_xxx），没等到 bookmarklist 时也尽早记下，
+  // 供删除划线时构造 bookmarkId / 拉 bookmarklist
+  if (data.bookId) _wereadBookId = data.bookId
   // 进度 API 兜底：网络章节拦截缺位时补上槽位。
   // 进度响应里的 chapterUid 是纯数字索引（如 20），不带 e_/t_ 前缀，
   // 所以前缀只能来自真实章节捕获：本 frame 的 _chapterSlot（已被 !_chapterSlot 排除），
   // 或跨 frame 共享的 coreadChapter.slot。有真实前缀才构造槽位，否则不伪造——
-  // 用默认 'e' 给 txt 书会造出错误的 e_N，污染标注和跳转（比留空更糟：留空走 /find-chapter 检索兜底）。
+  // 用默认 'e' 给 txt 书会造出错误的 e_N，污染标注。
   if (!_chapterSlot && Number.isFinite(book.chapterIdx)) {
     const shared = await readSharedChapter()
     const sharedSlot = shared && (!shared.bookId || shared.bookId === baseBookId(ctx.bookId)) ? shared.slot : ''
@@ -192,7 +263,17 @@ async function handleProgressContent(url, raw) {
     if (prefix) {
       const slot = `${prefix}_${book.chapterIdx}`
       _chapterSlot = slot
-      persistSharedChapter(ctx.bookId, slot, book.chapterTitle || ctx.chapter || '')
+      persistSharedChapter(ctx.bookId, slot, book.chapterTitle || ctx.chapter || '', _chapterUidInt)
+    }
+  }
+  // 无论槽位是否已有，都把最新整数 chapterUid 持久化到共享章节
+  // （getProgress 是整数 chapterUid 的可靠来源，可能只在本 frame 触发；
+  //  引用创建在别的 frame 时靠 shared.uidInt 兜底）
+  if (_chapterUidInt) {
+    const slotForPersist = _chapterSlot || ''
+    const titleForPersist = book.chapterTitle || ctx.chapter || ''
+    if (slotForPersist || titleForPersist) {
+      persistSharedChapter(ctx.bookId, slotForPersist, titleForPersist, _chapterUidInt)
     }
   }
   const payload = {
@@ -223,6 +304,213 @@ async function handleProgressContent(url, raw) {
   } catch (e) {
     console.warn('[CoRead] progress POST failed:', e.message)
   }
+}
+
+// ── 3.5 微信读书划线 → 共读引用（bookmarklist 批量 + addBookmark 实时） ─────
+// 把微信读书划线（markText + chapterUid 整数 + range 位置）同步成共读引用：
+// 跳转直接用整数 chapterUid 走 WeRead 原生 URL / 内部定位，不依赖 DOM。
+// 幂等：入库前先查 /annotations 已存在的 selectedText，避免重复堆积。
+// 触发源：1) bookmarklist 响应（打开书/刷新时的已有划线）；2) addBookmark 请求
+//（用户新画一条线的实时创建，立即成引用）。
+async function syncBookmarkRef(text, uidInt, range, bookmarkId) {
+  const t = String(text || '').trim()
+  const u = Number(uidInt) || 0
+  if (!t || !u) return false
+  const ctx = getReadingContext()
+  const bookId = ctx.bookId
+  if (!bookId) return false
+  try {
+    const r = await fetch(`${RECEIVER}/annotations?bookId=${encodeURIComponent(bookId)}`)
+    const list = await r.json()
+    for (const a of list || []) {
+      if (a.selectedText && normalizeText(a.selectedText) === normalizeText(t)) return false  // 已存在
+    }
+  } catch {}
+  try {
+    const resp = await fetch(`${RECEIVER}/annotation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...ctx, selectedText: t, userNote: '',
+        silent: true, setRef: false, source: 'bookmark-sync',
+        chapterUid: '', chapterUidInt: u,
+        bookmarkRange: String(range || ''),
+        // 持久化 bookmarkId：删除引用时侧栏直接携带，绕开内存映射/frame 差异
+        bookmarkId: String(bookmarkId || ''),
+        timestamp: Math.floor(Date.now() / 1000),
+      }),
+    })
+    postDebug({ source: 'bookmark-sync', stage: 'created', chapterUidInt: u, range: String(range || ''), bookmarkId: String(bookmarkId || ''), text: t.slice(0, 24) })
+    return resp.ok
+  } catch { return false }
+}
+
+// 微信读书划线 → bookmarkId 映射（删除引用时用它删微信读书的划线）。
+// key: `${baseBookId}:${chapterUidInt}:${range}`。bookmarklist 响应 + addBookmark 响应填充。
+const _bookmarkIdByRange = {}
+// 微信读书内部书 ID（形如 CB_xxx，bookmarklist / getProgress / bookmarkId 里出现），
+// 用于按已知格式构造 bookmarkId、拉取 bookmarklist 精确匹配。与 URL 里的 v-id 不同。
+let _wereadBookId = ''
+// 我们自己发起的 removeBookmark（侧栏删引用时直接调 API），page_hook 同样会拦截到，
+// 用这个集合跳过自触发，避免把刚删完的引用再删一遍 / 推无意义的删除事件。
+const _removingBookmarkIds = new Set()
+
+function rememberBookmarkId(bookId, uidInt, range, bookmarkId) {
+  if (!bookmarkId || !range) return
+  const u = Number(uidInt) || 0
+  if (!u) return
+  _bookmarkIdByRange[`${baseBookId(bookId)}:${u}:${String(range)}`] = String(bookmarkId)
+}
+
+// 从 bookmarkId（形如 `${wereadBookId}_${chapterUidInt}_${start}-${end}`，如
+// CB_5mV8e38bN3LX70d71Y1rh59U_159_6325-6356）解析章节与位置。
+// addBookmark 响应只有 bookmarkId、不含 chapterUid/range，请求侧信息又可能跨 frame 丢失，
+// 用它兜底回填映射。返回 null 表示格式不符（注释类 bookmarkId 可能不同）。
+function parseBookmarkIdParts(bookmarkId) {
+  const parts = String(bookmarkId || '').split('_')
+  if (parts.length < 3) return null
+  const range = parts[parts.length - 1]
+  const uid = Number(parts[parts.length - 2])
+  if (!uid || !/^\d+-\d+$/.test(range)) return null
+  return { uidInt: uid, range, wereadBookId: parts.slice(0, parts.length - 2).join('_') }
+}
+
+async function handleBookmarkContent(url, raw) {
+  let data
+  try { data = JSON.parse(raw) } catch { return }
+  const ctx = getReadingContext()
+  const updated = Array.isArray(data.updated) ? data.updated : []
+  if (!updated.length) return
+  for (const bk of updated) {
+    if (bk.bookId) _wereadBookId = bk.bookId
+    const text = String(bk.markText || bk.text || '').trim()
+    const uidInt = Number(bk.chapterUid) || 0
+    if (!text || !uidInt) continue
+    if (bk.bookmarkId) rememberBookmarkId(ctx.bookId, uidInt, bk.range || '', bk.bookmarkId)
+    await syncBookmarkRef(text, uidInt, bk.range || bk.markPos || '', bk.bookmarkId || '')
+  }
+}
+
+// 微信读书内部删除划线（用户在书页里点「删除划线」）：请求体含 bookmarkId，
+// 据此把对应共读引用从接收端存档删掉（receiver 会推 annotation-removed 事件，
+// 侧栏据此移除引用列表并刷新共读标记）。自己发起的删除用 _removingBookmarkIds 跳过。
+async function handleWeReadRemoveBookmark(body) {
+  let data
+  try { data = JSON.parse(body) } catch { return }
+  const bookmarkId = String(data.bookmarkId || '')
+  if (!bookmarkId) return
+  if (_removingBookmarkIds.has(bookmarkId)) {
+    postDebug({ source: 'bookmark-remove', stage: 'we-read-sync-skip', bookmarkId })
+    return
+  }
+  const parts = parseBookmarkIdParts(bookmarkId)  // 顺带回填 wereadBookId
+  if (parts && !_wereadBookId) _wereadBookId = parts.wereadBookId
+  const ctx = getReadingContext()
+  postDebug({ source: 'bookmark-remove', stage: 'we-read-sync', bookmarkId, uidInt: parts && parts.uidInt, range: parts && parts.range, bookId: ctx.bookId })
+  try {
+    const resp = await fetch(`${RECEIVER}/annotation-delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        bookmarkId,
+        bookId: ctx.bookId || '',
+        chapterUidInt: (parts && parts.uidInt) || 0,
+        bookmarkRange: (parts && parts.range) || '',
+        source: 'weread',
+      }),
+    })
+    const j = await resp.json().catch(() => null)
+    postDebug({ source: 'bookmark-remove', stage: 'we-read-sync-result', deleted: j && j.deleted })
+  } catch (e) {
+    postDebug({ source: 'bookmark-remove', stage: 'we-read-sync-err', message: e.message })
+  }
+}
+
+// addBookmark 请求体里 markText 是 base64 编码的 UTF-8（如 "5ZCO5aSH..." → "后备队..."），
+// 只有纯 base64 字母表（无空格/标点）且解码出有效中文（允许少量结尾替换字符）才解码，否则原样保留。
+function tryBase64Decode(s) {
+  try {
+    const t = String(s || '').trim()
+    if (t.length < 12) return s
+    if (!/^[A-Za-z0-9+/=]+$/.test(t)) return s
+    const binary = atob(t)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+    const decoded = new TextDecoder().decode(bytes)
+    const cjk = (decoded.match(/[一-鿿]/g) || []).length
+    const bad = (decoded.match(/�/g) || []).length
+    if (cjk > 0 && bad <= Math.max(1, Math.floor(decoded.length / 20))) return decoded
+  } catch {}
+  return s
+}
+
+// 实时：用户新画一条微信读书划线（addBookmark 请求体含位置）。
+// 新建成功后自动打开侧栏，让"划线即引用"有看得见的反应（侧栏打开时 SSE 会推给它）。
+// 记下请求的位置（响应里没有 chapterUid/range），供 addBookmark 响应回填 bookmarkId。
+// 用 Map<range> 池代替原单个槽位：快速连画多条划线时各自独立，响应按 range 精确
+// 匹配，避免后到请求覆盖前一条导致 bookmarkId 记到错误位置（AI-006）。
+const _pendingAddBookmarks = new Map()
+function _findPendingAddBookmark(rangeKey) {
+  if (!_pendingAddBookmarks.size) return null
+  const exact = rangeKey && _pendingAddBookmarks.get(String(rangeKey))
+  if (exact) return exact
+  // 响应不携带任何位置信息时按插入序取最老一条（FIFO best-effort）
+  return _pendingAddBookmarks.values().next().value || null
+}
+async function handleAddBookmark(url, body) {
+  let data
+  try { data = JSON.parse(body) } catch { return }
+  const text = tryBase64Decode(data.markText)
+  const range = String(data.range || '')
+  if (range) {
+    _pendingAddBookmarks.set(range, { chapterUidInt: Number(data.chapterUid) || 0, range })
+    if (_pendingAddBookmarks.size > 50) {  // 防泄漏上限，超限丢最老
+      const oldestKey = _pendingAddBookmarks.keys().next().value
+      _pendingAddBookmarks.delete(oldestKey)
+    }
+  }
+  postDebug({ source: 'bookmark-sync', stage: 'add-req', uid: data.chapterUid, range: data.range, hasMark: !!data.markText, markLen: String(text || '').length })
+  const created = await syncBookmarkRef(text, data.chapterUid, data.range)
+  if (created) {
+    try { chrome.runtime.sendMessage({ action: 'openPanel' }).catch(() => {}) } catch {}
+  }
+}
+
+// addBookmark 响应：提取新建划线的 bookmarkId，删除引用时用它删微信读书的划线。
+// 宽容解析（{bookmarkId} / {book:{...}} / {data:{...}}）。响应通常只有 bookmarkId，
+// 没有 chapterUid/range，优先从 bookmarkId 内嵌位置或 _pendingAddBookmarks 池补全后缓存。
+function handleAddBookmarkResponse(raw) {
+  let data
+  try { data = JSON.parse(raw) } catch { return }
+  const bookmarkId =
+    data.bookmarkId || data.id ||
+    (data.book && (data.book.bookmarkId || data.book.id)) ||
+    (data.data && (data.data.bookmarkId || data.data.id)) || ''
+  if (!bookmarkId) {
+    postDebug({ source: 'bookmark-sync', stage: 'add-resp-no-id', preview: String(raw).slice(0, 160) })
+    return
+  }
+  // 位置信息的权威优先级（AI-006，防快速连画多条时 pending 被后续请求覆盖导致串槽）：
+  //   1) 响应体自带 chapterUid/range（新建划线的真实位置）
+  //   2) bookmarkId 字符串内嵌的 wereadBookId_uidInt_range（parseBookmarkIdParts）
+  //   3) 请求时按 range 记下的 pending 池（best-effort，精确匹配或 FIFO 最老）
+  const parsed = parseBookmarkIdParts(bookmarkId)
+  if (parsed && !_wereadBookId) _wereadBookId = parsed.wereadBookId
+  const respUidInt = Number(data.chapterUid || (data.book && data.book.chapterUid) || (data.data && data.data.chapterUid)) || 0
+  const respRange = String(data.range || (data.book && data.book.range) || (data.data && data.data.range) || '')
+  let uidInt = respUidInt || (parsed && parsed.uidInt) || 0
+  let range = respRange || (parsed && parsed.range) || ''
+  if (!uidInt || !range) {
+    const pending = _findPendingAddBookmark(range)
+    if (pending) {
+      if (!uidInt) uidInt = pending.chapterUidInt
+      if (!range) range = pending.range
+    }
+  }
+  if (range) _pendingAddBookmarks.delete(String(range))  // 消费掉的 pending 及时清掉
+  const ctx = getReadingContext()
+  if (uidInt && range) rememberBookmarkId(ctx.bookId, uidInt, range, bookmarkId)
+  postDebug({ source: 'bookmark-sync', stage: 'add-resp', bookmarkId, uidInt, range, parsedUid: parsed && parsed.uidInt, parsedRange: parsed && parsed.range, respUidInt, respRange })
 }
 
 // ── 4. 标注弹窗 ────────────────────────────────────────────────────────────
@@ -316,14 +604,23 @@ async function setCurrentRef(selectedText) {
     return false
   }
   const ctx = getReadingContext()
-  // 本 frame 拿不到章节信息时，用跨 frame 共享的最新章节兜底（仅限同一本书）
-  if (!ctx.chapterUid || !ctx.chapter) {
-    const shared = await readSharedChapter()
-    if (shared && (!shared.bookId || shared.bookId === baseBookId(ctx.bookId))) {
-      if (!ctx.chapterUid && shared.slot) ctx.chapterUid = shared.slot
-      if (!ctx.chapter && shared.title) ctx.chapter = shared.title
-    }
+  // 本 frame 拿不到章节信息时，用跨 frame 共享的最新章节兜底（仅限同一本书）。
+  // 整数 chapterUid 无条件合并：getProgress 可能只在顶层 frame 触发，本 frame 为 0，
+  // 而 URL k 后缀解码也可能因顶层未导航而缺失，需要共享数据兜底。
+  const shared = await readSharedChapter()
+  if (shared && (!shared.bookId || shared.bookId === baseBookId(ctx.bookId))) {
+    if (!ctx.chapterUid && shared.slot) ctx.chapterUid = shared.slot
+    if (!ctx.chapter && shared.title) ctx.chapter = shared.title
+    if (!ctx.chapterUidInt && shared.uidInt) ctx.chapterUidInt = shared.uidInt
   }
+  // 诊断：记录设引用时的上下文（含整数 chapterUid 是否拿到），排查跳转问题
+  postDebug({
+    source: 'setref',
+    stage: 'ctx',
+    chapterUid: ctx.chapterUid || '',
+    chapterUidInt: ctx.chapterUidInt || 0,
+    topUrl: (() => { try { return window.top.location.pathname } catch { return '' } })().slice(0, 90),
+  })
 
   // 后台静默发送：正文缓存（保留，为侧栏后续提问提供上下文）
   trySendSelectionContent(ctx.chapterUid, ctx, selectedText, _copySelection)
@@ -358,7 +655,7 @@ async function setCurrentRef(selectedText) {
     await chrome.storage.local.set({
       pendingSelectRef: {
         bookId: ctx.bookId, bookTitle: ctx.bookTitle, chapter: ctx.chapter || '',
-        chapterUid: ctx.chapterUid || '', selectedText,
+        chapterUid: ctx.chapterUid || '', chapterUidInt: ctx.chapterUidInt || 0, selectedText,
       },
     })
   } catch {}
@@ -366,7 +663,7 @@ async function setCurrentRef(selectedText) {
     chrome.runtime?.sendMessage({
       action: 'coreadSetRefApply',
       ref: { bookId: ctx.bookId, bookTitle: ctx.bookTitle, chapter: ctx.chapter || '',
-        chapterUid: ctx.chapterUid || '', selectedText },
+        chapterUid: ctx.chapterUid || '', chapterUidInt: ctx.chapterUidInt || 0, selectedText },
     }).catch(() => {})
   } catch {}
   // 自动打开侧栏，让用户看到当前引用，之后在侧栏里提问
@@ -435,7 +732,7 @@ async function handleChapterContent(url, raw) {
     _chapterSlot = slotUid
     _chapterPrefix = slotUid.split('_')[0] || _chapterPrefix
     if (ctx.chapter) _chapterTitle = ctx.chapter
-    persistSharedChapter(bookId, slotUid, ctx.chapter)
+    persistSharedChapter(bookId, slotUid, ctx.chapter, _chapterUidInt)
   }
   const chapterUid = /^[te]_\d+$/.test(slotUid) && ctx.chapter
     // 前缀用当前章节标题，而不是 chapterFileName(ctx,'')：ctx 在 _chapterSlot 更新前
@@ -818,8 +1115,15 @@ function postReaderStructure() {
 }
 
 // ── 9. MutationObserver：章节切换 + 工具栏检测 ─────────────────────────────
+let _lastBookBaseId = ''
 const observer = new MutationObserver(() => {
   const ctx = getReadingContext()
+  // SPA 式不刷新切书兜底：top path 的 bookId 变了就广播，让侧栏跟随
+  const base = baseBookId(ctx.bookId)
+  if (base && base !== _lastBookBaseId) {
+    _lastBookBaseId = base
+    broadcastBookContext(ctx)
+  }
   if (ctx.chapter !== lastChapterTitle) onChapterChange(ctx)
   injectToolbarButton()
   scheduleCoReadMarking()
@@ -831,7 +1135,7 @@ document.addEventListener('mousedown', e => {
   if (popup && !popup.contains(e.target)) removePopup()
 }, true)
 
-// ── 10. 接收侧栏跳转请求 ──────────────────────────────────────────────────
+// ── 10. 接收侧栏消息 ───────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 引用删除后刷新共读标记：先清掉页面上所有旧标记再重新标记，
   // 否则被删的引用会一直留在书页上（只加不减的 markCoReadPassages 不会自己清）。
@@ -841,84 +1145,166 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     scheduleCoReadMarking()
     return
   }
-  if (msg.action !== 'jumpToAnnotation') return
-  const ctx = getReadingContext()
-  sendResponse({ bookId: ctx.bookId, chapterUid: ctx.chapterUid, chapter: ctx.chapter, bookTitle: ctx.bookTitle })
-  jumpToChapterAndHighlight(msg.bookId, msg.chapterUid, msg.selectedText)
-  return true
+  // 侧栏打开/切 tab 时查询当前阅读上下文（AI-001）
+  if (msg.action === 'getReadingContext') {
+    const ctx = getReadingContext()
+    sendResponse({ bookId: ctx.bookId, bookTitle: ctx.bookTitle, chapter: ctx.chapter, chapterUid: ctx.chapterUid, chapterUidInt: ctx.chapterUidInt })
+    return true
+  }
+  // 删除引用时同步删除微信读书划线：按 range 查 bookmarkId。
+  // 解析顺序：1) 引用持久化的 bookmarkId（annotation 直接携带，绕开内存映射）
+  //           2) 内存映射 _bookmarkIdByRange
+  //           3) 已知格式构造（wereadBookId_chapterUidInt_range）
+  //           4) 拉 bookmarklist 按章节+range 精确匹配（权威兜底）
+  // 定位后优先直接同源调 /web/book/removeBookmark；失败再尝试 page_hook 调 reader 组件。
+  if (msg.action === 'removeWeReadUnderline') {
+    try { if (window.top !== window) { sendResponse({ ok: false, reason: 'not-top' }); return false } } catch {}
+    postDebug({ source: 'bookmark-remove', stage: 'request', chapterUidInt: msg.chapterUidInt, range: msg.range, hasBookmarkId: !!msg.bookmarkId })
+    removeWeReadUnderlineByRef(msg).then(result => {
+      postDebug({ source: 'bookmark-remove', stage: 'result', ok: result.ok, reason: result.reason || '', via: result.via || '' })
+      sendResponse({ ok: result.ok, reason: result.reason || '' })
+      // 画布阅读器没有组件钩子可调（vue/react 均为 0），API 删完服务器状态后
+      // 画布仍残留黄划线，只有刷新页面才消失。删除成功后自动刷新一次。
+      // 微信读书会用 getProgress 恢复阅读位置。via==='pagehook' 时组件自己重绘了，不需要刷。
+      if (result.ok && result.via !== 'pagehook') {
+        postDebug({ source: 'bookmark-remove', stage: 'page-reload', via: result.via || '' })
+        setTimeout(() => { try { location.reload() } catch (e) { postDebug({ source: 'bookmark-remove', stage: 'reload-err', message: e.message }) } }, 400)
+      }
+      return true
+    })
+    return true
+  }
 })
 
-async function jumpToChapterAndHighlight(bookId, chapterUid, selectedText) {
-  const ctx = getReadingContext()
-  const currentBase = baseBookId(ctx.bookId)
-  const targetBase = baseBookId(bookId)
-  // 存储的 chapterUid 可能是拼接名（中文版前言_e_0），WeRead 只认原生槽位
-  const slot = toWereadHashSlot(chapterUid)
-
-  // 不同书 → 跳转整个页面
-  if (targetBase && currentBase !== targetBase) {
-    const url = slot
-      ? `https://weread.qq.com/web/reader/${targetBase}#${slot}`
-      : `https://weread.qq.com/web/reader/${targetBase}`
-    try { window.top.location.href = url } catch { location.href = url }
-    return
+// 解析 bookmarkId 并删除微信读书划线。
+// 返回 { ok, reason?, via? }。直接调 removeBookmark API（同源，含登录态），
+// 失败再尝试 page_hook 通过 reader 组件删除。
+async function removeWeReadUnderlineByRef(msg) {
+  const bookId = msg.bookId || ''
+  const uidInt = Number(msg.chapterUidInt) || 0
+  const range = String(msg.range || '')
+  const key = `${baseBookId(bookId)}:${uidInt}:${range}`
+  // 权威候选：引用持久化的 bookmarkId / 内存映射（来自 bookmarklist / addBookmark 响应），
+  // 基本可信，失败后允许走 page_hook 兜底
+  const authoritative = []
+  if (msg.bookmarkId) authoritative.push(String(msg.bookmarkId))
+  if (_bookmarkIdByRange[key]) authoritative.push(String(_bookmarkIdByRange[key]))
+  // 构造候选：按已知格式 bookmarkId = `${wereadBookId}_${chapterUidInt}_${range}` 拼出来，
+  // 只试直接 API（格式不符/已失效时 succ:0 快速失败，不反复触发 page_hook 3 秒超时）
+  const constructed = (_wereadBookId && uidInt && /^\d+-\d+$/.test(range))
+    ? [`${_wereadBookId}_${uidInt}_${range}`] : []
+  for (const id of [...new Set(authoritative)]) {
+    const ok = await removeWeReadUnderline(id, {})
+    if (ok) return { ok: true, via: 'id' }
   }
-
-  // 同书不同章节 → 修改 hash（weread 的 reader iframe 通过 hash 切换章节）
-  if (slot) {
-    try { window.top.location.hash = '#' + slot } catch {}
-    try { location.hash = '#' + slot } catch {}
-    // 等页面渲染
-    await new Promise(r => setTimeout(r, 2000))
+  for (const id of constructed) {
+    if (authoritative.includes(id)) continue
+    const ok = await removeWeReadUnderline(id, { skipFallback: true })
+    if (ok) return { ok: true, via: 'id' }
   }
-
-  // 在当前可见的 DOM 中查找并高亮文字
-  if (selectedText) findAndHighlight(selectedText)
-}
-
-function findAndHighlight(text) {
-  if (!text) return
-  // 清除旧高亮
-  document.querySelectorAll('.coread-highlight').forEach(el => {
-    const p = el.parentNode
-    if (p) p.replaceChild(document.createTextNode(el.textContent), el)
-  })
-
-  // 缩短搜索词提高命中率
-  const needle = text.replace(/\s+/g, '').slice(0, 30)
-  if (!needle) return
-
-  // 在 DOM 中搜索文本节点
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false)
-  let bestNode = null, bestLen = 0
-  while (walker.nextNode()) {
-    const compact = walker.currentNode.textContent.replace(/\s+/g, '')
-    const idx = compact.indexOf(needle)
-    if (idx !== -1 && compact.length > bestLen) {
-      bestNode = walker.currentNode
-      bestLen = compact.length
-    }
-  }
-
-  if (bestNode) {
+  // 权威兜底：拉 bookmarklist 按章节+range 精确匹配后删除
+  if (_wereadBookId && uidInt && range) {
     try {
-      const parent = bestNode.parentNode
-      const span = document.createElement('span')
-      span.className = 'coread-highlight'
-      span.style.cssText = 'background:#ffeb3b;border-radius:2px;padding:1px 0;'
-      // 把整个文本节点包进高亮 span
-      parent.insertBefore(span, bestNode)
-      span.appendChild(bestNode)
-      span.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      const found = await findBookmarkIdFromList(_wereadBookId, uidInt, range)
+      if (found && !authoritative.includes(found) && !constructed.includes(found)) {
+        const ok = await removeWeReadUnderline(found, {})
+        if (ok) return { ok: true, via: 'bookmarklist' }
+        return { ok: false, reason: 'remove-failed' }
+      }
     } catch {}
   }
+  return (authoritative.length || constructed.length) ? { ok: false, reason: 'remove-failed' } : { ok: false, reason: 'no-bookmark-id' }
+}
+
+// 拉取微信读书 bookmarklist，按 chapterUid + range 精确匹配 bookmarkId。
+async function findBookmarkIdFromList(wereadBookId, uidInt, range) {
+  const resp = await fetch(`/web/book/bookmarklist?bookId=${encodeURIComponent(wereadBookId)}`, { credentials: 'include' })
+  const j = await resp.json().catch(() => null)
+  for (const bk of (j && j.updated) || []) {
+    if (Number(bk.chapterUid) === uidInt && String(bk.range || '') === String(range) && bk.bookmarkId) {
+      return String(bk.bookmarkId)
+    }
+  }
+  return ''
+}
+
+// 删除微信读书划线：先直接调 removeBookmark API（同源，含登录态）；
+// 若失败，再尝试 page_hook 通过 reader 组件删除。opts.skipFallback 为真时
+// 失败直接返回（避免对构造/错误的候选 id 反复触发 page_hook 的 3 秒超时）。
+async function removeWeReadUnderline(bookmarkId, opts = {}) {
+  // 标记为自己发起的删除：page_hook 拦截到的 removeBookmark-req 据此跳过，
+  // 避免把刚删完的引用再同步删一遍
+  _removingBookmarkIds.add(String(bookmarkId))
+  try {
+    try {
+      const resp = await fetch('/web/book/removeBookmark', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ bookmarkId }),
+      })
+      const j = await resp.json().catch(() => ({}))
+      // 成功判定只看响应体：HTTP 200 但 succ:0（如 id 已失效/格式不符）不能算成功，
+      // 否则会误报"已删除"而书页划线仍在。空体/非 JSON 时才退回 resp.ok。
+      if (j && (j.succ === 1 || j.success === 1 || j.code === 0 ||
+        (resp.ok && !('succ' in j) && !('success' in j) && !('code' in j)))) {
+        postDebug({ source: 'bookmark-remove', stage: 'api-direct', bookmarkId, succ: j.succ })
+        return true
+      }
+      postDebug({ source: 'bookmark-remove', stage: 'api-direct-fail', bookmarkId, resp: String(resp.status), body: String(JSON.stringify(j)).slice(0, 200) })
+    } catch (e) {
+      postDebug({ source: 'bookmark-remove', stage: 'api-direct-err', message: e.message })
+    }
+  } finally {
+    _removingBookmarkIds.delete(String(bookmarkId))
+  }
+  if (opts.skipFallback) return false
+  // 回退：page_hook 调 reader 组件删除划线（会重绘画布）
+  return new Promise((resolve) => {
+    let settled = false
+    const onResult = (e) => {
+      if (!e.data || e.data.__cr !== 'coread-remove-bookmark-result') return
+      window.removeEventListener('message', onResult)
+      if (!settled) { settled = true; resolve(!!e.data.ok) }
+      // 记录 page_hook 的组件查找结果，便于定位为何删不掉/找不到组件
+      if (e.data.diag) {
+        postDebug({ source: 'bookmark-remove', stage: 'pagehook-diag', ok: e.data.ok, method: e.data.method || '', reason: e.data.reason || '', diag: JSON.stringify(e.data.diag).slice(0, 900) })
+      }
+    }
+    window.addEventListener('message', onResult)
+    setTimeout(() => {
+      window.removeEventListener('message', onResult)
+      if (!settled) { settled = true; resolve(false) }
+    }, 3000)
+    try { window.postMessage({ __cr: 'coread-remove-bookmark', bookmarkId }, '*') } catch (e) {
+      if (!settled) { settled = true; resolve(false) }
+    }
+  })
+}
+
+// 主动扫描阅读器环境：page_hook 找删除划线的方法/组件并回报 diag。
+// 加载时 + 渲染后各扫一次，配合结构诊断定位"删除划线后画布不刷新"的组件。
+function scanReaderEnv() {
+  try {
+    const onResult = (e) => {
+      if (!e.data || e.data.__cr !== 'coread-scan-reader-result') return
+      window.removeEventListener('message', onResult)
+      postDebug({ source: 'structure', stage: 'pagehook-scan', ok: e.data.ok, method: e.data.method || '', diag: JSON.stringify(e.data.diag || {}).slice(0, 900) })
+    }
+    window.addEventListener('message', onResult)
+    window.postMessage({ __cr: 'coread-scan-reader' }, '*')
+    setTimeout(() => window.removeEventListener('message', onResult), 4000)
+  } catch {}
 }
 
 // 初始化
 const initCtx = getReadingContext()
 lastChapterUid = initCtx.chapterUid
 lastChapterTitle = initCtx.chapter
+_lastBookBaseId = baseBookId(initCtx.bookId)
+broadcastBookContext(initCtx)
 postDebug({ source: 'lifecycle', stage: 'content-loaded' })
+postDebug({ source: 'content-version', version: 'v3-pending-fix' })
 console.log('[CoRead] content script loaded', initCtx)
 
 // 首屏章节的共读标记（DOM 渐进渲染时 observer 会继续补标）
@@ -927,3 +1313,81 @@ scheduleCoReadMarking()
 // 结构诊断：加载时 + 内容渲染后各记录一次
 postReaderStructure()
 setTimeout(postReaderStructure, 2500)
+
+// 阅读器环境扫描：加载时 + 渲染后各一次
+scanReaderEnv()
+setTimeout(scanReaderEnv, 3500)
+
+// ── 11. 跳转引用定位（AI-006） ─────────────────────────────────────────────
+// 侧栏 jumpToAnnotation 把 { bookId, selectedText, ts } 写进 chrome.storage.local.pendingJump；
+// 目标页每个 content script frame 加载后（以及 storage 变更时）消费它：在正文里滚动
+// 高亮引用的句子。WeRead 是 SPA、正文异步渲染，findAndHighlight 内部轮询最多约 15s。
+function findAndHighlight(text) {
+  const needle = String(text || '').replace(/\s+/g, '').slice(0, 30)
+  if (!needle) return Promise.resolve({ found: false, reason: 'no-needle' })
+  return new Promise((resolve) => {
+    let attempts = 0
+    const tryFind = () => {
+      attempts++
+      // 清除旧高亮
+      document.querySelectorAll('.coread-highlight').forEach(el => {
+        const p = el.parentNode
+        if (p) p.replaceChild(document.createTextNode(el.textContent), el)
+      })
+      const nodes = []
+      const collect = (root, out) => {
+        const doc = root.ownerDocument || root
+        const w = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false)
+        let n
+        while ((n = w.nextNode())) out.push(n)
+        const hosts = root.querySelectorAll('*')
+        for (const h of hosts) if (h.shadowRoot) collect(h.shadowRoot, out)
+      }
+      collect(document, nodes)
+      // 命中最长文本节点（包含引用的段落），减少误命中
+      let best = null, bestLen = 0
+      for (const n of nodes) {
+        const compact = n.textContent.replace(/\s+/g, '')
+        if (compact.indexOf(needle) !== -1 && compact.length > bestLen) { best = n; bestLen = compact.length }
+      }
+      if (best) {
+        try {
+          const parent = best.parentNode
+          const span = document.createElement('span')
+          span.className = 'coread-highlight'
+          span.style.cssText = 'background:#ffeb3b;border-radius:2px;padding:1px 0;'
+          parent.insertBefore(span, best)
+          span.appendChild(best)
+          span.scrollIntoView({ behavior: 'smooth', block: 'center' })
+          resolve({ found: true, attempts })
+          return
+        } catch (e) { resolve({ found: false, attempts }); return }
+      }
+      if (attempts < 18) setTimeout(tryFind, 800)  // 最多约 15s
+      else resolve({ found: false, attempts })
+    }
+    tryFind()
+  })
+}
+
+async function checkPendingJump() {
+  try {
+    const { pendingJump } = await chrome.storage.local.get('pendingJump')
+    if (!pendingJump || !pendingJump.selectedText) return
+    if (Date.now() - (pendingJump.ts || 0) > 40000) {
+      await chrome.storage.local.remove('pendingJump')  // 过期清理
+      return
+    }
+    if (pendingJump.bookId && baseBookId(pendingJump.bookId) !== baseBookId(getReadingContext().bookId)) return
+    const result = await findAndHighlight(pendingJump.selectedText)
+    if (result && result.found) {
+      await chrome.storage.local.remove('pendingJump')  // 命中后消费掉
+    }
+  } catch {}
+}
+
+// 加载时 + storage 变更时各消费一次（SPA hash 路由不重载页面时靠 onChanged 兜底）
+checkPendingJump()
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.pendingJump) checkPendingJump()
+})

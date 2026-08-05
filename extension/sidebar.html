@@ -13,6 +13,8 @@
       display: flex;
       flex-direction: column;
       overflow: hidden;
+      /* 消息字号可调：AI-002 */
+      --msg-font-size: 13px;
     }
     #header {
       background: #fff;
@@ -23,8 +25,23 @@
       gap: 10px;
       flex-shrink: 0;
     }
-    #header .title { font-weight: 400; font-size: 12px; color: #888; flex: 1; letter-spacing: 0.01em; }
+    #header .title { font-weight: 400; font-size: 12px; color: #888; flex: 1; letter-spacing: 0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #dot { width: 7px; height: 7px; border-radius: 50%; background: #ddd; flex-shrink: 0; transition: background 0.3s; }
+    /* 字号调节按钮（AI-002） */
+    .fs-btn {
+      flex: 0 0 auto;
+      border: 1px solid #e0e0e0;
+      background: #fff;
+      color: #666;
+      border-radius: 4px;
+      font-size: 10px;
+      line-height: 1;
+      padding: 4px 5px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .fs-btn:hover:not(:disabled) { border-color: #07c160; color: #07c160; }
+    .fs-btn:disabled { opacity: 0.35; cursor: default; }
     /* ── 当前引用卡片 ──────────────────────────── */
     #ref-current {
       background: #fff;
@@ -139,6 +156,8 @@
       display: flex;
       flex-direction: column;
       box-shadow: -2px 0 16px rgba(0,0,0,0.12);
+      /* 基准字号跟随消息字号（AI-002）：抽屉内文字用 em 相对缩放 */
+      font-size: var(--msg-font-size);
     }
     #ref-drawer .drawer-head {
       display: flex;
@@ -151,15 +170,18 @@
     }
     #ref-drawer .drawer-head .drawer-title {
       flex: 1;
-      font-size: 13px;
+      font-size: 1em;
       font-weight: 600;
       color: #333;
-      min-width: 80px;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     #ref-drawer .drawer-head .drawer-close {
       border: none;
       background: none;
-      font-size: 18px;
+      font-size: 1.38em;
       cursor: pointer;
       color: #aaa;
       padding: 0 4px;
@@ -187,7 +209,7 @@
       margin-bottom: 2px;
     }
     #ref-drawer .drawer-item .di-num {
-      font-size: 10px;
+      font-size: 0.77em;
       font-weight: 700;
       color: #07c160;
       background: #e8f5e9;
@@ -196,13 +218,13 @@
       flex-shrink: 0;
     }
     #ref-drawer .drawer-item .di-book {
-      font-size: 10px;
+      font-size: 0.77em;
       color: #07c160;
       font-weight: 600;
       margin-bottom: 2px;
     }
     #ref-drawer .drawer-item .di-chapter {
-      font-size: 10px;
+      font-size: 0.77em;
       color: #aaa;
       margin-bottom: 3px;
     }
@@ -211,7 +233,7 @@
       border: 1px solid #ddd;
       border-radius: 6px;
       padding: 5px 8px;
-      font-size: 12px;
+      font-size: 0.92em;
       outline: none;
       margin-top: 6px;
       font-family: inherit;
@@ -220,30 +242,28 @@
     }
     #drawer-search:focus { border-color: #07c160; }
     #ref-drawer .drawer-item .di-text {
-      font-size: 12px;
+      font-size: 0.92em;
       color: #555;
       line-height: 1.5;
-      display: -webkit-box;
-      -webkit-line-clamp: 3;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
     }
-    #ref-drawer .drawer-item.expanded .di-text {
-      display: block;
-      -webkit-line-clamp: unset;
-    }
+    #ref-drawer .drawer-item.expanded .di-text { display: none; }
     #ref-drawer .drawer-item .di-full {
       display: none;
       margin-top: 4px;
-      padding-top: 6px;
-      border-top: 1px dashed #eee;
-      font-size: 12px;
+      font-size: 0.92em;
       color: #444;
       line-height: 1.7;
     }
     #ref-drawer .drawer-item.expanded .di-full { display: block; }
+    /* 搜索命中高亮 */
+    #ref-drawer .drawer-item mark {
+      background: #ffe58f;
+      border-radius: 2px;
+      padding: 0 1px;
+      color: inherit;
+    }
     #ref-drawer .drawer-item .di-toggle {
-      font-size: 10px;
+      font-size: 0.77em;
       color: #07c160;
       cursor: pointer;
       margin-top: 3px;
@@ -260,9 +280,10 @@
       background: #fff;
       border-radius: 4px;
       padding: 2px 8px;
-      font-size: 10px;
+      font-size: 0.77em;
       cursor: pointer;
       color: #666;
+      margin-right: 4px;
     }
     #ref-drawer .drawer-item .di-jump-btn:hover { border-color: #07c160; color: #07c160; }
     #ref-drawer .drawer-item .di-del-btn {
@@ -270,7 +291,7 @@
       background: #fff;
       border-radius: 4px;
       padding: 2px 8px;
-      font-size: 10px;
+      font-size: 0.77em;
       cursor: pointer;
       color: #bbb;
       margin-left: 4px;
@@ -333,7 +354,7 @@
       border: 1px solid #e8f5e9;
       border-radius: 8px;
       padding: 10px 12px;
-      font-size: 12px;
+      font-size: var(--msg-font-size);
       color: #555;
       line-height: 1.6;
     }
@@ -348,7 +369,7 @@
       border-radius: 14px 14px 2px 14px;
       padding: 9px 13px;
       max-width: 82%;
-      font-size: 13px;
+      font-size: var(--msg-font-size);
       line-height: 1.65;
       white-space: pre-wrap;
       word-break: break-word;
@@ -419,7 +440,7 @@
       border-radius: 14px 14px 14px 2px;
       padding: 9px 13px;
       max-width: 88%;
-      font-size: 13px;
+      font-size: var(--msg-font-size);
       line-height: 1.65;
       white-space: pre-wrap;
       word-break: break-word;
@@ -431,7 +452,7 @@
       border: 1px solid #ececec;
       border-radius: 14px 14px 14px 2px;
       padding: 10px 16px;
-      font-size: 13px;
+      font-size: var(--msg-font-size);
       color: #999;
       display: flex;
       align-items: center;
@@ -446,6 +467,145 @@
     @keyframes thinking-bounce {
       0%, 60%, 100% { transform: translateY(0); }
       30% { transform: translateY(-6px); }
+    }
+
+    /* ── 提问位置浮窗（AI-005）──────────────────── */
+    /* 仿 DeepSeek 滚动导航：折叠态不画卡片，只有右缘几根稀疏的小横杠；
+       悬停时横杠变绿，卡片才浮现并平滑展开成 240px 提问列表，横杠成为卡片右缘把手。 */
+    #jump-fab {
+      position: fixed;
+      right: 18px;               /* 避开右侧滚动条（#msgs 滚动条约 15px 宽） */
+      top: 50%;
+      transform: translateY(-50%);
+      z-index: 60;
+      display: flex;
+      align-items: stretch;
+      width: 30px;
+      max-height: min(360px, 62vh);
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 12px;
+      overflow: hidden;
+      transition: width 0.22s ease, background 0.22s ease,
+                  border-color 0.22s ease, box-shadow 0.22s ease;
+    }
+    #jump-fab.open {
+      width: 268px;
+      background: #fff;
+      border-color: #e5e7eb;
+      box-shadow: 0 10px 34px rgba(0,0,0,0.13);
+    }
+    /* 提问列表区 */
+    #jump-panel {
+      flex: 1;
+      min-width: 0;
+      display: none;
+      flex-direction: column;
+    }
+    #jump-fab.open #jump-panel { display: flex; }
+    #jump-panel .jump-list {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;      /* 不出现水平滚动条，文本尾部省略 */
+      padding: 10px 8px;
+    }
+    /* 条目：裸文本、无边框无编号，悬停浅灰，当前项绿字加粗 + 左侧指示条
+       （对应 DeepSeek 的 ef46fbc6 > fae5876e 指示元素） */
+    #jump-panel .jump-item {
+      position: relative;
+      padding: 8px 12px 8px 18px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    #jump-panel .jump-item:hover { background: #f5f6f7; }
+    #jump-panel .jump-text {
+      display: block;          /* 行内元素不做省略，必须块级才生效 ellipsis */
+      font-size: 12px;
+      line-height: 1.5;
+      color: #3f434a;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #jump-panel .jump-item.active .jump-text { color: #07c160; font-weight: 600; }
+    #jump-panel .jump-item.active::before {
+      content: '';
+      position: absolute;
+      left: 5px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 3px;
+      height: 15px;
+      border-radius: 2px;
+      background: #07c160;
+    }
+    #jump-panel .jump-empty {
+      padding: 18px 12px;
+      text-align: center;
+      font-size: 12px;
+      color: #b0b3b8;
+    }
+    /* 右缘把手：几根稀疏的小横杠（折叠态的全部内容，间距拉开不局促） */
+    #jump-fab-btn {
+      width: 30px;
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      min-height: 46px;
+      cursor: pointer;
+      border-left: 1px solid transparent;
+      transition: border-color 0.22s;
+    }
+    #jump-fab.open #jump-fab-btn { border-left-color: #f0f1f3; }
+    #jump-fab-btn .jbar {
+      width: 18px;
+      height: 2px;
+      border-radius: 2px;
+      background: #b7bcc4;
+      transition: background 0.2s, width 0.2s;
+    }
+    #jump-fab-btn .jbar.sel {
+      width: 26px;               /* 当前提问所在域的横杠：更长 + 实心绿 */
+      background: #07c160;
+    }
+    #jump-fab:hover #jump-fab-btn .jbar,
+    #jump-fab.open #jump-fab-btn .jbar {
+      background: #07c160;
+    }
+    /* 悬停省略文本时的完整内容 tooltip（浮于卡片内，避开右缘把手） */
+    .jump-tip {
+      position: absolute;
+      left: 8px;
+      right: 40px;
+      top: 8px;
+      max-height: 200px;
+      background: rgba(35,38,44,0.95);
+      color: #f5f6f7;
+      font-size: 12px;
+      line-height: 1.6;
+      padding: 8px 10px;
+      border-radius: 8px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+      z-index: 10;
+      display: none;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      pointer-events: none;
+    }
+    .jump-tip.on { display: block; }
+    /* 跳转目标消息的短暂高亮 */
+    .msg-user.jump-flash .bubble {
+      animation: jump-flash 1.2s ease;
+    }
+    @keyframes jump-flash {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255, 193, 7, 0); }
+      30% { box-shadow: 0 0 0 4px rgba(255, 193, 7, 0.55); }
     }
 
     /* ── 删除确认弹窗 ──────────────────────────── */
@@ -491,34 +651,17 @@
 <body>
   <div id="header">
     <span style="font-size:15px;line-height:1">📖</span>
-    <span class="title"><em>We read to know we are not alone.</em></span>
+    <span class="title" id="current-book"><em>We read to know we are not alone.</em></span>
+    <button class="fs-btn" id="fs-down" title="减小字号">Ａ−</button>
+    <button class="fs-btn" id="fs-up" title="增大字号">Ａ＋</button>
     <span id="dot"></span>
-  </div>
-
-  <!-- 当前选中的引用卡片 -->
-  <div id="ref-current">
-    <div class="rc-head">
-      <span class="rc-label">📌 当前引用</span>
-      <button id="rc-jump-btn" title="跳转到原文">📍</button>
-      <button id="rc-jump-back-btn" title="返回跳转前位置" style="display:none">↩</button>
-      <button id="rc-switch-btn">切换引用 ▸</button>
-      <button id="rc-collapse-btn" title="折叠/展开">▾</button>
-      <button class="rc-del" id="rc-del-btn" title="删除引用">🗑</button>
-      <button class="rc-deselect" id="rc-deselect-btn" title="取消引用">✕</button>
-    </div>
-    <div class="rc-body">
-      <div class="rc-book" id="rc-book"></div>
-      <div class="rc-text" id="rc-text"></div>
-      <div class="rc-meta" id="rc-meta"></div>
-    </div>
-    <div class="rc-empty" id="rc-empty">暂无选中的引用，点上方「切换引用」选择一条划线</div>
   </div>
 
   <!-- 引用列表抽屉 -->
   <div id="ref-drawer">
     <div class="drawer-panel">
       <div class="drawer-head">
-        <span class="drawer-title">全部引用</span>
+        <span class="drawer-title" id="drawer-title">全部引用</span>
         <button class="drawer-close" id="drawer-close-btn">✕</button>
         <input type="text" id="drawer-search" placeholder="搜索引用…">
       </div>
@@ -539,10 +682,41 @@
   </div>
 
   <div id="msgs"></div>
+
+  <!-- 当前选中的引用卡片（AI-003：固定在底部输入框上方，随当前书切换） -->
+  <div id="ref-current">
+    <div class="rc-head">
+      <span class="rc-label">📌 当前引用</span>
+      <button id="rc-jump-btn" title="在微信读书打开原文位置">📍</button>
+      <button id="rc-jump-back-btn" title="返回跳转前位置" style="display:none">↩</button>
+      <button id="rc-switch-btn">切换引用 ▸</button>
+      <button id="rc-collapse-btn" title="折叠/展开">▾</button>
+      <button class="rc-del" id="rc-del-btn" title="删除引用">🗑</button>
+      <button class="rc-deselect" id="rc-deselect-btn" title="取消引用">✕</button>
+    </div>
+    <div class="rc-body">
+      <div class="rc-book" id="rc-book"></div>
+      <div class="rc-text" id="rc-text"></div>
+      <div class="rc-meta" id="rc-meta"></div>
+    </div>
+    <div class="rc-empty" id="rc-empty">暂无选中的引用，点「切换引用」选择一条划线</div>
+  </div>
+
   <div id="footer">
     <textarea id="input" placeholder="说点什么…" rows="1"></textarea>
     <button id="send-btn">发送</button>
   </div>
+
+  <!-- 提问位置浮窗（AI-005）：一张卡片。折叠态右缘几条小横杠（数量随提问数动态，最多 10 条），
+       悬停展开提问列表，点击条目跳转；悬停省略文本用 tooltip 显示完整内容 -->
+  <div id="jump-fab" aria-label="我的提问">
+    <div id="jump-panel">
+      <div class="jump-list" id="jump-list"></div>
+    </div>
+    <div id="jump-fab-btn" aria-hidden="true"></div>
+    <div class="jump-tip" id="jump-tip"></div>
+  </div>
+
   <script src="sidebar.js"></script>
 </body>
 </html>

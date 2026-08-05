@@ -13,6 +13,11 @@ receiver/books/*
 
 # Agent 标记文件
 agent/.coldstart_skipped
+agent/.stop
+# 会话流水账（强杀恢复用，个人数据）
+agent/session_journal.jsonl
+# profile/soul 重写前备份
+agent/*.bak
 
 # Node.js
 node_modules/
