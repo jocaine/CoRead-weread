@@ -973,20 +973,22 @@ let annTurnCount = 0
 async function processNewAnnotations() {
   const anns = readAnnotations()
   let cursor = getCursor()
-  // 游标超出实际行数（文件被清空/截断过，如删除操作或手动清理）：重置游标，
-  // 否则之后新增的标注会被 cursor >= anns.length 永久跳过。
-  // 注意：删除任意一行都会使「游标(=旧行数) > 新行数」成立并触发归零，这是正常的；
-  // 归零后旧标注会被遍历一遍（当前全部为 silent，不触发讨论），不会重放。
-  if (cursor > anns.length || (anns.length === 0 && cursor > 0)) {
-    setCursor(0)
-    cursor = 0
+  // 游标超出实际行数（文件被清空/截断过，如删除操作或手动清理）：把游标钳到当前
+  // 行数即可，不要再归零重扫（AI-011）。否则删除任意一条引用（/annotation-delete
+  // 重写文件使行数变少）都会触发归零、把全部旧标注重读一遍——旧式标注（无
+  // setRef/source，改版前创建）会被当成新划线重新触发 LLM 讨论，每次删除都重放。
+  // 钳位后新追加的标注照常从末尾处理，不会永久跳过；已处理的旧标注也不再重扫。
+  if (cursor > anns.length) {
+    cursor = anns.length
+    setCursor(cursor)
   }
   if (cursor >= anns.length) return false
 
   for (let i = cursor; i < anns.length; i++) {
     const ann = anns[i]
-    // silent 标注只存档不触发讨论（用户已通过 /chat 发送了聊天消息）
-    if (ann.silent) continue
+    // AI-010：标注一律是"引用"（setRef 设为引用 / source=bookmark-sync 划线同步），
+    // 只存档不触发讨论（用户通过侧栏 /chat 提问）；silent 概念已移除，改用来源字段判别
+    if (ann.setRef || ann.source === 'bookmark-sync') continue
     currentAnn = ann
     annTurnCount = 0
     // AI-001：标注讨论进入所属书的历史，并更新"正在读的书"

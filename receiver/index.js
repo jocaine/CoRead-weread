@@ -175,6 +175,8 @@ const server = http.createServer(async (req, res) => {
       } catch { return [] }
     }
     // 标注全部保留，聊天消息截最近 200 条
+    // AI-010：标注一律是"引用"，历史回放时侧栏只把它们并入引用列表 + 参与对账清理，
+    // 不渲染消息气泡（见 sidebar loadHistory）。silent 概念已移除，这里不需要再透传。
     const annItems = []
     for (const d of readJsonl(path.join(INBOX_DIR, 'annotations.jsonl'))) {
       annItems.push({ role: 'annotation', content: `《${d.bookTitle}》${d.chapter || ''}`,
@@ -326,22 +328,10 @@ const server = http.createServer(async (req, res) => {
       fs.appendFileSync(path.join(INBOX_DIR, 'annotations.jsonl'), line + '\n')
       writeBookMeta(data.bookId, data)
       console.log(`[annotation] ${data.bookTitle} · ${data.chapter} · "${data.selectedText?.slice(0, 20)}..."`)
-      // 静默标注不触发 agent 自动讨论，也不推送侧栏（用户已通过 /chat 发送）
-      if (!data.silent) {
-        triggerInject(`【新划线】《${data.bookTitle}》${data.chapter}`)
-        // 推送标注事件到侧栏（含用户批注）
-        pushSSE('message', {
-          role: 'annotation',
-          content: `《${data.bookTitle}》${data.chapter || ''}`,
-          selectedText: data.selectedText,
-          userNote: data.userNote || '',
-          bookId: data.bookId,
-          bookTitle: data.bookTitle,
-          chapter: data.chapter || '',
-          chapterUid: data.chapterUid || '',
-          chapterUidInt: data.chapterUidInt || 0,
-        })
-      } else if (data.setRef) {
+      // AI-010：标注一律是"引用"（划线共读设为引用 / 微信读书划线同步），不触发 agent
+      // 自动讨论、不推 annotation 消息气泡；只按来源推送引用事件让侧栏实时加进引用列表。
+      // （旧的"划线即讨论"非静默分支已无入口，silent 概念整体移除。）
+      if (data.setRef) {
         // 划线共读弹窗只"设为当前引用"，不触发 agent 讨论：推送 annotation-select 事件，
         // 侧栏收到后把该标注加入引用列表并选中为当前引用
         pushSSE('message', {

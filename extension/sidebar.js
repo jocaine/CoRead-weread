@@ -628,13 +628,7 @@ function addBubble(role, content, extra, note, bookId) {
   // AI-001：书签标记，供按书隔离消息区（引用回复走 _renderRefReply，其内单独打标）
   if (bookId) el.dataset.book = baseBookId(bookId)
 
-  if (role === 'annotation') {
-    el.className = 'msg-annotation'
-    el.innerHTML = `<span class="label">📌 共读引文</span>
-      ${extra ? `<div class="quote">"${esc(extra)}"</div>` : ''}
-      <div class="text">${esc(content)}</div>
-      ${note ? `<div class="user-note">💬 ${esc(note)}</div>` : ''}`
-  } else if (role === 'user') {
+  if (role === 'user') {
     el.className = 'msg-user'
     el.innerHTML = `<div class="bubble">${esc(content)}</div>`
   } else if (role === 'user-popup') {
@@ -644,8 +638,17 @@ function addBubble(role, content, extra, note, bookId) {
     const quoteText = note ? `> "${esc(note)}"\n\n` : ''
     el.innerHTML = `<div class="bubble">${quoteText}${esc(content)}</div>`
   } else {
-    if (_pendingRefs.length) {
-      // 非流式的引用回复（如历史回放）：直接渲染完整气泡
+    if (_pendingRefs.length || _streamEl) {
+      if (_streamEl) {
+        // 流式已显示但最终记录走了兜底路径（-1 标记丢失等）：就地升级/补齐，
+        // 避免在已显示的气泡旁再渲染一个重复气泡
+        const entry = _pendingRefs.shift()
+        if (entry && entry.ref) upgradeStreamToRefReply(_streamEl, entry.ref, content)
+        else patchStreamedComplete(_streamEl, content)
+        _streamEl = null
+        return
+      }
+      // 非流式的完整渲染（历史回放 / 兜底）：直接渲染
       _renderRefReply(content)
       return
     }
@@ -685,24 +688,23 @@ function _isDuplicate(d) {
 
 // ── 流式渲染 ──────────────────────────────────────────────────────────────
 // 不变量：一条回复只产生一个气泡。chunk 合并进同一个 _streamEl；-1 标记只置
-// 完成标志；流结束后的最终记录由 connect() 跳过（内容已在流里显示）或用于
-// 渲染引用回复的完整气泡——绝不走 addBubble 再建一个。
+// 完成标志（保留 _streamEl 供最终记录升级/补齐）；最终记录处理后置空 _streamEl。
+// 引用回复也流式实时显示，引用条在最终记录到达时就地补上——绝不走 addBubble 再建一个。
 let _streamEl = null
 let _streamDone = false
 
 function _handleStream(d) {
   if (d._stream === -1) {
-    // 流结束标记：清掉气泡指针（内容已在 DOM 里），置完成标志等最终记录
-    _streamEl = null
+    // 流结束标记：置完成标志等最终完整记录。_streamEl 不置空——最终记录要
+    // 用它就地升级出引用条（引用回复）或补齐完整文本（普通回复缺尾）。
     _streamDone = true
     _thinkingBook = ''  // AI-001：本条回复的书签使命结束
     return
   }
-  // 引用回复（_pendingRefs 队列非空）：未完成输出前不显示，保持思考动画，
-  // 等最终完整记录到达后由 connect() 一次渲染带引用的气泡
-  if (_pendingRefs.length) return
+  // 上一条流已 -1 但最终记录缺失（异常断开/回放跳变）：放弃旧气泡，新流开新气泡
+  if (_streamDone) { _streamDone = false; _streamEl = null }
 
-  // 普通回复：打字机，合并渲染进同一个气泡
+  // 打字机，合并渲染进同一个气泡（引用回复也实时显示）
   hideThinking()
   if (!_streamEl) {
     const msgs = document.getElementById('msgs')
@@ -718,24 +720,15 @@ function _handleStream(d) {
   maybeAutoScroll(_streamEl.parentElement)
 }
 
-// 渲染一条「带引用的完整回复」气泡：引用回复在流式结束后（或非流式消息）调用，
-// 提取自原 addBubble 的 ref-reply 分支，供两种路径复用。
-function _renderRefReply(content) {
-  const ref = _pendingRefs.shift()  // AI-006：按提交顺序 shift，避免串槽
-  if (!ref) return
-  hideThinking()
-  const msgs = document.getElementById('msgs')
-  const el = document.createElement('div')
-  el.className = 'msg-assistant ref-reply'
-  // AI-001：引用回复归属该书
-  if (ref.bookId) el.dataset.book = baseBookId(ref.bookId)
+// 引用回复气泡的完整 HTML（引用条 + 引用原文预览 + 回复正文）
+function refReplyHTML(ref, content) {
   const book = esc(ref.bookTitle || '')
   const chapter = esc((ref.chapter || '').slice(0, 12))
   const num = findRefNum(ref.bookTitle, ref.chapter, ref.selectedText)
   const snippet = esc((ref.selectedText || '').slice(0, 80))
   // 注意：不要用带前导空白的模板字符串，bubble 是 white-space:pre-wrap，
   // 前导换行/空格会在气泡顶部渲染出一大片空白。
-  el.innerHTML =
+  return (
     `<div class="ref-bar" data-ref-num="${num}">` +
       `<span class="ref-book">${book}</span>` +
       (chapter ? `<span class="ref-chapter">${chapter}</span>` : '') +
@@ -745,14 +738,56 @@ function _renderRefReply(content) {
       `<div class="ref-quote-preview" data-ref-num="${num}">"${snippet}${(ref.selectedText || '').length > 80 ? '…' : ''}"</div>` +
       `${esc(content)}` +
     `</div>`
+  )
+}
 
+function bindRefReplyClicks(el, ref) {
   // 点击引用条或预览 → 切换当前引用
   el.querySelector('.ref-bar')?.addEventListener('click', () => selectRefByPending(ref))
   el.querySelector('.ref-quote-preview')?.addEventListener('click', () => selectRefByPending(ref))
+}
 
+// 渲染一条队列条目对应的完整气泡（非流式路径 / 流式气泡缺失时的兜底）。
+// 队列条目统一为 { ref: 引用信息|null }；ref 非空渲染引用条气泡，null（自由提问）渲染普通气泡。
+function _renderEntry(entry, content) {
+  if (!entry) return
+  hideThinking()
+  const msgs = document.getElementById('msgs')
+  const el = document.createElement('div')
+  const ref = entry.ref
+  if (ref) {
+    el.className = 'msg-assistant ref-reply'
+    // AI-001：引用回复归属该书
+    if (ref.bookId) el.dataset.book = baseBookId(ref.bookId)
+    el.innerHTML = refReplyHTML(ref, content)
+    bindRefReplyClicks(el, ref)
+  } else {
+    el.className = 'msg-assistant'
+    el.innerHTML = `<div class="bubble">${esc(content)}</div>`
+  }
   msgs.appendChild(el)
   applyBookFilter()
   maybeAutoScroll(msgs)
+}
+
+function _renderRefReply(content) {
+  _renderEntry(_pendingRefs.shift(), content)  // AI-006：按提交顺序 shift，避免串槽
+}
+
+// 流式路径收尾：引用回复把流式普通气泡就地升级成带引用条的气泡（引用条此时才显示）
+function upgradeStreamToRefReply(el, ref, content) {
+  if (!el) return
+  hideThinking()
+  el.classList.add('ref-reply')
+  el.innerHTML = refReplyHTML(ref, content)
+  bindRefReplyClicks(el, ref)
+}
+
+// 流式路径收尾：普通回复用最终完整记录补齐气泡（修复流式节流可能丢尾）
+function patchStreamedComplete(el, content) {
+  if (!el) return
+  const b = el.querySelector('.bubble')
+  if (b) b.textContent = content
 }
 
 // ── SSE ──────────────────────────────────────────────────────────────────────
@@ -776,12 +811,19 @@ function connect() {
         return
       }
 
-      // 流刚结束后的最终完整记录：普通回复内容已在流里显示过，直接跳过；
-      // 引用回复（_pendingRefs 队列非空）此时才一次渲染带引用的完整气泡。
+      // 流结束后的最终完整记录：引用回复把流式气泡就地升级出引用条；
+      // 普通回复用完整内容补齐（修复流式节流可能丢尾）。
       if (_streamDone && d.role === 'assistant') {
         _streamDone = false
         _seenMsgs.add(_msgKey(d))  // 登记，防 SSE 回放重复
-        _renderRefReply(d.content)  // 队列非空才渲染引用气泡，内部按序 shift
+        const entry = _pendingRefs.shift()  // 队列非空才渲染引用气泡，内部按序 shift
+        if (entry && entry.ref) {
+          if (_streamEl) upgradeStreamToRefReply(_streamEl, entry.ref, d.content)
+          else _renderEntry(entry, d.content)  // 空回复等无流式气泡时兜底
+        } else {
+          patchStreamedComplete(_streamEl, d.content)
+        }
+        _streamEl = null
         return
       }
 
@@ -827,19 +869,16 @@ function connect() {
         addBubble('assistant', d.content)
       } else if (d.role === 'user-popup') {
         // 来自共读弹窗的用户消息（AI-001：引用回复绑定该书）
-        _pendingRefs.push({ bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter, selectedText: d.selectedText })
+        _pendingRefs.push({ ref: { bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter, selectedText: d.selectedText } })
         addBubble('user-popup', d.content, null, d.selectedText, d.bookId)
-        // 弹窗发送的标注要实时加入引用列表（标注记录 silent:true，receiver 不会推 annotation 事件）
+        // 弹窗发送的标注要实时加入引用列表（标注走 annotation-select 事件，不产生消息气泡）
         if (d.bookId && d.selectedText) {
           addRecentAnn({ bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter,
             chapterUid: d.chapterUid, selectedText: d.selectedText })
         }
-      } else if (d.role === 'annotation') {
-        showThinking(d.bookId)
-        addBubble('annotation', d.content, d.selectedText, d.userNote, d.bookId)
-        addRecentAnn({ bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter,
-          chapterUid: d.chapterUid, selectedText: d.selectedText })
       }
+      // AI-010：不再处理 role='annotation'——标注一律是引用（走 annotation-select/annotation-sync），
+      // receiver 不推 annotation 消息气泡，消息区不再渲染"只显示引用"的气泡。
     } catch {}
   }
   sseConn.onerror = () => {
@@ -867,7 +906,7 @@ async function submit() {
 
   if (selectedAnn) {
     // AI-001：引用回复气泡按 bookId 打书签隔离；入队等最终记录配对（AI-006）
-    _pendingRefs.push({ bookId: selectedAnn.bookId, bookTitle: selectedAnn.bookTitle, chapter: selectedAnn.chapter, selectedText: selectedAnn.selectedText })
+    _pendingRefs.push({ ref: { bookId: selectedAnn.bookId, bookTitle: selectedAnn.bookTitle, chapter: selectedAnn.chapter, selectedText: selectedAnn.selectedText } })
     body.bookId = selectedAnn.bookId
     body.bookTitle = selectedAnn.bookTitle
     body.chapter = selectedAnn.chapter || ''
@@ -875,9 +914,10 @@ async function submit() {
     body.selectedText = selectedAnn.selectedText
     body.content = `[引用]《${selectedAnn.bookTitle}》${selectedAnn.chapter || ''}\n> "${selectedAnn.selectedText}"\n\n${content}`
   } else {
-    // 自由提问：不入队。不能清空 _pendingRefs——前一条引用回复若还在流式，
-    // 其最终记录仍需要自己的队项配对；队项在最终记录到达时由 _renderRefReply
-    // 消费，正常流程不会残留（AI-006）。
+    // AI-006：自由提问也入队一个 ref:null 条目，保证最终记录按提交顺序配对。
+    // 之前自由消息不入队，若「自由回复流式中途又发引用」，自由回复的最终记录
+    // 会错配到新入队的引用（引用条错标）；现在每条消息都有占位，配对不乱。
+    _pendingRefs.push({ ref: null })
     // 自由消息也把当前书标记传给 receiver，落库后历史回放能按书归属（AI-001）
     if (_currentBook && _currentBook.base) {
       body.bookId = _currentBook.base
@@ -893,9 +933,10 @@ async function submit() {
     })
   } catch (e) {
     console.warn('[CoRead] chat POST failed:', e.message)
-    // 发送失败：消息没到 receiver，agent 不会回复。撤销思考动画并清掉待渲染
-    // 引用，否则下一条真实回复会被过期引用污染（引用条错标、气泡不显示）。
-    _pendingRefs = []  // 本条没到 receiver、agent 不会回复，清掉待渲染引用防污染
+    // 发送失败：这条消息没到 receiver、agent 不会回复。弹掉刚入队的自己的条目，
+    // 避免它的最终记录永远不来、把后续真实回复的配对挤偏。不整队清空——前一条
+    // 仍在流式的回复还需要自己的队项配对。
+    _pendingRefs.pop()
     hideThinking()
   }
 }
@@ -1229,7 +1270,8 @@ async function loadHistory() {
     for (const d of items) {
       if (d.role === 'annotation') {
         if (d.bookId) histBook = baseBookId(d.bookId)
-        addBubble('annotation', d.content, d.selectedText, d.userNote, d.bookId)
+        // AI-010：标注一律是"引用"（设为引用 / 划线同步），不触发讨论也不产生消息气泡，
+        // 历史回放只把它们并入引用列表（addRecentAnn）+ 参与对账清理（histAnnKeys）。
         // 已在本地的引用不重复添加；侧栏关闭期间新增的标注补进来
         // （select:false 避免覆盖恢复的选中/取消选中状态）
         const exists = RECENT_ANNS.some(a => sameRef(a, d))
@@ -1250,7 +1292,7 @@ async function loadHistory() {
         if (ref) { histPendingRef = ref; if (d.bookId) histPendingRef.bookId = d.bookId }
       }
       else if (d.role === 'assistant') {
-        _pendingRefs = histPendingRef ? [histPendingRef] : []
+        _pendingRefs = histPendingRef ? [{ ref: histPendingRef }] : []
         histPendingRef = null
         addBubble('assistant', d.content, null, null, histBook)
       }

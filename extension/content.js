@@ -332,7 +332,7 @@ async function syncBookmarkRef(text, uidInt, range, bookmarkId) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         ...ctx, selectedText: t, userNote: '',
-        silent: true, setRef: false, source: 'bookmark-sync',
+        setRef: false, source: 'bookmark-sync',
         chapterUid: '', chapterUidInt: u,
         bookmarkRange: String(range || ''),
         // 持久化 bookmarkId：删除引用时侧栏直接携带，绕开内存映射/frame 差异
@@ -637,7 +637,7 @@ async function setCurrentRef(selectedText) {
     const resp = await fetch(`${RECEIVER}/annotation`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...ctx, selectedText, userNote: '', silent: true, setRef: true, timestamp: Math.floor(Date.now() / 1000) }),
+      body: JSON.stringify({ ...ctx, selectedText, userNote: '', setRef: true, timestamp: Math.floor(Date.now() / 1000) }),
       signal: ctrl.signal,
     })
     clearTimeout(timer)
