@@ -43,11 +43,9 @@ document.head.appendChild(styleEl)
 
 // ── 2. 接收 page_hook.js（MAIN world）拦截到的消息 ──────────────────────────
 let _copiedText = ''
-let _copySelection = null
 window.addEventListener('message', e => {
   if (e.data?.__cr === 'copy') {
     _copiedText = e.data.text
-    _copySelection = e.data.selection || null
   }
   if (e.data?.__cr === 'chapter') handleChapterContent(e.data.url, e.data.raw)
   if (e.data?.__cr === 'progress') handleProgressContent(e.data.url, e.data.raw)
@@ -68,7 +66,15 @@ window.addEventListener('message', e => {
       preview: e.data.preview || '',
     })
   }
+  if (e.data?.__cr === 'crj-debug') {
+    postDebug({ source: 'crj', stage: 'debug', diag: e.data.diag || null })
+  }
+  if (e.data?.__cr === 'crj-url-poll') {
+    // page_hook 在 crj 改写后轮询 URL，判断微信读书是否真的导航到目标章
+    postDebug({ source: 'crj', stage: 'url-poll', path: e.data.path, search: e.data.search })
+  }
 })
+
 
 // ── 3. 从 DOM / URL 读取当前阅读上下文 ────────────────────────────────────
 // 通知侧栏当前书籍上下文（AI-001 书籍隔离）。
@@ -160,14 +166,6 @@ function baseBookId(bookId) {
   return String(bookId || '').replace(/k[0-9a-f]{16,}$/i, '')
 }
 
-// 乱码/损坏文本检测：含替换字符 �（传输/解码损坏的明确标记），
-// 或 WeRead 的加密章节 blob（32 位 hex 前缀 + 一长串 base64）。这类文本存成引用
-// 会成为侧栏里删不掉的乱码引用（jsonl 里通常没有对应记录，删除永远返回 deleted:0）。
-function isGarbledText(text) {
-  const s = String(text || '')
-  if (/[\uFFFD]/.test(s)) return true
-  return /^[0-9A-Fa-f]{32}[A-Za-z0-9+/=]{100,}$/.test(s.trim())
-}
 
 function getQueryParam(queryText, name) {
   for (const part of String(queryText || '').split('&')) {
@@ -513,169 +511,41 @@ function handleAddBookmarkResponse(raw) {
   postDebug({ source: 'bookmark-sync', stage: 'add-resp', bookmarkId, uidInt, range, parsedUid: parsed && parsed.uidInt, parsedRange: parsed && parsed.range, respUidInt, respRange })
 }
 
-// ── 4. 标注弹窗 ────────────────────────────────────────────────────────────
-let popup = null
-
-function removePopup() {
-  if (popup) { popup.remove(); popup = null }
-}
-
-function showAnnotationPopup(selectedText, x, y) {
-  removePopup()
-  if (!selectedText) return
-
-  popup = document.createElement('div')
-  popup.id = 'coread-popup'
-  Object.assign(popup.style, {
-    position: 'fixed',
-    left: Math.min(x - 150, window.innerWidth - 320) + 'px',
-    top: Math.min(y + 12, window.innerHeight - 180) + 'px',
-    zIndex: '2147483647',
-    background: '#fff',
-    border: '1px solid #e0e0e0',
-    borderRadius: '8px',
-    boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
-    padding: '12px',
-    width: '300px',
-    fontFamily: '-apple-system, sans-serif',
-    fontSize: '14px',
-  })
-
-  popup.innerHTML = `
-    <div style="color:#888;margin-bottom:4px;font-size:11px;">设为当前引用</div>
-    <div style="color:#555;margin-bottom:10px;font-size:12px;line-height:1.5;max-height:72px;overflow-y:auto;
-                padding:6px 8px;background:#f8f8f8;border-left:3px solid #07c160;border-radius:4px;">
-      ${escHtml(selectedText)}
-    </div>
-    <div style="display:flex;gap:8px;margin-top:8px;justify-content:flex-end;">
-      <button id="coread-cancel"
-        style="padding:4px 12px;border:1px solid #ddd;border-radius:4px;
-               background:#f5f5f5;cursor:pointer;font-size:13px;">取消</button>
-      <button id="coread-send"
-        style="padding:4px 12px;border:none;border-radius:4px;
-               background:#07c160;color:#fff;cursor:pointer;font-size:13px;">设为引用</button>
-    </div>
-  `
-  document.documentElement.appendChild(popup)
-  setTimeout(() => popup?.querySelector('#coread-send')?.focus(), 50)
-
-  popup.querySelector('#coread-cancel').addEventListener('click', removePopup)
-  popup.querySelector('#coread-send').addEventListener('click', async () => {
-    const sendBtn = popup.querySelector('#coread-send')
-
-    // 显示设置状态
-    sendBtn.disabled = true
-    sendBtn.textContent = '设置中...'
-
-    const ok = await setCurrentRef(selectedText)
-
-    if (ok) {
-      sendBtn.textContent = '已设为引用 ✓'
-      sendBtn.style.background = '#576b95'
-    } else {
-      sendBtn.textContent = '设置失败'
-      sendBtn.style.background = '#e74c3c'
-    }
-    setTimeout(() => removePopup(), 1200)
-  })
-  popup.addEventListener('mousedown', e => e.stopPropagation())
-}
-
+// 取当前真实选中的文字（AI-011）。微信读书正文可能渲染在子 frame，顶层 getSelection
+// 拿不到正文里的选区——所以递归遍历所有同源 iframe/frame 文档，取第一个非空选区。
 function getDirectSelectionText() {
-  const docs = [document]
-  try {
-    if (window.top?.document && window.top.document !== document) docs.push(window.top.document)
-  } catch {}
-  for (const doc of docs) {
-    const text = doc.getSelection?.()?.toString?.()?.trim()
-    if (text) return text
+  const textOf = (doc) => (doc?.getSelection?.()?.toString?.() || '').trim()
+  // 保持原顺序：本 frame 优先，其次顶层
+  const top = (() => { try { return window.top?.document } catch { return null } })()
+  const own = textOf(document)
+  if (own) return own
+  if (top && top !== document) {
+    const t = textOf(top)
+    if (t) return t
+  }
+  // 正文子 frame：DFS 遍历所有可达 iframe/frame 文档
+  const seen = new Set([document])
+  if (top) seen.add(top)
+  const stack = [document, top].filter(Boolean)
+  while (stack.length) {
+    const doc = stack.pop()
+    if (!doc || doc.nodeType !== 9) continue
+    let frames = []
+    try { frames = Array.from(doc.querySelectorAll('iframe, frame')) } catch { frames = [] }
+    for (const f of frames) {
+      let cd = null
+      try { cd = f.contentDocument } catch {}
+      if (!cd || seen.has(cd)) continue
+      seen.add(cd)
+      const t = textOf(cd)
+      if (t) return t
+      stack.push(cd)
+    }
   }
   return ''
 }
 
-function escHtml(t) {
-  return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-}
-
-async function setCurrentRef(selectedText) {
-  // 乱码防护：损坏/编码文本不存为引用，弹窗会显示「设置失败」
-  if (isGarbledText(selectedText)) {
-    console.warn('[CoRead] 拒绝乱码引用：', String(selectedText).slice(0, 30))
-    return false
-  }
-  const ctx = getReadingContext()
-  // 本 frame 拿不到章节信息时，用跨 frame 共享的最新章节兜底（仅限同一本书）。
-  // 整数 chapterUid 无条件合并：getProgress 可能只在顶层 frame 触发，本 frame 为 0，
-  // 而 URL k 后缀解码也可能因顶层未导航而缺失，需要共享数据兜底。
-  const shared = await readSharedChapter()
-  if (shared && (!shared.bookId || shared.bookId === baseBookId(ctx.bookId))) {
-    if (!ctx.chapterUid && shared.slot) ctx.chapterUid = shared.slot
-    if (!ctx.chapter && shared.title) ctx.chapter = shared.title
-    if (!ctx.chapterUidInt && shared.uidInt) ctx.chapterUidInt = shared.uidInt
-  }
-  // 诊断：记录设引用时的上下文（含整数 chapterUid 是否拿到），排查跳转问题
-  postDebug({
-    source: 'setref',
-    stage: 'ctx',
-    chapterUid: ctx.chapterUid || '',
-    chapterUidInt: ctx.chapterUidInt || 0,
-    topUrl: (() => { try { return window.top.location.pathname } catch { return '' } })().slice(0, 90),
-  })
-
-  // 后台静默发送：正文缓存（保留，为侧栏后续提问提供上下文）
-  trySendSelectionContent(ctx.chapterUid, ctx, selectedText, _copySelection)
-  trySendDomContent(ctx.chapterUid, ctx, selectedText)
-
-  // 存为引用：等待入库结果，成功才走后续。setRef:true 让 receiver 推送
-  // annotation-select 事件，侧栏实时设为"当前引用"，不再向 agent 发送提问。
-  // 失败时如实返回 false（弹窗显示「设置失败」），避免出现提示成功但标注
-  // 从未入库的假象（共读标记 / 历史恢复 / 删除同步全部依赖 annotations.jsonl）。
-  let ok = false
-  try {
-    const ctrl = new AbortController()
-    const timer = setTimeout(() => ctrl.abort(), 10_000)
-    const resp = await fetch(`${RECEIVER}/annotation`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...ctx, selectedText, userNote: '', setRef: true, timestamp: Math.floor(Date.now() / 1000) }),
-      signal: ctrl.signal,
-    })
-    clearTimeout(timer)
-    ok = resp.ok
-  } catch { ok = false }
-  if (!ok) {
-    console.warn('[CoRead] 设为引用失败：receiver 不可达')
-    return false
-  }
-
-  console.log('[CoRead] set current ref', selectedText.slice(0, 30))
-  // 入库成功后：记录待选引用（侧栏本次才打开时加载并选中）、通知侧栏实时选中、
-  // 自动打开侧栏、刷新共读标记。
-  try {
-    await chrome.storage.local.set({
-      pendingSelectRef: {
-        bookId: ctx.bookId, bookTitle: ctx.bookTitle, chapter: ctx.chapter || '',
-        chapterUid: ctx.chapterUid || '', chapterUidInt: ctx.chapterUidInt || 0, selectedText,
-      },
-    })
-  } catch {}
-  try {
-    chrome.runtime?.sendMessage({
-      action: 'coreadSetRefApply',
-      ref: { bookId: ctx.bookId, bookTitle: ctx.bookTitle, chapter: ctx.chapter || '',
-        chapterUid: ctx.chapterUid || '', chapterUidInt: ctx.chapterUidInt || 0, selectedText },
-    }).catch(() => {})
-  } catch {}
-  // 自动打开侧栏，让用户看到当前引用，之后在侧栏里提问
-  try { chrome.runtime?.sendMessage({ action: 'openPanel' }) } catch {}
-
-  // 新标注已入库：清空共读标注缓存，下次 observer 触发时重新拉取，让刚共读的段落被标上
-  _coReadAnns = null
-  scheduleCoReadMarking()
-  return true
-}
-
-// ── 5. 注入 CoRead 按钮到 weread 工具栏 ───────────────────────────────────
+// ── 5. 注入 CoRead 按钮到 weread 工具栏（AI-011：划线内容 → 引用栏搜索） ──
 function injectToolbarButton() {
   const container = document.querySelector('.reader_toolbar_itemContainer')
   if (!container || container.querySelector('.coread-toolbar-btn')) return
@@ -683,31 +553,33 @@ function injectToolbarButton() {
   const btn = document.createElement('div')
   btn.className = 'toolbarItem coread-toolbar-btn'
   btn.style.cssText = 'cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;width:56px;flex-shrink:0;'
+  btn.title = '在侧栏引用栏中搜索划线内容（如角色名）'
   btn.innerHTML = `
-    <div class="toolbarItem_icon" style="font-size:18px;line-height:1;color:#fff;">📖</div>
-    <div class="toolbarItem_text" style="font-size:11px;color:#fff;margin-top:2px;">共读</div>
+    <div class="toolbarItem_icon" style="font-size:18px;line-height:1;color:#fff;">🔍</div>
+    <div class="toolbarItem_text" style="font-size:11px;color:#fff;margin-top:2px;">查引用</div>
   `
 
+  // AI-011：优先直接读选区（DOM 书精确；canvas 书正文画在画布上、无原生选区，读不到），
+  // 空则点微信读书复制按钮兜底（普通选区给精确文本，划线内选区给整条——canvas 书
+  // 已知限制：微信读书的精确子选区只在真实 Ctrl+C 的 isTrusted 路径里重建，无法绕过）。
   btn.addEventListener('click', async () => {
     try {
-      const toolbar = document.querySelector('.reader_toolbar_container')
-      const rect = toolbar?.getBoundingClientRect() || { left: 200, bottom: 300, width: 300 }
-
-      // 触发 wr_copy 按钮，拦截其 clipboard 调用来取得选中文字
       _copiedText = getDirectSelectionText()
-      _copySelection = null
-      try { document.querySelector('.toolbarItem.wr_copy')?.click() }
-      catch (e) {
-        await postDebug({ source: 'toolbar', stage: 'wr-copy-click-error', message: e.message })
+      if (!_copiedText) {
+        try { document.querySelector('.toolbarItem.wr_copy')?.click() }
+        catch (e) {
+          await postDebug({ source: 'toolbar', stage: 'wr-copy-click-error', message: e.message })
+        }
+        await new Promise(r => setTimeout(r, 250))
       }
-      await new Promise(r => setTimeout(r, 250))
 
       if (!_copiedText) {
         console.warn('[CoRead] 未能获取选中文字，请确认 clipboard hook 已注入')
         await postDebug({ source: 'toolbar', stage: 'copy-empty' })
         return
       }
-      showAnnotationPopup(_copiedText, rect.left + rect.width / 2, rect.bottom)
+      // 划线内容 → 侧栏引用栏搜索（替换原「设为引用」弹窗：引用已改由微信读书划线直接产生）
+      openRefSearch(_copiedText)
     } catch (e) {
       console.warn('[CoRead] toolbar click failed:', e)
       await postDebug({ source: 'toolbar', stage: 'click-error', message: e.message, stack: String(e.stack || '').slice(0, 600) })
@@ -716,6 +588,21 @@ function injectToolbarButton() {
 
   container.appendChild(btn)
   console.log('[CoRead] toolbar button injected')
+}
+
+// AI-011：用选中/划线文字在侧栏引用栏搜索（如查角色名在所有引用里的出现）。
+// 三管齐下保证侧栏无论是否已打开都能搜到：
+// 1) 存 storage 待搜词（侧栏本次才打开时加载兜底，见 sidebar.js applyPendingRefSearch）
+// 2) 实时消息（侧栏已打开时立即应用）
+// 3) 打开侧栏（让用户看到搜索结果）
+async function openRefSearch(selectedText) {
+  try {
+    await chrome.storage.local.set({ pendingRefSearch: { query: selectedText, ts: Date.now() } })
+  } catch {}
+  try {
+    chrome.runtime?.sendMessage({ action: 'coreadOpenRefSearch', query: selectedText }).catch(() => {})
+  } catch {}
+  try { chrome.runtime?.sendMessage({ action: 'openPanel' }) } catch {}
 }
 
 // ── 6. 章节正文处理 ─────────────────────────────────────────────────────────
@@ -814,45 +701,6 @@ function chapterFileName(ctx, chapterUid) {
   return chapterUid || ctx.chapterUid
     || sanitizeChapterTitle(ctx.chapter)
     || `t${Date.now()}`
-}
-
-async function trySendSelectionContent(chapterUid, ctx, selectedText, selection) {
-  const text = selection?.context || ''
-  const containsSelection = selectedText ? normalizeText(text).includes(normalizeText(selectedText)) : false
-  await postDebug({
-    ...ctx,
-    source: 'selection',
-    stage: 'annotation-send',
-    textLength: text.length,
-    contextLength: selection?.contextLength || 0,
-    containsSelection,
-    selectedTextLength: selectedText.length,
-    selectedPreview: previewText(selectedText),
-    textPreview: previewText(text),
-    ancestorTag: selection?.ancestorTag || '',
-    ancestorClass: String(selection?.ancestorClass || '').slice(0, 120),
-  })
-  if (!text || text.length < 100 || !containsSelection) return
-  const uid = chapterFileName(ctx, chapterUid)
-  try {
-    await fetch(`${RECEIVER}/content`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        bookId: ctx.bookId,
-        baseBookId: baseBookId(ctx.bookId),
-        bookTitle: ctx.bookTitle,
-        chapterUid: uid,
-        chapterTitle: ctx.chapter,
-        text,
-        selectedText,
-        source: 'selection',
-      }),
-    })
-    console.log(`[CoRead] chapter saved via selection: ${text.length} chars uid=${uid}`)
-  } catch (e) {
-    console.warn('[CoRead] selection content POST failed:', e.message)
-  }
 }
 
 async function trySendDomContent(chapterUid, ctxOverride, selectedText = '') {
@@ -1130,11 +978,6 @@ const observer = new MutationObserver(() => {
 })
 observer.observe(document.body, { childList: true, subtree: true })
 
-// 点击空白关闭弹窗
-document.addEventListener('mousedown', e => {
-  if (popup && !popup.contains(e.target)) removePopup()
-}, true)
-
 // ── 10. 接收侧栏消息 ───────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 引用删除后刷新共读标记：先清掉页面上所有旧标记再重新标记，
@@ -1149,6 +992,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'getReadingContext') {
     const ctx = getReadingContext()
     sendResponse({ bookId: ctx.bookId, bookTitle: ctx.bookTitle, chapter: ctx.chapter, chapterUid: ctx.chapterUid, chapterUidInt: ctx.chapterUidInt })
+    return true
+  }
+  // 跳转前捕获阅读位置锚点（AI-006 返回用）：bookId + 章节 + 视口顶部可见文本
+  if (msg.action === 'getReadingAnchor') {
+    sendResponse(captureReadingAnchor())
+    return true
+  }
+  // 侧栏同章跳转（canvas）：不导航，直接在当前页点笔记面板条目让微信读书自己定位（AI-011）
+  if (msg.action === 'locateNotePanel') {
+    if (window.top !== window) { sendResponse({ ok: false, reason: 'not-top' }); return false }
+    locateViaNotePanel(msg.text).then(nd => {
+      postDebug({ source: 'jump', stage: 'note-panel-msg', ok: !!(nd.found && nd.clicked), found: nd.found, clicked: nd.clicked, items: nd.items, panelOpen: nd.panelOpen, reason: nd.reason || '' })
+      sendResponse({ ok: !!(nd.found && nd.clicked), diag: nd })
+    })
+    return true
+  }
+  // 侧栏同章跳转的兜底 ping：pendingJump 已写入，这里主动触发一次消费
+  //（storage.onChanged 在 content script 刚挂监听时可能漏事件）
+  if (msg.action === 'checkPendingJump') {
+    checkPendingJump()
+    sendResponse({ received: true })
     return true
   }
   // 删除引用时同步删除微信读书划线：按 range 查 bookmarkId。
@@ -1304,7 +1168,7 @@ lastChapterTitle = initCtx.chapter
 _lastBookBaseId = baseBookId(initCtx.bookId)
 broadcastBookContext(initCtx)
 postDebug({ source: 'lifecycle', stage: 'content-loaded' })
-postDebug({ source: 'content-version', version: 'v3-pending-fix' })
+postDebug({ source: 'content-version', version: 'v3-note-gate' })
 console.log('[CoRead] content script loaded', initCtx)
 
 // 首屏章节的共读标记（DOM 渐进渲染时 observer 会继续补标）
@@ -1322,18 +1186,133 @@ setTimeout(scanReaderEnv, 3500)
 // 侧栏 jumpToAnnotation 把 { bookId, selectedText, ts } 写进 chrome.storage.local.pendingJump；
 // 目标页每个 content script frame 加载后（以及 storage 变更时）消费它：在正文里滚动
 // 高亮引用的句子。WeRead 是 SPA、正文异步渲染，findAndHighlight 内部轮询最多约 15s。
-function findAndHighlight(text) {
+// position：'start' 让命中文本对齐视口顶部（返回阅读位置用），默认 'center' 居中高亮（跳引用用）。
+
+// 可靠滚动：微信读书阅读器有自管滚动容器（canvas/分段渲染），scrollIntoView smooth
+// 在 scroll 监听环境下实测是 no-op（侧栏 #msgs 同款问题，见 AI-004 记忆）。改手动定位：
+// 沿祖先链找最近的可滚动容器（scrollHeight>clientHeight 且 overflow-y 可滚），直接设
+// scrollTop，让高亮 span 对齐视口顶部（'start'）或居中（'center'）。找不到容器回退 window。
+// 每个 pendingJump 只记一次滚动诊断（首次命中时上报 scroller 探测结果，判断 canvas 书
+// 的真实滚动容器到底符不符合启发式，定位"找到了但没滚到"的根因）。
+let _scrollDiagLogged = false
+// 章节正文容器。findAndHighlight / 未命中诊断只搜这里——全文档搜索会命中右侧笔记面板
+//（wr_reader_note_panel_*）里 0×0 的引用文本条目（实测：172 章跳转命中笔记面板 item，
+// 无布局尺寸，滚动必然失败）。canvas 书正文在 .readerChapterContent 的隐藏文本层里。
+function chapterContentRoot() {
+  try {
+    return document.querySelector('.readerChapterContent') || document.querySelector('[class*="readerChapterContent"]') || document
+  } catch { return document }
+}
+
+// charIndex/totalChars：needle 在整个章节压缩文本中的字符偏移/总长，用于 canvas 隐藏层
+// 元素零布局尺寸时按字符比例近似定位（隐藏层与可见滚动容器同源，字符比例≈滚动比例）。
+function scrollSpanIntoView(span, position, charIndex, totalChars) {
+  try {
+    let target = null
+    try { target = span.getBoundingClientRect() } catch {}
+    // 第一遍：最近的 overflow-y auto|scroll 且真实溢出的祖先（老行为，DOM 书首选）。
+    // 第二遍兜底：没有 auto|scroll 时，取路径上最外层 overflow hidden 且真实溢出的容器
+    // ——canvas 阅读器的自管滚动容器常是 overflow:hidden（scrollTop 仍可手动设置生效）。
+    let scroller = span.parentElement
+    let hiddenCandidate = null
+    const candidates = []  // 诊断：记录路径上的候选容器
+    while (scroller) {
+      const cs = getComputedStyle(scroller)
+      const overflowY = cs.overflowY || 'visible'
+      const hasOverflow = scroller.scrollHeight > scroller.clientHeight + 4
+      candidates.push({ tag: scroller.tagName, cls: String(scroller.className || '').slice(0, 50), overflowY, sh: scroller.scrollHeight, ch: scroller.clientHeight })
+      if (/(auto|scroll)/.test(overflowY) && hasOverflow) break
+      if (/hidden/.test(overflowY) && hasOverflow) hiddenCandidate = scroller  // 每次覆盖 → 最终是最外层
+      scroller = scroller.parentElement
+    }
+    if (!scroller) scroller = hiddenCandidate
+    if (!scroller) {
+      // 祖先链找不到（含 hidden 兜底也没有）→ 扫一遍全文档，取溢出最大
+      // （scrollHeight-clientHeight）的滚动候选容器。canvas 阅读器的真实滚动容器有时在
+      // 目标元素的兄弟分支上（不在祖先链里），只在此兜底路径扫一次，代价可控。
+      try {
+        let bestEl = null, bestOverflow = 0
+        const all = document.querySelectorAll('*')
+        for (let i = 0; i < all.length; i++) {
+          const el = all[i]
+          const cs = getComputedStyle(el)
+          if (!/(auto|scroll|hidden)/.test(cs.overflowY || 'visible')) continue
+          const o = el.scrollHeight - el.clientHeight
+          if (o > bestOverflow) { bestOverflow = o; bestEl = el }
+        }
+        if (bestEl && bestOverflow > 4) scroller = bestEl
+      } catch {}
+    }
+    if (!_scrollDiagLogged) {
+      _scrollDiagLogged = true
+      let tInfo = null
+      try {
+        const cs = getComputedStyle(span)
+        tInfo = { tag: span.tagName, cls: String(span.className || '').slice(0, 50), display: cs.display, visibility: cs.visibility, position: cs.position }
+      } catch {}
+      postDebug({
+        source: 'jump', stage: 'scroll-diag',
+        target: tInfo,
+        targetRect: target ? { w: Math.round(target.width), h: Math.round(target.height), top: Math.round(target.top) } : null,
+        scroller: scroller ? { tag: scroller.tagName, cls: String(scroller.className || '').slice(0, 50), overflowY: (getComputedStyle(scroller).overflowY || ''), sh: scroller.scrollHeight, ch: scroller.clientHeight } : null,
+        candidates: candidates.slice(0, 8),
+        charIndex: charIndex || 0, totalChars: totalChars || 0,
+      })
+    }
+    if (!scroller) {
+      // 连滚动容器都找不到 → 退到窗口滚动（rect 定位）
+      if (target) {
+        const relTop = target.top - (window.scrollY || 0)
+        let next = (window.scrollY || 0) + relTop
+        if (position !== 'start') next -= (window.innerHeight - (target.height || 0)) / 2
+        window.scrollTo(0, Math.max(0, Math.round(next)))
+      }
+      return
+    }
+    if (target && target.width !== 0 && target.height !== 0) {
+      // rect 可用（DOM 书 / 有布局的隐藏层）：按目标相对容器的偏移滚动
+      const sRect = scroller.getBoundingClientRect()
+      const relTop = target.top - sRect.top
+      let next = scroller.scrollTop + relTop
+      if (position === 'start') next -= 8  // 顶部留一点余量，避开工具栏
+      else next -= (sRect.height - target.height) / 2  // 居中
+      scroller.scrollTop = Math.max(0, Math.round(next))
+      return
+    }
+    // rect 不可用（canvas 隐藏层元素零布局尺寸，实测 172 章隐藏层 rect 为 0×0）：
+    // 用字符偏移比例近似定位到引文所在页。
+    if (charIndex && totalChars > 0) {
+      const frac = Math.max(0, Math.min(1, charIndex / totalChars))
+      scroller.scrollTop = Math.max(0, Math.round(frac * (scroller.scrollHeight - scroller.clientHeight)))
+      console.log(`[CoRead] canvas char-fraction scroll ${Math.round(frac * 100)}% (${charIndex}/${totalChars}) scroller=${scroller.tagName}.${String(scroller.className || '').split(' ')[0]} sh=${scroller.scrollHeight} ch=${scroller.clientHeight}`)
+      return
+    }
+    // 都没有 → 尽力窗口滚动
+    if (target) {
+      const relTop = target.top - (window.scrollY || 0)
+      let next = (window.scrollY || 0) + relTop
+      if (position !== 'start') next -= (window.innerHeight - (target.height || 0)) / 2
+      window.scrollTo(0, Math.max(0, Math.round(next)))
+    }
+  } catch (e) {
+    console.log('[CoRead] scrollSpanIntoView error:', e && e.message)
+  }
+}
+
+function findAndHighlight(text, position, noDom) {
   const needle = String(text || '').replace(/\s+/g, '').slice(0, 30)
   if (!needle) return Promise.resolve({ found: false, reason: 'no-needle' })
   return new Promise((resolve) => {
     let attempts = 0
     const tryFind = () => {
       attempts++
-      // 清除旧高亮
-      document.querySelectorAll('.coread-highlight').forEach(el => {
-        const p = el.parentNode
-        if (p) p.replaceChild(document.createTextNode(el.textContent), el)
-      })
+      // 清除旧高亮（noDom 模式本来就不插入，无需清理）
+      if (!noDom) {
+        document.querySelectorAll('.coread-highlight').forEach(el => {
+          const p = el.parentNode
+          if (p) p.replaceChild(document.createTextNode(el.textContent), el)
+        })
+      }
       const nodes = []
       const collect = (root, out) => {
         const doc = root.ownerDocument || root
@@ -1343,22 +1322,51 @@ function findAndHighlight(text) {
         const hosts = root.querySelectorAll('*')
         for (const h of hosts) if (h.shadowRoot) collect(h.shadowRoot, out)
       }
-      collect(document, nodes)
+      collect(chapterContentRoot(), nodes)
+      // 全文本压缩 + 各节点起点（跨节点搜索 / 字符比例定位共用）
+      let joined = '', starts = []
+      try {
+        for (const n of nodes) { starts.push(joined.length); joined += n.textContent.replace(/\s+/g, '') }
+      } catch {}
       // 命中最长文本节点（包含引用的段落），减少误命中
-      let best = null, bestLen = 0
-      for (const n of nodes) {
-        const compact = n.textContent.replace(/\s+/g, '')
-        if (compact.indexOf(needle) !== -1 && compact.length > bestLen) { best = n; bestLen = compact.length }
+      let best = null, bestLen = 0, bestIdx = -1
+      for (let k = 0; k < nodes.length; k++) {
+        const compact = nodes[k].textContent.replace(/\s+/g, '')
+        if (compact.indexOf(needle) !== -1 && compact.length > bestLen) { best = nodes[k]; bestLen = compact.length; bestIdx = k }
+      }
+      // needle 在整个章节压缩文本中的起始偏移（canvas 字符比例定位用）
+      let hit = -1
+      if (best && bestIdx >= 0) {
+        const compact = best.textContent.replace(/\s+/g, '')
+        hit = starts[bestIdx] + compact.indexOf(needle)
+      } else if (!best) {
+        // 单节点没命中 → 跨节点搜索：canvas 隐藏文本层按行/句切成很多短节点，30 字引文常
+        // 跨多个节点，单节点 indexOf 永远找不到（F3）。命中 needle 起点落在哪个节点用哪个。
+        hit = joined.indexOf(needle)
+        if (hit !== -1) {
+          for (let k = nodes.length - 1; k >= 0; k--) {
+            if (starts[k] <= hit) { best = nodes[k]; break }
+          }
+        }
       }
       if (best) {
         try {
+          if (noDom) {
+            // canvas 书：只滚动不改 DOM。canvas 阅读器的隐藏文本层与滚动容器同源，
+            // 直接滚动包含引文的元素即可到达引文；插入 span 会触发微信读书重渲染、
+            // 把位置重置回章节开头（AI-006 诊断确认），故这里只取参照元素滚动。
+            const ref = best.parentNode || best.parentElement
+            scrollSpanIntoView(ref, position, hit, joined.length)
+            resolve({ found: true, attempts, noDom: true })
+            return
+          }
           const parent = best.parentNode
           const span = document.createElement('span')
           span.className = 'coread-highlight'
           span.style.cssText = 'background:#ffeb3b;border-radius:2px;padding:1px 0;'
           parent.insertBefore(span, best)
           span.appendChild(best)
-          span.scrollIntoView({ behavior: 'smooth', block: 'center' })
+          scrollSpanIntoView(span, position, hit, joined.length)
           resolve({ found: true, attempts })
           return
         } catch (e) { resolve({ found: false, attempts }); return }
@@ -1370,24 +1378,398 @@ function findAndHighlight(text) {
   })
 }
 
-async function checkPendingJump() {
+// AI-006 返回用：捕获阅读视口顶部附近的可见文本作定位锚点。跳转前侧栏调它，
+// 返回时用 findAndHighlight 按锚点把页面重新滚回原阅读位置（不只回章节）。
+// 只扫视口上半部（避开顶部工具栏、不抓屏外段落），命中"最靠上"的可见文本节点。
+function captureReadingAnchor() {
+  try {
+    const ctx = getReadingContext()
+    const nodes = []
+    const collect = (root, out) => {
+      const doc = root.ownerDocument || root
+      const w = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false)
+      let n
+      while ((n = w.nextNode())) out.push(n)
+      const hosts = root.querySelectorAll('*')
+      for (const h of hosts) if (h.shadowRoot) collect(h.shadowRoot, out)
+    }
+    collect(document, nodes)
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    const scanTop = 60          // 避开顶部工具栏
+    const scanBottom = vh * 0.45  // 只看视口上半部
+    let best = null
+    let bestTop = Infinity
+    for (const n of nodes) {
+      const t = (n.textContent || '').replace(/\s+/g, '')
+      if (t.length < 12) continue
+      const r = n.parentNode ? n.parentNode.getBoundingClientRect() : null
+      if (!r || r.width === 0 || r.height === 0) continue
+      if (r.bottom < scanTop || r.top > scanBottom) continue
+      if (r.left < 0 || r.right > vw) continue  // 只看主文本列
+      if (r.top < bestTop) { bestTop = r.top; best = n }
+    }
+    if (!best) return { ok: false, reason: 'no-visible-text' }
+    return {
+      ok: true,
+      bookId: ctx.bookId,
+      chapterUidInt: ctx.chapterUidInt || 0,
+      anchorText: (best.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40),
+    }
+  } catch (e) {
+    return { ok: false, reason: 'throw:' + (e && e.message) }
+  }
+}
+
+// 未命中重试：WeRead 章节正文异步渲染，一次 findAndHighlight（内部轮询约 15s）可能
+// 在章节还没画出来时结束。TTL 内额外重试几次，覆盖晚渲染 / 首帧未就绪的场景。
+let _pendingJumpRetries = 0
+// 笔记面板定位的 in-flight 守卫：同章跳转时 onChanged + sidebar ping 可能各触发一次
+// checkPendingJump，同一 ts 只点一次笔记条目（见 checkPendingJump noDom 分支）。
+let _notePanelInFlightTs = 0
+const PENDING_JUMP_MAX_RETRIES = 4
+// 本 frame content script 加载时间 / 加载时章节：用于区分「源页（跳转前已加载很久）」和
+// 「目标页（跳转后新加载）」。源页只滚动不消费 pendingJump，否则 +2.5s 的 confirm 会在
+// 导航提交前把 pendingJump 删掉，目标页加载后就什么都没了（F1 竞态 → 停在章节开头）。
+const _contentLoadedAt = Date.now()
+const _loadedChapterUidInt = chapterUidIntFromUrl()
+
+// ── 笔记面板原生定位（AI-011） ───────────────────────────────────────────────
+// canvas 书正文画在画布上，DOM 滚动定位不到引文（Rounds 1-5 已验证无解）。微信读书自己的
+// 笔记面板（右侧"笔记"tab）每条划线条目点击 = 它自己执行精确到句的原生定位（跨章/同章/
+// 画布书全生效）。这里在目标页找到引用对应的那条，dispatch click 让微信读书自己跳。
+// 返回 diag 供上报；未命中调用方回退 findAndHighlight（保留原行为不倒退）。
+// querySelDeep：面板/条目可能藏在 shadow root 里，递归穿透（Rounds 3 里 collectText 也要
+// 递归 shadow 才找得到 canvas 书正文，同款问题）。
+function querySelDeep(root, sel) {
+  const out = []
+  try { for (const e of root.querySelectorAll(sel)) out.push(e) } catch {}
+  try {
+    for (const h of root.querySelectorAll('*')) {
+      if (h.shadowRoot) out.push(...querySelDeep(h.shadowRoot, sel))
+    }
+  } catch {}
+  return out
+}
+async function locateViaNotePanel(quoteText, probeOnly) {
+  const diag = { found: false, clicked: 0, items: 0, panelOpen: false, matched: [], reason: '' }
+  try {
+    const needle = String(quoteText || '').replace(/\s+/g, '')
+    if (!needle) { diag.reason = 'empty-quote'; return diag }
+    const panel = (querySelDeep(document, '.wr_reader_note_panel')[0])
+      || (querySelDeep(document, '[class*="note_panel"]')[0])
+      || null
+    diag.panelOpen = !!panel && (panel.offsetWidth > 0 || panel.offsetHeight > 0 || panel.getClientRects().length > 0)
+    let items = []
+    for (const s of ['.wr_reader_note_panel_item', '[class*="note_panel_item"]', '[class*="note_item"]']) {
+      items = querySelDeep(document, s)
+      if (items.length) break
+    }
+    diag.items = items.length
+    if (!items.length) { diag.reason = 'no-items'; return diag }
+    let matchedItem = null
+    for (const item of items) {
+      const txt = (item.textContent || '').replace(/\s+/g, '')
+      if (txt.indexOf(needle) !== -1) { matchedItem = item; break }
+    }
+    if (!matchedItem) { diag.reason = 'no-text-match'; return diag }
+    diag.found = true
+    diag.matched.push(String(matchedItem.className || matchedItem.tagName || '').slice(0, 80))
+    if (probeOnly) return diag  // 探测模式：只判断条目在不在/匹配不匹配，不点击
+    // 点击目标：优先条目内的"回原文/定位"按钮（各版本命名不一），没有就点条目本身。
+    const clickTargets = []
+    try {
+      for (const b of matchedItem.querySelectorAll('a, button, [role="button"], [class*="original"], [class*="locate"], [class*="go_origin"]')) {
+        const t = String(b.textContent || '').trim()
+        if (/原文|定位|查看|去阅读/.test(t) || /original|locate/i.test(String(b.className || ''))) clickTargets.push(b)
+      }
+    } catch {}
+    clickTargets.push(matchedItem)
+    const seen = new Set()
+    for (const t of clickTargets) {
+      if (seen.has(t)) continue
+      seen.add(t)
+      try {
+        t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }))
+        diag.clicked++
+      } catch {}
+    }
+    return diag
+  } catch (e) {
+    diag.reason = 'throw:' + (e && e.message)
+    return diag
+  }
+}
+// 消费 pendingJump（带 ts 守卫：2.5s 延迟期间若被新跳转覆盖则不消费）。
+async function consumePendingJump(ts) {
   try {
     const { pendingJump } = await chrome.storage.local.get('pendingJump')
-    if (!pendingJump || !pendingJump.selectedText) return
-    if (Date.now() - (pendingJump.ts || 0) > 40000) {
-      await chrome.storage.local.remove('pendingJump')  // 过期清理
-      return
-    }
-    if (pendingJump.bookId && baseBookId(pendingJump.bookId) !== baseBookId(getReadingContext().bookId)) return
-    const result = await findAndHighlight(pendingJump.selectedText)
-    if (result && result.found) {
-      await chrome.storage.local.remove('pendingJump')  // 命中后消费掉
-    }
+    if (ts !== undefined && pendingJump && pendingJump.ts !== ts) return
+    await chrome.storage.local.remove('pendingJump')
+    console.log('[CoRead] jump consumed (note-panel)')
   } catch {}
 }
 
-// 加载时 + storage 变更时各消费一次（SPA hash 路由不重载页面时靠 onChanged 兜底）
+// ── 笔记面板定位轮询（AI-011） ──────────────────────────────────────────────
+// 实测：bookmarklist 数据 ~1s 就到，但笔记条目要 ~20s 才渲染进 DOM（微信读书自己延迟）。
+// 关键坑（AI-011 实测）：条目出现 ≠ 阅读器就绪。数据缓存的页面条目 1s 就出现，但 canvas
+// 阅读器要到 ~15-20s 才就绪，过早点击是 no-op（v3-note-poll 整段回退就是这个原因）。所以
+// 这里「就绪门」：条目已渲染 且 页面加载超过 NOTE_PANEL_READY_GATE_MS 才点击；点击后若
+// 触发微信读书 reload 导航（落章不落句），pendingJump 保留，新页面循环重试、就绪后再点。
+// 就绪门调参依据：能用的 v3-note-panel 点击发生在页面加载 ~20s（冷加载条目 20s 才现）。
+const NOTE_PANEL_READY_GATE_MS = 18000
+const NOTE_PANEL_TRY_OPEN = false  // 实验：点开"笔记"tab 尝试提前渲染（代价：面板弹出）
+let _notePanelTimer = null
+async function notePanelJumpLoop(pj) {
+  if (window.top !== window) return  // 面板只在顶层 frame
+  if (_notePanelTimer) return
+  let tries = 0
+  let opened = false
+  let prevItems = 0
+  const tick = async () => {
+    _notePanelTimer = null
+    try {
+      // 每次 tick 校验：pendingJump 已被新跳转覆盖则中止（避免旧循环点到旧引用）
+      const cur = await chrome.storage.local.get('pendingJump').catch(() => ({}))
+      if (!cur.pendingJump || (pj.ts !== undefined && cur.pendingJump.ts !== pj.ts)) {
+        postDebug({ source: 'jump', stage: 'note-panel-abort', tries })
+        _notePanelInFlightTs = 0
+        return
+      }
+      if (NOTE_PANEL_TRY_OPEN && !opened) {
+        opened = true
+        const po = tryOpenNotePanel()
+        if (po.clicked) postDebug({ source: 'jump', stage: 'note-panel-open', cls: po.cls, text: po.text })
+      }
+      // 探测：只看条目在不在、匹配不匹配，不点击（就绪门判定用）
+      const probe = await locateViaNotePanel(pj.selectedText, true)
+      tries++
+      const age = Date.now() - _contentLoadedAt
+      // 未就绪：条目没渲染 或 阅读器没就绪 → 继续等（过早点击是 no-op，AI-011 实测）
+      if (probe.items === 0 || age < NOTE_PANEL_READY_GATE_MS) {
+        // 日志防刷屏：首次、items 从 0→N 的瞬间、以及每 12 次 tick 记一条
+        if (tries === 1 || (probe.items > 0 && prevItems === 0) || tries % 12 === 0) {
+          postDebug({ source: 'jump', stage: 'note-panel-wait', tries, items: probe.items, reason: probe.reason || '', pageAge: age })
+        }
+        prevItems = probe.items
+        if (tries < 100) {  // ~70s 上限
+          _notePanelTimer = setTimeout(tick, 700)
+          return
+        }
+        _notePanelInFlightTs = 0
+        postDebug({ source: 'jump', stage: 'note-panel-timeout', tries, items: probe.items, reason: probe.reason || '', pageAge: age })
+        consumePendingJump(pj.ts)
+        return
+      }
+      // 就绪：真正点击定位（微信读书自己精确到句）
+      const nd = await locateViaNotePanel(pj.selectedText, false)
+      if (nd.found && nd.clicked) {
+        _notePanelInFlightTs = 0
+        console.log(`[CoRead] jump note-panel clicked items=${nd.items} pageAge=${age} tries=${tries}`)
+        postDebug({
+          source: 'jump', stage: 'note-panel', found: true, clicked: nd.clicked,
+          items: nd.items, panelOpen: nd.panelOpen, tries, reason: nd.reason || '',
+          pageAge: age, gateMs: NOTE_PANEL_READY_GATE_MS,
+          chapterChanged: chapterUidIntFromUrl() !== _loadedChapterUidInt,
+        })
+        setTimeout(() => consumePendingJump(pj.ts), 2500)
+        return
+      }
+      // 点击意外未命中（条目刚出现又消失/文本变了）→ 继续轮询
+      postDebug({ source: 'jump', stage: 'note-panel-miss-after-ready', tries, reason: nd.reason || '', items: nd.items })
+      _notePanelTimer = setTimeout(tick, 700)
+    } catch (e) {
+      postDebug({ source: 'jump', stage: 'note-panel-err', message: e && e.message })
+      if (tries < 100) _notePanelTimer = setTimeout(tick, 1000)
+      else { _notePanelInFlightTs = 0; consumePendingJump(pj.ts) }
+    }
+  }
+  tick()
+}
+
+// 实验：点开"笔记"tab 尝试提前渲染笔记条目（NOTE_PANEL_TRY_OPEN 开启时调用）。
+// 只点可见的、文本以"笔记"开头的 tab/button；找不到就放弃（轮询照跑，20s 后条目自现）。
+function tryOpenNotePanel() {
+  const diag = { clicked: false, cls: '', text: '' }
+  try {
+    const els = document.querySelectorAll('[role="tab"], button, [class*="tab"]')
+    for (const el of els) {
+      if (!el.getClientRects().length) continue
+      const t = String(el.textContent || '').trim()
+      if (/^笔记/.test(t) && t.length <= 8) {
+        diag.cls = String(el.className || '').slice(0, 80)
+        diag.text = t.slice(0, 20)
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }))
+        diag.clicked = true
+        return diag
+      }
+    }
+  } catch {}
+  return diag
+}
+
+async function checkPendingJump() {
+  try {
+    const { pendingJump } = await chrome.storage.local.get('pendingJump')
+    if (!pendingJump || !pendingJump.selectedText) {
+      console.log('[CoRead] jump: no pendingJump')
+      return
+    }
+    const age = Date.now() - (pendingJump.ts || 0)
+    if (age > 60000) {
+      await chrome.storage.local.remove('pendingJump')  // 过期清理
+      console.log('[CoRead] jump: expired, removed', age)
+      return
+    }
+    const curBook = baseBookId(getReadingContext().bookId)
+    const tgtBook = pendingJump.bookId ? baseBookId(pendingJump.bookId) : ''
+    if (tgtBook && tgtBook !== curBook) {
+      postDebug({ source: 'jump', stage: 'guard-book-mismatch', tgtBook, curBook })
+      return  // 书都不匹配：不消费也不重试（重试也白搭）
+    }
+    // canvasCrj 跳转用 noDom 模式（只滚动不改 DOM）：canvas 阅读器隐藏文本层与滚动容器
+    // 同源，滚动即可到达引文；插入 span 会触发微信读书重渲染、把位置重置回章节开头
+    //（AI-006 诊断确认），故 canvas 书不插 DOM 高亮，位置由滚动决定。
+    const noDom = !!pendingJump.canvasScroll
+    // 每次跳转序列首次尝试时重置滚动诊断（重试不再重复上报）
+    if (_pendingJumpRetries === 0) _scrollDiagLogged = false
+    // canvas 书（noDom）：正文在画布上，DOM 滚不动，优先点微信读书笔记面板里引用对应的
+    // 原生条目——点它 = 微信读书自己精确到句定位（AI-011）。点击不触发页面导航/重载，
+    // 不存在 k-suffix 重载流"导航提交前消费掉目标"的竞态，故命中即延迟消费、不套 allowConsume。
+    // 只在本 frame 是顶层 frame 时尝试（笔记面板在顶层），子 frame 直接走回退。
+    if (noDom) {
+      // canvas 书：正文画在画布上，findAndHighlight 的 DOM 滚动 5 轮实测无效（且内部最多轮询
+      // 15s，会把重试拖慢）。唯一能精确到句的是笔记面板条目点击（AI-011）。但条目要 ~20s 才
+      // 渲染进 DOM（bookmarklist 数据 ~1s 就到，渲染被微信读书延迟）——一次 locate 必落空，
+      // 直接起 700ms 轮询循环，条目一出现立刻点击定位。防重复：同章跳转时 onChanged 与
+      // sidebar ping 各触发一次 checkPendingJump，同一 ts 只起一个循环。
+      if (_notePanelInFlightTs === pendingJump.ts) return
+      _notePanelInFlightTs = pendingJump.ts
+      notePanelJumpLoop(pendingJump)
+      return
+    }
+    const result = await findAndHighlight(pendingJump.selectedText, pendingJump.position, noDom)
+    if (result && result.found) {
+      // 命中后不立即消费：WeRead 的 k-suffix 导航会异步加载/重绘章节，可能把刚定位的
+      // 位置清掉（表现就是"停在章节开头"）。延迟 ~2.5s 再确认一次，确认时重跑
+      // findAndHighlight 重新滚动，若仍在则消费。
+      const allowConsume = allowConsumePendingJump(pendingJump)
+      console.log(`[CoRead] jump found noDom=${noDom} attempts=${result.attempts} allowConsume=${allowConsume}`)
+      postDebug({
+        source: 'jump', stage: noDom ? 'canvas-scroll' : 'highlight-found',
+        attempts: result.attempts, allowConsume,
+        pageAge: Date.now() - _contentLoadedAt,
+        chapterChanged: chapterUidIntFromUrl() !== _loadedChapterUidInt,
+      })
+      if (allowConsume) setTimeout(() => { confirmPendingJumpHighlight(noDom, pendingJump.ts) }, 2500)
+      return
+    }
+    // 诊断：定位未命中时上报 DOM 状态。hasNeedleInDom 用跨节点拼接判断（与 findAndHighlight
+    // 一致），避免引文跨节点时单节点扫描误报 false。
+    try {
+      const nd = String(pendingJump.selectedText || '').replace(/\s+/g, '').slice(0, 30)
+      let inDom = false
+      try {
+        // 与 findAndHighlight 的 collect 一致：也要递归进 shadow root，否则 canvas 书正文
+        // 藏在 shadow 里时 hasNeedleInDom 会误报 false，把调试带偏。
+        const textNodes = []
+        const collectText = (root, out) => {
+          const doc = root.ownerDocument || root
+          const w = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false)
+          let nn
+          while ((nn = w.nextNode())) out.push(nn)
+          const hosts = root.querySelectorAll('*')
+          for (const h of hosts) if (h.shadowRoot) collectText(h.shadowRoot, out)
+        }
+        collectText(chapterContentRoot(), textNodes)
+        let joined = ''
+        for (const tn of textNodes) joined += (tn.textContent || '').replace(/\s+/g, '')
+        inDom = joined.indexOf(nd) !== -1
+      } catch {}
+      console.log(`[CoRead] jump miss: needleInDom=${inDom} attempts=${result.attempts}`)
+      postDebug({
+        source: 'jump', stage: 'highlight-miss',
+        hasNeedleInDom: inDom,
+        bodyTextLen: (document.body.innerText || '').length,
+        pCount: document.querySelectorAll('p').length,
+        topUrl: (() => { try { return window.top.location.pathname } catch { return '' } })().slice(0, 90),
+      })
+    } catch {}
+    if (_pendingJumpRetries < PENDING_JUMP_MAX_RETRIES) {
+      _pendingJumpRetries++
+      setTimeout(checkPendingJump, 4000)
+    }
+  } catch (e) {
+    console.log('[CoRead] jump check error:', e && e.message)
+  }
+}
+
+// 是否允许消费 pendingJump：目标页（跳转后新加载的页 / SPA 已切到目标章）才消费。
+// 源页（加载很久且章节未变）只滚动不消费；若 confirm 在导航提交前消费，目标页就没目标了。
+function allowConsumePendingJump(pendingJump) {
+  try {
+    const pageAge = Date.now() - _contentLoadedAt
+    if (pageAge < 15000) return true  // 刚加载 → 大概率是目标页（整页 reload 跳转）
+    const cur = chapterUidIntFromUrl()
+    if (cur !== _loadedChapterUidInt) {
+      // SPA 切章：只有当前章正是目标章才消费，避免手动翻页把 pendingJump 错消费掉
+      const m = String(pendingJump.bookId || '').match(/k([0-9a-f]{16,})$/i)
+      if (!m) return true
+      const tgt = Number(weReadDecode(m[1]))
+      if (!tgt || cur === tgt) return true
+      return false
+    }
+    return false  // 源页：同章跳转、导航还没提交，不消费
+  } catch { return false }
+}
+
+// 命中后的确认：重跑一次 findAndHighlight 重新高亮/滚动，扛过 SPA 重渲染清掉定位的情况。
+// 重跑仍命中 → 消费 pendingJump；未命中（章节还在重渲染）→ 走常规重试。
+// ts 校验：confirm 调度时的 pendingJump 若已被新跳转覆盖，则不消费（F4 不对称守卫）。
+async function confirmPendingJumpHighlight(noDom, ts) {
+  try {
+    const { pendingJump } = await chrome.storage.local.get('pendingJump')
+    if (!pendingJump || !pendingJump.selectedText) {
+      console.log('[CoRead] jump confirm: no pendingJump')
+      return
+    }
+    if (ts !== undefined && pendingJump.ts !== ts) {
+      console.log('[CoRead] jump confirm: pendingJump replaced, skip')
+      return
+    }
+    const age = Date.now() - (pendingJump.ts || 0)
+    if (age > 60000) {
+      await chrome.storage.local.remove('pendingJump')
+      return
+    }
+    const result = await findAndHighlight(pendingJump.selectedText, pendingJump.position, noDom)
+    if (result && result.found) {
+      _pendingJumpRetries = 0
+      await chrome.storage.local.remove('pendingJump')
+      console.log('[CoRead] jump confirmed + consumed')
+      return
+    }
+    console.log('[CoRead] jump confirm re-miss')
+    if (_pendingJumpRetries < PENDING_JUMP_MAX_RETRIES) {
+      _pendingJumpRetries++
+      setTimeout(checkPendingJump, 4000)
+    }
+  } catch (e) {
+    console.log('[CoRead] jump confirm error:', e && e.message)
+  }
+}
+
+// 加载时 + storage 变更时各消费一次（SPA hash 路由不重载页面时靠 onChanged 兜底）。
+// 新 pendingJump（新一次跳转）重置重试计数，避免上次残留的重试次数影响本次。
+function onPendingJumpChanged() {
+  _pendingJumpRetries = 0
+  checkPendingJump()
+}
+// 补发 page_hook 在 document_start 阶段写的 crj 诊断（那时 postMessage 还没被监听）。
+// page_hook 是 MAIN world，这里的 isolated world 读不到它的 window.__crjDiagLog，
+// 改用 DOM CustomEvent 让 page_hook 补发（DOM 事件跨 world 可达，见 page_hook.js）。
+try { window.dispatchEvent(new CustomEvent('coread-flush-crj')) } catch {}
 checkPendingJump()
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes.pendingJump) checkPendingJump()
+  if (area === 'local' && changes.pendingJump) onPendingJumpChanged()
 })

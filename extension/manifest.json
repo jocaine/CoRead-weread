@@ -3,7 +3,7 @@
   "name": "CoRead - AI共读",
   "version": "0.1.0",
   "description": "微信读书私密标注 + 正文足迹捕获，配合 CoRead 共读 agent 使用",
-  "permissions": ["storage", "sidePanel", "tabs"],
+  "permissions": ["storage", "sidePanel", "tabs", "unlimitedStorage"],
   "side_panel": {
     "default_path": "sidebar.html"
   },

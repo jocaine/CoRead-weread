@@ -1,4 +1,15 @@
 const RECEIVER = 'http://127.0.0.1:7239'
+
+// 侧栏调试上报（与 content.js 的 postDebug 同写 receiver/inbox/debug.jsonl，source=sidebar）
+function postSidebarDebug(data) {
+  try {
+    fetch(`${RECEIVER}/debug`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'sidebar', ...data, timestamp: Date.now() }),
+    }).catch(() => {})
+  } catch {}
+}
 let sseConn = null
 let _lastEventId = 0  // 已收到的最新 SSE 事件 id，断线重连时用于续传（AI-006）
 
@@ -26,7 +37,9 @@ function maybeAutoScroll(el) {
 
 // ── 引用划线数据 ──────────────────────────────────────────────────────────
 const RECENT_ANNS = []
-const MAX_RECENT = 50
+// 本地工作列表上限。一本书正常最多几千条引用（隔离机制下面板一次只显示当前书的），
+// 5000 留足余量；全量存档在 receiver 的 annotations.jsonl，本地列表只是工作缓存。
+const MAX_RECENT = 5000
 let selectedAnn = null
 // 待渲染的「引用回复」队列（FIFO）。每条引用提交 push 一项，最终完整记录到达时
 // shift 队首配对渲染。SSE 事件严格有序（agent 按 chat_input 顺序处理并流式输出），
@@ -36,6 +49,7 @@ let _pendingRefs = []
 let _refNumCounter = 0   // 引用序号计数器
 let _selectionStateRestored = false  // 是否已从存储恢复过选中状态（含显式取消）
 let _pendingSelectRef = null  // 划线共读"设为当前引用"的待选标记（来自 content.js storage）
+let _pendingRefSearch = null  // AI-011：划线内容"引用栏搜索"的待搜词（来自 content.js storage）
 
 // 当前阅读的书籍（AI-001 隔离）：由 content.js 广播 / 侧栏主动查询获得。
 // 切书后只显示当前书的引用与对话，其他书的上下文隐藏不删除。
@@ -71,15 +85,31 @@ function refMatches(a, b) {
 }
 
 // ── 持久化 ────────────────────────────────────────────────────────────────
+// refs 大数组防抖写：划线狂点不落盘，安静 800ms 写一次，pagehide 兜底冲掉，
+// 避免每次划线都全量重写整个列表（MAX_RECENT=5000 量级序列化毫秒级）。
+// 关键小状态（选中引用、序号计数）仍由 saveState 立即写，防面板随时关闭丢失。
+let _refsSaveTimer = 0
+function serializeRefs() {
+  return RECENT_ANNS.map(a => ({
+    bookId: a.bookId, bookTitle: a.bookTitle, chapter: a.chapter,
+    chapterUid: a.chapterUid, chapterUidInt: a.chapterUidInt || 0,
+    bookmarkRange: a.bookmarkRange || '', bookmarkId: a.bookmarkId || '',
+    selectedText: a.selectedText, refNum: a.refNum
+  }))
+}
+function flushRefsSave() {
+  clearTimeout(_refsSaveTimer)
+  try { chrome.storage.local.set({ refs: serializeRefs() }) } catch {}
+}
+function scheduleRefsSave() {
+  clearTimeout(_refsSaveTimer)
+  _refsSaveTimer = setTimeout(flushRefsSave, 800)
+}
+window.addEventListener('pagehide', flushRefsSave)
+
 function saveState() {
   try {
     chrome.storage.local.set({
-      refs: RECENT_ANNS.map(a => ({
-        bookId: a.bookId, bookTitle: a.bookTitle, chapter: a.chapter,
-        chapterUid: a.chapterUid, chapterUidInt: a.chapterUidInt || 0,
-        bookmarkRange: a.bookmarkRange || '', bookmarkId: a.bookmarkId || '',
-        selectedText: a.selectedText, refNum: a.refNum
-      })),
       refNumCounter: _refNumCounter,
       selectedRef: selectedAnn ? {
         bookId: selectedAnn.bookId, bookTitle: selectedAnn.bookTitle,
@@ -90,6 +120,7 @@ function saveState() {
       } : null
     })
   } catch {}
+  scheduleRefsSave()
 }
 
 async function loadState() {
@@ -118,6 +149,11 @@ async function loadState() {
     // 下次面板加载时重试；只有成功应用或被更新的显式选择取代时才清除。
     if (data.pendingSelectRef) {
       _pendingSelectRef = data.pendingSelectRef
+    }
+    // AI-011：划线内容"引用栏搜索"的待搜词（content.js 工具栏按钮写入）。
+    // 应用后即清除（见 applyPendingRefSearch），不长期驻留。
+    if (data.pendingRefSearch) {
+      _pendingRefSearch = data.pendingRefSearch
     }
   } catch {}
 }
@@ -149,6 +185,16 @@ function applyPendingSelect() {
   // applySetRef（annotation-select SSE / 直连消息）或下次面板加载再试。
 }
 
+// AI-011：应用"划线内容 → 引用栏搜索"的待搜词（来自 content.js 工具栏按钮）。
+// 打开引用抽屉并填入搜索词，然后清除待搜词，避免面板每次加载都重复弹抽屉。
+async function applyPendingRefSearch() {
+  if (!_pendingRefSearch) return
+  const q = _pendingRefSearch.query || ''
+  _pendingRefSearch = null
+  try { await chrome.storage.local.remove('pendingRefSearch') } catch {}
+  if (q) await openDrawerWithSearch(q)
+}
+
 // 把一条标注设为"当前引用"（划线共读）：加入引用列表并强制选中，不发送任何提问。
 // 触发来源：receiver 的 annotation-select SSE 事件，或 content.js 的直接消息（coreadSetRefApply）。
 function applySetRef(ann) {
@@ -175,6 +221,13 @@ chrome.runtime.onMessage.addListener((msg) => {
     const r = msg.ref
     applySetRef({ bookId: r.bookId, bookTitle: r.bookTitle, chapter: r.chapter || '',
       chapterUid: r.chapterUid || '', chapterUidInt: r.chapterUidInt || 0, selectedText: r.selectedText })
+  }
+  // AI-011：划线内容 → 引用栏搜索（来自 content.js 工具栏按钮，侧栏已打开时的实时通道）。
+  // 同时清掉 storage 待搜词，避免面板后续加载再重复开一次抽屉。
+  if (msg?.action === 'coreadOpenRefSearch') {
+    _pendingRefSearch = null
+    try { chrome.storage.local.remove('pendingRefSearch') } catch {}
+    openDrawerWithSearch(msg.query || '')
   }
   // AI-001：content.js 广播当前阅读书籍（切书 = 页面导航，content.js 重载即广播）
   if (msg?.action === 'coreadBookContext') {
@@ -266,14 +319,15 @@ function renderCurrentRef() {
 
   card.classList.add('on')
 
-  // 没有选中引用时，显示空状态：隐藏详情/操作区，仅保留表头和提示
+  // 没有选中引用时，显示空状态：隐藏详情/操作区，仅保留表头和提示；
+  // 「↩ 返回」例外：有跳转记录（可能刚跳过引用、未选中）时仍显示
   if (!selectedAnn) {
     card.classList.add('empty')
     document.getElementById('rc-jump-btn').style.display = 'none'
-    document.getElementById('rc-jump-back-btn').style.display = 'none'
     document.getElementById('rc-del-btn').style.display = 'none'
     document.getElementById('rc-collapse-btn').style.display = 'none'
     document.getElementById('rc-deselect-btn').style.display = 'none'
+    renderJumpBack()
     return
   }
 
@@ -297,11 +351,10 @@ function renderCurrentRef() {
 let drawerSearchQuery = ''
 
 function filterAnns() {
-  // AI-001：引用按当前书隔离。有当前书时只列出该书的引用，无则全部
-  let list = RECENT_ANNS
-  if (_currentBook && _currentBook.base) {
-    list = list.filter(a => baseBookId(a.bookId) === _currentBook.base)
-  }
+  // AI-001：引用严格按当前书隔离。未读到书（_currentBook 为 null）时不列任何引用，
+  // 绝不回退成"全部"，否则抽屉会把多本书的引用混在一起（正是"没隔离"的根因）。
+  if (!_currentBook || !_currentBook.base) return []
+  let list = RECENT_ANNS.filter(a => baseBookId(a.bookId) === _currentBook.base)
   const q = drawerSearchQuery.trim().toLowerCase()
   if (!q) return list
   return list.filter(a => {
@@ -344,16 +397,19 @@ function matchVisibleInPreview(text, q) {
 function renderDrawer() {
   const list = document.getElementById('drawer-list')
   list.innerHTML = ''
-  // AI-001：标题标注当前隔离范围——在读书籍时只列该书引用，未在读时才是"全部引用"
+  // AI-001：标题标注当前隔离范围——在读书籍时只列该书引用，未在读时提示先打开书
   const titleEl = document.getElementById('drawer-title')
   if (titleEl) titleEl.textContent = _currentBook && _currentBook.bookTitle
     ? `引用 · 《${_currentBook.bookTitle}》`
-    : '全部引用'
+    : '当前未在读'
 
   const anns = filterAnns()
 
   if (anns.length === 0) {
-    list.innerHTML = '<div style="text-align:center;color:#bbb;padding:20px;font-size:0.92em;">无匹配引用</div>'
+    const hint = !_currentBook
+      ? '未在读书籍页，打开一本书后再来切换引用'
+      : '无匹配引用'
+    list.innerHTML = `<div style="text-align:center;color:#bbb;padding:20px;font-size:0.92em;">${hint}</div>`
     return
   }
 
@@ -409,9 +465,16 @@ function renderDrawer() {
       item.querySelector('.di-toggle').textContent = expanded ? '展开 ▼' : '折叠 ▲'
     })
 
-    // 点击跳转按钮：在微信读书打开引用所在章节
+    // 点击跳转按钮：在微信读书打开引用所在章节。
+    // 同时选中该引用并收起抽屉，让「当前引用」卡片显示它和「↩ 返回」按钮
+    //（AI-006：否则跳转后卡片是空态，返回按钮不可见）
     item.querySelector('.di-jump-btn')?.addEventListener('click', (e) => {
       e.stopPropagation()
+      selectedAnn = ann
+      clearPendingSelect()
+      saveState()
+      closeDrawer()
+      renderRefUI()
       jumpToAnnotation(ann)
     })
 
@@ -426,8 +489,14 @@ function renderDrawer() {
 }
 
 async function openDrawer() {
-  drawerSearchQuery = ''
-  document.getElementById('drawer-search').value = ''
+  await openDrawerWithSearch('')
+}
+
+// AI-011：打开引用抽屉并预填搜索词（划线内容搜索用，来自 content.js 工具栏按钮）。
+// query 为空等价于普通打开。与 openDrawer 一致：打开前重查当前书，防止显示错书的引用。
+async function openDrawerWithSearch(query) {
+  drawerSearchQuery = query || ''
+  document.getElementById('drawer-search').value = drawerSearchQuery
   document.getElementById('ref-drawer').classList.add('on')
   // AI-001：打开前向活动 tab 重新查询当前书。跨 tab 的最后一次广播可能把
   // _currentBook 带偏（后台 tab 加载晚于前台），不刷新就会显示错书的引用。
@@ -1036,8 +1105,39 @@ function md5(s) {
   return hex(md51(s))
 }
 
-// 「返回跳转前位置」状态：跳转时记住原 tab URL，点击 ↩ 恢复（AI-006）。
-let jumpBackPos = null  // { url }
+// 「返回跳转前位置」状态：跳转时记住原阅读位置，点击 ↩ 恢复（AI-006）。
+// 持久化到 storage（面板重开也能恢复返回能力）；带 TTL 防陈旧导航。
+// 字段：url 原 tab URL、tabId 跳转的 tab、bookId 原书、chapterUidInt 原章节、
+// anchorText 原阅读视口顶部的可见文本锚点、ts 跳转时间。
+let jumpBackPos = null
+const JUMP_BACK_TTL = 60 * 60 * 1000  // 返回记录 1 小时内有效
+
+async function persistJumpBack() {
+  try { if (jumpBackPos) await chrome.storage.local.set({ jumpBackPos }) } catch {}
+}
+
+async function clearJumpBack() {
+  try { await chrome.storage.local.remove('jumpBackPos') } catch {}
+}
+
+async function loadJumpBack() {
+  try {
+    const { jumpBackPos: saved } = await chrome.storage.local.get('jumpBackPos')
+    if (!saved || !saved.url) return
+    if (saved.ts && Date.now() - saved.ts > JUMP_BACK_TTL) {
+      await clearJumpBack()
+      return
+    }
+    jumpBackPos = saved
+    renderJumpBack()
+  } catch {}
+}
+
+// 从微信读书 reader URL 提取书 ID（路径段可能带 k 后缀，先归一）
+function bookIdFromReaderUrl(url) {
+  const m = /^https:\/\/weread\.qq\.com\/web\/reader\/([^/?#]+)/.exec(String(url || ''))
+  return m ? baseBookId(m[1]) : ''
+}
 
 // 从存储的 chapterUid 提取 WeRead 认识的原生 hash 槽位（e_0 / t_1）
 // 兼容两种存储格式：原始槽位 "e_0"，或拼接名 "中文版前言_e_0"
@@ -1086,58 +1186,133 @@ function weReadEncode(input) {
 // 靠 pendingJump（storage）在书页里滚动高亮引用的句子（AI-006）。
 async function jumpToAnnotation(ann) {
   try {
-    const [tab] = await chrome.tabs.query({ url: 'https://weread.qq.com/*' })
     const base = baseBookId(ann.bookId)
     if (!base) { console.warn('[CoRead] jump: missing bookId'); return }
 
-    // 记住当前位置供「↩ 返回」（AI-006，恢复跳转前章节）
+    // 多 tab 时跳到正确的那一个：优先正打开该书（或处于活动状态）的 weread tab，
+    // 其次任意 weread tab，再无则新建。避免跳进多个 tab 里错误的那一个。
+    let [tab] = await chrome.tabs.query({ url: `https://weread.qq.com/web/reader/${base}*` })
+    if (!tab) [tab] = await chrome.tabs.query({ url: 'https://weread.qq.com/*', active: true, lastFocusedWindow: true })
+    if (!tab) [tab] = await chrome.tabs.query({ url: 'https://weread.qq.com/*' })
+
+    // 记住当前位置供「↩ 返回」（AI-006）：向当前阅读 tab 捕获视口顶部可见文本作
+    // 锚点 + 原章节整数 id，返回时导航回原章节并精确恢复阅读位置（不只回章节）。
+    let anchor = null
+    if (tab && tab.id) {
+      try {
+        anchor = await chrome.tabs.sendMessage(tab.id, { action: 'getReadingAnchor' }, { frameId: 0 }).catch(() => null)
+      } catch {}
+    }
     if (tab && tab.url) {
-      jumpBackPos = { url: tab.url }
+      jumpBackPos = {
+        url: tab.url,
+        tabId: tab.id || 0,
+        bookId: (anchor && anchor.bookId) || bookIdFromReaderUrl(tab.url),
+        chapterUidInt: (anchor && Number(anchor.chapterUidInt)) || 0,
+        anchorText: (anchor && anchor.anchorText) || '',
+        ts: Date.now(),
+      }
+      await persistJumpBack()
       renderJumpBack()
     }
 
-    // 章节定位优先级：chapterUidInt → k-suffix URL（精确）；
-    //   缺失时用 chapterUid 原生 hash 槽位（e_0/t_1）→ #slot；
-    //   再缺失用引用文字在本地正文缓存反查（/find-chapter）→ chapterUid 或 slot。
+    // 章节定位优先级：chapterUidInt → k-suffix URL（精确，保证章节正确）；
+    //   缺失时复用注解 bookId 自身带的 k-suffix——那是注解被捕获那一刻的 reader URL
+    //   章节，比 chapterUid 槽位可靠（SPA 章节切换时 URL 槽位/DOM 标题常滞后记错，
+    //   例如学做工注解真实槽位 e_0 被记成 e_1，直接 #slot 会跳错章）；
+    //   再缺失用 chapterUid 原生 hash 槽位（e_0/t_1）→ #slot；
+    //   最后用引用文字在本地正文缓存反查（/find-chapter）→ chapterUid 或 slot。
+    //   canvas 书（chapterUidInt + bookmarkRange 齐全）额外带 ?crj=uid:start：page_hook
+    //   改写 getProgress 让微信读书自己也定位到引文（尽力辅助，见下）。
     const uid = Number(ann.chapterUidInt) || 0
+    const crjStart = parseInt(String(ann.bookmarkRange || '').split('-')[0], 10)
+    const useCrj = uid > 0 && Number.isFinite(crjStart) && crjStart >= 0
+    // 微信读书自己的跳转约定（用户实测 + AI-011）：跨章带 k、同章不带 k；它的精确定位是
+    // 阅读器内部函数（笔记面板条目点击 = 它自己精确到句），URL 的 k 后缀只是章节导航记账。
+    // 所以 canvas 书：同章不导航（当前页点笔记面板定位，避免 reload 打乱阅读位置），
+    // 跨章带 k 落章后目标页 content script 点笔记面板条目完成精确到句（不再带 crj——
+    // getProgress 改写五轮实测不生效）。
+    const currentUid = (anchor && Number(anchor.chapterUidInt)) || 0
+    // canvas 书定位全交给笔记面板（AI-011）：笔记面板点击自己会导航到目标章（跨章自愈），
+    // 侧栏导航是多余的、只会造成"reload→getProgress 恢复阅读区→再定位"的两步走。
+    // 同章（currentUid===uid）或当前章未知（URL 无 k 后缀时 anchor=0）都 noNav；
+    // 未知章若实际跨章，笔记面板点击仍会把微信读书带到目标章，不倒退。
+    const sameChapter = useCrj && uid > 0 && (currentUid === uid || currentUid === 0)
     let url = `https://weread.qq.com/web/reader/${base}`
-    let located = uid > 0
-    if (uid > 0) {
-      try {
-        const k = weReadEncode(uid)
-        if (k) { url += 'k' + k } else { located = false }
-      } catch { located = false }
-    }
-    if (!located) {
-      const slot = toWereadHashSlot(ann.chapterUid || '')
-      if (slot) {
-        url += '#' + slot
-      } else if (ann.selectedText) {
+    let located = false
+    let noNav = false
+    if (useCrj && sameChapter) {
+      // 同章（canvas）：不改 URL、不导航。写 pendingJump，当前页 content script（onChanged）
+      // 点笔记面板条目定位；再 ping 一次兜底 storage 事件漏触发。
+      noNav = true
+    } else if (useCrj) {
+      // 跨章（canvas）：带 k 落到目标章，不带 crj。
+      const k = weReadEncode(uid)
+      if (k) { url += 'k' + k; located = true }
+    } else {
+      located = uid > 0
+      if (uid > 0) {
         try {
-          const r = await fetch(`${RECEIVER}/find-chapter?bookId=${encodeURIComponent(ann.bookId)}` +
-            `&text=${encodeURIComponent(ann.selectedText.slice(0, 60))}`)
-          const j = await r.json()
-          if (j && Number(j.chapterUid) > 0) {
-            const k = weReadEncode(Number(j.chapterUid))
-            if (k) url += 'k' + k
-          } else if (j && j.slot) {
-            url += '#' + j.slot
-          }
-        } catch {}
+          const k = weReadEncode(uid)
+          if (k) { url += 'k' + k } else { located = false }
+        } catch { located = false }
+      }
+      if (!located) {
+        // bookId 形如 {base}k{suffix}：后缀就是捕获时的真实章节编码，原样拼回即可，
+        // 不需要再 weReadEncode（base 已由 baseBookId 剥离后缀）。
+        const m = String(ann.bookId || '').match(/k([0-9a-f]{16,})$/i)
+        if (m) { url += 'k' + m[1]; located = true }
+      }
+      if (!located) {
+        const slot = toWereadHashSlot(ann.chapterUid || '')
+        if (slot) {
+          url += '#' + slot
+        } else if (ann.selectedText) {
+          try {
+            const r = await fetch(`${RECEIVER}/find-chapter?bookId=${encodeURIComponent(ann.bookId)}` +
+              `&text=${encodeURIComponent(ann.selectedText.slice(0, 60))}`)
+            const j = await r.json()
+            if (j && Number(j.chapterUid) > 0) {
+              const k = weReadEncode(Number(j.chapterUid))
+              if (k) url += 'k' + k
+            } else if (j && j.slot) {
+              url += '#' + j.slot
+            }
+          } catch {}
+        }
       }
     }
 
     // 先把待定位的引用原文写进 storage，内容脚本在目标页加载后用它在书页里
     // 滚动高亮（AI-006，恢复跳转后定位引用的句子；storage 交给帧内自行消费）。
+    // canvasCrj 跳转标记 canvasScroll：内容脚本用"只滚动不改 DOM"的方式定位（见 content.js
+    // findAndHighlight 的 noDom 模式），避免修改隐藏文本层触发微信读书重渲染。
     if (ann.selectedText) {
       try {
         await chrome.storage.local.set({
-          pendingJump: { bookId: ann.bookId, selectedText: ann.selectedText, ts: Date.now() },
+          pendingJump: {
+            bookId: ann.bookId, selectedText: ann.selectedText, ts: Date.now(),
+            canvasScroll: useCrj || undefined,
+          },
         })
       } catch {}
     }
 
-    if (tab) {
+    console.log(`[CoRead] jumpToAnnotation url=${url} useCrj=${useCrj} noNav=${noNav} sameChapter=${sameChapter}`)
+    postSidebarDebug({
+      stage: 'jump-decision', url, useCrj, noNav, sameChapter,
+      uid, crjStart, currentUid, anchorUid: (anchor && anchor.chapterUidInt) || 0,
+      hasAnchor: !!anchor, base,
+    })
+    if (noNav && tab && tab.id) {
+      // 同章（canvas）：不导航。pendingJump 已写入，onChanged 会触发当前页消费；再 ping
+      // 一次兜底（content script 挂监听前 storage 变更可能漏事件）。ping 失败（content
+      // script 不在）则什么都不做——不倒退：同章不导航本就是最安全的落点。
+      try {
+        await chrome.tabs.sendMessage(tab.id, { action: 'checkPendingJump' }, { frameId: 0 }).catch(() => {})
+        await chrome.tabs.update(tab.id, { active: true })
+      } catch {}
+    } else if (tab) {
       await chrome.tabs.update(tab.id, { url, active: true })
     } else {
       await chrome.tabs.create({ url, active: true })
@@ -1151,11 +1326,36 @@ async function jumpToAnnotation(ann) {
 async function jumpBack() {
   try {
     if (!jumpBackPos || !jumpBackPos.url) return
-    // 返回时同时清掉待定位目标，避免恢复的页面再次被高亮定位
-    try { await chrome.storage.local.remove('pendingJump') } catch {}
-    const [tab] = await chrome.tabs.query({ url: 'https://weread.qq.com/*' })
-    if (tab) await chrome.tabs.update(tab.id, { url: jumpBackPos.url, active: true })
+    // 恢复 URL：有捕获的章节时用 k{encode(uid)} 精确导航回原章节——不依赖微信读书
+    // 的进度恢复（同书内跳转时进度已被目标章节覆盖），无章节信息才回退保存的原 URL。
+    let url = jumpBackPos.url
+    const uid = Number(jumpBackPos.chapterUidInt) || 0
+    const bookId = jumpBackPos.bookId || bookIdFromReaderUrl(jumpBackPos.url)
+    if (uid > 0 && bookId) {
+      try {
+        const k = weReadEncode(uid)
+        if (k) url = `https://weread.qq.com/web/reader/${baseBookId(bookId)}k${k}`
+      } catch {}
+    }
+    // 有锚点：用锚点替换 pendingJump，恢复页的 findAndHighlight 按锚点滚动回原
+    // 阅读位置（position:'start'，锚点回到视口顶部≈原阅读视野）；无锚点则维持
+    // 原行为清掉旧的待定位目标。
+    if (jumpBackPos.anchorText && bookId) {
+      await chrome.storage.local.set({
+        pendingJump: { bookId, selectedText: jumpBackPos.anchorText, position: 'start', ts: Date.now() },
+      })
+    } else {
+      try { await chrome.storage.local.remove('pendingJump') } catch {}
+    }
+    // 优先回跳转时那个 tab（tabId），tab 已关则回退任意 weread tab
+    let tab = null
+    if (jumpBackPos.tabId) {
+      try { tab = await chrome.tabs.get(jumpBackPos.tabId) } catch {}
+    }
+    if (!tab) [tab] = await chrome.tabs.query({ url: 'https://weread.qq.com/*' })
+    if (tab) await chrome.tabs.update(tab.id, { url, active: true })
     jumpBackPos = null
+    await clearJumpBack()
     renderJumpBack()
   } catch (e) {
     console.warn('[CoRead] jump back failed:', e.message)
@@ -1326,6 +1526,9 @@ async function loadHistory() {
   applyPendingSelect()
   // 恢复的引用列表可能没有触发 addRecentAnn 的渲染，这里统一刷新一次
   renderRefUI()
+  // AI-011：/history 刷新了 RECENT_ANNS 后，若引用抽屉已开着（划线内容搜索可能
+  // 在面板加载期间由实时消息提前打开），重渲染一次让搜索结果显示最新数据
+  renderDrawer()
 }
 
 // ── 提问位置浮窗（AI-005）───────────────────────────────────────────────────
@@ -1560,11 +1763,15 @@ if (_jumpMsgsEl) {
   }, { passive: true })
 }
 
-// 启动后查询当前阅读书籍（AI-001）：覆盖「切书后重开侧栏」的场景
+// 启动后查询当前阅读书籍（AI-001）：覆盖「切书后重开侧栏」的场景。
+// applyPendingRefSearch 放在 loadHistory 之后：引用列表就绪后再打开抽屉搜索，
+// 否则搜索框填了词但列表还是空的（AI-011）。
 loadState()
   .then(loadHistory)
+  .then(applyPendingRefSearch)
   .then(connect)
   .then(() => refreshCurrentBook())
+loadJumpBack()  // AI-006：面板重开后恢复「↩ 返回」能力（有未过期的跳转记录时）
 
 // 活动 tab 变化时刷新当前书（AI-001）：用户在多本书 / 多个微信读书 tab 间切换
 try { chrome.tabs.onActivated.addListener(() => refreshCurrentBook()) } catch {}
