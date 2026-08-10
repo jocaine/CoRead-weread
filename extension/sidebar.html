@@ -510,17 +510,23 @@
       overflow-x: hidden;      /* 不出现水平滚动条，文本尾部省略 */
       padding: 10px 8px;
     }
-    /* 条目：裸文本、无边框无编号，悬停浅灰，当前项绿字加粗 + 左侧指示条
-       （对应 DeepSeek 的 ef46fbc6 > fae5876e 指示元素） */
+    /* 条目：每行 = 文本 + 右侧横杠（AI-014），列表滚动时行与横杠一起滚（横杠就在项内）。
+       选中项(active)：绿字加粗 + 左侧绿指示条 + 右侧绿横杠；悬停项：中性浅灰底 + 右侧琥珀
+       横杠——hover 与选中视觉严格区分。列表滚动不再把视口首行标成选中，选中态只跟随聊天
+       当前提问。（对应 DeepSeek 的 ef46fbc6 > fae5876e 指示元素） */
     #jump-panel .jump-item {
       position: relative;
+      display: flex;
+      align-items: center;
+      gap: 8px;
       padding: 8px 12px 8px 18px;
       border-radius: 8px;
       cursor: pointer;
       transition: background 0.15s;
     }
-    #jump-panel .jump-item:hover { background: #f5f6f7; }
+    #jump-panel .jump-item:hover { background: #f2f3f5; }
     #jump-panel .jump-text {
+      flex: 1;                 /* 占满剩余宽度，让右侧横杠贴边 */
       display: block;          /* 行内元素不做省略，必须块级才生效 ellipsis */
       font-size: 12px;
       line-height: 1.5;
@@ -541,40 +547,58 @@
       border-radius: 2px;
       background: #07c160;
     }
+    /* 每项右侧的横杠：默认灰；悬停琥珀（与选中绿区分）；选中绿且更长 */
+    #jump-panel .jump-item .jbar {
+      width: 14px;
+      height: 3px;
+      border-radius: 2px;
+      background: #d6dae1;
+      flex-shrink: 0;
+      transition: background 0.15s, width 0.15s;
+    }
+    #jump-panel .jump-item:hover .jbar { background: #f59e0b; }
+    #jump-panel .jump-item.active .jbar { width: 22px; background: #07c160; }
     #jump-panel .jump-empty {
       padding: 18px 12px;
       text-align: center;
       font-size: 12px;
       color: #b0b3b8;
     }
-    /* 右缘把手：几根稀疏的小横杠（折叠态的全部内容，间距拉开不局促） */
+    /* 右缘把手：折叠态横杠列，与展开态项内横杠同一套样式（一条 = 一个问题）。
+       列溢出（提问很多）时内部滚动、当前条自动滚到可见；.jbar-wrap 的 margin:auto 让少量
+       横杠垂直居中、大量横杠可从两端滚到（避免 justify-content:center 溢出裁顶） */
     #jump-fab-btn {
       width: 30px;
       flex-shrink: 0;
       display: flex;
       flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 9px;
       min-height: 46px;
+      padding: 6px 0;        /* AI-014：上下留白，避免首尾横杠被 #jump-fab 的圆角 overflow 裁掉 */
+      overflow-y: auto;
+      scrollbar-width: none;  /* 隐藏滚动条，用"当前条自动滚到可见"替代 */
       cursor: pointer;
       border-left: 1px solid transparent;
       transition: border-color 0.22s;
     }
-    #jump-fab.open #jump-fab-btn { border-left-color: #f0f1f3; }
+    #jump-fab-btn::-webkit-scrollbar { display: none; }
+    .jbar-wrap {
+      margin: auto;          /* 居中 + 溢出时两端可达 */
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 9px;
+    }
+    /* AI-014：展开时横杠已内嵌到每项右侧，右缘把手列隐藏；折叠时才显示 */
+    #jump-fab.open #jump-fab-btn { display: none; }
     #jump-fab-btn .jbar {
-      width: 18px;
-      height: 2px;
+      width: 14px;
+      height: 3px;
       border-radius: 2px;
-      background: #b7bcc4;
+      background: #d6dae1;
       transition: background 0.2s, width 0.2s;
     }
     #jump-fab-btn .jbar.sel {
-      width: 26px;               /* 当前提问所在域的横杠：更长 + 实心绿 */
-      background: #07c160;
-    }
-    #jump-fab:hover #jump-fab-btn .jbar,
-    #jump-fab.open #jump-fab-btn .jbar {
+      width: 22px;               /* 当前提问所在条：更长 + 实心绿（与项内选中样式一致） */
       background: #07c160;
     }
     /* 悬停省略文本时的完整内容 tooltip（浮于卡片内，避开右缘把手） */
@@ -707,8 +731,8 @@
     <button id="send-btn">发送</button>
   </div>
 
-  <!-- 提问位置浮窗（AI-005）：一张卡片。折叠态右缘几条小横杠（数量随提问数动态，最多 10 条），
-       悬停展开提问列表，点击条目跳转；悬停省略文本用 tooltip 显示完整内容 -->
+  <!-- 提问位置浮窗（AI-005）：一张卡片。折叠态右缘几条小横杠（最多 10 条，AI-014 起为
+       随当前提问滑动的窗口）；悬停展开提问列表，点击条目跳转；悬停省略文本用 tooltip 显示完整内容 -->
   <div id="jump-fab" aria-label="我的提问">
     <div id="jump-panel">
       <div class="jump-list" id="jump-list"></div>

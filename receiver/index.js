@@ -269,6 +269,12 @@ const server = http.createServer(async (req, res) => {
               chapter: d.chapter || '',
               chapterUid: d.chapterUid || '',
               chapterUidInt: d.chapterUidInt || 0,
+              // 返回完整记录：侧栏据此把该书标注合并进引用列表（抽屉打开/SSE重连时
+              // 拉全量补齐，不依赖 SSE 是否恰好送达；AI-012）
+              bookId: d.bookId || '',
+              bookTitle: d.bookTitle || '',
+              bookmarkRange: d.bookmarkRange || '',
+              bookmarkId: d.bookmarkId || '',
               userNote: d.userNote || '',
               timestamp: d.receivedAt || (d.timestamp ? d.timestamp * 1000 : 0),
             })

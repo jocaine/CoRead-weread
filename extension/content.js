@@ -994,9 +994,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ bookId: ctx.bookId, bookTitle: ctx.bookTitle, chapter: ctx.chapter, chapterUid: ctx.chapterUid, chapterUidInt: ctx.chapterUidInt })
     return true
   }
-  // 跳转前捕获阅读位置锚点（AI-006 返回用）：bookId + 章节 + 视口顶部可见文本
+  // 跳转前捕获阅读位置锚点（AI-006 返回用）：bookId + 章节 + 视口顶部可见文本；
+  // 画布书额外带滚动比例（AI-012 跳回用）。async：章节整数要查跨帧共享章节兜底。
   if (msg.action === 'getReadingAnchor') {
-    sendResponse(captureReadingAnchor())
+    captureReadingAnchor().then(sendResponse)
     return true
   }
   // 侧栏同章跳转（canvas）：不导航，直接在当前页点笔记面板条目让微信读书自己定位（AI-011）
@@ -1014,6 +1015,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     checkPendingJump()
     sendResponse({ received: true })
     return true
+  }
+  // AI-012 画布书跳回：history.back() 让微信读书原生恢复到跳转前的阅读视图。
+  // 前向跳转 noNav（无 reload），笔记面板点击是 SPA pushState——back() 回到跳转前章节，
+  // 微信读书用自己的内存状态还原滚动位置（DOM 无滚动容器，滚动比例方案对此书无解）。
+  // 守卫：只在仍在阅读页 且 history 有可回退项时 back()；否则返回 ok:false 由侧栏回退 URL 导航。
+  if (msg.action === 'historyBackToReading') {
+    try {
+      if (window.top !== window) { sendResponse({ ok: false, reason: 'not-top' }); return false }
+      if (!location.pathname.startsWith('/web/reader/')) { sendResponse({ ok: false, reason: 'not-reader' }); return false }
+      if (history.length <= 1) { sendResponse({ ok: false, reason: 'no-history' }); return false }
+      history.back()
+      postDebug({ source: 'jump-back', stage: 'history-back', len: history.length })
+      sendResponse({ ok: true })
+      return true
+    } catch (e) {
+      sendResponse({ ok: false, reason: 'throw:' + (e && e.message) })
+      return false
+    }
   }
   // 删除引用时同步删除微信读书划线：按 range 查 bookmarkId。
   // 解析顺序：1) 引用持久化的 bookmarkId（annotation 直接携带，绕开内存映射）
@@ -1378,12 +1397,89 @@ function findAndHighlight(text, position, noDom) {
   })
 }
 
+// 画布书判定：阅读器正文里有没有 <canvas>（画布书正文画在 canvas 上，DOM 书正文是 <p>）。
+// 防误判：DOM 书正文是 <p> 文本（画布书如《静静的顿河》pCount 实测 0-3），有 canvas 但
+// <p> 数量正常 → 判定为 DOM 书，避免误伤 noNav/锚点跳回逻辑（AI-012）。
+function isCanvasBook() {
+  try {
+    const roots = []
+    const cr = chapterContentRoot()
+    if (cr && cr !== document) roots.push(cr)
+    roots.push(document)
+    let hasCanvas = false
+    for (const r of roots) {
+      try { if (r.querySelectorAll('canvas').length > 0) { hasCanvas = true; break } } catch {}
+    }
+    if (!hasCanvas) return false
+    try {
+      if (document.querySelectorAll('p').length >= 10) return false
+    } catch {}
+    return true
+  } catch {}
+  return false
+}
+
+// 画布书阅读器的滚动容器探测（AI-012 跳回用）：正文画在 canvas 上，可滚 DOM 是隐藏文本层
+// 的容器（overflow:hidden，scrollTop 手动设置生效——scrollSpanIntoView 的 hiddenCandidate
+// 兜底已确认这种容器存在）。优先 overflow:hidden + 最大可滚量；无 hidden 时退 auto/scroll。
+// 关键坑（AI-012 实测）：省略号标题等小元素 scrollHeight-clientHeight 只有几十 px，会把
+// 候选带偏（抓到 readerTopBar_title）。真阅读滚动容器可滚量都很大（数千 px），故设阈值
+// o>100 排除假候选。返回 null = 阅读器无可滚 DOM（canvas 内部自滚），调用方优雅降级。
+function findCanvasScroller() {
+  try {
+    const roots = []
+    const cr = chapterContentRoot()
+    if (cr && cr !== document) roots.push(cr)
+    roots.push(document)
+    let bestEl = null, bestOverflow = 0, bestHidden = false
+    for (const root of roots) {
+      let all
+      try { all = root.querySelectorAll('*') } catch { continue }
+      for (let i = 0; i < all.length; i++) {
+        const el = all[i]
+        let cs
+        try { cs = getComputedStyle(el) } catch { continue }
+        const oy = cs.overflowY || 'visible'
+        if (!/(auto|scroll|hidden)/.test(oy)) continue
+        const o = el.scrollHeight - el.clientHeight
+        if (o <= 100) continue  // 排除省略号标题等假候选
+        const hidden = /hidden/.test(oy)
+        if (hidden && !bestHidden) { bestEl = el; bestOverflow = o; bestHidden = true; continue }
+        if (hidden === bestHidden && o > bestOverflow) { bestEl = el; bestOverflow = o }
+      }
+    }
+    return bestEl ? { el: bestEl, overflow: bestOverflow } : null
+  } catch { return null }
+}
+
 // AI-006 返回用：捕获阅读视口顶部附近的可见文本作定位锚点。跳转前侧栏调它，
 // 返回时用 findAndHighlight 按锚点把页面重新滚回原阅读位置（不只回章节）。
 // 只扫视口上半部（避开顶部工具栏、不抓屏外段落），命中"最靠上"的可见文本节点。
-function captureReadingAnchor() {
+// AI-012：画布书正文画在 canvas 上、无可见 DOM 文本，锚点必空/垃圾——改记阅读器滚动容器的
+// 滚动比例（canvasFrac），跳回时设回 scrollTop 近似还原视图。章节整数优先 URL k 后缀 / 本帧
+// getProgress 追踪，回退跨帧共享章节 coreadChapter.uidInt（画布书跳转瞬间 URL 无 k 后缀、
+// _chapterUidInt 常为 0，实测 anchorUid=0 导致跳回拼不出 k{uid}，靠共享章节兜底）。
+async function captureReadingAnchor() {
   try {
     const ctx = getReadingContext()
+    const shared = await readSharedChapter()
+    const sameBook = shared && shared.bookId === baseBookId(ctx.bookId)
+    const uidInt = ctx.chapterUidInt || (sameBook ? Number(shared.uidInt) || 0 : 0) || 0
+    const isCanvas = isCanvasBook()
+    let canvasFrac = null
+    if (isCanvas) {
+      const sc = findCanvasScroller()
+      if (sc && sc.overflow > 0) canvasFrac = sc.el.scrollTop / sc.overflow
+      postDebug({
+        source: 'jump-back', stage: 'capture',
+        uidInt, canvasFrac,
+        scrollerCls: sc ? String(sc.el.className || sc.el.tagName || '').slice(0, 60) : '',
+        overflow: sc ? sc.overflow : -1,
+        bodyTextLen: (document.body.innerText || '').length,
+      })
+    }
+    // 可见文本锚点只对 DOM 书有意义（画布书拿到的是工具栏/书名垃圾，跳回不用）。
+    // 仍扫一遍：DOM 书靠它精确恢复。
     const nodes = []
     const collect = (root, out) => {
       const doc = root.ownerDocument || root
@@ -1409,13 +1505,15 @@ function captureReadingAnchor() {
       if (r.left < 0 || r.right > vw) continue  // 只看主文本列
       if (r.top < bestTop) { bestTop = r.top; best = n }
     }
-    if (!best) return { ok: false, reason: 'no-visible-text' }
-    return {
+    const base = {
       ok: true,
       bookId: ctx.bookId,
-      chapterUidInt: ctx.chapterUidInt || 0,
-      anchorText: (best.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40),
+      chapterUidInt: uidInt,
+      canvas: isCanvas || undefined,
+      canvasFrac,
     }
+    if (!best) return { ...base, ok: false, reason: 'no-visible-text', anchorText: '' }
+    return { ...base, anchorText: (best.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40) }
   } catch (e) {
     return { ok: false, reason: 'throw:' + (e && e.message) }
   }
@@ -1522,7 +1620,9 @@ const NOTE_PANEL_TRY_OPEN = false  // 实验：点开"笔记"tab 尝试提前渲
 let _notePanelTimer = null
 async function notePanelJumpLoop(pj) {
   if (window.top !== window) return  // 面板只在顶层 frame
-  if (_notePanelTimer) return
+  // AI-012：轮询槽被占用（可能是画布书跳回 canvasRestoreLoop 在等就绪门）时不静默丢目标，
+  // 等槽释放再起——老循环读到 pendingJump ts 变化会自己 abort 腾出槽。
+  if (_notePanelTimer) { _notePanelTimer = setTimeout(() => notePanelJumpLoop(pj), 700); return }
   let tries = 0
   let opened = false
   let prevItems = 0
@@ -1587,6 +1687,90 @@ async function notePanelJumpLoop(pj) {
   tick()
 }
 
+// ── 画布书跳回：滚动比例恢复视图（AI-012） ─────────────────────────────────
+// 前向跳转 noNav（不刷新），跳回 URL 导航会 reload；reload 后画布阅读器 ~18s 才就绪，
+// 就绪前设 scrollTop 是 no-op（同 notePanelJumpLoop 的就绪门，AI-011 实测）。跳回目标是
+// "回到原阅读视图"而非精确到句——用跳转前抓的滚动比例（scrollTop/可滚量）近似还原。
+// 无可滚容器（canvas 内部自滚）时优雅降级：只保证章对了，消费掉目标不反复尝试。
+// 复用 _notePanelTimer 作轮询槽（同一 pendingJump 只会走 notePanelJumpLoop / 这里之一，
+// checkPendingJump 的 _notePanelInFlightTs 守卫已按 ts 去重）。
+async function canvasRestoreLoop(pj) {
+  if (window.top !== window) return  // 滚动容器只在顶层 frame
+  // AI-012：轮询槽被占用（前向跳转 notePanelJumpLoop 在定位）时不静默丢目标，
+  // 等槽释放再起——老循环读到 pendingJump ts 变化会自己 abort 腾出槽。
+  if (_notePanelTimer) { _notePanelTimer = setTimeout(() => canvasRestoreLoop(pj), 700); return }
+  let tries = 0
+  let applied = false
+  const tick = async () => {
+    _notePanelTimer = null
+    try {
+      // 每次 tick 校验：pendingJump 已被新跳转覆盖则中止（避免旧循环改错滚动位置）
+      const cur = await chrome.storage.local.get('pendingJump').catch(() => ({}))
+      if (!cur.pendingJump || (pj.ts !== undefined && cur.pendingJump.ts !== pj.ts)) {
+        postDebug({ source: 'jump-back', stage: 'abort', tries })
+        _notePanelInFlightTs = 0
+        return
+      }
+      const age = Date.now() - _contentLoadedAt
+      const sc = findCanvasScroller()
+      const ready = !!sc && sc.overflow > 0
+      if (!ready || age < NOTE_PANEL_READY_GATE_MS) {
+        // 日志防刷屏：首次、刚就绪的瞬间、以及每 12 次 tick 记一条
+        if (tries === 1 || (ready && !applied) || tries % 12 === 0) {
+          postDebug({ source: 'jump-back', stage: 'wait', tries, ready, pageAge: age, overflow: sc ? sc.overflow : -1 })
+        }
+        if (tries < 100) {  // ~70s 上限
+          _notePanelTimer = setTimeout(tick, 700)
+          return
+        }
+        _notePanelInFlightTs = 0
+        postDebug({ source: 'jump-back', stage: 'timeout', tries, ready, pageAge: age })
+        consumePendingJump(pj.ts)
+        return
+      }
+      // 就绪：设回滚动比例（视图近似还原）。微信读书异步重绘可能清掉定位 → 延迟确认重设
+      const frac = Math.max(0, Math.min(1, Number(pj.canvasFrac) || 0))
+      const next = Math.round(frac * sc.overflow)
+      sc.el.scrollTop = next
+      applied = true
+      console.log(`[CoRead] jump-back canvas restore frac=${frac.toFixed(3)} next=${next}/${sc.overflow} pageAge=${age}`)
+      postDebug({
+        source: 'jump-back', stage: 'applied', tries, pageAge: age, frac, next, overflow: sc.overflow,
+        cls: String(sc.el.className || sc.el.tagName || '').slice(0, 60),
+      })
+      setTimeout(() => { confirmCanvasRestore(pj.ts, frac) }, 2500)
+    } catch (e) {
+      postDebug({ source: 'jump-back', stage: 'err', message: e && e.message })
+      if (tries < 100) _notePanelTimer = setTimeout(tick, 1000)
+      else { _notePanelInFlightTs = 0; consumePendingJump(pj.ts) }
+    }
+  }
+  tick()
+}
+
+// 命中后的确认：重设一次滚动比例（扛过 WeRead 异步重绘清掉定位），然后消费 pendingJump。
+// ts 校验：confirm 调度时的 pendingJump 若已被新跳转覆盖则不消费（同 confirmPendingJumpHighlight）。
+async function confirmCanvasRestore(ts, frac) {
+  try {
+    const { pendingJump } = await chrome.storage.local.get('pendingJump')
+    if (!pendingJump || pendingJump.canvasFrac == null) return
+    if (ts !== undefined && pendingJump.ts !== ts) return
+    const age = Date.now() - (pendingJump.ts || 0)
+    if (age > 60000) { await chrome.storage.local.remove('pendingJump'); return }
+    const sc = findCanvasScroller()
+    if (sc && sc.overflow > 0) {
+      sc.el.scrollTop = Math.round(Math.max(0, Math.min(1, Number(frac) || 0)) * sc.overflow)
+      postDebug({ source: 'jump-back', stage: 'confirm', frac, overflow: sc.overflow })
+    } else {
+      postDebug({ source: 'jump-back', stage: 'confirm-no-scroller' })
+    }
+    await chrome.storage.local.remove('pendingJump')
+    _notePanelInFlightTs = 0
+  } catch (e) {
+    postDebug({ source: 'jump-back', stage: 'confirm-err', message: e && e.message })
+  }
+}
+
 // 实验：点开"笔记"tab 尝试提前渲染笔记条目（NOTE_PANEL_TRY_OPEN 开启时调用）。
 // 只点可见的、文本以"笔记"开头的 tab/button；找不到就放弃（轮询照跑，20s 后条目自现）。
 function tryOpenNotePanel() {
@@ -1611,7 +1795,8 @@ function tryOpenNotePanel() {
 async function checkPendingJump() {
   try {
     const { pendingJump } = await chrome.storage.local.get('pendingJump')
-    if (!pendingJump || !pendingJump.selectedText) {
+    // AI-012：画布书跳回只写 canvasFrac（无 selectedText，滚动比例恢复视图）
+    if (!pendingJump || (!pendingJump.selectedText && pendingJump.canvasFrac == null)) {
       console.log('[CoRead] jump: no pendingJump')
       return
     }
@@ -1645,7 +1830,13 @@ async function checkPendingJump() {
       // sidebar ping 各触发一次 checkPendingJump，同一 ts 只起一个循环。
       if (_notePanelInFlightTs === pendingJump.ts) return
       _notePanelInFlightTs = pendingJump.ts
-      notePanelJumpLoop(pendingJump)
+      // AI-012 跳回：canvasFrac 指"恢复原阅读视图"（滚动比例，跳回用），selectedText 指
+      // "定位引用"（笔记面板点击，前向跳转用）。两者互斥，按字段分流。
+      if (pendingJump.canvasFrac != null) {
+        canvasRestoreLoop(pendingJump)
+      } else {
+        notePanelJumpLoop(pendingJump)
+      }
       return
     }
     const result = await findAndHighlight(pendingJump.selectedText, pendingJump.position, noDom)

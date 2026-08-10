@@ -350,18 +350,40 @@ function renderCurrentRef() {
 // ── 引用列表抽屉 ──────────────────────────────────────────────────────────
 let drawerSearchQuery = ''
 
+// 引用在书里的位置排序键：章节号 + 章内偏移。
+function refPosition(a) {
+  const uid = Number(a.chapterUidInt) || 0
+  const m = /^(\d+)/.exec(String(a.bookmarkRange || ''))
+  const offset = m ? Number(m[1]) : -1
+  return [uid, offset]
+}
+// 按书中位置倒序：位置最靠后的（最新章节 / 章内更靠后）排在最上面（AI-013）。
+// 缺章节定位（uid=0）的引用沉底；同位置用 Array.prototype.sort 稳定序兜底。
+function sortRefsByPositionDesc(list) {
+  return list.slice().sort((a, b) => {
+    const pa = refPosition(a), pb = refPosition(b)
+    for (let i = 0; i < 2; i++) {
+      if (pa[i] !== pb[i]) return pb[i] - pa[i]
+    }
+    return 0
+  })
+}
+
 function filterAnns() {
   // AI-001：引用严格按当前书隔离。未读到书（_currentBook 为 null）时不列任何引用，
   // 绝不回退成"全部"，否则抽屉会把多本书的引用混在一起（正是"没隔离"的根因）。
   if (!_currentBook || !_currentBook.base) return []
   let list = RECENT_ANNS.filter(a => baseBookId(a.bookId) === _currentBook.base)
   const q = drawerSearchQuery.trim().toLowerCase()
-  if (!q) return list
-  return list.filter(a => {
-    return (a.bookTitle || '').toLowerCase().includes(q) ||
-      (a.chapter || '').toLowerCase().includes(q) ||
-      (a.selectedText || '').toLowerCase().includes(q)
-  })
+  if (q) {
+    list = list.filter(a => {
+      return (a.bookTitle || '').toLowerCase().includes(q) ||
+        (a.chapter || '').toLowerCase().includes(q) ||
+        (a.selectedText || '').toLowerCase().includes(q)
+    })
+  }
+  // AI-013：抽屉按书中位置倒序显示（只排序渲染副本，不影响 RECENT_ANNS 内部与选中逻辑）
+  return sortRefsByPositionDesc(list)
 }
 
 // 搜索命中高亮：把文本按查询切分，命中的片段包 <mark>。分段后各自 esc，
@@ -488,6 +510,37 @@ function renderDrawer() {
   }
 }
 
+// AI-012：从 receiver 拉当前书的全部标注，合并进引用列表（缺的补上）。
+// 根因：侧栏引用列表靠「面板加载时 loadHistory + 实时 SSE」维护，而 SSE 断点续传
+// 缓冲有限（receiver 重启即清空），错过事件后列表会永久落后——书页画线却每次实时
+// 读 /annotations 文件，于是出现「书上有线、抽屉里没有」的不一致。这里主动拉全量补齐，
+// 不依赖 SSE 是否恰好送达。receiver 未启动时静默失败，沿用本地列表。
+async function syncAnnsFromReceiver() {
+  if (!_currentBook || !_currentBook.base) return false
+  try {
+    const r = await fetch(`${RECEIVER}/annotations?bookId=${encodeURIComponent(_currentBook.base)}`)
+    const list = await r.json()
+    if (!Array.isArray(list)) return false
+    let added = 0
+    for (const d of list) {
+      if (!d.selectedText) continue
+      const exists = RECENT_ANNS.some(a => sameRef(a, d))
+      if (!exists) {
+        addRecentAnn({
+          bookId: d.bookId || _currentBook.base,
+          bookTitle: d.bookTitle || _currentBook.bookTitle,
+          chapter: d.chapter || '', chapterUid: d.chapterUid || '',
+          chapterUidInt: d.chapterUidInt || 0,
+          bookmarkRange: d.bookmarkRange || '', bookmarkId: d.bookmarkId || '',
+          selectedText: d.selectedText,
+        }, { select: false })
+        added++
+      }
+    }
+    return added > 0
+  } catch { return false }
+}
+
 async function openDrawer() {
   await openDrawerWithSearch('')
 }
@@ -501,6 +554,9 @@ async function openDrawerWithSearch(query) {
   // AI-001：打开前向活动 tab 重新查询当前书。跨 tab 的最后一次广播可能把
   // _currentBook 带偏（后台 tab 加载晚于前台），不刷新就会显示错书的引用。
   await refreshCurrentBook()
+  // AI-012：从 receiver 拉当前书全量标注合并进列表——补上 SSE 可能漏掉的最新划线，
+  // 抽屉永远显示存档里的全量（书页画线实时读文件，这里对齐）。
+  await syncAnnsFromReceiver()
   renderDrawer()
   setTimeout(() => document.getElementById('drawer-search').focus(), 100)
 }
@@ -866,7 +922,13 @@ function connect() {
   // 首次连接 _lastEventId=0 → 不带参数 → receiver 不回放（历史由 /history 加载）。
   const q = _lastEventId > 0 ? `?lastId=${_lastEventId}` : ''
   sseConn = new EventSource(`${RECEIVER}/events${q}`)
-  sseConn.onopen = () => setDot(true)
+  sseConn.onopen = () => {
+    setDot(true)
+    // AI-012：重连成功后自愈——补上断连期间漏掉的标注，无需重开面板。
+    // 初始连接时 _currentBook 可能尚未就绪（refreshCurrentBook 在其后执行），
+    // 此时 syncAnnsFromReceiver 内守卫直接返回，由首次 loadHistory 兜底。
+    syncAnnsFromReceiver().then(changed => { if (changed) { renderRefUI(); renderDrawer() } })
+  }
   sseConn.onmessage = (e) => {
     try {
       const d = JSON.parse(e.data)
@@ -1108,7 +1170,9 @@ function md5(s) {
 // 「返回跳转前位置」状态：跳转时记住原阅读位置，点击 ↩ 恢复（AI-006）。
 // 持久化到 storage（面板重开也能恢复返回能力）；带 TTL 防陈旧导航。
 // 字段：url 原 tab URL、tabId 跳转的 tab、bookId 原书、chapterUidInt 原章节、
-// anchorText 原阅读视口顶部的可见文本锚点、ts 跳转时间。
+// anchorText 原阅读视口顶部的可见文本锚点（DOM 书）、canvas 是否画布书、
+// crossChapter 前向跳转是否跨章（画布书跳回选 history.back() vs URL 导航）、
+// canvasFrac 画布书滚动比例（尽力，AI-012）、ts 跳转时间。
 let jumpBackPos = null
 const JUMP_BACK_TTL = 60 * 60 * 1000  // 返回记录 1 小时内有效
 
@@ -1203,16 +1267,32 @@ async function jumpToAnnotation(ann) {
         anchor = await chrome.tabs.sendMessage(tab.id, { action: 'getReadingAnchor' }, { frameId: 0 }).catch(() => null)
       } catch {}
     }
+    const uid = Number(ann.chapterUidInt) || 0
+    const currentUid = (anchor && Number(anchor.chapterUidInt)) || 0
     if (tab && tab.url) {
-      jumpBackPos = {
-        url: tab.url,
-        tabId: tab.id || 0,
-        bookId: (anchor && anchor.bookId) || bookIdFromReaderUrl(tab.url),
-        chapterUidInt: (anchor && Number(anchor.chapterUidInt)) || 0,
-        anchorText: (anchor && anchor.anchorText) || '',
-        ts: Date.now(),
+      const isCanvas = !!(anchor && anchor.canvas)
+      const crossChapter = isCanvas ? (currentUid > 0 && currentUid !== uid) : undefined
+      // AI-012：画布书「确认同章」跳转，WeRead 无任何返回逻辑（用户实测），不提供 ↩；
+      // 只有跨章（浏览器 back 可恢复）或章未知（保守提供，跳回走 URL 导航）才记返回状态。
+      const sameChapterCanvas = isCanvas && currentUid > 0 && currentUid === uid
+      if (sameChapterCanvas) {
+        jumpBackPos = null
+        try { await clearJumpBack() } catch {}
+      } else {
+        jumpBackPos = {
+          url: tab.url,
+          tabId: tab.id || 0,
+          bookId: (anchor && anchor.bookId) || bookIdFromReaderUrl(tab.url),
+          chapterUidInt: currentUid,
+          // 画布书锚点是工具栏/书名垃圾（AI-012），不存——跨章跳回靠浏览器 back 原生恢复
+          anchorText: isCanvas ? '' : ((anchor && anchor.anchorText) || ''),
+          canvas: isCanvas || undefined,
+          crossChapter,
+          canvasFrac: (anchor && Number.isFinite(anchor.canvasFrac)) ? anchor.canvasFrac : null,
+          ts: Date.now(),
+        }
+        await persistJumpBack()
       }
-      await persistJumpBack()
       renderJumpBack()
     }
 
@@ -1224,7 +1304,6 @@ async function jumpToAnnotation(ann) {
     //   最后用引用文字在本地正文缓存反查（/find-chapter）→ chapterUid 或 slot。
     //   canvas 书（chapterUidInt + bookmarkRange 齐全）额外带 ?crj=uid:start：page_hook
     //   改写 getProgress 让微信读书自己也定位到引文（尽力辅助，见下）。
-    const uid = Number(ann.chapterUidInt) || 0
     const crjStart = parseInt(String(ann.bookmarkRange || '').split('-')[0], 10)
     const useCrj = uid > 0 && Number.isFinite(crjStart) && crjStart >= 0
     // 微信读书自己的跳转约定（用户实测 + AI-011）：跨章带 k、同章不带 k；它的精确定位是
@@ -1232,12 +1311,13 @@ async function jumpToAnnotation(ann) {
     // 所以 canvas 书：同章不导航（当前页点笔记面板定位，避免 reload 打乱阅读位置），
     // 跨章带 k 落章后目标页 content script 点笔记面板条目完成精确到句（不再带 crj——
     // getProgress 改写五轮实测不生效）。
-    const currentUid = (anchor && Number(anchor.chapterUidInt)) || 0
     // canvas 书定位全交给笔记面板（AI-011）：笔记面板点击自己会导航到目标章（跨章自愈），
     // 侧栏导航是多余的、只会造成"reload→getProgress 恢复阅读区→再定位"的两步走。
-    // 同章（currentUid===uid）或当前章未知（URL 无 k 后缀时 anchor=0）都 noNav；
-    // 未知章若实际跨章，笔记面板点击仍会把微信读书带到目标章，不倒退。
-    const sameChapter = useCrj && uid > 0 && (currentUid === uid || currentUid === 0)
+    // AI-012：captureReadingAnchor 加了共享章节兜底后 currentUid 可能已可靠，但画布书仍
+    // 一律 noNav（跨章也交给笔记面板自导航，零 reload）——只在 DOM 书才按「同章 or 未知」
+    // 判 noNav、已知跨章走 URL 导航。
+    const isCanvasAnchor = !!(anchor && anchor.canvas)
+    const sameChapter = useCrj && uid > 0 && (isCanvasAnchor ? true : (currentUid === uid || currentUid === 0))
     let url = `https://weread.qq.com/web/reader/${base}`
     let located = false
     let noNav = false
@@ -1326,8 +1406,11 @@ async function jumpToAnnotation(ann) {
 async function jumpBack() {
   try {
     if (!jumpBackPos || !jumpBackPos.url) return
+    const isCanvas = !!jumpBackPos.canvas
     // 恢复 URL：有捕获的章节时用 k{encode(uid)} 精确导航回原章节——不依赖微信读书
     // 的进度恢复（同书内跳转时进度已被目标章节覆盖），无章节信息才回退保存的原 URL。
+    // 画布书章节在跳转瞬间常捕获为 0（AI-012，URL 无 k 后缀），已由 content.js 用共享
+    // 章节兜底；这里若仍为 0 则退回原 URL（可能被微信读书进度带偏，尽力而为）。
     let url = jumpBackPos.url
     const uid = Number(jumpBackPos.chapterUidInt) || 0
     const bookId = jumpBackPos.bookId || bookIdFromReaderUrl(jumpBackPos.url)
@@ -1337,23 +1420,66 @@ async function jumpBack() {
         if (k) url = `https://weread.qq.com/web/reader/${baseBookId(bookId)}k${k}`
       } catch {}
     }
-    // 有锚点：用锚点替换 pendingJump，恢复页的 findAndHighlight 按锚点滚动回原
-    // 阅读位置（position:'start'，锚点回到视口顶部≈原阅读视野）；无锚点则维持
-    // 原行为清掉旧的待定位目标。
-    if (jumpBackPos.anchorText && bookId) {
-      await chrome.storage.local.set({
-        pendingJump: { bookId, selectedText: jumpBackPos.anchorText, position: 'start', ts: Date.now() },
-      })
-    } else {
-      try { await chrome.storage.local.remove('pendingJump') } catch {}
-    }
+    // 待恢复目标写进 pendingJump（仅在 URL 导航回退时写）：
+    // - DOM 书：锚点文本 + position:'start'，findAndHighlight 按锚点滚动回原阅读位置；
+    // - 画布书：canvasScroll + canvasFrac（滚动比例尽力，canvasRestoreLoop 设回 scrollTop）。
+    // 画布书不写垃圾锚点（工具栏/书名）——避免 findAndHighlight 把 span 插进隐藏文本层
+    // 触发微信读书重渲染、把位置重置回章首（AI-006）。
     // 优先回跳转时那个 tab（tabId），tab 已关则回退任意 weread tab
     let tab = null
     if (jumpBackPos.tabId) {
       try { tab = await chrome.tabs.get(jumpBackPos.tabId) } catch {}
     }
     if (!tab) [tab] = await chrome.tabs.query({ url: 'https://weread.qq.com/*' })
-    if (tab) await chrome.tabs.update(tab.id, { url, active: true })
+    if (!tab) {
+      // 没有可回跳的 tab：DOM 书锚点目标先写入 pendingJump，等下次打开该书时消费
+      if (!isCanvas && jumpBackPos.anchorText && bookId) {
+        await chrome.storage.local.set({
+          pendingJump: { bookId, selectedText: jumpBackPos.anchorText, position: 'start', ts: Date.now() },
+        })
+      }
+      postSidebarDebug({ stage: 'jump-back', action: 'no-tab', isCanvas, uid, hasFrac: jumpBackPos.canvasFrac != null })
+      jumpBackPos = null
+      await clearJumpBack()
+      renderJumpBack()
+      return
+    }
+    // AI-012 画布书跳回（用户实测 WeRead 行为）：
+    // - 跨章：WeRead 自身无返回逻辑，但浏览器 back 能原生恢复——直接 history.back() 并信任，
+    //   不做二次导航覆盖（上版轮询校验 + URL 兜底会竞态把 back 的效果冲掉）。
+    // - 同章/章未知：WeRead 无任何返回逻辑（同章无 back），画布书也无 DOM 滚动容器——
+    //   只保证章对（URL 导航），章内位置无法恢复。
+    let didBack = false
+    if (isCanvas && jumpBackPos.crossChapter && tab.id) {
+      try {
+        const r = await chrome.tabs.sendMessage(tab.id, { action: 'historyBackToReading', targetUrl: jumpBackPos.url }, { frameId: 0 }).catch(() => null)
+        didBack = !!(r && r.ok)
+      } catch {}
+    }
+    if (didBack) {
+      // 浏览器 back 已触发，WeRead 原生恢复阅读位置；清掉旧 pendingJump 防被恢复页消费干扰
+      try { await chrome.storage.local.remove('pendingJump') } catch {}
+    } else {
+      // back 守卫拒绝 / 非跨章画布书 / DOM 书 → URL 导航回原章（reload 后由恢复机制定位）
+      const ts = Date.now()
+      if (!isCanvas && jumpBackPos.anchorText && bookId) {
+        await chrome.storage.local.set({
+          pendingJump: { bookId, selectedText: jumpBackPos.anchorText, position: 'start', ts },
+        })
+      } else if (isCanvas && jumpBackPos.canvasFrac != null && bookId) {
+        await chrome.storage.local.set({
+          pendingJump: { bookId, canvasScroll: true, canvasFrac: jumpBackPos.canvasFrac, ts },
+        })
+      } else {
+        try { await chrome.storage.local.remove('pendingJump') } catch {}
+      }
+      if (tab) await chrome.tabs.update(tab.id, { url, active: true })
+    }
+    postSidebarDebug({
+      stage: 'jump-back', action: didBack ? 'history-back' : 'navigate',
+      isCanvas, uid, crossChapter: jumpBackPos.crossChapter, didBack, url: url.slice(0, 90),
+      hasFrac: jumpBackPos.canvasFrac != null,
+    })
     jumpBackPos = null
     await clearJumpBack()
     renderJumpBack()
@@ -1537,6 +1663,7 @@ async function loadHistory() {
 const jumpFab = document.getElementById('jump-fab')
 const jumpListEl = document.getElementById('jump-list')
 let _jumpTargets = []  // 与浮窗列表条目一一对应的用户消息元素
+let _jumpBarWinStart = 0  // AI-015：折叠横杠窗口在 _jumpTargets 里的起始序号（= 面板列表视口顶部）
 
 // 提取一条用户消息的提问摘要：跳过引用行（> 开头）和 [引用] 头部，取首行正文
 function questionSnippet(el) {
@@ -1562,8 +1689,11 @@ function collectQuestions() {
   return out
 }
 
-// 折叠态横杠数量随提问数动态变化：<10 有几条显示几条，≥10 只显示 10 条
-//（更多提问靠展开面板的滚动条查看）。0 条提问时整个浮窗隐藏。
+// 折叠态（面板收起）右缘把手横杠 = 面板列表视口的缩影（约 10 条窗口）：
+// 窗口起点 = 面板列表视口顶部（listWindowStart），条 i = 提问 winStart+i（1:1），
+// 高亮 = 当前提问所在条（active - winStart，按它实际在窗口内的位置，不强制置为最后一条）。
+// 展开态（面板打开）时把手列隐藏，每根横杠内嵌到对应列表项的右侧、随列表一起滚动
+// （见 renderJumpList / sidebar.html）。0 条提问时整个浮窗隐藏。
 // 计算当前视口所在的「提问+回答」域对应的提问序号：提问 i 与其回答构成一个域，
 // 顶部已滚过、且最靠下的那个提问即为当前域。视口落在哪个域，就高亮哪根横杠。
 function computeJumpActive() {
@@ -1590,27 +1720,82 @@ function computeJumpActive() {
   return active
 }
 
-// 把选中态落到折叠横杠上：与当前域对应的那根横杠高亮（超出已显示条数则不高亮）
+// 面板列表当前视口顶部的提问序号 = 折叠横杠窗口的起点（列表滚动时用它让折叠列镜像视口）。
+// 与 computeJumpActive 同理：取"顶部已滚过、且最靠下"的那个，即视口顶部那条。
+// 滚到底部只剩不足 10 条时返回视口第一条，窗口起点由调用方 clamp 到 n-10。
+function listWindowStart() {
+  const list = jumpListEl
+  if (!list) return 0
+  const items = list.querySelectorAll('.jump-item')
+  const n = items.length
+  if (n === 0) return 0
+  const listRect = list.getBoundingClientRect()
+  let start = -1
+  for (let i = 0; i < n; i++) {
+    const relTop = items[i].getBoundingClientRect().top - listRect.top
+    if (relTop <= 8) { start = i; continue }
+    break
+  }
+  if (start === -1) start = 0
+  return start
+}
+
+// 把选中态落到折叠横杠上：active 映射到窗口内条号（active - 窗口起点）
 function applyJumpBarActive(active) {
   const btn = document.getElementById('jump-fab-btn')
   if (!btn) return
-  btn.querySelectorAll('.jbar').forEach((b, i) => b.classList.toggle('sel', i === active))
+  const idx = active - _jumpBarWinStart
+  btn.querySelectorAll('.jbar').forEach((b, i) => b.classList.toggle('sel', i === idx))
+}
+
+// 当前提问变化时统一入口（聊天滚动、消息增删都走这里）。
+// AI-015：折叠横杠窗口 = 面板列表视口的缩影，选中态只标在当前提问实际所在的那一格
+// （active - winStart），不再把窗口终点硬锚到当前提问——否则面板里选中第 7 条、关回后
+// 横杠却永远是最后一个（此前 bug）。面板展开时窗口完全镜像列表视口（列表滚动由下方
+// 监听维护）；面板收起时窗口是上次镜像的视口，仅在当前提问滑出窗口时才被拉回：
+// 从窗口顶部滑出 → 窗口贴它（第 1 格），从底部滑出 → 窗口贴它（最后 1 格）。
+// 前 9 条提问时窗口贴顶、高亮随序号前移；≤10 问时窗口恒为 [0..n-1]，条 i ↔ 提问 i。
+function syncJumpBar(active) {
+  if (active === undefined) active = computeJumpActive()
+  const n = _jumpTargets.length
+  if (n === 0) { _jumpBarWinStart = 0; return }
+  const maxStart = Math.max(0, n - 10)
+  if (jumpFab.classList.contains('open')) {
+    // 面板展开：折叠列隐藏，窗口 = 列表视口的实时镜像（起点取视口顶部那条）
+    _jumpBarWinStart = Math.min(listWindowStart(), maxStart)
+    applyJumpBarActive(active)
+    return
+  }
+  // 面板收起：保留镜像到的视口；当前提问滑出窗口才按最靠近的一侧拉回
+  if (active < _jumpBarWinStart) _jumpBarWinStart = active
+  else if (active >= _jumpBarWinStart + 10) _jumpBarWinStart = active - 9
+  _jumpBarWinStart = Math.min(_jumpBarWinStart, maxStart)
+  applyJumpBarActive(active)
 }
 
 function renderJumpBars() {
   if (!jumpFab) return
+  _jumpTargets = collectQuestions()  // 折叠态也能算当前域
   const btn = document.getElementById('jump-fab-btn')
   if (!btn) return
-  _jumpTargets = collectQuestions()  // 折叠态也能算当前域
-  const n = Math.min(_jumpTargets.length, 10)
+  const n = _jumpTargets.length
   btn.innerHTML = ''
-  for (let i = 0; i < n; i++) {
+  if (n === 0) {
+    _jumpBarWinStart = 0
+    jumpFab.style.display = 'none'
+    return
+  }
+  const w = Math.min(n, 10)  // 收起时只显示当前视口窗口的横杠（最多 10 条）
+  const wrap = document.createElement('div')
+  wrap.className = 'jbar-wrap'
+  for (let i = 0; i < w; i++) {
     const bar = document.createElement('span')
     bar.className = 'jbar'
-    btn.appendChild(bar)
+    wrap.appendChild(bar)
   }
-  jumpFab.style.display = _jumpTargets.length === 0 ? 'none' : ''
-  applyJumpBarActive(computeJumpActive())
+  btn.appendChild(wrap)
+  jumpFab.style.display = ''
+  syncJumpBar()
 }
 
 // 完整内容 tooltip：在卡片内条目上方显示，避开右缘把手
@@ -1668,17 +1853,20 @@ function updateJumpActive() {
   const items = jumpListEl.querySelectorAll('.jump-item')
   items.forEach((it, i) => it.classList.toggle('active', i === active))
   // 让高亮项在面板内保持可见：手动算 scrollTop，不用 scrollIntoView——
-  // scrollIntoView 在 #msgs 的滚动事件里调用，会取消正在进行的平滑滚动
+  // scrollIntoView 在 #msgs 的滚动事件里调用，会取消正在进行的平滑滚动。
+  // AI-015：keep-in-view——当前项已在面板视口内就不滚动（保留用户正在浏览的位置，
+  // 折叠列也能按它实际在视口里的位置高亮）；只有滑出视口才从边缘拉回。此前强制置顶
+  // 会打断浏览，且让选中格永远顶到视口第 1 格（用户报告折叠列永远是最后/第 1 格的根因之一）。
   if (items[active] && jumpListEl) {
     const listRect = jumpListEl.getBoundingClientRect()
-    const itemRect = items[active].getBoundingClientRect()
-    if (itemRect.top < listRect.top) {
-      jumpListEl.scrollTop += itemRect.top - listRect.top
-    } else if (itemRect.bottom > listRect.bottom) {
-      jumpListEl.scrollTop += itemRect.bottom - listRect.bottom
+    const r = items[active].getBoundingClientRect()
+    if (r.top < listRect.top) {
+      jumpListEl.scrollTop += r.top - listRect.top - 2
+    } else if (r.bottom > listRect.bottom) {
+      jumpListEl.scrollTop += r.bottom - listRect.bottom + 2
     }
   }
-  applyJumpBarActive(active)  // 同步折叠横杠的选中态
+  syncJumpBar(active)  // AI-015：同步折叠横杠（窗口镜像列表视口 + 选中格按实际位置高亮）
 }
 
 function renderJumpList() {
@@ -1700,12 +1888,15 @@ function renderJumpList() {
     span.className = 'jump-text'
     span.textContent = text
     item.appendChild(span)
+    const bar = document.createElement('span')  // AI-014：每项右侧横杠，随列表一起滚动
+    bar.className = 'jbar'
+    item.appendChild(bar)
     item.addEventListener('click', () => {
       // 跳转后保持面板打开（仿 DeepSeek 滚动导航），高亮随滚动定位到目标提问，
       // 便于连续跳转；移出卡片自动收起
       jumpToQuestion(el)
     })
-    // 文本被省略（超宽）时，悬停用 tooltip 显示完整内容
+    // 文本被省略（超宽）时，悬停用 tooltip 显示完整内容（横杠 hover 由 CSS :hover 处理）
     item.addEventListener('mouseenter', () => {
       if (span.scrollWidth > span.clientWidth + 1) showJumpTip(item, text)
     })
@@ -1716,13 +1907,19 @@ function renderJumpList() {
 }
 
 function openJumpPanel() {
+  const wasOpen = jumpFab.classList.contains('open')
   jumpFab.classList.add('open')
-  renderJumpList()
+  // AI-014：已展开时再次移入（fab mouseenter 每进一次都触发）不再重建列表，
+  // 避免项内横杠的 transition 被重置造成闪烁；消息增删由 MutationObserver 负责刷新
+  if (!wasOpen) renderJumpList()
 }
 
 function closeJumpPanel() {
   jumpFab.classList.remove('open')
   hideJumpTip()
+  // AI-015：关回后折叠列 = 面板最后视口的缩影；若用户浏览列表时把当前提问滑出了
+  // 该视口，这里把窗口拉回选中项周围（保持在窗口内、按最近一侧显示）
+  syncJumpBar()
 }
 
 // 仿 DeepSeek：悬停小横杠自动展开提问列表，移出（含面板区域）延迟收起。
@@ -1758,8 +1955,21 @@ if (_jumpMsgsEl) {
     if (jumpFab.classList.contains('open')) {
       updateJumpActive()
     } else {
-      applyJumpBarActive(computeJumpActive())  // 折叠态：滚动时同步当前域的横杠选中
+      syncJumpBar()  // AI-015：折叠态滚动聊天时同步当前域高亮（窗口仅在选中项滑出时移动）
     }
+  }, { passive: true })
+}
+// AI-015：面板列表滚动只把折叠横杠窗口同步到列表视口（listWindowStart），改的是窗口
+// 起点、不动选中态——选中态只由聊天当前提问（computeJumpActive）决定。此前版本在列表
+// 滚动时把列表位置当选中项去驱动折叠横杠，导致面板关回后折叠列显示的是列表位置而非
+// 被选中提问（用户报告的 bug）。面板展开时折叠列隐藏，此同步是为关回后"折叠列 = 面板
+// 最后视口的缩影"：选中项落在该视口内就按实际位置高亮（第 7 条→第 7 格），落在外则由
+// closeJumpPanel 里的 syncJumpBar 把窗口拉回选中项周围。
+if (jumpListEl) {
+  jumpListEl.addEventListener('scroll', () => {
+    if (!jumpFab.classList.contains('open')) return
+    _jumpBarWinStart = Math.min(listWindowStart(), Math.max(0, _jumpTargets.length - 10))
+    applyJumpBarActive(computeJumpActive())
   }, { passive: true })
 }
 

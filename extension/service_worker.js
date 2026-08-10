@@ -10,6 +10,12 @@
 
 const RECEIVER = 'http://127.0.0.1:7239'
 
+// AI-012：放开 chrome.storage.session 给 content script 用。默认访问级别是
+// TRUSTED_CONTEXTS（仅扩展页面/后台），content script 属于 untrusted context——
+// 此前 content.js 里的 readSharedChapter/persistSharedChapter 一直在静默失败，
+// 跨帧共享章节（coreadChapter）从未真正生效，画布书跳回章节捕获为 0。
+chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' }).catch(() => {})
+
 self.addEventListener('fetch', event => {
   const url = event.request.url
   if (!url.includes('weread.qq.com/web/book/chapter/e_')) return
