@@ -694,6 +694,25 @@ function extractTakeaway(reply) {
 // ── 会话中实时记忆（MEMORIZE 协议） ─────────────────────────────────────────
 // LLM 在回复末尾发 【MEMORIZE:profile|soul】标记（见 AGENT.md），
 // 这里解析它、剥离它（不让用户看到标记）、就地合并进对应的记忆文件。
+
+// profile 与 soul 的语义定义（AI-013）：合并时把"这个文件是什么、能写什么"喂给 LLM，
+// 防止模型把两者混为一谈——历史故障里 soul.md 曾被用户画像内容整段覆盖。
+const MEMORY_SPECS = {
+  profile: {
+    file: 'profile.md',
+    maxChars: 400,
+    purpose: '用户的长期阅读画像：品味、关注主题、思维习惯、知识背景',
+    scope: '只写用户的事实、品味、知识背景与思维习惯；不要写入你自己的立场、观点或相处方式',
+  },
+  soul: {
+    file: 'soul.md',
+    maxChars: 400,  // 250→400：旧规则易被压缩挤掉，放宽后模型更倾向保留原规则
+    purpose: '你自己的自画像：讨论中形成的立场、共识与分歧、与用户相处的方式、行为要求',
+    scope: '只写你自己的立场与行为规则，并完整保留原内容中已有的行为规则；绝不写入用户的画像类内容',
+  },
+}
+const MEMORY_SPEC_LIST = Object.keys(MEMORY_SPECS).map(type => ({ type, ...MEMORY_SPECS[type] }))
+
 function extractMemorize(reply) {
   const m = String(reply || '').match(/【MEMORIZE:(profile|soul)】\s*([\s\S]+?)\s*$/)
   return m ? { target: m[1], content: m[2].trim() } : null
@@ -706,19 +725,20 @@ function stripMemorize(text) {
 
 // 把一条待记住的内容就地合并进 profile.md / soul.md（一次小 LLM 调用）
 async function runMemoryMerge(target, memory) {
-  const file = target === 'profile' ? 'profile.md' : 'soul.md'
-  const maxChars = target === 'profile' ? 400 : 250
+  const spec = MEMORY_SPECS[target] || MEMORY_SPECS.profile
+  const { file, maxChars } = spec
   const filePath = path.join(AGENT_DIR, file)
   const oldContent = readIfExists(filePath)
   if (oldContent) {
     try { fs.copyFileSync(filePath, filePath + '.bak') } catch {}
   }
   const prompt = `用户刚刚在对话中表达了值得长期记住的内容：\n\n${memory}\n\n` +
-    `请把它合入当前的 ${file}：若有重复则合并覆盖，若无则补充进去，` +
-    `保持精简，删去被覆盖的旧条目。\n\n` +
+    `请把它合入当前的 ${file}（${spec.purpose}）。\n` +
+    `要求：${spec.scope}。\n` +
+    `若有重复则合并覆盖，若无则补充进去，保持精简，删去被覆盖的旧条目。\n\n` +
     `只输出合并后的完整 ${file} 内容（≤${maxChars}字），不要输出任何其他文字、标记或说明。\n\n` +
     `原内容：\n${oldContent || '（尚无记录）'}`
-  const content = await rewriteWithRetry(target, prompt)
+  const content = await rewriteWithRetry(target, prompt, maxChars)
   if (content) {
     fs.writeFileSync(filePath, content + '\n')
     console.log(`  ✓ ${file} 已就地更新（memory trigger）`)
@@ -777,13 +797,10 @@ async function saveSessionMemory({ minMsgs = 2 } = {}) {
   console.log(`\n正在固化本次会话记忆（${msgs.length} 条对话）...`)
   const transcript = transcriptText(msgs)
 
-  const specs = [
-    { type: 'profile', file: 'profile.md', maxChars: 400 },
-    { type: 'soul', file: 'soul.md', maxChars: 250 },
-  ]
+  const specs = MEMORY_SPEC_LIST
   let anyWritten = false
 
-  for (const { type, file, maxChars } of specs) {
+  for (const { type, file, maxChars, purpose, scope } of specs) {
     const filePath = path.join(AGENT_DIR, file)
     const oldContent = readIfExists(filePath)
 
@@ -793,12 +810,13 @@ async function saveSessionMemory({ minMsgs = 2 } = {}) {
     }
 
     const prompt = `会话即将结束。以下是本次讨论的记录：\n\n${transcript}\n\n` +
-      `请从上面的讨论中提炼出与用户相关的新认知，与以下 ${file} 原内容合并，` +
+      `请从上面的讨论中提炼出属于 ${file}（${purpose}）的新内容，与以下原内容合并，` +
       `输出完整的重写版本（删去被覆盖的旧条目，保持精简）。\n\n` +
+      `要求：${scope}。\n\n` +
       `只输出合并后的完整 ${file} 内容（≤${maxChars}字），不要输出任何其他文字、标记或说明。\n` +
-      `无新认知则原样输出原内容。\n\n原内容：\n${oldContent || '（尚无记录）'}`
+      `本次讨论若没有属于 ${file} 的新内容，则原样输出原内容。\n\n原内容：\n${oldContent || '（尚无记录）'}`
 
-    let content = await rewriteWithRetry(type, prompt)
+    let content = await rewriteWithRetry(type, prompt, maxChars)
     if (content) {
       fs.writeFileSync(filePath, content + '\n')
       anyWritten = true
@@ -825,12 +843,23 @@ async function recoverUnmergedMemory() {
   console.log('✅ 记忆恢复完成。\n')
 }
 
-async function rewriteWithRetry(type, prompt) {
+// AI-012：推理型模型偶尔把思考草稿当成最终输出返回（明显长于目标上限，或复述了任务指令）。
+// 此类内容绝不能写进 profile/soul（会覆盖长期记忆），判为"垃圾输出"并触发重试。
+function isMergeOutputGarbage(text, maxChars) {
+  const t = String(text || '')
+  if (t.replace(/\s/g, '').length > maxChars * 3) return true  // 远超目标上限 → 是思考草稿而非精简产物
+  if (t.includes('原内容：') || t.includes('注意字数限制') || t.includes('maxChars')) return true  // 复述了任务指令
+  return false
+}
+
+async function rewriteWithRetry(type, prompt, maxChars) {
   const MIN_LEN = 30  // 去空白后最少 30 字
   const META = '_meta'  // AI-001：记忆重写是元任务，用独立历史，不污染任何书的上下文
 
   for (let attempt = 0; attempt < 2; attempt++) {
-    const resp = await say(prompt, { maxTokens: 1200, bookKey: META })
+    // AI-012：maxTokens 从 1200 提到 4096——推理型模型先思考再输出，1200 常被思考耗尽、
+    // 最终产物还没写完就被截断（截断的思考草稿正是 soul.md 被写乱的原因）。
+    const resp = await say(prompt, { maxTokens: 4096, bookKey: META })
     // say() 成功时把 {role:'user'} + {role:'assistant'} 推入了 META 历史；
     // say() 失败时返回 "⚠️ ..." 且已自行 pop 掉它 push 的 user 消息（净变化 0）。
     // 下面是 LLM 对单任务的回复，整段即是目标内容，无需正则切割。
@@ -843,16 +872,19 @@ async function rewriteWithRetry(type, prompt) {
     }
 
     const stripped = content.replace(/\s/g, '')
-    if (stripped.length >= MIN_LEN) return content
+    if (stripped.length >= MIN_LEN && !isMergeOutputGarbage(content, maxChars)) return content
 
-    // 校验失败（成功但太短）：从 META 历史里摘掉这次的 user+assistant 再重试。
+    // 校验失败（太短 / 思考草稿）：从 META 历史里摘掉这次的 user+assistant 再重试。
     // 只有 say() 成功时 META 历史才多了这两条；失败路径已在 say() 内平衡，不能 pop，
     // 否则会删掉上一轮真实对话。
-    console.log(`  ⚠️ ${type} 第 ${attempt + 1} 次校验未通过（去空白 ${stripped.length} 字），重试...`)
+    const reason = stripped.length < MIN_LEN
+      ? `去空白仅 ${stripped.length} 字，太短`
+      : '输出像思考草稿（字数远超上限或复述了任务指令）'
+    console.log(`  ⚠️ ${type} 第 ${attempt + 1} 次校验未通过（${reason}），重试...`)
     const metaHist = histFor(META)
     metaHist.pop()  // 移除这次的 assistant 回复
     metaHist.pop()  // 移除这次的 user 消息
-    prompt = `上一次的输出太短或为空（去空白仅 ${stripped.length} 字）。请重新输出合并后的完整内容，不要省略。`
+    prompt = `上一次的输出未通过校验（${reason}）。请重新输出合并后的完整内容（≤${maxChars}字）：直接给最终结果，不要任何推理过程、字数计算或说明。`
   }
 
   return null
