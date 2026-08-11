@@ -15,6 +15,7 @@ import path from 'path'
 import readline from 'readline'
 import { fileURLToPath } from 'url'
 import { execSync } from 'child_process'
+import { processStackMessage } from './lib/topic-stack.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const AGENT_DIR = __dirname
@@ -29,6 +30,8 @@ const CHAT_OUTPUT = path.join(INBOX_DIR, 'chat_output.jsonl')
 const _repliedFingerprints = new Set()  // 去重：防止同一消息被重复回复
 const STOP_FILE = path.join(AGENT_DIR, '.stop')  // stop.bat 写入哨兵 → poller 检测后优雅保存退出
 const JOURNAL_FILE = path.join(AGENT_DIR, 'session_journal.jsonl')  // 会话流水账：强杀/断电后启动时恢复记忆
+const TOPIC_STACK_FILE = path.join(AGENT_DIR, 'topic_stack.json')  // 会意讨论栈（AI-016/Q2.5）：跨会话持久化，等待归并
+const TOPIC_PENDING_FILE = path.join(AGENT_DIR, 'topic_pending.jsonl')  // 待归类桶：收口讨论组 {ts, entries} 纯追加
 
 const API_KEY = process.env.COREAD_API_KEY
 const API_BASE = (process.env.COREAD_API_BASE || '').replace(/\/$/, '')
@@ -389,11 +392,13 @@ function htmlTitle(text) {
   return match ? match[1].replace(/<[^>]+>/g, '').trim() : ''
 }
 
-async function callLLMOnce(maxTokens = 8192, hist = []) {
+async function callLLMOnce(maxTokens = 8192, hist = [], opts = {}) {
+  const system = opts.system !== undefined ? opts.system : SYSTEM  // 判定调用可覆盖 SYSTEM（避免阅读助手指令干扰判定）
   const body = JSON.stringify({
     model: MODEL,
-    messages: [{ role: 'system', content: SYSTEM }, ...hist],
+    messages: [{ role: 'system', content: system }, ...hist],
     max_tokens: maxTokens,
+    ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
     tool_choice: 'none',
   })
 
@@ -530,11 +535,11 @@ async function* callLLMStream(maxTokens = 8192, hist = []) {
   return fullContent
 }
 
-async function callLLM(maxTokens = 8192, hist = []) {
+async function callLLM(maxTokens = 8192, hist = [], opts = {}) {
   let lastErr
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      return await callLLMOnce(maxTokens, hist)
+      return await callLLMOnce(maxTokens, hist, opts)
     } catch (e) {
       lastErr = e
       // 超时、网络错误、服务端错误均可重试
@@ -661,7 +666,8 @@ async function say(userText, options = {}) {
   }
 
   hist.push({ role: 'assistant', content: displayContent })
-  if (key !== '_meta') journalAppend({ kind: 'msg', bookKey: key, role: 'assistant', content: displayContent })
+  // assistantSelected：本条 AI 回复针对的划线（侧栏带划线提问时由调用方传入），供会意栈重启恢复降级背景轮次
+  if (key !== '_meta') journalAppend({ kind: 'msg', bookKey: key, role: 'assistant', content: displayContent, ...(options.assistantSelected ? { assistantSelected: options.assistantSelected } : {}) })
   return stripCodeBlocks(displayContent)
 }
 
@@ -689,6 +695,104 @@ function saveTakeaway(ann, takeaway) {
 function extractTakeaway(reply) {
   const match = reply.match(/【TAKEAWAY】(.+)/)
   return match ? match[1].trim() : null
+}
+
+// ── 会意讨论栈（AI-016 / Q2.5）────────────────────────────────────────────
+// 专题化讨论栈跨会话持久化：topic_stack.json 存栈，topic_pending.jsonl 纯追加收口讨论组。
+// 本模块只负责接消息喂栈、归档收口讨论组；不参与判专题化/判同一性（在 lib/topic-stack.js）。
+function readTopicStack() {
+  try {
+    const raw = fs.readFileSync(TOPIC_STACK_FILE, 'utf8')
+    const arr = JSON.parse(raw)
+    return Array.isArray(arr) ? arr : []
+  } catch {
+    return []
+  }
+}
+
+function saveTopicStack(stack) {
+  if (fs.existsSync(TOPIC_STACK_FILE)) fs.copyFileSync(TOPIC_STACK_FILE, TOPIC_STACK_FILE + '.bak')  // 先备份，后读写（用户本地数据）
+  fs.writeFileSync(TOPIC_STACK_FILE, JSON.stringify(stack, null, 2))
+}
+
+// 收口讨论组 {ts, entries} 纯追加进待归类桶（与设计文档一致：桶条目 = 讨论组本身）。
+// 类似 journalAppend：append 不备份。ts 已是收口时间戳，不再叠加写入时间。
+function appendTopicPending(group) {
+  fs.appendFileSync(TOPIC_PENDING_FILE, JSON.stringify(group) + '\n')
+}
+
+// 从会话流水账恢复"上一轮 AI 回复"：对话流紧邻上一条 assistant 消息的内容
+// （以及它针对的划线，如果有）。扫描倒序，取第一条 kind:'msg' 且 role:'assistant'。
+// 划线来自 journal 的 assistantSelected 字段（say() 在 options.assistantSelected 存在时写入）。
+function lastAssistantFromJournal() {
+  try {
+    const raw = fs.readFileSync(JOURNAL_FILE, 'utf8')
+    const lines = raw.split('\n')
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim()
+      if (!line) continue
+      let e
+      try { e = JSON.parse(line) } catch { continue }
+      if (e?.kind === 'msg' && e?.role === 'assistant' && String(e?.content || '').trim()) {
+        return {
+          content: String(e.content),
+          selected: e.assistantSelected && String(e.assistantSelected.text || '').trim() ? e.assistantSelected : undefined,
+        }
+      }
+    }
+  } catch {}
+  return null
+}
+
+// callLLM(maxTokens, hist, opts) 与模块约定的 callLLM(prompt, maxTokens) 参数顺序相反，包一层。
+// 判定调用不带阅读助手 SYSTEM（避免 MEMORIZE/TAKEAWAY 等指令干扰判定格式），用最小判定系统；
+// temperature: 0 保证判定确定性（与冒烟脚本一致）。
+const JUDGE_SYSTEM = '你只负责按用户的指令输出要求格式的结果，不附加任何解释。'
+function judgeLLM(prompt, maxTokens) {
+  return callLLM(maxTokens || 2048, [{ role: 'user', content: prompt }], { system: JUDGE_SYSTEM, temperature: 0 })
+}
+
+// 从聊天消息提取划线结构体 { text, book, chapter }（无划线返回 undefined）。供 selected / journal 记录复用。
+function selectionFromMsg(msg) {
+  return msg && msg.selectedText
+    ? { text: msg.selectedText, book: msg.bookTitle || '', chapter: msg.chapter || '' }
+    : undefined
+}
+
+// 把聊天消息组装成栈模块协议：{ userNote, selected?, assistantContext? }
+function buildTopicUnit(msg, lastReply, lastReplySelected) {
+  const unit = { userNote: msg.content }
+  const sel = selectionFromMsg(msg)
+  if (sel) unit.selected = sel
+  if (lastReply) {
+    unit.assistantContext = { content: lastReply }
+    if (lastReplySelected) unit.assistantContext.selected = lastReplySelected
+  }
+  return unit
+}
+
+let topicStack = []  // 会意讨论栈运行时态：main 启动时 readTopicStack() 加载，driveTopicStack 内部读写
+
+// 喂一条用户消息进会意栈；AI 回复追加进栈（P1：栈条目 = 用户轮次 + AI 回复，判同一性需完整上下文）；
+// 收口时归档讨论组。任何异常都不影响主回复（try/catch 隔离）。
+async function driveTopicStack(unit, reply) {
+  try {
+    const r = await processStackMessage(topicStack, unit, {
+      callLLM: judgeLLM,
+      maxTokens: 2048,
+      log: (m) => console.log(`  [会意栈] ${m}`),
+    })
+    if (r.action === 'ignored') return  // 忽略：栈未变，不写盘
+    // AI 回复是针对本条用户消息的（带它的划线），追加进新栈（pushed 或 closed_and_pushed 的新栈）
+    topicStack = [...r.stack, { role: 'assistant', content: String(reply || '').trim(), ...(unit.selected ? { selected: unit.selected } : {}) }]
+    saveTopicStack(topicStack)
+    if (r.action === 'closed_and_pushed' && r.closed) {
+      appendTopicPending(r.closed)
+      console.log(`  [会意栈] 收口讨论组 → 待归类桶（ts=${r.closed.ts}, ${r.closed.entries.length} 轮）`)
+    }
+  } catch (e) {
+    console.log(`  [会意栈] 本轮跳过（不影响主回复）: ${e.message}`)
+  }
 }
 
 // ── 会话中实时记忆（MEMORIZE 协议） ─────────────────────────────────────────
@@ -1051,6 +1155,14 @@ async function main() {
   const had = await processNewAnnotations()
   if (!had) console.log('（暂无新标注。开始阅读后划线，我会接话。）\n')
 
+  // ⛔ 会意栈入口已注释：话题库（AI-016/Q2.5）未完成，暂不写 topic_stack.json / topic_pending.jsonl。
+  //    恢复接入时取消本段 + 侧栏循环 + REPL 循环三处注释。
+  // 会意栈运行时态：恢复上次会话的栈 + 上一轮 AI 回复（对话流紧邻上一条 assistant 消息，作降级判定材料）
+  // topicStack = readTopicStack()
+  // const lastAssist = lastAssistantFromJournal()
+  // let lastReply = lastAssist ? lastAssist.content : null
+  // let lastReplySelected = lastAssist ? lastAssist.selected : undefined
+
   rl.prompt()
 
   let busy = false
@@ -1134,11 +1246,17 @@ async function main() {
             userMsg += '\n\n（请在这轮回应结尾加一行：【TAKEAWAY】你的一句收口总结，15-30字）'
           }
         }
-        const reply = await say(userMsg, { bookKey: key })
+        const reply = await say(userMsg, { bookKey: key, assistantSelected: selectionFromMsg(msg) })
         const takeaway = extractTakeaway(reply)
         // TAKEAWAY 只归属书级讨论；自由提问不写书级总结
         if (bookScoped && takeaway && currentAnn) { saveTakeaway(currentAnn, takeaway) }
         console.log('\n[侧栏] ' + stripCodeBlocks(reply) + '\n')
+        // ⛔ 会意栈入口已注释（话题库未完成，见 main 初始化段说明）
+        // 会意栈：喂当前消息（以上一轮 AI 回复为降级上下文）；收口时归档讨论组。
+        // lastReply/lastReplySelected 是"上一轮 AI 回复"——先喂栈（用旧值），再更新为本轮回复
+        // await driveTopicStack(buildTopicUnit(msg, lastReply, lastReplySelected), reply)
+        // lastReply = stripCodeBlocks(reply)
+        // lastReplySelected = selectionFromMsg(msg)
       }
       setChatInputCursor(inputs.length)
     } catch (e) { console.log(`⚠️ ${e.message}\n`) }
@@ -1188,6 +1306,11 @@ async function main() {
         }
 
         console.log('\n' + stripCodeBlocks(reply) + '\n')
+        // ⛔ 会意栈入口已注释（话题库未完成，见 main 初始化段说明）
+        // 会意栈：REPL 输入也是用户追问，喂进栈；REPL 无划线，selected 恒缺省
+        // await driveTopicStack(buildTopicUnit({ content: line }, lastReply, lastReplySelected), reply)
+        // lastReply = stripCodeBlocks(reply)
+        // lastReplySelected = undefined
       }
     } catch (e) {
       console.log(`⚠️ ${e.message}\n`)
