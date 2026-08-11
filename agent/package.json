@@ -6,6 +6,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node --env-file-if-exists=.env index.js",
-    "coldstart": "node --env-file-if-exists=.env scripts/coldstart.js"
+    "coldstart": "node --env-file-if-exists=.env scripts/coldstart.js",
+    "test": "node --test",
+    "smoke": "node --env-file-if-exists=.env scripts/smoke-topicize.mjs",
+    "smoke:stack": "node --env-file-if-exists=.env scripts/smoke-stack.mjs"
   }
 }

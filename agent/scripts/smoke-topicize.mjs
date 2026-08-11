@@ -1,0 +1,127 @@
+#!/usr/bin/env node
+/**
+ * 判专题化（AI-016）真实 API 冒烟测试 — 端到端验证"模拟提问 → 真实模型 → 是否专题化"。
+ * 与单元测试（test/topicize.test.js，假 LLM 测代码逻辑）互补：本脚本测模型是否听话、判得准不准。
+ * 运行：npm run smoke（需 agent/.env 配置 COREAD_API_KEY / COREAD_API_BASE）
+ * 建议在改判据 / 改指令 / 换模型后跑一次。
+ */
+import { buildTopicizePrompt, parseJudgeResult } from '../lib/topicize.js'
+
+// .env 由 npm run smoke（--env-file-if-exists=.env）加载，直接读 process.env
+const API_KEY = process.env.COREAD_API_KEY
+const API_BASE = (process.env.COREAD_API_BASE || '').replace(/\/$/, '')
+const MODEL = process.env.COREAD_MODEL || 'gpt-4o'
+if (!API_KEY || !API_BASE) throw new Error('.env 缺少 COREAD_API_KEY / COREAD_API_BASE')
+
+async function callLLMOnce(prompt) {
+  const resp = await fetch(`${API_BASE}/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 512,
+      temperature: 0, // 判定任务要确定性（docstring 中"建议固定低温度"的落点）
+      tool_choice: 'none',
+    }),
+  })
+  const raw = await resp.text()
+  if (!resp.ok) throw new Error(`API ${resp.status}: ${raw.slice(0, 200)}`)
+  const data = JSON.parse(raw)
+  const msg = data.choices?.[0]?.message
+  return (msg?.content || msg?.reasoning_content || '').trim()
+}
+
+// 模拟用户提问（判定材料=提问本身；sel 有值时附带划线，仅用于解析提问中的指代——
+// 2026-08-11 用户定调：边界情况若有对应划线要作为上下文加入，指代解析后该进就进；
+// 但词义/闲聊/情绪等无需划线的判定不能被划线内容带偏）。期望值 = 按 Q2 判据人工标定。
+// 依据列说明为什么标这个期望，供审阅。
+const GROUPS = [
+  {
+    title: '应专题化（有可推进内核）',
+    cases: [
+      { name: '机制+观点', note: '一个政权靠什么维持？我总觉得光靠暴力撑不久，那它还能靠什么？', expect: true, basis: '机制问题+用户观点，可推进' },
+      { name: '跨书应用', note: '"制度是外部条件的函数"这个讲法，放到今天的企业组织里还成立吗？', expect: true, basis: '可跨书应用' },
+      { name: '制度比较', note: '福利国家和自由放任模式，哪个更能维持自己的秩序？', expect: true, basis: '比较+机制' },
+      { name: '反例求解释', note: '如果人都是被位置决定的，那怎么解释出身底层却改写规则的人？', expect: true, basis: '分析性质疑' },
+      { name: '混合提问', note: '这段讲列宁对工人贵族的看法——这个理论现在还成立吗？有没有被后来的历史推翻？', expect: true, basis: '先事实后分析，含机制内核' },
+      { name: '没读懂问机制', note: '我没看懂这段，作者说秩序是内生的，这个内生到底是什么机制？', expect: true, basis: '虽带"没读懂"，追问的是机制' },
+      { name: '超短深问', note: '凭什么是她当权？', expect: true, basis: '合法性/机制问题' },
+      { name: '观点求漏洞', note: '我觉得列宁的工人贵族论有问题，它的漏洞在哪？', expect: true, basis: '反驳性可推进' },
+      { name: '假设推演', note: '如果苏联多撑二十年，工人贵族论还会被当作教条吗？', expect: true, basis: '机制推演' },
+      { name: '动机分析', note: '格里高利为什么背叛自己的立场？是性格还是处境？', expect: true, basis: '人物动机分析' },
+    ],
+  },
+  {
+    title: '不应专题化（一次答完 / 闲聊）',
+    cases: [
+      { name: '词义带深刻划线', note: '"代偿"这个词是什么意思？', sel: '制度是外部条件的函数，代价总是由最弱者代偿', expect: false, basis: '词义一次答完，划线深刻也不判（防带偏）' },
+      { name: '情节', note: '这个角色后来死了吗？', expect: false, basis: '情节事实' },
+      { name: '史实', note: '列宁的《怎么办》是哪一年写的？', expect: false, basis: '史实核实' },
+      { name: '认人', note: '书里那个"老头子"是谁？', expect: false, basis: '人物指认' },
+      { name: '读音', note: '这个字怎么读？', expect: false, basis: '读音' },
+      { name: '闲聊带划线', note: '你也读过这本书吗？觉得怎么样？', sel: '两种秩序交替统治这个小镇，每个家庭都被撕裂', expect: false, basis: '闲聊寒暄，划线不改变判定' },
+      { name: '出处核实', note: '这段是不是出自《论持久战》？', expect: false, basis: '文献核实' },
+      { name: '总结请求', note: '帮我总结一下这一章讲了什么', expect: false, basis: '服务性总结' },
+      { name: '情绪抒发带划线', note: '看哭了，这种书不能多看', sel: '他在两种秩序之间被撕成两半，最后谁也没有原谅他', expect: false, basis: '情绪抒发，无问题，划线不改变判定' },
+    ],
+  },
+  {
+    title: '边界/陷阱（措辞模糊，考验判据稳定性）',
+    cases: [
+      { name: '指代短问无划线', note: '那这个怎么维持？', expect: false, basis: '无划线可解析，指代不明 → 保守不进' },
+      { name: '指代短问有划线', note: '那这个怎么维持？', sel: '一个政权想维持自己的秩序，光靠暴力撑不久', expect: true, basis: '划线解析"这个"=秩序的维持 → 机制问题，该进' },
+      { name: '双问混合', note: '这个人是谁？以及他为什么能控制整个村子？', expect: true, basis: '第二问是机制，整体有内核' },
+      { name: '前置陈述+比较', note: '我查了史料，这种制度明代就有雏形，它跟苏联的制度是一回事吗？', expect: true, basis: '比较分析' },
+      { name: '审美评价带划线', note: '你觉得这本书的结尾写得好吗？', sel: '老人认出故人，两人对坐无语', expect: false, basis: '主观评价一次答完，划线不改变判定' },
+      { name: '荐书', note: '关于这个话题还有哪些书值得读？', expect: false, basis: '荐书一次答完' },
+      { name: '哲学空泛带划线', note: '人生到底有什么意义？', sel: '格里高利在两种秩序间来回摇摆', expect: false, basis: '空泛与划线脱钩，不拔高成空话' },
+      { name: '反问带立场', note: '难道秩序真的能靠暴力维持？', expect: true, basis: '反问即机制断言，可反驳可推进' },
+      { name: '情绪带内核', note: '我实在想不通，为什么这些制度能撑这么久还不崩？', expect: true, basis: '情绪外壳下是机制追问' },
+      { name: '长句多问', note: '为什么他能赢？是出身还是手段？赢了之后又靠什么坐稳？', expect: true, basis: '多问皆机制，可推进' },
+      { name: '反讽断言', note: '呵，秩序？不过是强者的遮羞布罢了，你觉得呢？', expect: true, basis: '带观点的机制断言，可反驳' },
+      { name: '书对照', note: '这和《1984》里说的那套有什么不同？', sel: '国家的统治建立在对言论的全面控制之上', expect: true, basis: '跨书比较分析（划线解析"那套"）' },
+      { name: '语无伦次无划线', note: '那个什么……就是那个……维持？', expect: false, basis: '无划线可解析，信息不足 → 保守不进' },
+      { name: '元问题', note: '你猜我为什么总问秩序的问题？', expect: false, basis: '自指闲聊，无内容内核' },
+      { name: '立场站队', note: '你站哪边？暴力派还是认同派？', expect: false, basis: '观点互动，无机制追问' },
+    ],
+  },
+]
+
+const CASES = GROUPS.flatMap((g) => g.cases.map((c) => ({ ...c, group: g.title })))
+// 用例名等宽对齐：名称最长 8 字，含中文/英文混合用 padEnd 按码点不够精确，统一补到 8
+const pad = (s) => String(s).padEnd(10)
+
+// 每个用例连跑 ROUNDS 轮：temperature 0 下判定应完全稳定，
+// 轮间结果不一致 = 模型在判据边界上摇摆（2026-08-10 抓到的"审美评价"两轮两结果）
+const ROUNDS = 3
+
+let totalHit = 0
+let unstable = 0
+console.log(`模型: ${MODEL} | temperature: 0 | 用例: ${CASES.length} × ${ROUNDS} 轮\n`)
+let lastGroup = null
+for (const c of CASES) {
+  if (c.group !== lastGroup) {
+    console.log(`=== ${c.group} ===`)
+    lastGroup = c.group
+  }
+  const rounds = []
+  let rawSample = ''
+  for (let r = 0; r < ROUNDS; r++) {
+    const raw = await callLLMOnce(buildTopicizePrompt({ userNote: c.note, selected: c.sel ? { text: c.sel } : undefined }))
+    if (!rawSample) rawSample = raw
+    const parsed = parseJudgeResult(raw)
+    rounds.push(parsed ? (parsed.topicized ? '专' : '不') : '解失')
+  }
+  const expectSym = c.expect ? '专' : '不'
+  const hitCount = rounds.filter((r) => r === expectSym).length
+  const stable = new Set(rounds).size === 1
+  if (!stable) unstable++
+  totalHit += hitCount
+  const brief = rawSample.length > 55 ? rawSample.slice(0, 55).replace(/\n/g, '↵') + '…' : rawSample.replace(/\n/g, '↵')
+  const selPart = c.sel ? ` 划线: "${c.sel.length > 18 ? c.sel.slice(0, 18) + '…' : c.sel}"` : ''
+  console.log(`${hitCount === ROUNDS ? '✔' : '✘'} ${pad(c.name)}期望=${expectSym} | ${ROUNDS}轮判定: ${rounds.join('/')} | ${hitCount}/${ROUNDS}${stable ? '' : ' ⚠️不稳定'} | 提问: "${c.note}"${selPart}`)
+  if (hitCount < ROUNDS) console.log(`          原始输出样本: ${brief}`)
+}
+console.log(`\n命中率: ${totalHit}/${CASES.length * ROUNDS} | 不稳定用例(轮间摇摆): ${unstable}`)
+process.exitCode = totalHit === CASES.length * ROUNDS ? 0 : 1
