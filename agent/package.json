@@ -9,6 +9,9 @@
     "coldstart": "node --env-file-if-exists=.env scripts/coldstart.js",
     "test": "node --test",
     "smoke": "node --env-file-if-exists=.env scripts/smoke-topicize.mjs",
-    "smoke:stack": "node --env-file-if-exists=.env scripts/smoke-stack.mjs"
+    "smoke:stack": "node --env-file-if-exists=.env scripts/smoke-stack.mjs",
+    "judge:real": "node --env-file-if-exists=.env scripts/judge-real.mjs",
+    "extract:real": "node --env-file-if-exists=.env scripts/extract-real-cases.mjs",
+    "group:discussions": "node --env-file-if-exists=.env scripts/group-discussions.mjs"
   }
 }

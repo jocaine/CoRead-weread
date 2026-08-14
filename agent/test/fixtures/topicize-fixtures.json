@@ -1,0 +1,81 @@
+{
+  "_comment": "判专题化单元测试数据（AI-016）。数据与代码分离：test 从本文件读取输入，mock LLM 响应队列与断言仍留在测试代码里。",
+
+  "assistReply": "意义不是被发现的，而是每个人通过选择与行动定义出来的——萨特所谓\"存在先于本质\"。",
+
+  "inputs": {
+    "analytic": {
+      "bookTitle": "静静的顿河",
+      "chapter": "六",
+      "selected": { "text": "老人认出故人，两人对坐无语", "book": "静静的顿河", "chapter": "六" },
+      "userNote": "一种秩序靠什么维持得下去？维持条件是内生的还是外来的？"
+    },
+    "fact": {
+      "bookTitle": "静静的顿河",
+      "chapter": "一",
+      "selected": { "text": "格里高利翻身上马", "book": "静静的顿河", "chapter": "一" },
+      "userNote": "这人物原型是谁？"
+    },
+    "chitchat": {
+      "bookTitle": "静静的顿河",
+      "chapter": "一",
+      "selected": { "text": "格里高利翻身上马", "book": "静静的顿河", "chapter": "一" },
+      "userNote": "这本书你读着累不累？"
+    },
+    "noSelected": { "userNote": "为什么？" },
+    "withExchange": {
+      "selected": { "text": "x" },
+      "userNote": "为什么？",
+      "exchange": [
+        { "role": "user", "content": "再展开说说" },
+        { "role": "assistant", "content": "制度是外部位置的函数" }
+      ],
+      "context": "读者在制度的可复制性上反复交锋"
+    },
+    "downgradePrompt": {
+      "userNote": "那照这么说，宗教给人规定的意义又算什么？",
+      "assistantContext": { "content": "意义不是被发现的，而是每个人通过选择与行动定义出来的——萨特所谓\"存在先于本质\"。" },
+      "_downgrade": true
+    },
+    "pureWithAssist": {
+      "userNote": "为什么？",
+      "assistantContext": { "content": "意义不是被发现的，而是每个人通过选择与行动定义出来的——萨特所谓\"存在先于本质\"。" }
+    },
+    "downgradeCases": {
+      "selfKernel": {
+        "userNote": "一种秩序靠什么维持得下去？",
+        "assistantContext": { "content": "秩序是外部条件的函数。" }
+      },
+      "noAssist": { "userNote": "这词什么意思？" },
+      "carryOn": {
+        "userNote": "那照这么说，宗教给人规定的意义又算什么？",
+        "assistantContext": { "content": "意义不是被发现的，而是每个人通过选择与行动定义出来的——萨特所谓\"存在先于本质\"。" }
+      },
+      "pureReaction": {
+        "userNote": "嗯嗯，有道理",
+        "assistantContext": { "content": "意义不是被发现的，而是每个人通过选择与行动定义出来的——萨特所谓\"存在先于本质\"。" }
+      },
+      "laugh": {
+        "userNote": "哈哈哈",
+        "assistantContext": { "content": "意义不是被发现的，而是每个人通过选择与行动定义出来的——萨特所谓\"存在先于本质\"。" }
+      }
+    }
+  },
+
+  "parseCases": [
+    { "name": "专题化 → {topicized:true}", "text": "{\"topicized\":true}", "expect": true },
+    { "name": "不专题化 → {topicized:false}", "text": "{\"topicized\":false}", "expect": false },
+    { "name": "多余字段（kind/core 残留）被忽略不破坏解析", "text": "{\"topicized\":true,\"kind\":\"analytic\",\"core\":\"一种秩序靠什么维持\",\"reason\":\"y\"}", "expect": true },
+    { "name": "容忍 ```json 代码块围栏", "text": "```json\n{\"topicized\":true}\n```", "expect": true },
+    { "name": "模型带前言回显 → 从第一个 { 提取", "text": "我们只需要输出JSON。{\"topicized\":true}", "expect": true },
+    { "name": "前言+围栏+回显 → fallback 提取", "text": "```json\n我们只需要输出JSON。{\"topicized\":false}\n```", "expect": false },
+    { "name": "JSON 字符串值内嵌 } 是合法 JSON", "text": "{\"topicized\":true,\"note\":\"公式 x=1} 表示什么\"}", "expect": true },
+    { "name": "非 JSON 文本 → null", "text": "就是闲聊而已", "expect": null },
+    { "name": "非法 JSON → null", "text": "{\"topicized\": true,", "expect": null },
+    { "name": "缺 topicized → null", "text": "{}", "expect": null },
+    { "name": "只有 kind/core 无 topicized → null", "text": "{\"kind\":\"analytic\",\"core\":\"x\"}", "expect": null },
+    { "name": "topicized 非布尔（字符串）→ null", "text": "{\"topicized\":\"yes\"}", "expect": null },
+    { "name": "topicized 非布尔（数字）→ null", "text": "{\"topicized\":1}", "expect": null },
+    { "name": "空字符串 → null", "text": "", "expect": null }
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "_comment": "判同一性 + 讨论栈单元测试数据（AI-016 / Q2.5）。数据与代码分离：test 从本文件读取输入，mock LLM 响应队列与断言仍留在测试代码里。",
+
+  "sampleStack": [
+    { "role": "user", "content": "一个政权靠什么维持？光靠暴力撑不久", "selected": { "text": "老人认出故人，两人对坐无语", "book": "《静静的顿河》", "chapter": "六" } },
+    { "role": "assistant", "content": "维持靠的是一整套制度化安排，暴力只是最后的手段。" },
+    { "role": "user", "content": "那维持条件是内生的还是外来的？" }
+  ],
+
+  "messages": {
+    "continuation": { "userNote": "不对，我觉得制度自身的惯性才是关键" },
+    "switched": { "userNote": "列宁的工人贵族论为什么后来被抛弃了？" },
+    "chitchat": { "userNote": "哈哈这书真敢写" },
+    "openStack": { "userNote": "政权靠什么维持？", "selected": { "text": "老人认出故人", "book": "《静静的顿河》", "chapter": "六" } },
+    "nonTopic": { "userNote": "这个词什么意思？" },
+    "downgradeCarryOn": { "userNote": "那照这么说，宗教给人规定的意义又算什么？", "assistantContext": { "content": "意义是被创造的，不是被发现的。" } },
+    "downgradeCarryOnWithSel": {
+      "userNote": "那照这么说，宗教给人规定的意义又算什么？",
+      "assistantContext": {
+        "content": "意义是被创造的，不是被发现的。",
+        "selected": { "text": "老人认出故人，两人对坐无语", "book": "《静静的顿河》", "chapter": "六" }
+      }
+    },
+    "downgradeNoSel": { "userNote": "那照这么说，意义是主观的？", "assistantContext": { "content": "意义是被创造的。" } },
+    "normalTopicWithAssist": { "userNote": "一种秩序靠什么维持得下去？", "assistantContext": { "content": "无关的上一轮回复" } },
+    "downgradeStillNon": { "userNote": "嗯嗯", "assistantContext": { "content": "意义是被创造的。" } },
+    "switchedWithAssist": { "userNote": "列宁的工人贵族论为什么后来被抛弃了？", "assistantContext": { "content": "关于旧问题（秩序维持）的上一轮回复" } }
+  },
+
+  "selected": { "text": "老人认出故人，两人对坐无语", "book": "《静静的顿河》", "chapter": "六" },
+
+  "parseCases": [
+    { "name": "前言回显 → same:true", "text": "我们只需要输出JSON。{\"same\":true}", "expect": true },
+    { "name": "围栏包裹 → same:false", "text": "```json\n{\"same\":false}\n```", "expect": false },
+    { "name": "多余字段容忍 → same:true", "text": "{\"same\":true,\"note\":\"承接上一轮\"}", "expect": true },
+    { "name": "缺 same → null", "text": "{}", "expect": null },
+    { "name": "same 非布尔 → null", "text": "{\"same\":\"yes\"}", "expect": null },
+    { "name": "非 JSON 文本 → null", "text": "闲聊", "expect": null }
+  ]
+}
