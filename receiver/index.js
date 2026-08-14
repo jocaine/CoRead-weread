@@ -66,8 +66,10 @@ setInterval(() => {
 }, 100)
 
 function bookDir(bookId) {
-  // 归一化：去掉微信读书的 k-suffix 会话变体，一本书只对应一个目录
-  const normalized = baseBookId(bookId)
+  // 归一化：去掉微信读书的 k-suffix 会话变体，一本书只对应一个目录。
+  // 再做路径安全化：即使 bookId 夹带 '..' / 分隔符，落点仍在 BOOKS_DIR 内
+  // （空结果回退 '_invalid'，不塌缩到根目录）。
+  const normalized = sanitizePathPart(baseBookId(bookId)) || '_invalid'
   const d = path.join(BOOKS_DIR, normalized)
   fs.mkdirSync(path.join(d, 'chapters'), { recursive: true })
   return d
@@ -75,6 +77,28 @@ function bookDir(bookId) {
 
 function baseBookId(bookId) {
   return String(bookId || '').replace(/k[0-9a-f]{16,}$/i, '')
+}
+
+// 路径安全化：只保留字母数字、下划线、连字符，剥离路径分隔符、点与 '..'，
+// 杜绝 bookId/chapterUid 夹带路径穿越（评审 P1）。微信读书的 bookId 与章节
+// 文件名只用到这些字符，不影响正常目录/文件名。
+function sanitizePathPart(id) {
+  return String(id || '').replace(/[^A-Za-z0-9_-]/g, '')
+}
+
+// GET 数据接口只允许扩展来源调用：阻止任意网页触发本地端扫描/建目录/读数据。
+// 扩展页面因 host_permissions 绕过 CORS，请求不带 Origin 头（实测 Sec-Fetch-Mode:cors / Sec-Fetch-Dest:empty）。
+// 任意网页的 fetch 必带 Origin（白名单拦）；<img>/导航/脚本客户端(curl) 的 Sec-Fetch 值不同（no-cors/image/navigate/缺失）。
+function originAllowed(origin, req) {
+  if (String(origin || '').includes('weread.qq.com')
+    || String(origin || '').startsWith('chrome-extension://')) return true
+  // 无 Origin：仅放行扩展页/内容脚本发起的浏览器请求指纹
+  if (!origin) {
+    const mode = req.headers['sec-fetch-mode'] || ''
+    const dest = req.headers['sec-fetch-dest'] || ''
+    return mode === 'cors' && dest === 'empty'
+  }
+  return false
 }
 
 function readBody(req) {
@@ -109,7 +133,7 @@ function cjkCount(text) {
 }
 
 function safeWriteContent(bookId, chapterUid, text, selectedText) {
-  const chapterFile = path.join(bookDir(bookId), 'chapters', `${chapterUid}.txt`)
+  const chapterFile = path.join(bookDir(bookId), 'chapters', `${sanitizePathPart(chapterUid) || '_invalid'}.txt`)
   const existing = readIfExists(chapterFile)
   if (existing && existing.length > text.length) {
     if (looksWereadEncoded(existing) && cjkCount(text) > 50) {
@@ -169,6 +193,8 @@ const server = http.createServer(async (req, res) => {
 
   // 历史记录（GET /history）
   if (req.method === 'GET' && req.url === '/history') {
+    // 来源限制：只允许扩展读历史，任意网页不可读走聊天/标注数据（评审 P1）
+    if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
     const readJsonl = (file) => {
       try {
         return fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l))
@@ -204,9 +230,13 @@ const server = http.createServer(async (req, res) => {
       if ('_stream' in d) continue  // 过滤流式中间分片
       chatItems.push({ role: 'assistant', content: d.content, _ts: d.timestamp || 0 })
     }
-    // 标注 + 最近 200 条聊天按时间戳交错排序：让标注与其自动回复相邻，
+    // 聊天消息先按时间戳混排、再取最近 500 条：user/assistant 交错后截取，
+    // 避免数组顺序里"全部 user 在前、assistant 在后"导致截尾把提问整个裁掉。
+    // 200 太小——agent 回复数是提问的 2~3 倍，200 窗口把老提问挤没（修：AI-016）。
+    const chatSorted = chatItems.sort((a, b) => (a._ts || 0) - (b._ts || 0))
+    // 标注 + 最近 500 条聊天按时间戳交错排序：让标注与其自动回复相邻，
     // 侧栏既按时间顺序展示，也能据此为回复继承正确的书籍书签（AI-001）
-    const allItems = [...annItems, ...chatItems.slice(-200)]
+    const allItems = [...annItems, ...chatSorted.slice(-500)]
       .sort((a, b) => (a._ts || 0) - (b._ts || 0))
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify(allItems))
@@ -222,6 +252,8 @@ const server = http.createServer(async (req, res) => {
     const bookId = u.searchParams.get('bookId') || ''
     const text = u.searchParams.get('text') || ''
     if (!bookId || !text) { res.writeHead(400); res.end('{}'); return }
+    // 来源限制：只允许扩展调用，任意网页的简单 GET 无法触发本地扫描/建目录（评审 P1）
+    if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
     const chaptersDir = path.join(bookDir(bookId), 'chapters')
     const needle = normalizeText(text).slice(0, 60)
     let best = null
@@ -251,6 +283,8 @@ const server = http.createServer(async (req, res) => {
   // 共读标注列表（GET /annotations?bookId=..）
   // 返回该书所有已共读标注（selectedText 等），供内容脚本在书页里标记共读段落。
   if (req.method === 'GET' && req.url.startsWith('/annotations?')) {
+    // 来源限制：只允许扩展读标注，任意网页不可读走划线数据（评审 P1）
+    if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
     const u = new URL(req.url, 'http://localhost')
     const bookId = u.searchParams.get('bookId') || ''
     const base = baseBookId(bookId)
@@ -289,6 +323,8 @@ const server = http.createServer(async (req, res) => {
 
   // SSE 订阅（GET /events[?lastId=..]）
   if (req.method === 'GET' && req.url.split('?')[0] === '/events') {
+    // 来源限制：只允许扩展订阅事件流，任意网页不可偷听聊天推送（评审 P1）
+    if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
