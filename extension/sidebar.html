@@ -5,6 +5,24 @@
   <title>CoRead 共读</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    /* AI-019：全局细滚动条——所有滚动容器统一：细(6px) + 半透明浅色圆角 thumb，轨道透明。
+       #jump-fab-btn 原有隐藏规则（display:none / scrollbar-width:none）特异性更高，不受影响。 */
+    *::-webkit-scrollbar { width: 6px; height: 6px; }
+    *::-webkit-scrollbar-track { background: transparent; }
+    *::-webkit-scrollbar-thumb {
+      background: rgba(0, 0, 0, 0.14);
+      border-radius: 3px;
+    }
+    *::-webkit-scrollbar-thumb:hover { background: rgba(0, 0, 0, 0.28); }
+    /* Firefox 兜底：标准属性会覆盖上面 webkit 6px（Chromium 实测 thin=10px），
+       故仅对 Firefox 生效；Chromium 走精确 6px。 */
+    @-moz-document url-prefix() {
+      * { scrollbar-width: thin; scrollbar-color: rgba(0, 0, 0, 0.14) transparent; }
+      #jump-tip { scrollbar-color: rgba(255, 255, 255, 0.22) transparent; }
+    }
+    /* 深色面（引用 tooltip）用亮色细滚动条，避免黑底黑条不可见 */
+    #jump-tip::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.22); }
+    #jump-tip::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.36); }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue', sans-serif;
       font-size: 14px;
@@ -115,6 +133,10 @@
       border-radius: 6px;
       border-left: 3px solid #07c160;
       margin-bottom: 6px;
+      /* AI-018：长划线不再无限撑高卡片，文本区限高内部滚动 */
+      max-height: 130px;
+      overflow-y: auto;
+      word-break: break-word;
     }
     #ref-current .rc-body .rc-meta {
       font-size: 11px;
@@ -123,6 +145,34 @@
       gap: 10px;
       margin-top: 2px;
     }
+    /* ── 折叠态缩略概览（AI-018）：折叠后仍显示书名 + 划线概览，不用展开就能
+       看到当前引用（折叠时切换引用也能直接看清），点概览可展开卡片 ── */
+    #ref-current .rc-preview {
+      display: none;
+      padding: 6px 12px 8px;
+      font-size: 11px;
+      color: #666;
+      line-height: 1.5;
+      cursor: pointer;
+      border-bottom: 1px solid #f0f0f0;
+      user-select: none;
+    }
+    #ref-current.collapsed:not(.empty) .rc-preview { display: block; }
+    #ref-current .rc-preview .rcp-book {
+      color: #07c160;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #ref-current .rc-preview .rcp-text {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      word-break: break-word;
+    }
+    #ref-current .rc-preview:hover .rcp-text { color: #07c160; }
     /* 空状态：未选中引用时隐藏详情与操作区，显示居中提示 */
     #ref-current.empty .rc-body { display: none; }
     #rc-empty {
@@ -718,6 +768,8 @@
       <button class="rc-del" id="rc-del-btn" title="删除引用">🗑</button>
       <button class="rc-deselect" id="rc-deselect-btn" title="取消引用">✕</button>
     </div>
+    <!-- AI-018：折叠态缩略概览（书名 + 划线前文），点击展开卡片 -->
+    <div class="rc-preview" id="rc-preview"></div>
     <div class="rc-body">
       <div class="rc-book" id="rc-book"></div>
       <div class="rc-text" id="rc-text"></div>

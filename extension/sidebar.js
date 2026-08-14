@@ -84,6 +84,25 @@ function refMatches(a, b) {
   return sameRef(a, b)
 }
 
+// 从本地列表移除满足条件的引用；若移除的是当前选中的引用，一并清空选中态并清除
+// 待选标记（AI-018）。划线删除（annotation-removed）、删除引用、/history 对账清理
+// 共用此入口——保证"列表里没了，选中态也没了"，避免卡片继续显示已删除引用 /
+// 已删划线的陈旧内容（此前 annotation-removed 与对账清理只 splice 不碰 selectedAnn，
+// 卡片会把已删除引用的内容一直显示到面板重开）。
+function removeAnns(pred) {
+  let selectedRemoved = false
+  for (let i = RECENT_ANNS.length - 1; i >= 0; i--) {
+    const a = RECENT_ANNS[i]
+    if (!pred(a)) continue
+    if (selectedAnn && refMatches(selectedAnn, a)) selectedRemoved = true
+    RECENT_ANNS.splice(i, 1)
+  }
+  if (selectedRemoved) {
+    selectedAnn = null
+    clearPendingSelect()
+  }
+}
+
 // ── 持久化 ────────────────────────────────────────────────────────────────
 // refs 大数组防抖写：划线狂点不落盘，安静 800ms 写一次，pagehide 兜底冲掉，
 // 避免每次划线都全量重写整个列表（MAX_RECENT=5000 量级序列化毫秒级）。
@@ -308,6 +327,17 @@ function selectRefByPending(ref) {
 }
 
 // ── 当前引用卡片 ──────────────────────────────────────────────────────────
+// AI-018：折叠态缩略概览 = 书名 + 划线前文。选中引用时填充，空态/无选中时清空，
+// 折叠时（.collapsed 且非 .empty）CSS 显示它——切换引用后折叠态也能直接看清当前引用。
+function renderCollapsedPreview() {
+  const pv = document.getElementById('rc-preview')
+  if (!pv) return
+  if (!selectedAnn) { pv.innerHTML = ''; return }
+  pv.innerHTML =
+    `<div class="rcp-book">《${esc(selectedAnn.bookTitle || '')}》</div>` +
+    `<div class="rcp-text">${esc(selectedAnn.selectedText || '')}</div>`
+}
+
 function renderCurrentRef() {
   const card = document.getElementById('ref-current')
 
@@ -327,6 +357,7 @@ function renderCurrentRef() {
     document.getElementById('rc-del-btn').style.display = 'none'
     document.getElementById('rc-collapse-btn').style.display = 'none'
     document.getElementById('rc-deselect-btn').style.display = 'none'
+    renderCollapsedPreview()  // 空态概览留空（CSS 也不显示）
     renderJumpBack()
     return
   }
@@ -338,6 +369,7 @@ function renderCurrentRef() {
   document.getElementById('rc-deselect-btn').style.display = ''
   renderJumpBack()  // AI-006：有跳转记录才显示「↩ 返回」
 
+  renderCollapsedPreview()
   document.getElementById('rc-text').textContent = selectedAnn.selectedText || ''
   document.getElementById('rc-book').textContent = selectedAnn.bookTitle || ''
 
@@ -672,6 +704,13 @@ document.getElementById('rc-collapse-btn').addEventListener('click', () => {
   btn.textContent = card.classList.contains('collapsed') ? '▸' : '▾'
 })
 
+// AI-018：点击折叠态概览直接展开卡片（看完整引用不用先点表头折叠按钮）
+document.getElementById('rc-preview')?.addEventListener('click', () => {
+  const card = document.getElementById('ref-current')
+  card.classList.remove('collapsed')
+  document.getElementById('rc-collapse-btn').textContent = '▾'
+})
+
 // 跳转到原文位置（微信读书原生章节 URL）
 document.getElementById('rc-jump-btn').addEventListener('click', () => {
   if (selectedAnn) jumpToAnnotation(selectedAnn)
@@ -978,15 +1017,13 @@ function connect() {
         return
       }
 
-      // 划线在微信读书里被删除（用户点「删除划线」）：同步移除引用列表 + 刷新书页共读标记
+      // 划线在微信读书里被删除（用户点「删除划线」）：同步移除引用列表 + 刷新书页共读标记。
+      // AI-018：走 removeAnns 统一入口——被删的是当前选中引用时一并清空选中态，
+      // 否则卡片会继续显示已删划线的陈旧内容（此前只 splice 不碰 selectedAnn）。
       if (d.role === 'annotation-removed') {
         const removed = d.removed || []
-        for (const r of removed) {
-          for (let i = RECENT_ANNS.length - 1; i >= 0; i--) {
-            if (refMatches(RECENT_ANNS[i], r)) RECENT_ANNS.splice(i, 1)  // AI-007：精确匹配，避免连坐
-          }
-        }
         if (removed.length) {
+          removeAnns(a => removed.some(r => refMatches(a, r)))  // AI-007：精确匹配，避免连坐
           saveState()
           renderRefUI()
           renderDrawer()  // 若抽屉开着，让被删引用从列表消失
@@ -1536,12 +1573,9 @@ async function deleteRef(ann) {
   const ok = await showConfirm('删除这条引用？', '删除后书页里的共读标记也会移除。')
   if (!ok) return
 
-  // 先从本地移除匹配项（AI-007：按 bookmarkId/章节位置精确匹配，避免同文本连坐删除）
-  for (let i = RECENT_ANNS.length - 1; i >= 0; i--) {
-    if (refMatches(RECENT_ANNS[i], ann)) RECENT_ANNS.splice(i, 1)
-  }
-  // 若删的是当前选中的引用，清空选中态
-  if (refMatches(selectedAnn, ann)) selectedAnn = null
+  // 先从本地移除匹配项（AI-007：按 bookmarkId/章节位置精确匹配，避免同文本连坐删除）。
+  // removeAnns 统一处理"移除的是当前选中引用 → 一并清空选中态"（AI-018）
+  removeAnns(a => refMatches(a, ann))
   saveState()
   renderRefUI()
   renderDrawer()  // 若抽屉开着，刷新列表让删除项消失
@@ -1626,6 +1660,8 @@ async function loadHistory() {
     // 对账清理：划线同步来的引用（带 bookmarkRange）必然存在于 annotations.jsonl，
     // 会在 /history 里返回。若微信读书里删了划线（可能发生在侧栏关闭期间），对应标注
     // 已从存档移除、/history 不再返回，这里把本地列表里的幽灵引用清掉，避免重开侧栏又冒出来。
+    // AI-018：走 removeAnns——被清掉的若是当前选中引用，一并清空选中态（此前只 splice，
+    // 恢复的选中引用被清理后卡片仍显示陈旧内容直到下次重开）。
     {
       const histAnnKeys = new Set()
       for (const d of items) {
@@ -1633,12 +1669,11 @@ async function loadHistory() {
           histAnnKeys.add(baseBookId(d.bookId) + '::' + String(d.selectedText || '').replace(/\s+/g, ''))
         }
       }
-      for (let i = RECENT_ANNS.length - 1; i >= 0; i--) {
-        const a = RECENT_ANNS[i]
-        if (!a.bookmarkRange) continue  // 手动弹窗引用不在这套数据里，不误删
+      removeAnns(a => {
+        if (!a.bookmarkRange) return false  // 手动弹窗引用不在这套数据里，不误删
         const key = baseBookId(a.bookId) + '::' + String(a.selectedText || '').replace(/\s+/g, '')
-        if (!histAnnKeys.has(key)) RECENT_ANNS.splice(i, 1)
-      }
+        return !histAnnKeys.has(key)
+      })
     }
     // 首次启动（本地从未保存选中状态）：默认选中最新的一条标注
     if (!_selectionStateRestored && !selectedAnn && RECENT_ANNS.length) {
