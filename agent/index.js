@@ -27,7 +27,41 @@ const CURSOR_FILE = path.join(INBOX_DIR, '.agent_cursor')
 const CHAT_INPUT = path.join(INBOX_DIR, 'chat_input.jsonl')
 const CHAT_INPUT_CURSOR = path.join(INBOX_DIR, '.chat_input_cursor')
 const CHAT_OUTPUT = path.join(INBOX_DIR, 'chat_output.jsonl')
-const _repliedFingerprints = new Set()  // 去重：防止同一消息被重复回复
+const REPLIED_FINGERPRINT_FILE = path.join(INBOX_DIR, '.chat_input_replied')
+// 去重：防止同一消息被重复回复。指纹落盘（启动时加载），进程重启后仍能跳过已回复过的消息，
+// 不会因游标异常被重置而把旧提问重放一遍（AI-011 同款教训，chat 侧）。
+const _repliedFingerprints = new Set(
+  (readIfExists(REPLIED_FINGERPRINT_FILE) || '').split('\n').filter(Boolean)
+)
+// 首次运行种子：老版本没有指纹文件，把 chat_input 里已处理过的旧消息指纹补齐
+if (_repliedFingerprints.size === 0) {
+  try {
+    for (const l of (readIfExists(CHAT_INPUT) || '').trim().split('\n').filter(Boolean)) {
+      try {
+        const d = JSON.parse(l)
+        if (typeof d.timestamp === 'number') {
+          _repliedFingerprints.add(`${d.timestamp}|${(d.content || '').slice(0, 80)}`)
+        }
+      } catch {}
+    }
+    if (_repliedFingerprints.size > 0) {
+      fs.writeFileSync(REPLIED_FINGERPRINT_FILE, [..._repliedFingerprints].join('\n') + '\n')
+    }
+  } catch {}
+}
+function persistRepliedFingerprint(fp) {
+  _repliedFingerprints.add(fp)
+  try {
+    fs.appendFileSync(REPLIED_FINGERPRINT_FILE, fp + '\n')
+    if (_repliedFingerprints.size > 2000) {
+      // 防文件无限增长：保留最近 1000 条指纹重写（正常不会触发）
+      const keep = [..._repliedFingerprints].slice(-1000)
+      _repliedFingerprints.clear()
+      for (const k of keep) _repliedFingerprints.add(k)
+      fs.writeFileSync(REPLIED_FINGERPRINT_FILE, keep.join('\n') + '\n')
+    }
+  } catch {}
+}
 const STOP_FILE = path.join(AGENT_DIR, '.stop')  // stop.bat 写入哨兵 → poller 检测后优雅保存退出
 const JOURNAL_FILE = path.join(AGENT_DIR, 'session_journal.jsonl')  // 会话流水账：强杀/断电后启动时恢复记忆
 const TOPIC_STACK_FILE = path.join(AGENT_DIR, 'topic_stack.json')  // 会意讨论栈（AI-016/Q2.5）：跨会话持久化，等待归并
@@ -603,14 +637,19 @@ async function say(userText, options = {}) {
   // AI-001：写入归属书/上下文的历史；元任务（记忆重写）由调用方显式传 _meta
   const key = options.bookKey || currentBookKey || '_common'
   const hist = histFor(key)
-  hist.push({ role: 'user', content: userText })
-  if (key !== '_meta') journalAppend({ kind: 'msg', bookKey: key, role: 'user', content: userText })  // 同步落盘，强杀也不丢
+  // AI-017：hist/journal 只存调用方给的入库文本（storeText：用户原话，或"划线原文引用+提问/批注"），
+  // 侧栏 enriched（[正在共读] 前缀+章节窗口）只在本次调用注入 callHist，防止书摘录当"用户的话"入库
+  const storeText = options.storeText != null ? options.storeText : userText
+  hist.push({ role: 'user', content: storeText })
+  if (key !== '_meta') journalAppend({ kind: 'msg', bookKey: key, role: 'user', content: storeText })  // 同步落盘，强杀也不丢
   let fullContent = ''
   let displayContent = ''  // 剥掉 MEMORIZE 标记后的展示文本
   let started = false  // 是否已写过流式记录
 
   try {
-    const stream = callLLMStreamWithRetry(options.maxTokens || 8192, hist)
+    // 本次调用喂 enriched（userText）：复制 hist、把最后一条（原话）换成调用文本
+    const callHist = [...hist.slice(0, -1), { role: 'user', content: userText }]
+    const stream = callLLMStreamWithRetry(options.maxTokens || 8192, callHist)
     let lastWrite = 0
     let result
     while (true) {
@@ -874,12 +913,13 @@ function unmergedJournalMsgs() {
   return lines.slice(lastCp + 1).filter(l => l.kind === 'msg')
 }
 
-// 把对话记录压成可喂给 LLM 的文本（取尾部，控制 token 成本）
-function transcriptText(msgs, maxChars = 6000) {
-  const txt = msgs.map(m => `[${m.bookKey || 'common'}] ${m.role}: ${m.content}`).join('\n')
-  return txt.length > maxChars
-    ? '…（对话过长，仅取最近部分）…\n' + txt.slice(txt.length - maxChars)
-    : txt
+// 把对话记录压成可喂给 LLM 的文本：区分说话人（用户/AI），不截断——
+// 记忆固化要基于全量对话（AI-017）。书摘录已不入库（见 say()），这里只含用户原话与 AI 回复。
+function transcriptText(msgs) {
+  return msgs.map(m => {
+    const who = m.role === 'assistant' ? 'AI' : '用户'
+    return `──── ${who}（${m.bookKey || 'common'}）────\n${m.content}`
+  }).join('\n\n')
 }
 
 // 合并成功后打 checkpoint，并顺带把 journal 轮转成一行（旧对话已蒸馏进 profile/soul，可弃）
@@ -1131,7 +1171,11 @@ async function processNewAnnotations() {
     const key = baseBookId(ann.bookId) || currentBookKey || '_common'
     if (baseBookId(ann.bookId)) currentBookKey = key
     console.log(`\n── 新划线 · 《${ann.bookTitle}》${ann.chapter || ''} ──`)
-    const reply = await say(buildAnnotationPrompt(ann), { bookKey: key })
+    // AI-017：标注讨论入库只留"位置 + 划线原文(引用) + 你的批注"，不含章节窗口与内部指令；
+    // 完整讨论 prompt 仍喂本次调用，见 say() 的 callHist
+    const storeText = `【划线】《${ann.bookTitle}》${ann.chapter || ''}\n划线原文：${ann.selectedText}` +
+      (ann.userNote ? `\n我的批注：${ann.userNote}` : '')
+    const reply = await say(buildAnnotationPrompt(ann), { bookKey: key, storeText })
     console.log('\n' + stripCodeBlocks(reply) + '\n')
   }
   setCursor(anns.length)
@@ -1206,7 +1250,9 @@ async function main() {
 
     // 处理来自侧栏的用户消息
     const inputs = readChatInputs()
-    if (getChatInputCursor() > inputs.length) setChatInputCursor(0)  // 文件清空/截断后重置游标，避免新消息被永久跳过
+    // 游标超出实际行数（文件被截断/手动清理过）：钳到当前行数，不要归零重扫。
+    // 归零会把全部旧提问重新处理一遍、产生重复回复（AI-011 同款教训，chat 侧）。
+    if (getChatInputCursor() > inputs.length) setChatInputCursor(inputs.length)
     const chatCursor = getChatInputCursor()
     if (chatCursor >= inputs.length) return
     busy = true
@@ -1217,8 +1263,7 @@ async function main() {
         // 去重：指纹 = 时间戳+内容前80字，防止同一消息被重复回复
         const fp = `${msg.timestamp || 0}|${(msg.content || '').slice(0, 80)}`
         if (_repliedFingerprints.has(fp)) { console.log(`  [dedup] skip: ${fp.slice(0,50)}`); continue }
-        _repliedFingerprints.add(fp)
-        if (_repliedFingerprints.size > 200) _repliedFingerprints.clear()
+        persistRepliedFingerprint(fp)
         // AI-001：消息归属当前书——有 bookId 用其书（自由消息也带书签，见 sidebar submit），
         // 无 bookId 则沿用"正在读的书"（currentBookKey），否则进 _common。
         const key = msg.bookId ? baseBookId(msg.bookId) : (currentBookKey || '_common')
@@ -1246,7 +1291,11 @@ async function main() {
             userMsg += '\n\n（请在这轮回应结尾加一行：【TAKEAWAY】你的一句收口总结，15-30字）'
           }
         }
-        const reply = await say(userMsg, { bookKey: key, assistantSelected: selectionFromMsg(msg) })
+        // AI-017：侧栏入库只留"划线原文(引用) + 你的提问"，不含 [正在共读] 章节窗口；自由消息保持原话
+        const storeText = msg.selectedText
+          ? `【划线】《${msg.bookTitle}》${msg.chapter || ''}\n划线原文：${msg.selectedText}\n我的提问：${msg.content}`
+          : msg.content
+        const reply = await say(userMsg, { bookKey: key, storeText, assistantSelected: selectionFromMsg(msg) })
         const takeaway = extractTakeaway(reply)
         // TAKEAWAY 只归属书级讨论；自由提问不写书级总结
         if (bookScoped && takeaway && currentAnn) { saveTakeaway(currentAnn, takeaway) }
