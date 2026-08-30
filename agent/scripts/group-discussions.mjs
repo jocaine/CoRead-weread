@@ -29,8 +29,11 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { judgeSameProblem, buildSameProblemInstruction } from '../lib/topic-stack.js'
 import { consolidateThreadQuestion, buildQuestionInstruction } from '../lib/thread-question.js'
+import { judgeDerivation } from '../lib/knowledge-graph.js'
+import { segmentStack } from '../lib/segment-stack.js'
 import { parseMessage, loadReplyByTs } from '../lib/chat-input.js'
 import { reconstructTopicized } from '../lib/results.js'
+import { completionOnce } from '../lib/llm-api.js'
 
 // 判同一性结果与指令版本绑定：指令变了，旧 sameResults 失效（重新判定），否则缓存会掩盖口径变化。
 function hashStr(s) {
@@ -53,30 +56,19 @@ const MODEL = process.env.COREAD_MODEL || 'gpt-4o'
 if (!API_KEY || !API_BASE) throw new Error('.env 缺少 COREAD_API_KEY / COREAD_API_BASE')
 
 const JUDGE_SYSTEM = '你只负责按用户的指令输出要求格式的结果，不附加任何解释。'
+// 真实 API 判定调用（lib/llm-api.js 统一实现：截断检测 + 预算升级重发，宁漏勿误）。
+// 升级后仍截断 → ⚠️ 失败串，judge 层重试；耗尽抛错 → 上层宁漏勿误。
 async function callLLM(prompt, maxTokens = 512) {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 120_000)
-  try {
-    const resp = await fetch(`${API_BASE}/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${API_KEY}` },
-      body: JSON.stringify({
-        model: MODEL,
-        messages: [{ role: 'system', content: JUDGE_SYSTEM }, { role: 'user', content: prompt }],
-        max_tokens: maxTokens,
-        temperature: 0,
-        tool_choice: 'none',
-      }),
-      signal: controller.signal,
-    })
-    const raw = await resp.text()
-    if (!resp.ok) throw new Error(`API ${resp.status}: ${raw.slice(0, 200)}`)
-    const data = JSON.parse(raw)
-    const msg = data.choices?.[0]?.message
-    return (msg?.content || msg?.reasoning_content || '').trim()
-  } finally {
-    clearTimeout(timer)
-  }
+  const r = await completionOnce({
+    apiBase: API_BASE,
+    apiKey: API_KEY,
+    model: MODEL,
+    system: JUDGE_SYSTEM,
+    prompt,
+    maxTokens,
+  })
+  if (!r.ok) return '⚠️ 输出被截断（finish_reason: length）'
+  return r.text
 }
 
 const data = JSON.parse(fs.readFileSync(DATA, 'utf-8'))
@@ -135,38 +127,77 @@ const toIgnored = (c) => {
 }
 
 // 收口当前栈 → 讨论组（threads 风格：id + book + chapter + openTs + excerpts + question）
-// question：收口时把这次专题化讨论追的具体问题归纳成一句（threads.question），按栈哈希缓存。
+// 2026-08-28 定调：收口后先**固化后分段**（lib/segment-stack.js：先判专题化、再判同一性，
+// 把栈内发散的具体问题细切成多个不可分割组）→ 归纳问题在分段**之后**，每段归纳一句 →
+// 一个栈可能产出多个讨论组；derived 边只存在于**同栈相邻段之间**（不比对上一个收口
+// 专题讨论——旧 lastDiscByBook 逻辑废弃）。
+// 判专题化复用结果文件的 verdictByTs（不重复调 LLM）；判同一性走真实 LLM（分段专用口径）。
 async function closeStack(stack, { open = false } = {}) {
-  // 栈含 AI 回复（assistant 条目，_caseId 与它的 user 条目相同）：只取 user 出 excerpt，避免重复
-  const userEntries = stack.filter((e) => e.role === 'user')
-  const first = userEntries[0]
-  const firstCase = caseById.get(first._caseId) || {}
-  const excerpts = userEntries.map((e) => toExcerpt(caseById.get(e._caseId)))
-  const thread = {
-    id: `d_${discussions.length + 1}`,
-    book: data.book,
-    chapter: parsedById.get(first._caseId)?.chapter || '',
-    openTs: firstCase.timestamp || first.t,
-    open,
-    excerpts,
+  const { segments } = await segmentStack(stack, {
+    callLLM,
+    log: (m) => console.log(`    └─ ${m}`),
+    // 复用已判专题化结论：entry._caseId → case.timestamp → verdictByTs；无结论才走 LLM
+    verdictOf: (e) => {
+      const c = e && e._caseId != null ? caseById.get(e._caseId) : null
+      const ts = c ? c.timestamp : undefined
+      return ts !== undefined && verdictByTs.has(ts) ? verdictByTs.get(ts) : undefined
+    },
+  })
+  const threads = []
+  const derivs = []
+  for (const seg of segments) {
+    // 段内条目保留 _caseId（segmentStack 透传原条目字段）：user 出 excerpt，assistant 跟随
+    const userEntries = seg.entries.filter((e) => e.role === 'user')
+    const first = userEntries[0]
+    const firstCase = caseById.get(first._caseId) || {}
+    const excerpts = userEntries.map((e) => toExcerpt(caseById.get(e._caseId)))
+    const thread = {
+      id: `d_${discussions.length + threads.length + 1}`,
+      book: String(firstCase.bookTitle || '').trim(),
+      chapter: parsedById.get(first._caseId)?.chapter || '',
+      openTs: firstCase.timestamp || first.t,
+      open,
+      excerpts,
+    }
+    // 具体问题由**该段**归纳（分段之后）：段内容定格（哈希稳定 → 重跑命中缓存）
+    const stackKey = hashStr(excerpts.map((e) => e.t).join('|'))
+    const cached = questionByKey.get(stackKey)
+    if (cached) {
+      thread.question = cached
+    } else {
+      try {
+        const r = await consolidateThreadQuestion(seg.entries, { callLLM, maxTokens: 384, attempts: 5, log: console.log })
+        thread.question = r.question
+        newlyQuestion.set(stackKey, r.question)
+        console.log(`  ✓ ${thread.id} question: ${r.question.slice(0, 40)}${r.question.length > 40 ? '…' : ''}`)
+      } catch (e) {
+        questionFailures++
+        console.log(`  ⚠️ ${thread.id} 归纳讨论问题失败: ${e.message}`)
+      }
+    }
+    threads.push(thread)
   }
-  // 具体问题由整栈归纳：closed 栈定格（哈希稳定 → 重跑命中缓存）；open 栈若后续增长，哈希变 → 重新归纳
-  const stackKey = hashStr(excerpts.map((e) => e.t).join('|'))
-  const cached = questionByKey.get(stackKey)
-  if (cached) {
-    thread.question = cached
-  } else {
+  // derived 边：**同栈相邻段之间**判定衍生（后一段是否从前一段思考中衍生，无显式
+  // 引用句式也算）。不比对上一个收口专题讨论（2026-08-28 定调）。
+  for (let i = 1; i < threads.length; i++) {
+    const prev = threads[i - 1]
+    const next = threads[i]
+    if (!prev.question || !next.question) continue
     try {
-      const r = await consolidateThreadQuestion(stack, { callLLM, maxTokens: 384, attempts: 5, log: console.log })
-      thread.question = r.question
-      newlyQuestion.set(stackKey, r.question)
-      console.log(`  ✓ ${thread.id} question: ${r.question.slice(0, 40)}${r.question.length > 40 ? '…' : ''}`)
+      const r = await judgeDerivation(
+        { prev: { question: prev.question, excerpts: prev.excerpts }, next: { question: next.question, excerpts: next.excerpts } },
+        { callLLM, maxTokens: 1024, attempts: 3, log: () => {} },
+      )
+      if (r.linked) {
+        derivs.push({ from: prev.id, to: next.id, reason: r.reason })
+        console.log(`    └─ 衍生关联（同栈段间）：${prev.id} → ${next.id}（${r.reason.slice(0, 40)}…）`)
+      }
     } catch (e) {
-      questionFailures++
-      console.log(`  ⚠️ ${thread.id} 归纳讨论问题失败: ${e.message}`)
+      console.log(`    ⚠️ 段间衍生失败（${prev.id} → ${next.id}）: ${e.message.slice(0, 60)}`)
     }
   }
-  return thread
+  // 无内核轮次不做过滤处理（跟随并入当前组，2026-08-28 定调），无滤掉统计
+  return { threads, derivations: derivs }
 }
 
 const discussions = []
@@ -174,13 +205,36 @@ const ignored = []
 const errors = []
 const sameById = new Map()  // 本次新判的同一性（写回用），与缓存合并
 const newlyQuestion = new Map()  // 本次新归纳的讨论问题（写回用），与缓存合并
+const derivations = []  // 衍生关联（收口时判定）：{ from: d_id, to: d_id, reason }——对话连续性的拓扑边
 let questionFailures = 0  // 归纳讨论问题失败的讨论组数
 let stack = []
+let curBookKey = null  // 当前消息所属书（换书 → 收口当前栈，跨书不判同一性/衍生）
 
-console.log(`模型: ${MODEL} | 判同一性分组 ${data.cases.length} 条（判专题化复用已存 results）\n`)
+// bookId 前缀归一（同书判断用；与 baseBookId 同思路——去 k-suffix）
+function bookKeyOf(c) {
+  return String(c.bookId || '').replace(/k[0-9a-f]{16,}$/i, '')
+}
+
+console.log(`模型: ${MODEL} | 判同一性分组 ${data.cases.length} 条（判专题化复用已存 results；多书按书切断）\n`)
 for (let i = 0; i < data.cases.length; i++) {
   const c = data.cases[i]
   const topicized = verdictByTs.get(c.timestamp) === true
+  const bk = bookKeyOf(c)
+
+  if (curBookKey !== null && bk !== curBookKey) {
+    // 换书：收口当前栈（跨书不判同一性、不判衍生）
+    if (stack.length) {
+      const { threads, derivations: segDerivs } = await closeStack(stack)
+      discussions.push(...threads)
+      derivations.push(...segDerivs)
+      const closed = threads[0]
+      console.log(`[${String(i + 1).padStart(3)}] 换书（${curBookKey.slice(0, 8)} → ${bk.slice(0, 8)}）→ 收口 ${threads.length} 组（${threads.map((t) => t.id).join('/')}）`)
+      if (closed) console.log(`    └─ 首组 ${closed.id}（${closed.excerpts.length} 条）`)
+    }
+    stack = []
+    curBookKey = bk
+  }
+  if (curBookKey === null) curBookKey = bk
 
   if (stack.length === 0) {
     if (topicized) {
@@ -208,16 +262,22 @@ for (let i = 0; i < data.cases.length; i++) {
   if (same) {
     stack.push(toEntry(c), ...(toAssist(c) ? [toAssist(c)] : []))
   } else if (topicized) {
-    const closed = await closeStack(stack)
-    discussions.push(closed)
+    const { threads, derivations: segDerivs } = await closeStack(stack)
+    discussions.push(...threads)
+    derivations.push(...segDerivs)
     stack = [toEntry(c), ...(toAssist(c) ? [toAssist(c)] : [])]
-    console.log(`[${String(i + 1).padStart(3)}] 换问题 + 专题化 → 收口 ${closed.id}（${closed.excerpts.length} 条），开新讨论`)
+    console.log(`[${String(i + 1).padStart(3)}] 换问题 + 专题化 → 收口 ${threads.map((t) => t.id).join('/')}（${threads.length} 组），开新讨论`)
   } else {
     ignored.push(toIgnored(c))
     console.log(`[${String(i + 1).padStart(3)}] 换问题 + 非专题化 → 忽略（${parsedById.get(c.id).note.slice(0, 40)}…）`)
   }
 }
-if (stack.length) discussions.push(await closeStack(stack, { open: true }))
+if (stack.length) {
+  const { threads, derivations: segDerivs } = await closeStack(stack, { open: true })
+  discussions.push(...threads)
+  derivations.push(...segDerivs)
+  console.log(`[结尾] 未收口栈 → 分段 ${threads.length} 组（${threads.map((t) => t.id).join('/')}，进行中）`)
+}
 
 const inDiscussions = discussions.reduce((n, d) => n + d.excerpts.length, 0)
 // 合并缓存的归纳问题 + 本次新归纳的（缓存指令版本一致时，重跑只补新讨论组的）
@@ -232,6 +292,7 @@ const groupSummary = {
   sameResults: sameByTs.size + sameById.size,
   threadQuestions: discussions.filter((d) => d.question).length,
   questionFailures,
+  derivations: derivations.length,
   at: new Date().toISOString().slice(0, 10),
 }
 if (fs.existsSync(RES)) fs.copyFileSync(RES, RES + '.bak')  // 先备份，后写回
@@ -246,13 +307,14 @@ const sameResults = (data.cases || [])
 const { results: _dropped, ...rest } = prevRes
 fs.writeFileSync(
   RES,
-  JSON.stringify({ ...rest, discussions, ignored, errors, sameResults, sameInstHash: INST_HASH, threadQuestions, qInstHash: Q_INST_HASH, groupSummary }, null, 2) + '\n',
+  JSON.stringify({ ...rest, discussions, ignored, errors, sameResults, sameInstHash: INST_HASH, threadQuestions, qInstHash: Q_INST_HASH, derivations, groupSummary }, null, 2) + '\n',
   'utf-8',
 )
 
-console.log(`\n讨论组 ${discussions.length}（含 ${inDiscussions} 条专题化消息）| 忽略 ${ignored.length} | 判同一性失败 ${errors.length} | 归纳问题 ${threadQuestions.length}（失败 ${questionFailures}）`)
+console.log(`\n讨论组 ${discussions.length}（含 ${inDiscussions} 条专题化消息）| 忽略 ${ignored.length} | 判同一性失败 ${errors.length} | 归纳问题 ${threadQuestions.length}（失败 ${questionFailures}）| 衍生关联 ${derivations.length}`)
 for (const d of discussions) {
   const briefs = d.excerpts.map((e) => e.q.length > 22 ? e.q.slice(0, 22) + '…' : e.q).join(' / ')
   console.log(`  ${d.id}${d.open ? ' [进行中]' : ''} [章${d.chapter}] (${d.excerpts.length}条) ${briefs}`)
 }
+for (const dv of derivations) console.log(`  └─ ${dv.from} → ${dv.to}（${dv.reason.slice(0, 50)}…）`)
 console.log(`\n结果已写回: ${path.relative(process.cwd(), RES)}`)

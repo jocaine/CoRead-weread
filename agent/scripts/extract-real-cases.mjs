@@ -9,8 +9,8 @@
  * + 位置 id；note/sel/chapter/quoted 等派生字段由 lib/chat-input.js 在读取时解析，
  * 不进数据文件（保证数据文件结构与真实数据源一致）。
  *
- * 用法：node --env-file-if-exists=.env scripts/extract-real-cases.mjs [bookIdPrefix]
- * 默认提取《静静的顿河》（ee442b...f24）。
+ * 用法：node --env-file-if-exists=.env scripts/extract-real-cases.mjs [bookIdPrefix,...]
+ * 默认提取《静静的顿河》（ee442b...f24）；多个前缀用逗号分隔（多书全量）。
  * 运行前先备份 chat_input.jsonl（全局规则：个人数据先备份后读写）。
  */
 import fs from 'node:fs'
@@ -22,8 +22,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const INBOX = path.resolve(__dirname, '../../receiver/inbox/chat_input.jsonl')
 const DATA = path.resolve(__dirname, './data/judge-real-cases.json')
 
-// 默认《静静的顿河》；可用参数覆盖（需传 baseBookId 前缀）
-const BOOK_PREFIX = process.argv[2] || 'ee442b83643425f356d5638653338624e334c58373064373159317268353955f24'
+// 默认《静静的顿河》；可用参数覆盖（逗号分隔多个 baseBookId 前缀，如 'ee442b83,6f742a63,54a42df3'）
+const PREFIXES = (process.argv[2] || 'ee442b83643425f356d5638653338624e334c58373064373159317268353955f24')
+  .split(',').map((s) => s.trim()).filter(Boolean)
 
 if (!fs.existsSync(INBOX)) throw new Error(`聊天流文件不存在：${INBOX}`)
 
@@ -36,7 +37,7 @@ for (const line of fs.readFileSync(INBOX, 'utf-8').split('\n')) {
   if (!line.trim()) continue
   let d
   try { d = JSON.parse(line) } catch { continue }
-  if (!String(d.bookId || '').startsWith(BOOK_PREFIX)) continue
+  if (!PREFIXES.some((p) => String(d.bookId || '').startsWith(p))) continue
   const ts = d.timestamp
   if (seenTs.has(ts)) continue  // 同一条消息重复落盘去重
   seenTs.add(ts)
@@ -47,8 +48,8 @@ cases.sort((a, b) => a.timestamp - b.timestamp)
 cases.forEach((c, i) => { c.id = i + 1 })
 
 const out = {
-  book: '静静的顿河',
-  source: `${INBOX}（${BOOK_PREFIX}，${cases.length} 条用户消息）`,
+  book: '多书（' + PREFIXES.join(',') + '）',
+  source: `${INBOX}（${PREFIXES.join(',')}，${cases.length} 条用户消息）`,
   cases,
 }
 fs.mkdirSync(path.dirname(DATA), { recursive: true })

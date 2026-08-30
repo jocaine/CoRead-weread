@@ -4,6 +4,9 @@ agent/.env
 # 个人阅读数据（隐私）
 agent/profile.md
 agent/soul.md
+agent/self-portrait.md
+学做工会意图拓扑.md
+学做工讨论记录-重建版.md
 
 # 运行时消息队列和书库（个人数据）
 receiver/inbox/*
@@ -19,10 +22,14 @@ agent/session_journal.jsonl
 agent/session_journal.jsonl.bak-*
 # profile/soul 重写前备份
 agent/*.bak
-# 真实阅读数据判定材料/结果（个人数据，不提交）及其备份
-agent/scripts/data/judge-real-cases.json
-agent/scripts/data/judge-real-results.json
-agent/scripts/data/*.bak*
+# 真实数据产物与跑批日志（个人数据，不提交）——judge 材料/结果、会意图产物、演示文件、过程日志
+agent/scripts/data/
+!agent/scripts/data/.gitkeep
+
+# 个人 MCP 配置 / 本地过程性脚本
+.mcp.json
+.xzg-topo.cjs
+receiver/index.js.bak-debug
 
 # Node.js
 node_modules/

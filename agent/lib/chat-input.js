@@ -12,9 +12,13 @@
  *
  * AI 回复配对：用户消息在 chat_input.jsonl，AI 回复在 chat_output.jsonl（无 bookId）。
  * 策略：全时间线（所有 user + 所有 assistant 消息）按 ts 升序，每条 user 消息的回复 =
- * 该 user 消息之后、下一条 user 消息之前的**最后一条**非空 assistant 内容。
- * 为什么取最后：chat_output 的回复是流式累计快照（_stream 连续递增，每一条都含前一条全文），
- * 只有最后一条是完整回复（例："先"→"先纠正：不是康尼派…"→…）。
+ * 该 user 消息之后、下一条 user 消息之前的**第一条不带 `_stream`** 的非空 assistant 内容。
+ * 为什么取第一条不带 `_stream`：chat_output 的回复是流式累计快照（`_stream` 连续递增，
+ * 每一条都含前一条全文，`_stream:-1` 是流结束标记）——这些快照都不是最终完整回复；
+ * 真正的完整回复由 appendChatOutput 单独写一条**不带 `_stream`** 的记录。所以配对
+ * 锚点是 `_stream` 字段：第一条不带它的 assistant 才是本 user 消息的回复。
+ * （此前"最后一条非空 assistant"规则会抓到不属于本会话的孤儿回复——它的 user 消息
+ * 不在 chat_input 里，配对不到；修正后孤儿回复不匹配任何 user 消息。）
  */
 import fs from 'node:fs'
 
@@ -27,7 +31,9 @@ export function loadReplyByTs({ inputPath, outputPath }) {
       let d
       try { d = JSON.parse(line) } catch { continue }
       if (typeof d.timestamp !== 'number') continue
-      msgs.push(role === 'assistant' ? { role, ts: d.timestamp, content: d.content } : { role, ts: d.timestamp })
+      msgs.push(role === 'assistant'
+        ? { role, ts: d.timestamp, content: d.content, hasStream: typeof d._stream === 'number' }
+        : { role, ts: d.timestamp })
     }
   }
   collect(inputPath, 'user')
@@ -37,13 +43,14 @@ export function loadReplyByTs({ inputPath, outputPath }) {
   const replyByTs = new Map()
   for (let i = 0; i < msgs.length; i++) {
     if (msgs[i].role !== 'user') continue
-    let last = ''
+    let reply = ''
     for (let j = i + 1; j < msgs.length; j++) {
       const n = msgs[j]
       if (n.role === 'user') break            // 下一条是用户消息 → 该用户消息无后续回复
-      if (n.content) last = n.content         // 累计快照：覆盖为最后一条（完整回复）
+      if (n.hasStream) continue               // 流式累计快照 / 流结束标记 → 不是完整回复
+      if (n.content) { reply = n.content; break }  // 第一条不带 _stream 的完整回复
     }
-    if (last) replyByTs.set(msgs[i].ts, last)
+    if (reply) replyByTs.set(msgs[i].ts, reply)
   }
   return replyByTs
 }
