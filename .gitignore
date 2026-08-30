@@ -26,6 +26,9 @@ agent/*.bak
 agent/scripts/data/
 !agent/scripts/data/.gitkeep
 
+# 会意图数据文件（用户本地数据：一张图一个文件，含用户真实讨论；.bak 同目录一并忽略）
+agent/data/
+
 # 个人 MCP 配置 / 本地过程性脚本
 .mcp.json
 .xzg-topo.cjs

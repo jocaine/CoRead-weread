@@ -58,6 +58,10 @@ test('图结构：建边（kind：user/derived）、findNode', () => {
   const e2 = addEdge(g, { from: 'n_nordic', to: 'n_cossack', kind: 'derived' })
   assert.equal(e2.kind, 'derived', 'derived 边（对话连续性衍生）')
   assert.equal(g.edges.length, 2)
+  // 悬空边防护（评审 P5）：from/to 必须是已有节点
+  assert.throws(() => addEdge(g, { from: 'n_nordic', to: 'n_missing' }), /不存在/, 'to 节点不存在抛错（不允许悬空边）')
+  assert.throws(() => addEdge(g, { from: 'n_missing', to: 'n_nordic' }), /不存在/, 'from 节点不存在抛错（不允许悬空边）')
+  assert.equal(g.edges.length, 2, '抛错后不产生边')
   assert.equal(findNode(g, 'n_nordic').point, '北欧制度的历史位置')
   assert.equal(findNode(g, 'n_missing'), null)
 })

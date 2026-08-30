@@ -137,6 +137,8 @@ function normalizeDiscussion(d) {
  *   即使没有显式引用句式）
  * 2026-08-27 用户定调：**去掉 quote 字段**——追溯与删改触发均未实现，字段暂不落库；
  * 引用短语只在引用解析协议里用（hits[].quote，层3 覆盖判定），不存进边。
+ * 2026-08-30（评审 P5）：**from/to 必须是图中已有节点**——不允许引用不存在的 id
+ * 产生悬空边污染拓扑（调用方重复校验无害）。
  * @param {object} graph
  * @param {object} edge { from, to, kind? }——kind 默认 "user"
  * @returns {object} 新建的边
@@ -145,6 +147,12 @@ export function addEdge(graph, edge) {
   const from = String(edge?.from || '').trim()
   const to = String(edge?.to || '').trim()
   if (!from || !to) throw new TypeError('addEdge: 需要 from 与 to')
+  if (!graph.nodes.some((n) => n.id === from)) {
+    throw new TypeError(`addEdge: from 节点不存在（${from}）——不允许悬空边`)
+  }
+  if (!graph.nodes.some((n) => n.id === to)) {
+    throw new TypeError(`addEdge: to 节点不存在（${to}）——不允许悬空边`)
+  }
   const e = {
     from,
     to,

@@ -158,6 +158,18 @@ function appendChatOutputStreamEnd() {
   } catch {}
 }
 
+// 会意图命中事件（topic-library-design.md §5.4④）：引用解析命中旧知识点 → 写一行
+// graph-hit 到 chat_output（不带 content/_stream——侧栏不渲染为消息、loadReplyByTs
+// 不参与回复配对），receiver 按既有通道转发为 SSE message，侧栏图视图据此高亮
+// 命中节点的 root→recent 路径并集。
+function appendGraphHit(hits, reason) {
+  try {
+    fs.appendFileSync(CHAT_OUTPUT, JSON.stringify({
+      role: 'graph-hit', hits, reason: String(reason || '').slice(0, 200), timestamp: Date.now(),
+    }) + '\n')
+  } catch {}
+}
+
 function readChatInputs() {
   const raw = readIfExists(CHAT_INPUT)
   if (!raw) return []
@@ -871,6 +883,15 @@ async function resolveCitations(userText) {
       for (const n of contextOf(graph, id)) pathNodes.set(n.id, n)
     }
     const valid = hits.filter((id) => graph.nodes.some((n) => n.id === id))
+    if (valid.length) {
+      // AI-020 命中事件：写 chat_output（role=graph-hit，不带 content/_stream——
+      // 不渲染为消息、不参与回复配对），receiver 按既有通道转发为 SSE，侧栏图视图
+      // 据此高亮命中节点的 root→recent 路径并集。reason = 命中的知识点 point 列表。
+      const reason = valid
+        .map((id) => { const n = graph.nodes.find((x) => x.id === id); return n ? `「${n.point}」` : id })
+        .join('、')
+      appendGraphHit(valid, reason)
+    }
     return { hits: valid, l3: valid.length ? l3Block([...pathNodes.values()]) : '' }
   } catch (e) {
     console.log(`  [引用解析] 本轮跳过（不影响主回复）: ${e.message}`)
@@ -979,6 +1000,7 @@ async function driveTopicStack(bookKey, unit, reply, cites) {
     const citesList = Array.isArray(cites) ? cites : []
     const lastUserIdx = r.stack.reduce((acc, e, i) => (e.role === 'user' ? i : acc), -1)
     const savedStack = r.stack.map((e, i) => (i === lastUserIdx && citesList.length ? { ...e, cites: citesList } : e))
+    let keptClosed = null  // 收口固化 0 节点产出时保留被收口讨论（压回栈顶，下次收口重试）
     if (r.action === 'closed_and_pushed' && r.closed) {
       const closed = r.closed
       // ① 固化后分段：先判专题化（识别知识点轮次；无内核轮次**不做过滤处理**，跟随并入
@@ -1039,9 +1061,18 @@ async function driveTopicStack(bookKey, unit, reply, cites) {
           console.log(`  [会意栈] 段间衍生判定失败（不建 derived 边，宁漏勿误）: ${e.message}`)
         }
       }
+      // 收口固化整体失败（0 节点产出，如 LLM API 持续故障时各段归纳/派生全部失败）：
+      // 被收口的讨论不能就此从栈里消失——它一旦弹掉就永不重试（原文只残留在
+      // session_journal 流水账里，需人工恢复）。0 产出时把整场讨论压回栈顶，下次收口
+      // 整体重试；讨论内容随栈跨会话持久化，期间不丢。部分成功（≥1 节点）维持
+      // "失败段弃组"（宁漏勿误）。
+      if (segResults.length === 0) {
+        keptClosed = closed.entries
+        console.log(`  [会意栈] ⚠️ 收口固化 0 节点产出，被收口讨论保留回栈（${closed.entries.length} 轮，下次收口重试）`)
+      }
       saveGraph()
     }
-    topicStacks[bookKey] = [...savedStack, { role: 'assistant', content: String(reply || '').trim(), ...(unit.selected ? { selected: unit.selected } : {}) }]
+    topicStacks[bookKey] = [...(keptClosed || []), ...savedStack, { role: 'assistant', content: String(reply || '').trim(), ...(unit.selected ? { selected: unit.selected } : {}) }]
     saveTopicStacks(topicStacks)
   } catch (e) {
     console.log(`  [会意栈] 本轮跳过（不影响主回复）: ${e.message}`)

@@ -61,11 +61,14 @@ export async function consolidateDiscussion(graph, discussion, deps = {}) {
 
 /**
  * derived 边：收口时判定的衍生关联（同一本书内"前一条收口讨论 → 当前收口讨论"）。
- * @returns {number} 建边条数（0 = 节点缺失或同节点，跳过）
+ * 同 pair 已有 derived 边则跳过（去重，2026-08-30 评审 P5：崩溃重放/重复判定
+ * 不建重复 derived 边；user 边与 derived 边语义不同，可同 pair 共存）。
+ * @returns {number} 建边条数（0 = 节点缺失/同节点/已存在，跳过）
  */
 export function addDerivedEdge(graph, fromNodeId, toNodeId) {
   if (!fromNodeId || !toNodeId || fromNodeId === toNodeId) return 0
   if (!graph.nodes.some((n) => n.id === fromNodeId) || !graph.nodes.some((n) => n.id === toNodeId)) return 0
+  if (graph.edges.some((e) => e.from === fromNodeId && e.to === toNodeId && e.kind === 'derived')) return 0
   addEdge(graph, { from: fromNodeId, to: toNodeId, kind: 'derived' })
   return 1
 }

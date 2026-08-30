@@ -64,7 +64,7 @@ test('固化：derived 边（跳过缺失/同节点）；user 引用边（from �
   addNode(g, { id: 'n_a', point: 'A' })
   addNode(g, { id: 'n_b', point: 'B' })
   assert.equal(addDerivedEdge(g, 'n_a', 'n_b'), 1)
-  assert.equal(addDerivedEdge(g, 'n_a', 'n_b'), 1, '同 pair 可重复（多次判定）')
+  assert.equal(addDerivedEdge(g, 'n_a', 'n_b'), 0, '同 pair 已有 derived 边去重（评审 P5）')
   assert.equal(addDerivedEdge(g, 'n_a', 'n_a'), 0, '同节点跳过')
   assert.equal(addDerivedEdge(g, 'n_x', 'n_b'), 0, '缺失节点跳过')
   assert.equal(addCitationEdges(g, ['n_a', 'n_a', 'n_b', 'n_不存在'], 'n_b'), 1, '重复引用同节点只建一条（去重）')
