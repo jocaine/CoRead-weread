@@ -42,6 +42,7 @@
       align-items: center;
       gap: 10px;
       flex-shrink: 0;
+      position: relative;   /* 文档菜单（#doc-menu）的定位锚点 */
     }
     #header .title { font-weight: 400; font-size: 12px; color: #888; flex: 1; letter-spacing: 0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #dot { width: 7px; height: 7px; border-radius: 50%; background: #ddd; flex-shrink: 0; transition: background 0.3s; }
@@ -57,6 +58,94 @@
       padding: 4px 5px;
       cursor: pointer;
       font-family: inherit;
+    }
+    .fs-btn:hover:not(:disabled) { border-color: #07c160; color: #07c160; }
+    .fs-btn:disabled { opacity: 0.35; cursor: default; }
+    /* 文档按钮（放入的文件 / 切换文档）：与字号按钮同排，图标略大 */
+    #doc-btn { font-size: 13px; padding: 3px 6px; line-height: 1; }
+
+    /* ── 放入的文件菜单（文档导入 / 切换） ──────────── */
+    #doc-menu {
+      display: none;
+      position: absolute;
+      top: 100%;
+      right: 8px;
+      width: 260px;
+      max-width: calc(100vw - 24px);
+      margin-top: 6px;
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.14);
+      z-index: 90;
+      flex-direction: column;
+      max-height: 62vh;
+    }
+    #doc-menu.on { display: flex; }
+    .doc-menu-head {
+      padding: 10px 12px 8px;
+      font-size: 11px;
+      color: #888;
+      font-weight: 600;
+      border-bottom: 1px solid #f0f0f0;
+      flex-shrink: 0;
+    }
+    .doc-menu-list { overflow-y: auto; padding: 6px; flex: 1; min-height: 0; }
+    /* 文档模式下切回微信读书的入口 */
+    .doc-back {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 12px;
+      color: #666;
+      margin-bottom: 4px;
+      border-bottom: 1px solid #f0f0f0;
+      padding-bottom: 9px;
+    }
+    .doc-back:hover { background: #f2f3f5; }
+    .doc-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 12px;
+      color: #444;
+    }
+    .doc-item:hover { background: #f2f3f5; }
+    .doc-item.sel { background: #f0faf3; color: #07c160; font-weight: 600; }
+    .doc-item .doc-icon { flex-shrink: 0; }
+    .doc-item .doc-name {
+      flex: 1;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .doc-item .doc-ext { font-size: 10px; color: #aaa; flex-shrink: 0; }
+    .doc-menu-foot { border-top: 1px solid #f0f0f0; padding: 6px; flex-shrink: 0; }
+    #doc-import-btn {
+      width: 100%;
+      border: 1px dashed #07c160;
+      color: #07c160;
+      background: #fafffb;
+      border-radius: 8px;
+      padding: 7px 0;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    #doc-import-btn:hover { background: #eefaf1; }
+    .doc-empty {
+      padding: 14px 10px;
+      text-align: center;
+      font-size: 12px;
+      color: #bbb;
+      line-height: 1.6;
     }
     .fs-btn:hover:not(:disabled) { border-color: #07c160; color: #07c160; }
     .fs-btn:disabled { opacity: 0.35; cursor: default; }
@@ -370,6 +459,46 @@
       align-items: flex-end;
       flex-shrink: 0;
     }
+    /* 放入文件（📎）按钮：输入框左侧的方形附件按钮 */
+    #attach-btn {
+      flex-shrink: 0;
+      width: 36px;
+      height: 36px;
+      border: 1px solid #ddd;
+      background: #fff;
+      border-radius: 10px;
+      font-size: 15px;
+      line-height: 1;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #attach-btn:hover { border-color: #07c160; }
+
+    /* ── 轻提示 toast（放入文件结果反馈） ──────────── */
+    #toast {
+      position: fixed;
+      top: 14px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-10px);
+      background: rgba(35, 38, 44, 0.94);
+      color: #f5f6f7;
+      font-size: 12px;
+      line-height: 1.5;
+      padding: 8px 14px;
+      border-radius: 8px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22);
+      z-index: 2000;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s, transform 0.2s;
+      max-width: 82%;
+      word-break: break-word;
+    }
+    #toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
+    #toast.err { background: rgba(180, 52, 45, 0.95); }
+
     #input {
       flex: 1;
       border: 1px solid #ddd;
@@ -651,12 +780,10 @@
       width: 22px;               /* 当前提问所在条：更长 + 实心绿（与项内选中样式一致） */
       background: #07c160;
     }
-    /* 悬停省略文本时的完整内容 tooltip（浮于卡片内，避开右缘把手） */
+    /* 悬停省略文本时的完整内容 tooltip（AI-031：显示在卡片左侧，不再堆在上方） */
     .jump-tip {
-      position: absolute;
-      left: 8px;
-      right: 40px;
-      top: 8px;
+      position: fixed;
+      max-width: 260px;
       max-height: 200px;
       background: rgba(35,38,44,0.95);
       color: #f5f6f7;
@@ -665,7 +792,7 @@
       padding: 8px 10px;
       border-radius: 8px;
       box-shadow: 0 4px 16px rgba(0,0,0,0.25);
-      z-index: 10;
+      z-index: 70;
       display: none;
       overflow-y: auto;
       white-space: pre-wrap;
@@ -720,15 +847,436 @@
     .confirm-cancel:hover { background: #e5e5e5; }
     .confirm-ok { background: #e74c3c; color: #fff; }
     .confirm-ok:hover { background: #d43c2f; }
+
+    /* ── 会意图拓扑视图（AI-020）────────────────────────── */
+    /* Obsidian 式话题拓扑图：全面板遮罩，由 graph-view.js 构建 DOM。
+       常态观察态：缩放/平移/悬停邻接/点选详情/搜索定位；
+       命中态：会话引用解析命中 → root→recent 路径高亮（横幅 + 提亮 + 压暗）。 */
+    #graph-overlay {
+      position: fixed;
+      inset: 0;
+      background: #fafbfc;
+      z-index: 1500;
+      display: none;
+      flex-direction: column;
+    }
+    #graph-overlay.on { display: flex; }
+    .gv-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 10px;
+      background: #fff;
+      border-bottom: 1px solid #ececec;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+    .gv-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: #333;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .gv-badge {
+      font-size: 10px;
+      color: #b45309;
+      background: #fef3c7;
+      border: 1px solid #fde68a;
+      border-radius: 10px;
+      padding: 1px 8px;
+      font-weight: 600;
+    }
+    .gv-search {
+      flex: 1;
+      min-width: 80px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 5px 10px;
+      font-size: 12px;
+      outline: none;
+      background: #fafafa;
+      font-family: inherit;
+      color: #333;
+    }
+    .gv-search:focus { border-color: #5b5fe8; }
+    .gv-btn {
+      border: 1px solid #e0e0e0;
+      background: #fff;
+      color: #555;
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: inherit;
+      white-space: nowrap;
+    }
+    .gv-btn:hover:not(:disabled) { border-color: #5b5fe8; color: #5b5fe8; }
+    .gv-btn.primary { background: #5b5fe8; border-color: #5b5fe8; color: #fff; }
+    .gv-btn.primary:hover { background: #4a4edb; }
+    .gv-btn.gv-close { margin-left: auto; color: #888; font-size: 13px; }
+    .gv-btn.gv-close:hover { color: #333; }
+    /* 命中横幅：会话引用解析命中 / 搜索命中 / 手动路径高亮 */
+    .gv-banner {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px 7px 12px;
+      background: #eef0fd;
+      border-bottom: 1px solid #d3d8fb;
+      font-size: 11px;
+      color: #2b2f6e;
+      line-height: 1.5;
+    }
+    .gv-banner.hit { background: #e3e7fc; }
+    .gv-banner-text { flex: 1; min-width: 0; word-break: break-word; }
+    .gv-banner-clear { flex-shrink: 0; }
+    .gv-canvas-wrap {
+      flex: 1;
+      position: relative;
+      min-height: 0;
+      overflow: hidden;
+    }
+    #gv-canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
+      touch-action: none;
+    }
+    #gv-canvas.panning { cursor: grabbing; }
+    .gv-hint {
+      position: absolute;
+      bottom: 8px;
+      left: 10px;
+      font-size: 10px;
+      color: #7c848d;
+      pointer-events: none;
+      user-select: none;
+    }
+    .gv-legend {
+      position: absolute;
+      left: 10px;
+      top: 10px;
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid #eef0f2;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 11px;
+      color: #3f4550;
+      line-height: 1.9;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+      pointer-events: none;
+    }
+    .gv-legend .sw {
+      display: inline-block;
+      width: 16px;
+      height: 3px;
+      border-radius: 2px;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    .gv-legend .ring {
+      display: inline-block;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      border: 2px solid;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    .gv-legend .gv-lg-title { margin-top: 8px; font-size: 11px; color: #7c8b9d; }
+    .gv-legend .gv-lg-row { display: flex; align-items: center; margin-top: 2px; line-height: 1.6; }
+    .gv-legend .gv-lg-name {
+      font-size: 11px; color: #3f4550;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      max-width: 200px; vertical-align: middle;
+    }
+    .gv-legend .gv-lg-empty { font-size: 11px; color: #9fb0c3; }
+    /* 节点详情面板（点选节点弹出） */
+    .gv-detail {
+      position: absolute;
+      right: 10px;
+      top: 10px;
+      bottom: 10px;
+      width: min(360px, 88%);
+      background: #fff;
+      border: 1px solid #e8e8e8;
+      border-radius: 10px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.10);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      --gd-fs: 15px;           /* 详情正文基准字号（AI-032），A± 可放大 13~22px */
+      font-size: var(--gd-fs, 15px);   /* 面板基准字号：正文与标题都以 em 跟随缩放 */
+    }
+    .gv-detail .gd-head {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 12px;
+      border-bottom: 1px solid #f0f0f0;
+      flex-shrink: 0;
+    }
+    .gv-detail .gd-title {
+      flex: 1;
+      min-width: 0;
+      font-size: 1em;
+      font-weight: 600;
+      color: #222;
+      line-height: 1.55;
+      max-height: 76px;
+      overflow-y: auto;
+      word-break: break-word;
+    }
+    .gv-detail .gd-close {
+      flex-shrink: 0;
+      border: none;
+      background: none;
+      cursor: pointer;
+      color: #aaa;
+      font-size: 14px;
+      padding: 0 2px;
+    }
+    .gv-detail .gd-close:hover { color: #333; }
+    /* 详情正文放大/缩小（AI-032）：A± 独立缩放整组文字，随开随用并记忆 */
+    .gv-detail .gd-fsgroup { display: flex; gap: 3px; flex-shrink: 0; }
+    .gv-detail .gd-fsbtn {
+      border: 1px solid #e5e7eb;
+      background: #f7f8fa;
+      color: #6a7178;
+      border-radius: 5px;
+      font-size: 11px;
+      line-height: 1;
+      padding: 4px 5px;
+      cursor: pointer;
+    }
+    .gv-detail .gd-fsbtn:hover { border-color: #5b5fe8; color: #5b5fe8; }
+    .gv-detail .gd-fsbtn:disabled { opacity: 0.35; cursor: default; border-color: #e5e7eb; color: #6a7178; }
+    .gv-detail .gd-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px 16px;
+      font-size: var(--gd-fs, 15px);
+      color: #33393f;
+      line-height: 1.78;
+    }
+    .gv-detail .gd-label {
+      font-size: 0.74em;
+      color: #6a7178;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      margin: 16px 0 7px;
+    }
+    .gv-detail .gd-label:first-child { margin-top: 2px; }
+    .gv-detail .gd-alias {
+      background: #f2f4f7;
+      border-radius: 8px;
+      padding: 7px 10px;
+      margin-bottom: 6px;
+      font-size: 0.9em;
+      color: #3f4550;
+      line-height: 1.7;
+    }
+    .gv-detail .gd-none { color: #bbb; font-size: 0.85em; }
+    .gv-detail .gd-disc {
+      border: 1px solid #eceef1;
+      border-radius: 10px;
+      padding: 11px 13px;
+      margin-bottom: 10px;
+      background: #fcfcfd;
+    }
+    .gv-detail .gd-disc .q { color: #222; line-height: 1.6; }
+    .gv-detail .gd-disc .meta { font-size: 0.72em; color: #7c848d; margin-top: 4px; }
+    .gv-detail .gd-disc .gd-q {
+      display: flex;
+      align-items: flex-start;
+      gap: 7px;
+      cursor: pointer;
+      color: #1f2430;
+      font-weight: 600;
+      line-height: 1.6;
+      user-select: none;
+    }
+    .gv-detail .gd-disc .gd-q:hover { color: #5b5fe8; }
+    .gv-detail .gd-disc .gd-caret {
+      flex-shrink: 0;
+      font-size: 0.72em;
+      color: #8a92a6;
+      margin-top: 2px;
+      transition: transform 0.15s;
+    }
+    .gv-detail .gd-disc .gd-q.open .gd-caret { transform: rotate(90deg); }
+    .gv-detail .gd-disc .gd-qbody {
+      margin-top: 9px;
+      padding-left: 14px;
+      border-left: 2px solid #e3e7fc;
+      max-height: 360px;   /* AI-038：正文独立小滚动区，排号钉在正上方不随正文滚走 */
+      overflow-y: auto;
+    }
+    .gv-detail .gd-disc .gd-qbody .meta { font-size: 0.78em; color: #7c848d; margin-bottom: 8px; }
+    /* 每轮交锋为独立区块（AI-032）：问/答分行、轮与轮间隔舒展（首轮不额外留白） */
+    .gv-detail .gd-round + .gd-round { margin-top: 10px; }
+    .gv-detail .gd-ex {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      font-size: 0.92em;
+      color: #3f4550;
+      line-height: 1.8;
+      padding: 2px 0;
+    }
+    .gv-detail .gd-ex-a { margin-top: 7px; }
+    .gv-detail .gd-ex .gxl {
+      flex-shrink: 0;
+      display: inline-block;
+      width: 1.5em;
+      height: 1.5em;
+      line-height: 1.5em;
+      text-align: center;
+      border-radius: 4px;
+      font-size: 0.74em;
+      color: #5b5fe8;
+      background: #eef0fd;
+      margin-top: 2px;
+    }
+    .gv-detail .gd-ex .gd-ext { flex: 1; min-width: 0; word-break: break-word; }
+    .gv-detail .gd-meta { font-size: 0.88em; color: #6a7178; line-height: 1.75; }
+    .gv-detail .gd-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+    /* 每条讨论内部的轮次导航（AI-038）：标题下 chip 排，作为正文上方不滚动的兄弟节点——
+       正文在独立小滚动区内滚动，排号始终在正上方，不用回顶部、无需 sticky、不会叠字 */
+    .gv-detail .gd-round-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 8px 0 6px;
+    }
+    .gv-detail .gd-pip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 22px;
+      height: 22px;
+      padding: 0 6px;
+      font-size: 0.8em;
+      line-height: 1;
+      font-weight: 600;
+      color: #5b5fe8;
+      background: #eef0fd;
+      border: 1px solid #d3d8fb;
+      border-radius: 6px;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .gv-detail .gd-pip:hover { background: #fdeddc; border-color: #f5c98a; color: #b45309; }
+    .gv-detail .gd-pip.active { background: #07c160; border-color: #07c160; color: #fff; }
+    /* 轮次 pip 详情 tooltip（AI-035）：悬停序号显示该轮「问/答」原文 */
+    .gv-detail .gd-pip-tip {
+      position: fixed;
+      max-width: 260px;
+      max-height: 220px;
+      background: rgba(35, 38, 44, 0.95);
+      color: #f5f6f7;
+      font-size: 12px;
+      line-height: 1.6;
+      padding: 8px 10px;
+      border-radius: 8px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+      z-index: 70;
+      display: none;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      pointer-events: none;
+    }
+    .gv-detail .gd-pip-tip.on { display: block; }
+    .gv-detail .gd-note {
+      margin-top: 10px;
+      font-size: 10px;
+      color: #b45309;
+      background: #fef9ec;
+      border: 1px solid #fdecc8;
+      border-radius: 6px;
+      padding: 5px 8px;
+    }
+    /* 悬停提示 */
+    .gv-tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: rgba(35, 38, 44, 0.95);
+      color: #f5f6f7;
+      font-size: 11px;
+      line-height: 1.55;
+      padding: 6px 10px;
+      border-radius: 7px;
+      max-width: 240px;
+      z-index: 6;
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 0.18s ease, visibility 0.18s ease;
+      word-break: break-word;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+    }
+    .gv-tooltip.show { opacity: 1; visibility: visible; }
+    .gv-tooltip b { color: #fff; }
+    .gv-tooltip div { margin-top: 2px; }
+    /* 空态 / 加载态 */
+    .gv-empty {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 24px;
+      text-align: center;
+      z-index: 4;
+    }
+    .gv-empty-text {
+      font-size: 13px;
+      color: #9aa0a8;
+      line-height: 1.7;
+      max-width: 260px;
+    }
+    .gv-empty-actions { display: flex; gap: 8px; }
+
+    /* AI-021（根因修复）：这些面板用 display:flex/block 定义，会覆盖 UA 的
+       [hidden]{display:none}——导致横幅 / 详情 / 空态永远常显（图视图"乱七八糟"的
+       直接原因）。这里强制让 hidden 属性生效：初始隐藏，只在该显示时由 JS 移除 hidden。 */
+    .gv-banner[hidden], .gv-detail[hidden], .gv-empty[hidden], .gv-legend[hidden] {
+      display: none !important;
+    }
+
   </style>
 </head>
 <body>
   <div id="header">
     <span style="font-size:15px;line-height:1">📖</span>
     <span class="title" id="current-book"><em>We read to know we are not alone.</em></span>
+    <button class="fs-btn" id="graph-btn" title="会意图（话题拓扑图）">◎</button>
+    <button class="fs-btn" id="doc-btn" title="放入的文件">📄</button>
     <button class="fs-btn" id="fs-down" title="减小字号">Ａ−</button>
     <button class="fs-btn" id="fs-up" title="增大字号">Ａ＋</button>
     <span id="dot"></span>
+  </div>
+
+  <!-- 放入的文件菜单（文档切换 / 放入文件入口） -->
+  <div id="doc-menu">
+    <div class="doc-menu-head">放入的文件</div>
+    <div class="doc-menu-list" id="doc-list"></div>
+    <div class="doc-menu-foot"><button id="doc-import-btn">＋ 放入文件</button></div>
   </div>
 
   <!-- 引用列表抽屉 -->
@@ -779,9 +1327,17 @@
   </div>
 
   <div id="footer">
+    <button id="attach-btn" title="放入文件（.md / .txt）">📎</button>
+    <input type="file" id="file-input" accept=".md,.markdown,.txt,.text" hidden>
     <textarea id="input" placeholder="说点什么…" rows="1"></textarea>
     <button id="send-btn">发送</button>
   </div>
+
+  <!-- 会意图拓扑视图（AI-020）：Obsidian 式话题拓扑图，全面板遮罩（DOM 由 graph-view.js 构建） -->
+  <div id="graph-overlay"></div>
+
+  <!-- 轻提示（放入文件结果反馈） -->
+  <div id="toast"></div>
 
   <!-- 提问位置浮窗（AI-005）：一张卡片。折叠态右缘几条小横杠（最多 10 条，AI-014 起为
        随当前提问滑动的窗口）；悬停展开提问列表，点击条目跳转；悬停省略文本用 tooltip 显示完整内容 -->
@@ -790,9 +1346,11 @@
       <div class="jump-list" id="jump-list"></div>
     </div>
     <div id="jump-fab-btn" aria-hidden="true"></div>
-    <div class="jump-tip" id="jump-tip"></div>
   </div>
+  <!-- 提问 tooltip（AI-031）：脱离 #jump-fab（其 transform 会裁剪 fixed 子弹）→ 左侧弹窗 -->
+  <div class="jump-tip" id="jump-tip"></div>
 
+  <script src="graph-view.js"></script>
   <script src="sidebar.js"></script>
 </body>
 </html>

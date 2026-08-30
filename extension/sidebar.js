@@ -58,6 +58,12 @@ let _currentBook = null  // { base, bookTitle }
 // 之后的 assistant 流式气泡继承，用于按书过滤消息区。
 let _thinkingBook = ''
 
+// ── 放入的文件（文档导入） ────────────────────────────────────────────────
+let _docs = []              // receiver /documents 拉取的文档列表 [{bookId, bookTitle, fileName, fileExt, importedAt}]
+let _docContext = null      // { base, bookTitle }：当前选中的文档上下文；null = 微信读书上下文
+let _lastWereadContext = null  // { base, bookTitle }：最近的微信读书上下文（文档模式下切回用）
+let _toastTimer = 0
+
 // 消息字号（AI-002）
 const FONT_SIZE_MIN = 11
 const FONT_SIZE_MAX = 18
@@ -248,8 +254,13 @@ chrome.runtime.onMessage.addListener((msg) => {
     try { chrome.storage.local.remove('pendingRefSearch') } catch {}
     openDrawerWithSearch(msg.query || '')
   }
-  // AI-001：content.js 广播当前阅读书籍（切书 = 页面导航，content.js 重载即广播）
+  // AI-001：content.js 广播当前阅读书籍（切书 = 页面导航，content.js 重载即广播）。
+  // 页面导航 = 正在读书：退出文档模式，回到微信读书上下文，并记录最近的微信读书上下文
   if (msg?.action === 'coreadBookContext') {
+    _docContext = null
+    if (typeof msg.bookId === 'string') {
+      _lastWereadContext = { base: baseBookId(msg.bookId), bookTitle: String(msg.bookTitle || '').trim() }
+    }
     applyBookContext(msg)
   }
 })
@@ -676,6 +687,12 @@ function applyBookContext(ctx) {
 // script 帧抢答、可能绑到非活动 tab 的书，这里点名唯一的目标（AI-008）。
 // bookId 为空（如无活动阅读页）也走 applyBookContext：把当前书重置为无书状态。
 async function refreshCurrentBook() {
+  // 放入文件的文档模式：优先保持文档上下文，不被微信读书页面/面板重开刷新覆盖；
+  // 退出文档模式（页面导航广播 / 菜单切回）后恢复跟随微信读书
+  if (_docContext) {
+    applyBookContext({ bookId: _docContext.base, bookTitle: _docContext.bookTitle })
+    return
+  }
   try {
     let ctx = null
     const [tab] = await chrome.tabs.query({ url: 'https://weread.qq.com/*', active: true, lastFocusedWindow: true })
@@ -684,10 +701,118 @@ async function refreshCurrentBook() {
         ctx = await chrome.tabs.sendMessage(tab.id, { action: 'getReadingContext' }, { frameId: 0 }).catch(() => null)
       } catch {}
     }
-    if (ctx && typeof ctx.bookId === 'string') applyBookContext(ctx)
-    else applyBookContext({ bookId: '' })  // 无活动阅读页 → 重置为无书状态
+    if (ctx && typeof ctx.bookId === 'string') {
+      _lastWereadContext = { base: baseBookId(ctx.bookId), bookTitle: String(ctx.bookTitle || '').trim() }
+      applyBookContext(ctx)
+    } else applyBookContext({ bookId: '' })  // 无活动阅读页 → 重置为无书状态
   } catch {}
 }
+
+// ── 放入的文件（文档导入） ────────────────────────────────────────────────
+function showToast(text, isErr) {
+  const el = document.getElementById('toast')
+  if (!el) return
+  el.textContent = text
+  el.classList.toggle('err', !!isErr)
+  el.classList.add('on')
+  clearTimeout(_toastTimer)
+  _toastTimer = setTimeout(() => el.classList.remove('on'), 2600)
+}
+
+// 从 receiver 拉取已放入的文档列表（用于文档菜单）
+async function loadDocs() {
+  try {
+    const r = await fetch(`${RECEIVER}/documents`)
+    const list = await r.json()
+    if (!Array.isArray(list)) return
+    _docs = list
+    renderDocMenu()
+  } catch {}  // 接收端未启动：静默，菜单显示空态
+}
+
+function renderDocMenu() {
+  const list = document.getElementById('doc-list')
+  if (!list) return
+  list.innerHTML = ''
+  const inDoc = !!_docContext
+  // 文档模式下提供「返回微信读书」入口（_lastWereadContext 由页面广播/面板打开时记录）
+  if (inDoc && _lastWereadContext) {
+    const back = document.createElement('div')
+    back.className = 'doc-back'
+    back.innerHTML = `<span>📖</span><span class="doc-name">微信读书《${esc(_lastWereadContext.bookTitle || '当前书')}》</span>`
+    back.addEventListener('click', () => {
+      _docContext = null
+      if (_lastWereadContext) applyBookContext({ bookId: _lastWereadContext.base, bookTitle: _lastWereadContext.bookTitle })
+      closeDocMenu()
+      showToast('已切回微信读书')
+    })
+    list.appendChild(back)
+  }
+  if (_docs.length === 0) {
+    list.innerHTML = '<div class="doc-empty">还没有放入文件，点下方按钮放入 .md / .txt 文档</div>'
+    return
+  }
+  for (const d of _docs) {
+    const item = document.createElement('div')
+    item.className = 'doc-item' + (inDoc && _docContext.base === d.bookId ? ' sel' : '')
+    item.innerHTML = `<span class="doc-icon">📄</span><span class="doc-name">${esc(d.bookTitle || d.fileName || '未命名')}</span><span class="doc-ext">${esc((d.fileExt || '').replace(/^\./, ''))}</span>`
+    item.addEventListener('click', () => {
+      _docContext = { base: d.bookId, bookTitle: d.bookTitle || d.fileName || '未命名文档' }
+      applyBookContext({ bookId: _docContext.base, bookTitle: _docContext.bookTitle })
+      closeDocMenu()
+      showToast(`已切到文档《${_docContext.bookTitle}》`)
+    })
+    list.appendChild(item)
+  }
+}
+
+function toggleDocMenu() {
+  const m = document.getElementById('doc-menu')
+  if (!m) return
+  const open = m.classList.toggle('on')
+  if (open) renderDocMenu()
+}
+
+function closeDocMenu() {
+  const m = document.getElementById('doc-menu')
+  if (m) m.classList.remove('on')
+}
+
+// 放入文件：读 .md/.txt 文本 → POST receiver /import → 立即切到该文档的阅读上下文
+async function importFile(file) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase()
+  if (!['md', 'markdown', 'txt', 'text'].includes(ext)) {
+    showToast('暂只支持 .md / .txt 文档文件', true)
+    return
+  }
+  if (file.size > 2 * 1024 * 1024) {
+    showToast('文件超过 2MB，暂不支持', true)
+    return
+  }
+  let content
+  try { content = await file.text() } catch { showToast('读取文件失败', true); return }
+  if (!content.trim()) { showToast('文件内容为空', true); return }
+  try {
+    const r = await fetch(`${RECEIVER}/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fileName: file.name, content }),
+    })
+    const d = await r.json().catch(() => ({}))
+    if (!r.ok) {
+      showToast(d && d.error ? `放入失败：${d.error}` : `放入失败（${r.status}）`, true)
+      return
+    }
+    // 导入即共读：切到该文档的上下文，直接开聊
+    _docContext = { base: d.bookId, bookTitle: d.bookTitle }
+    applyBookContext({ bookId: _docContext.base, bookTitle: _docContext.bookTitle })
+    await loadDocs()
+    showToast(d.updated ? `已更新文档《${d.bookTitle}》` : `已放入《${d.bookTitle}》`)
+  } catch {
+    showToast('放入失败：接收端未启动？', true)
+  }
+}
+
 
 // ── 事件绑定 ──────────────────────────────────────────────────────────────
 
@@ -753,6 +878,20 @@ try {
   applyFontSize()
 } catch {}
 
+// ── 放入文件（文档导入） ─────────────────────────────────────────────────
+document.getElementById('doc-btn')?.addEventListener('click', (e) => { e.stopPropagation(); toggleDocMenu() })
+document.getElementById('doc-import-btn')?.addEventListener('click', () => { document.getElementById('file-input')?.click() })
+document.getElementById('attach-btn')?.addEventListener('click', () => { document.getElementById('file-input')?.click() })
+document.getElementById('file-input')?.addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0]
+  if (f) importFile(f)
+  e.target.value = ''  // 清空选择，允许重复放入同一文件
+})
+// 点击菜单外区域关闭文档菜单
+document.addEventListener('click', (e) => {
+  const m = document.getElementById('doc-menu')
+  if (m && m.classList.contains('on') && !m.contains(e.target) && e.target.id !== 'doc-btn') closeDocMenu()
+})
 // ── 消息 ────────────────────────────────────────────────────────────────────
 let thinkingEl = null
 
@@ -973,7 +1112,16 @@ function connect() {
       const d = JSON.parse(e.data)
       if (d._seq) _lastEventId = Math.max(_lastEventId, d._seq)  // 记录进度，供续传
       if (d.type === 'connected') { setDot(true); return }
+      // 会意图刷新（AI-020）：图文件更新 → 图视图开着就重拉
+      if (d.type === 'graph-updated') { if (graphView?.isOpen()) graphView.reload(); return }
       if (d.type !== 'message') return
+
+      // 会意图命中（AI-020）：agent 引用解析命中旧知识点（L3 图路径上下文）→
+      // 图视图高亮各命中节点的 root→recent 路径并集；图未打开时暂存，打开即应用
+      if (d.role === 'graph-hit' && Array.isArray(d.hits) && d.hits.length) {
+        graphView?.onHit(d.hits, d.reason || '')
+        return
+      }
 
       // 流式记录（chunk / -1 结束标记）
       if (d._stream !== undefined) {
@@ -1029,6 +1177,12 @@ function connect() {
           renderDrawer()  // 若抽屉开着，让被删引用从列表消失
           try { chrome.runtime.sendMessage({ action: 'refreshCoReadMarks' }) } catch {}
         }
+        return
+      }
+
+      // 放入文件事件（其他面板导入时同步刷新文档列表；本面板导入走 importFile 直接更新）
+      if (d.role === 'file-imported') {
+        loadDocs()
         return
       }
 
@@ -1628,6 +1782,7 @@ async function loadHistory() {
     let histPendingRef = null
     let histBook = ''  // AI-001：历史游走中当前的书上下文，assistant 回复继承
     for (const d of items) {
+      if (d.role === 'graph-hit') continue  // AI-020：会意图命中事件不渲染为消息
       if (d.role === 'annotation') {
         if (d.bookId) histBook = baseBookId(d.bookId)
         // AI-010：标注一律是"引用"（设为引用 / 划线同步），不触发讨论也不产生消息气泡，
@@ -1833,7 +1988,7 @@ function renderJumpBars() {
   syncJumpBar()
 }
 
-// 完整内容 tooltip：在卡片内条目上方显示，避开右缘把手
+// 完整内容 tooltip（AI-031：显示在卡片左侧、垂直对齐条目中心，不再堆在上方）
 function showJumpTip(item, text) {
   const tip = document.getElementById('jump-tip')
   if (!tip) return
@@ -1843,9 +1998,13 @@ function showJumpTip(item, text) {
   if (fab) {
     const fabRect = fab.getBoundingClientRect()
     const itemRect = item.getBoundingClientRect()
-    let top = itemRect.top - fabRect.top - tip.offsetHeight - 8
-    const maxTop = fabRect.height - tip.offsetHeight - 8
-    top = Math.max(8, Math.min(top, maxTop))
+    const vw = window.innerWidth || document.documentElement.clientWidth || 0
+    const vh = window.innerHeight || document.documentElement.clientHeight || 0
+    // 右缘紧贴卡片左缘 - 10，垂直对齐条目中心
+    const right = Math.max(12, vw - fabRect.left + 10)
+    tip.style.right = Math.round(right) + 'px'
+    let top = itemRect.top + itemRect.height / 2 - tip.offsetHeight / 2
+    top = Math.max(12, Math.min(top, vh - tip.offsetHeight - 12))
     tip.style.top = Math.round(top) + 'px'
   }
 }
@@ -2008,6 +2167,20 @@ if (jumpListEl) {
   }, { passive: true })
 }
 
+// ── 会意图拓扑视图（AI-020）─────────────────────────────────────────────
+// 图视图（extension/graph-view.js）：Obsidian 式话题拓扑图。常态浏览（缩放/平移/
+// 悬停邻接/点选详情/搜索）；SSE graph-hit 命中 → 高亮 root→recent 路径并集。
+// 数据：GET {receiver}/graph（agent/data/knowledge-graph.json，图空时可 ?demo=1 预览）。
+const graphView = typeof CoReadGraphView !== 'undefined'
+  ? new CoReadGraphView.GraphView({
+      receiver: RECEIVER,
+      container: document.getElementById('graph-overlay'),
+      onHitNotify: (count) => showToast('🔗 会话命中会意图 ' + count + ' 个节点，打开「◎」查看拓扑脉络'),
+    })
+  : null
+const graphBtn = document.getElementById('graph-btn')
+if (graphBtn && graphView) graphBtn.addEventListener('click', () => graphView.open())
+
 // 启动后查询当前阅读书籍（AI-001）：覆盖「切书后重开侧栏」的场景。
 // applyPendingRefSearch 放在 loadHistory 之后：引用列表就绪后再打开抽屉搜索，
 // 否则搜索框填了词但列表还是空的（AI-011）。
@@ -2016,6 +2189,7 @@ loadState()
   .then(applyPendingRefSearch)
   .then(connect)
   .then(() => refreshCurrentBook())
+  .then(loadDocs)  // 启动时拉取已放入的文档列表（文档菜单）
 loadJumpBack()  // AI-006：面板重开后恢复「↩ 返回」能力（有未过期的跳转记录时）
 
 // 活动 tab 变化时刷新当前书（AI-001）：用户在多本书 / 多个微信读书 tab 间切换

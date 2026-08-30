@@ -8,8 +8,10 @@
 import http from 'http'
 import fs from 'fs'
 import path from 'path'
+import { createHash } from 'crypto'
 import { execSync } from 'child_process'
 import { fileURLToPath } from 'url'
+import { GRAPH_FILE, readGraphFile, buildDemoGraph } from './graph-data.js'  // AI-020：会意图图数据
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = parseInt(process.env.COREAD_PORT || '7239')
@@ -64,6 +66,18 @@ setInterval(() => {
     }
   } catch {}
 }, 100)
+
+// AI-020：会意图图文件变化轮询（3s 一次 stat）→ mtime 变化时 SSE graph-updated，
+// 侧栏图视图开着就自动重拉（图由会意系统固化到 agent/data/knowledge-graph.json）。
+let _graphFileMtime = 0
+setInterval(() => {
+  let m = 0
+  try { m = fs.statSync(GRAPH_FILE).mtimeMs } catch {}
+  if (m > 0 && m !== _graphFileMtime) {
+    _graphFileMtime = m
+    pushSSE('graph-updated', {})
+  }
+}, 3000)
 
 function bookDir(bookId) {
   // 归一化：去掉微信读书的 k-suffix 会话变体，一本书只对应一个目录。
@@ -228,6 +242,7 @@ const server = http.createServer(async (req, res) => {
     }
     for (const d of readJsonl(CHAT_OUTPUT)) {
       if ('_stream' in d) continue  // 过滤流式中间分片
+      if (d.role === 'graph-hit') continue  // AI-020：会意图命中事件不渲染为消息
       chatItems.push({ role: 'assistant', content: d.content, _ts: d.timestamp || 0 })
     }
     // 聊天消息先按时间戳混排、再取最近 500 条：user/assistant 交错后截取，
@@ -240,6 +255,55 @@ const server = http.createServer(async (req, res) => {
       .sort((a, b) => (a._ts || 0) - (b._ts || 0))
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify(allItems))
+    return
+  }
+
+  // 放入的文件列表（GET /documents）
+  // 返回所有通过「放入文件」导入的文档书（meta.source === 'file'），按放入时间倒序，
+  // 供扩展侧栏的文档菜单列出可切换的文档。
+  if (req.method === 'GET' && req.url === '/documents') {
+    // 来源限制：只允许扩展读文档列表（评审 P1 同款）
+    if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
+    const docs = []
+    try {
+      for (const name of fs.readdirSync(BOOKS_DIR)) {
+        let meta
+        try { meta = JSON.parse(fs.readFileSync(path.join(BOOKS_DIR, name, 'meta.json'), 'utf8')) }
+        catch { continue }
+        if (meta.source !== 'file' || !meta.bookId) continue
+        docs.push({
+          bookId: meta.bookId,
+          bookTitle: meta.bookTitle || '',
+          fileName: meta.fileName || '',
+          fileExt: meta.fileExt || '',
+          importedAt: meta.importedAt || 0,
+          updatedAt: meta.updatedAt || 0,
+        })
+      }
+    } catch {}
+    docs.sort((a, b) => (b.importedAt || 0) - (a.importedAt || 0))
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(docs))
+    return
+  }
+
+  // 会意图拓扑图（GET /graph[?demo=1]）——AI-020
+  // 返回 { nodes, edges, updatedAt, demo }：节点 = 知识点（point/aliases/discussions），
+  // 边 = 用户问题意识轨迹（from → to，kind: user|derived）。数据源 = agent/data/
+  // knowledge-graph.json（会意系统固化的图文件，一张图一个文件，§5.3）；?demo=1 时
+  // 用演示拓扑（scripts/data/knowledge-graph-demo.json）重建，供侧栏图视图在真实图
+  // 为空时预览交互与命中高亮。
+  if (req.method === 'GET' && req.url.split('?')[0] === '/graph') {
+    // 来源限制：只允许扩展读图（评审 P1 同款）
+    if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
+    const u = new URL(req.url, 'http://localhost')
+    let out = readGraphFile()
+    if (u.searchParams.get('demo') === '1') {
+      const dg = buildDemoGraph()
+      if (dg) out = { nodes: dg.nodes, edges: dg.edges, updatedAt: Date.now(), demo: true }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(out))
     return
   }
 
@@ -488,6 +552,48 @@ const server = http.createServer(async (req, res) => {
       const result = safeWriteContent(bookId, chapterUid, text, selectedText)
       writeBookMeta(bookId, data)
       console.log(`[content] bookId=${bookId} chapterUid=${chapterUid} (${text.length} chars) ${result}`)
+
+    } else if (url === '/import') {
+      // 放入文件（文档导入）：接收扩展侧栏放入的 .md/.txt 文档，存成一本"文档书"。
+      // 内容写入 books/{bookId}/chapters/e_0.txt，meta 标记 source:'file'，
+      // agent 据此把整篇文档作为上下文（见 agent/index.js fileDocContext）。
+      const { fileName, content } = data
+      if (!fileName || typeof content !== 'string') {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'missing fileName/content' })); return
+      }
+      const ext = path.extname(fileName).toLowerCase()
+      const ALLOWED_DOC_EXT = ['.md', '.markdown', '.txt', '.text']
+      if (!ALLOWED_DOC_EXT.includes(ext)) {
+        res.writeHead(415); res.end(JSON.stringify({ error: '暂不支持 ' + ext + ' 文件，只接受 .md/.txt' })); return
+      }
+      const MAX_DOC_CHARS = 2_000_000
+      if (content.length > MAX_DOC_CHARS) {
+        res.writeHead(413); res.end(JSON.stringify({ error: '文件过大（>2MB）' })); return
+      }
+      const title = path.basename(fileName, ext).trim() || '未命名文档'
+      // 文档书 bookId：doc_ + 文件名 hash。同名文件重复放入 = 覆盖更新同一本文档书。
+      const bookId = 'doc_' + createHash('sha1').update(title.toLowerCase()).digest('hex').slice(0, 24)
+      const dir = bookDir(bookId)
+      fs.writeFileSync(path.join(dir, 'chapters', 'e_0.txt'), content)
+      const metaFile = path.join(dir, 'meta.json')
+      const prevMeta = (() => { try { return JSON.parse(fs.readFileSync(metaFile, 'utf8')) } catch { return {} } })()
+      const updated = !!prevMeta.bookId
+      fs.writeFileSync(metaFile, JSON.stringify({
+        bookId,
+        baseBookId: bookId,
+        bookTitle: title,
+        fileName,
+        fileExt: ext,
+        source: 'file',
+        importedAt: prevMeta.importedAt || Date.now(),
+        updatedAt: Date.now(),
+      }))
+      // 推送事件：已打开的面板实时刷新文档列表（其他面板同步）
+      pushSSE('message', { role: 'file-imported', bookId, bookTitle: title, fileName })
+      console.log('[import] 《' + title + '》' + ext + ' (' + content.length + ' chars) ' + (updated ? 'updated' : 'created'))
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, bookId, bookTitle: title, updated }))
+      return  // 必须 return：否则落到底部公共 res.writeHead(200)，对已结束的响应二次 writeHead 抛 ERR_HTTP_HEADERS_SENT
 
     } else if (url === '/debug') {
       const line = JSON.stringify({ ...data, receivedAt: Date.now() })

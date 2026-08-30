@@ -39,7 +39,9 @@ CoRead 不是这样。
 - **跨书记忆**：讨论时自动检索你读过的其他书，有相关就自然带出来
 - **长期记忆生长**：阅读画像（profile）和 agent 自画像（soul）随每次共读更新，越来越懂你
 - **话题追踪**：没聊透的内容进入 open_topics，设定重提条件，不会丢
+- **会意图拓扑视图**：侧栏「◎」打开知识点拓扑图（Obsidian 式浏览：缩放/平移/悬停/点选详情/搜索），对话命中旧知识点时自动高亮 root→recent 拓扑脉络
 - **侧栏 UI**：Chrome Side Panel 原生展示，不遮挡正文
+- **放入文件**：侧栏可直接放入 .md/.txt 文档（「📎」或「📄」菜单），文档存为本地"文档书"，切换后即可与 AI 讨论全文
 - **完全本地**：所有数据存在你的机器上
 
 ---
@@ -56,6 +58,7 @@ Chrome Extension (extension/)
 本地接收端 receiver/index.js  :7239
   │  写 inbox/annotations.jsonl
   │  写 books/{bookId}/chapters/{chapterUid}.txt
+  │  放入文件 POST /import → books/doc_xxx/（文档书）
   │  SSE 推送 → Chrome Side Panel
   ▼
 Agent  agent/index.js
@@ -63,6 +66,7 @@ Agent  agent/index.js
   │  recall.js 跨书检索
   │  调用 LLM API（OpenAI 兼容）
   │  写 chat_output.jsonl → SSE → 侧栏显示
+  │  会意图 GET /graph → 侧栏拓扑视图（AI-020）
   └─ 会话结束：合并重写 profile.md / soul.md
 ```
 
@@ -135,7 +139,7 @@ coread/
 │   ├── manifest.json
 │   ├── content.js      # 标注弹窗、章节切换检测
 │   ├── service_worker.js   # 章节正文网络拦截
-│   ├── sidebar.html/js     # Chrome Side Panel 聊天 UI
+│   ├── sidebar.html/js     # Chrome Side Panel 聊天 UI（含「放入文件」导入 .md/.txt）
 │   └── page_hook.js    # MAIN world 注入，拦截 clipboard
 │
 ├── receiver/           # 本地 HTTP 接收端（localhost:7239）
