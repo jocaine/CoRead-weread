@@ -148,9 +148,11 @@ export async function judgeSegmentSame(message, group, deps = {}) {
  * 对弹出的栈（思维连续的段）做固化后分段。
  * @param {Array} entries 弹出的栈轮次 [{role:'user'|'assistant', content, selected?, cites?}]
  * @param {object} deps { callLLM 必填, log?, attempts?, verdictOf? }
- * @returns {Promise<{segments: Array, ignored: number}>}
+ * @returns {Promise<{segments: Array, ignored: number, noTopicized?: boolean}>}
  *   segments: [{ entries: [{role, content, selected?}], cites: string[] }]（不可分割的讨论组）
- *   ignored：恒 0（无内核轮次不做过滤处理，跟随并入当前组——2026-08-28 定调）
+ *   ignored：恒 0（无内核轮次不做过滤处理——有当前组则跟随并入；无当前组则挂起，
+ *     等后续专题化轮次开组时并入。2026-08-28 定调 + 2026-09：命中不替代专题化判断）
+ *   noTopicized：整栈没有任何专题化轮次（全部挂起）→ 零产物，调用方不保留重试
  */
 export async function segmentStack(entries, deps = {}) {
   const { callLLM, log = () => {}, attempts = MAX_ATTEMPTS, verdictOf } = deps
@@ -166,6 +168,9 @@ export async function segmentStack(entries, deps = {}) {
   let ignored = 0
   let cur = []        // 当前组（user + assistant 轮次）
   let curCites = []   // 当前组内 user 轮次的引用（去重）
+  let pending = []        // 无当前组时的非专题化挂起轮次（不独自成组，2026-09）
+  let pendingCites = []   // 挂起轮次的引用（并入首个专题化组时收集）
+  let sawTopicized = false  // 整栈是否有专题化轮次（无 → noTopicized，零产物不重试）
   let prevAssist = null  // 组内/栈内前一条 assistant（判专题化降级材料）
 
   const flush = () => {
@@ -218,16 +223,26 @@ export async function segmentStack(entries, deps = {}) {
     // 保留原条目的额外字段（如离线管线的 _caseId），段内条目不丢归属信息
     const entry = { ...e, role: 'user', content: userNote, ...(e.selected && String(e.selected.text || '').trim() ? { selected: e.selected } : {}) }
     const cites = Array.isArray(e.cites) ? e.cites : []
-    if (cur.length === 0) {
-      cur = [entry]
-      curCites = cites
+    if (!topicized) {
+      // 无内核轮次：不做过滤处理——命中不替代专题化判断（2026-09 定调）：
+      // 非专题化轮次不独自成组（不构成知识点、不参与归纳问题）。有当前组 →
+      // 跟随并入（只贡献 cites）；无当前组 → 挂起，等后续专题化轮次开组时并入。
+      if (cur.length === 0) {
+        pending.push(entry)
+        pendingCites.push(...cites)
+      } else {
+        cur.push(entry)
+        curCites.push(...cites)
+      }
       continue
     }
-
-    if (!topicized) {
-      // 无内核轮次：不做过滤处理，并入当前组（不判同一、不切段）
-      cur.push(entry)
-      curCites.push(...cites)
+    sawTopicized = true
+    if (cur.length === 0) {
+      // 专题化轮次开组：先并入挂起的非专题化跟随者（含其 cites），再做首条
+      cur = [...pending, entry]
+      curCites = [...pendingCites, ...cites]
+      pending = []
+      pendingCites = []
       continue
     }
 
@@ -254,5 +269,5 @@ export async function segmentStack(entries, deps = {}) {
     }
   }
   flush()  // 结尾：开着的组收口
-  return { segments, ignored }
+  return { segments, ignored, noTopicized: !sawTopicized }
 }

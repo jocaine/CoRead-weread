@@ -6,7 +6,7 @@
  *
  * 两种状态：
  * - 观察态（一般情况）：浏览整张拓扑图——滚轮缩放、拖拽空白平移、拖节点微调布局、
- *   悬停高亮邻接子图、点选节点看详情（point / 能指 / 节点讨论 / 元信息）、
+ *   悬停高亮邻接子图、点选节点看详情（point / 相关说法 / 节点讨论 / 元信息）、
  *   搜索定位（point / aliases / 讨论问题）、图例（边种类、root、recent）。
  * - 命中态（对话命中）：SSE graph-hit（agent 引用解析命中旧知识点）→ 高亮各命中节点
  *   的 root→recent 路径并集（与 agent/lib/knowledge-graph.js contextOf 同规则：
@@ -27,10 +27,10 @@
   'use strict'
 
   // ── 常量 ────────────────────────────────────────────────────────────────
-  const REPULSION = 13000      // 斥力系数（f = REP / d²）
+  const REPULSION = 22000      // 斥力系数（f = REP / d²）AI-038：提高 → 节点间距更大，缩放不易碰撞
   const SPRING = 0.018         // 弹簧系数（沿边）
-  const REST_LEN = 170        // 边静止长度（世界单位）
-  const GRAVITY = 0.009       // 重心引力系数
+  const REST_LEN = 200        // 边静止长度（世界单位）AI-038：拉长 → 相连节点更松，内部留白更大
+  const GRAVITY = 0.004       // 重心引力系数 AI-038：调低 → 向心聚拢更弱，整体更铺开
   const DAMPING = 0.85        // 速度阻尼
   const MAX_SPEED = 13        // 速度上限
   const TICKS = 420           // 物理迭代上限（每帧 2 子步 → 约 3.5s 收敛）
@@ -39,8 +39,13 @@
   const FRICTION_K = 0.45     // 静止摩擦系数：低速每步再乘 0.45，静止时安静不发飘
   const COLLIDE_PAD = 1.0     // 碰撞死区（屏幕 px）：重叠小于此值不推，静止不发飘（亚像素重叠不可见）
   const LABEL_MIN_SCALE = 0.5  // 标签可见/参与碰撞的最低缩放：低于此值不画标签，也不做标签碰撞（防缩小后乱碰）
-  const MAX_PUSH = 24         // 单对单帧最大推开量（世界单位）：防极端缩放/拖拽时瞬时甩飞
-  const MAX_STEP = 6          // 单节点每帧最大位移预算（世界单位）：重排渐进发生，不爆发式甩飞
+  const MAX_PUSH = 30         // 单对单帧最大推开量（世界单位）：AI-038 略增，缩放时弹开更利落
+  const MAX_STEP = 9          // 单节点每帧最大位移预算（世界单位）：AI-038 略增，去重叠更敏捷
+  const EDGE_CURVE = 0.16    // 曲边幅度系数（AI-034，占边长比例）：折返/互向边自动弯向相反侧
+  const EDGE_CURVE_MAX = 200 // 曲边最大弯高（px）：超长边封顶，防弯过头甚至打结
+  const ANG_MIN = 0.55       // 入射/出射边最小夹角（rad≈31.5°）：近 0=重合/折返，直接掰开（AI-037）
+  const ANG_GAIN = 4.0       // 角分辨率力增益：缺角(rad)→速度增量
+  const ANG_PUSH_MAX = 1.0   // 单边单帧速度增量上限：防瞬时甩飞，温和收敛
 
 
   const COLORS = {
@@ -134,6 +139,37 @@
     return { ordered, roots, recent: targets, pathEdges }
   }
 
+  // 命中按"链"分组（2026-09 用户定调）：链 = 一个命中节点的 root→recent 路径；
+  // 路径节点集有交集的命中合并为同一条链（一个命中在另一命中的路径上、或共享
+  // root/中间节点），互不相交的命中各自成链。返回
+  // [{ hits: [被命中的节点 id...], nodes: [链上全部节点 id，拓扑序], pathEdges: [链内边] }]
+  function computeChains(nodes, edges, targetIds) {
+    const byId = new Map(nodes.map((n) => [n.id, n]))
+    const targets = (Array.isArray(targetIds) ? targetIds : [targetIds])
+      .map((id) => String(id || '').trim())
+      .filter((id) => id && byId.has(id))
+    const chains = []
+    for (const t of targets) {
+      const path = computePath(nodes, edges, [t])
+      const pathSet = new Set(path.ordered)
+      const overlap = chains.filter((c) => c.nodes.some((id) => pathSet.has(id)))
+      if (!overlap.length) {
+        chains.push({ hits: [t], nodes: path.ordered.slice(), pathEdges: path.pathEdges.slice() })
+        continue
+      }
+      const c = overlap[0]
+      c.hits.push(t)
+      c.nodes = topoSort([...new Set([...c.nodes, ...path.ordered])], edges)
+      for (const o of overlap.slice(1)) {
+        c.hits.push(...o.hits)
+        c.nodes = topoSort([...new Set([...c.nodes, ...o.nodes])], edges)
+        chains.splice(chains.indexOf(o), 1)
+      }
+      c.pathEdges = edges.filter((e) => c.nodes.includes(e.from) && c.nodes.includes(e.to))
+    }
+    return chains
+  }
+
   // 书名归一（AI-025）：冒烟数据里 book 字段形如「书名  章节」（章节号跟在书名后），
   // 取色/展示时剥离章节后缀，让同一本书的节点同色；无后缀则原样返回。
   function bookName(bookTitle) {
@@ -222,23 +258,37 @@
      * @param {object} opts
      *   receiver: string  receiver 地址（默认 http://127.0.0.1:7239）
      *   container: HTMLElement  #graph-overlay（CSS .on 控制显示，DOM 由本类构建）
-     *   onHitNotify: (count:number)=>void  命中但图视图未打开时的通知回调
+     *   onPick: (node:{id,point,aliases,discussions})=>void  选择模式下双击节点回调
+     *     （自由模式手动选取引用用，2026-09）
      */
     constructor(opts = {}) {
       this.recv = opts.receiver || 'http://127.0.0.1:7239'
       this.container = opts.container
-      this.onHitNotify = typeof opts.onHitNotify === 'function' ? opts.onHitNotify : null
+      this.onPick = typeof opts.onPick === 'function' ? opts.onPick : null
 
       this.graph = null      // { nodes, edges, demo, updatedAt }
       this.run = null        // 运行时：{ nodes:[{id,point,aliases,discussions,books,r,x,y,vx,vy,pinned,color}], edges:[{from,to,kind}], byId }
       this.cam = { x: 0, y: 0, scale: 1 }   // 世界→屏幕：sx = (wx - cam.x)*scale + W/2
-      this.hl = null         // 高亮态：{ mode:'hit'|'manual'|'search', ids:Set, edges:Set, roots:[], recent:[], targets:[], reason, at }
+      this.hl = null         // 高亮态：{ mode:'hit'|'manual'|'search', ids:Set, edges:Set, roots:[], recent:[], targets:[], reason, at, chains? }
+      this._hlHidden = false // 当前讨论命中高亮是否被用户手动隐藏（横幅按钮切换；hl 数据保留，渲染跳过）
+      this._focusChain = 0   // 当前聚焦的链下标（hl.chains 内的索引；0 = 第一条）
+      this._chainTimer = 0   // 多链轮播计时器（自动弹出动画：逐链展示横幅 + 聚焦）
+      this._pickMode = false // 节点选取模式（自由模式手动选取引用）：单击看详情，双击选取
+      this._pickSelectTimer = 0  // 选取模式下单击→详情打开的延迟计时器（防详情面板遮挡双击）
       this.hover = null      // 悬停节点 id
       this.sel = null        // 选中节点 id
-      this.pendingHits = null // 图未打开时收到的命中 { hits, reason }
+      // 命中自动弹出 + 渐隐关闭（AI-020 命中动画）：图未打开时命中 → 自动打开 →
+      // 播放命中路径动画（横幅 + 高亮 + 相机适配）→ 停留 → .gv-fading 渐隐关闭。
+      // _autoCloseTimer：停留计时；_fadeTimer：渐隐过渡计时（CSS 0.7s 一致）。
+      this._autoCloseTimer = 0
+      this._fadeTimer = 0
       this._physics = { running: false, tick: 0 }
       this._anim = null      // 相机动画
+      this._preFocusCam = null  // 聚焦前相机快照（取消聚焦/点空白时恢复，2026-09 用户定调——不回整体最小视图）
+      this._savedState = null   // 单击预览暂存：{ hl, focusChain, hidden }——manual 覆盖消息级高亮前保存，点空白取消时原样恢复（2026-09 修复）
+      this._bannerBtnKind = 'hl' // 横幅按钮类型：'hl' 高亮显隐切换 | 'clear' 清除搜索（2026-09）
       this._pulseUntil = 0
+      this._pendingChainFit = false   // 物理收敛时的一次性命中聚焦校准挂起标记（2026-10）
       this._dragging = null
       // 悬停过渡（AI-027）：压暗/放大/pill 淡入淡出按帧缓动，不再闪变
       this._nodeDim = new Map()   // 节点压暗强度 0..1（1 = 非邻接全暗）
@@ -247,85 +297,157 @@
       this._raf = 0
       this._built = false
       this._bound = false
+      this._loadPromise = null   // 加载中的 promise（防重入：open 与 applyHit 并发加载时复用）
       this._open = false
       this._demo = false
-      this._source = 'file'   // 图数据来源：file（固化图）| results（冒烟有效图）| demo（演示拓扑）
+      this._free = false   // 自由模式沙盒图（/graph?free=1，测试固化产物）
+      this._source = 'file'   // 图数据来源：file（固化图）| results（冒烟有效图）| demo（演示拓扑）| free（自由模式沙盒图）
       this._baseScale = 0       // 内容长度分级基准 = 初始 fit scale（决定初始化显示多短）
       this._bookColors = null   // 同图取色表（AI-028）：buildRun 时按全部书名贪心分配
       this._detailFont = 15    // 详情正文基准字号（AI-032），A± 缩放 13~22px，localStorage 记忆
       this._detailFontMin = 13
       this._detailFontMax = 22
       try { const v = +localStorage.getItem('coread.graphDetailFont'); if (v >= this._detailFontMin && v <= this._detailFontMax) this._detailFont = v } catch {}
-      this._settleFitted = false  // 物理收敛后是否已自动适配一次
       this._w = 0
       this._h = 0
       this._ro = null
     }
 
     // ── 公开接口 ──────────────────────────────────────────────────────────
-    open() {
+    // 打开遮罩的公共部分（open 与命中自动弹出共用）：显示容器、建 DOM、绑定事件、
+    // 清残留渐隐态。不做数据加载（调用方各自决定拉图时机）。
+    _openOverlay() {
       this._open = true
       if (!this.container) return
       this.container.classList.add('on')
+      this.container.classList.remove('gv-fading')
       if (!this._built) this._build()
       this._bind()
       this._resize()
       // 双保险（AI-021）：display:none → flex 切换后 clientWidth/clientHeight 常要到
       // 下一帧才稳定，直接读可能是 0（canvas 按 0 尺寸渲染成空画布）。等一帧再测一次。
       requestAnimationFrame(() => { if (this._open) { this._resize(); this.render() } })
-      if (this.pendingHits) {
-        const p = this.pendingHits
-        this.pendingHits = null
-        this.applyHit(p.hits, p.reason, 'hit')
-      } else {
-        this.loadGraph(this._demo)   // 每次打开重拉一次，图文件更新即生效
-      }
+    }
+    open() {
+      this._cancelAutoDismiss()   // 用户手动打开：取消挂起的自动渐隐（命中动画让位）
+      this._openOverlay()
+      this.loadGraph(this._demo, this._free)   // 每次打开重拉一次，图文件更新即生效
     }
     close() {
       this._open = false
       this.hover = null
       this._physics.running = false   // 关闭时停掉常驻物理/渲染循环，避免后台空转
       this._hideTooltip()
+      this._savedState = null   // 关闭即丢弃 manual 暂存（下次打开重拉图，命中态按 targets 重算）
       if (this.container) this.container.classList.remove('on')
+      // 关闭即退出选取模式（下次进入由侧栏重新 setPickMode(true)）
+      if (this._pickMode) this.setPickMode(false)
     }
     isOpen() { return this._open }
 
-    /** SSE graph-hit 命中：图未打开时暂存 + 通知，打开时应用 */
+    /**
+     * SSE graph-hit 命中（无论自由模式还是读书模式，行为一致）：
+     * - 图未打开 → 自动弹出拓扑图 → 播放命中路径动画（横幅 + 高亮 + 相机适配，
+     *   横幅即命中通知）→ 停留后渐隐关闭（.gv-fading，0.7s opacity）。
+     * - 图已打开（用户正在浏览）→ 直接应用命中高亮，不自动关闭。
+     */
     onHit(hits, reason) {
       const ids = (Array.isArray(hits) ? hits : []).filter(Boolean)
       if (!ids.length) return
+      console.log('[CoRead][gv] onHit', ids.length, String(reason || '').slice(0, 24), 'open=', this._open)
+      this._cancelAutoDismiss()   // 新命中取消挂起的自动渐隐（旧动画让位）
       if (!this._open) {
-        this.pendingHits = { hits: ids, reason: reason || '' }
-        if (this.onHitNotify) this.onHitNotify(ids.length)
+        this._autoShowHit(ids, reason || '')
         return
       }
       this.applyHit(ids, reason || '', 'hit')
     }
 
+    // 命中自动弹出 + 渐隐关闭：打开遮罩 → 等图加载并应用命中（root→recent 路径
+    // 高亮 + 横幅通知 + 相机适配）→ 按链展示：单链停留后渐隐关闭；多链轮播
+    // （每条链横幅 + 聚焦，全部播完再渐隐关闭）。
+    async _autoShowHit(hits, reason) {
+      this._openOverlay()
+      await this.applyHit(hits, reason, 'hit')
+      if (!this.graph) { this.close(); return }   // 图加载失败：不演动画，直接收起
+      const chains = this.hl && this.hl.chains
+      if (chains && chains.length > 1) {
+        this._startChainCarousel(chains.length)
+      } else {
+        clearTimeout(this._autoCloseTimer)
+        this._autoCloseTimer = setTimeout(() => this.fadeOutClose(), 3200)
+      }
+    }
+
+    // 渐隐关闭：加 .gv-fading（opacity 0，transition 0.7s）→ 过渡结束后再真正
+    // close（display:none）。过渡期间用户手动打开/关闭都安全（open 清 fading，
+    // close 幂等）。
+    fadeOutClose() {
+      if (!this._open || !this.container) return
+      this.container.classList.add('gv-fading')
+      clearTimeout(this._fadeTimer)
+      this._fadeTimer = setTimeout(() => {
+        this.container.classList.remove('gv-fading')
+        this.close()
+      }, 700)
+    }
+
+    // 取消挂起的自动渐隐（新命中/用户手动打开时调用），并清残留渐隐态
+    _cancelAutoDismiss() {
+      clearTimeout(this._autoCloseTimer)
+      clearTimeout(this._fadeTimer)
+      clearTimeout(this._chainTimer)
+      if (this.container) this.container.classList.remove('gv-fading')
+    }
+
+    /** 切换图数据来源：'formal'（正式固化图）| 'demo'（演示拓扑）| 'free'（自由模式沙盒图）。
+     *  侧栏自由模式入口/退出时调用；开着时立即重拉，关着时下次打开生效。 */
+    setMode(mode) {
+      if (mode === 'free') { this._free = true; this._demo = false }
+      else if (mode === 'demo') { this._demo = true; this._free = false }
+      else { this._demo = false; this._free = false }
+      this._cancelAutoDismiss()   // 用户主动切数据源：取消挂起的自动渐隐
+      if (this._open) this.loadGraph(this._demo, this._free)
+    }
+
     /** 图文件更新（SSE graph-updated）：开着就重拉；重拉后保留高亮（按 targets 重算） */
     reload() {
       if (!this._open) return
-      this.loadGraph(this._demo)
+      this.loadGraph(this._demo, this._free)
     }
 
-    /** 重新拉图并（重）布局。返回 Promise<graph|null> */
-    async loadGraph(demo) {
+    /** 重新拉图并（重）布局。返回 Promise<graph|null>。
+     *  防重入（2026-10）：open() 与 applyHit/applyStackHits 可能并发触发加载
+     *  （打开图按钮 → open 立即 loadGraph，refreshStackHits 的命中恢复里若图还没
+     *  加载完也会 loadGraph），复用同一个 promise——否则两次 buildRun + 两次
+     *  fitToNodes 竞态：后完成的 fitToNodes(全图) 会把先完成的命中链聚焦覆盖掉，
+     *  正是"栈有命中时打开拓扑图聚焦位置不对"的根因（隐藏高亮后图已加载，
+     *  命中恢复不再触发第二次加载，所以没这个问题）。 */
+    async loadGraph(demo, free) {
+      if (this._loadPromise) return this._loadPromise
+      this._loadPromise = this._doLoad(demo, free)
+      try { return await this._loadPromise } finally { this._loadPromise = null }
+    }
+    async _doLoad(demo, free) {
       this._demo = !!demo
+      if (free !== undefined) this._free = !!free
       this._setLoading('加载中…')
       try {
-        const res = await fetch(this.recv + '/graph' + (this._demo ? '?demo=1' : ''))
+        const q = this._demo ? '?demo=1' : this._free ? '?free=1' : ''
+        const res = await fetch(this.recv + '/graph' + q)
         if (!res.ok) throw new Error('HTTP ' + res.status)
         const g = await res.json()
         this.graph = {
           nodes: Array.isArray(g.nodes) ? g.nodes : [],
           edges: Array.isArray(g.edges) ? g.edges : [],
           demo: !!g.demo,
+          free: !!g.free,
           updatedAt: g.updatedAt || 0,
         }
         this._demo = this.graph.demo
-        this._source = g.source || (this._demo ? 'demo' : 'file')
+        this._free = this.graph.free
+        this._source = g.source || (this._demo ? 'demo' : this._free ? 'free' : 'file')
         this._updateSourceBadge()
-        this._settleFitted = false
         this.buildRun()
         this._renderBookLegend()
         this._setLoading('')
@@ -339,6 +461,10 @@
         this.startPhysics()
         this._baseScale = 0   // 重算内容长度分级基准（初始 fit scale）
         this.fitToNodes(this.run.nodes, false)
+        // 注：这里不做"有命中态就聚焦链"（2026-10 试过又去掉）——加载完成瞬间
+        // 物理刚从环形初始布局开始收敛，此刻 _fitToChain 的目标坐标未稳定，聚焦
+        // 位置不对；命中聚焦统一交给物理收敛后的 _pendingChainFit 落位
+        this._renderBanner()   // 重开图时搜索框残留旧词 → 恢复搜索横幅（2026-10）
         this.render()
         return this.graph
       } catch (e) {
@@ -349,20 +475,111 @@
       }
     }
 
-    /** 命中应用：算 root→recent 路径并集 → 高亮 + 横幅 + 适配相机（手动高亮不动相机） */
-    async applyHit(hits, reason, mode) {
+    /** 命中应用：算 root→recent 路径并集 → 高亮 + 横幅 + 适配相机（手动高亮不动相机）。
+     *  noFit=true：不播聚焦动画（打开图场景用——物理未收敛时动画目标基于环形
+     *  初始布局的瞬时坐标，位置不对；聚焦交给物理收敛后的 _pendingChainFit 落位） */
+    async applyHit(hits, reason, mode, noFit) {
+      console.log('[CoRead][gv] applyHit', mode, 'hits=', (hits || []).length, 'noFit=', !!noFit)
       if (!this.graph) {
-        const g = await this.loadGraph(this._demo)
+        const g = await this.loadGraph(this._demo, this._free)
         if (!g) return
       }
       const result = computePath(this.run.nodes, this.run.edges, hits)
+      console.log('[CoRead][gv] applyHit ordered=', result.ordered.length)
       if (!result.ordered.length) {
-        if (this.onHitNotify) this.onHitNotify(0)
         return
       }
       this.setHighlight(result, mode || 'hit', reason || '')
-      if (mode !== 'manual') {
-        this.fitToNodes(result.ordered.map((id) => this.run.byId.get(id)).filter(Boolean), true)
+      if (mode !== 'manual' && !noFit) {
+        this._fitToChain()
+      }
+    }
+
+    /** 当前讨论命中（2026-09 用户定调）：命中 = 当前实时栈 cites 的节点脉络。
+     *  打开图 / 收到 stack-updated / 切书时由侧栏调用：hits 非空 → 恢复
+     *  "当前讨论命中"高亮 + 横幅；hits 空（栈已收口结束）→ 清除 hit 态高亮
+     *  （不动 manual / search 高亮）。 */
+    applyStackHits(hits) {
+      console.log('[CoRead][gv] applyStackHits', Array.isArray(hits) ? hits.length : 'n/a', 'hl=', this.hl && this.hl.mode, 'at-ago=', this.hl ? Math.round((Date.now() - this.hl.at) / 1000) + 's' : '-')
+      if (!Array.isArray(hits) || !hits.length) {
+        // 命中动画保护（2026-10）：graph-hit 刚应用（4s 内）时，栈刷新的空结果
+        // 不得立刻清除命中横幅——receiver 3s 轮询/栈写入滞后都可能让 /stack-hits
+        // 暂时返回空（新消息尚未固化入栈），此时清横幅会把"消息命中"反馈吞掉；
+        // 动画播完、用户稳定浏览后，栈收口清空才正常清除（2026-09 用户定调）
+        if (this.hl && this.hl.mode === 'hit' && Date.now() - this.hl.at > 4000) this.clearHighlight()
+        return
+      }
+      // 打开图（图还没加载）时 noFit：不播聚焦动画——物理刚从环形初始布局开始
+      // 收敛，动画目标基于未稳定的瞬时坐标，聚焦位置不对；改为物理收敛后由
+      // _pendingChainFit 一次性落位。图已加载的栈刷新/切书恢复保持动画聚焦。
+      const needLoad = !this.graph
+      if (needLoad) this._pendingChainFit = true   // 打开图场景：收敛后落位链聚焦
+      return this.applyHit(hits, '', 'hit', needLoad)
+    }
+
+    // 聚焦当前链：相机适配到 _focusChain 指向的链节点；无链/无高亮 → 整体视图。
+    // noAnim=true：直接落位（物理收敛后/动画结束时的校准用，不再播动画）
+    _fitToChain(noAnim) {
+      if (!this.run) return
+      const chains = this.hl && this.hl.chains
+      const c = chains && chains.length ? chains[Math.min(this._focusChain, chains.length - 1)] : null
+      const ids = c ? c.nodes : (this.hl ? [...this.hl.ids] : [])
+      const nodes = ids.map((id) => this.run.byId.get(id)).filter(Boolean)
+      this.fitToNodes(nodes.length ? nodes : this.run.nodes, !noAnim)
+    }
+
+    // 用户手动切换聚焦链：取消自动轮播与渐隐（用户在看，不自动关闭），聚焦所选链
+    focusChain(i) {
+      this._cancelChainCarousel()
+      this._focusChain = i
+      this._renderBanner()
+      this._renderChainSwitch()
+      this._fitToChain()
+    }
+
+    // 聚焦到某节点所在的链（多链高亮时；选取新链节点后由侧栏调用，2026-09）。
+    // 节点不在任何链 / 单链 → 不动。
+    focusNodeChain(id) {
+      const chains = this.hl && this.hl.chains
+      if (!chains || chains.length <= 1) return
+      const ci = chains.findIndex((c) => c.hits.includes(id) || c.nodes.includes(id))
+      if (ci >= 0 && ci !== this._focusChain) this.focusChain(ci)
+    }
+
+    // 多链轮播（自动弹出动画）：依次展示每条链（横幅切换 + 聚焦），每条停留后
+    // 播放下一条；全部播完 → 渐隐关闭。用户交互（切链/隐藏/手动打开）会取消。
+    _startChainCarousel(n) {
+      clearTimeout(this._chainTimer)
+      const step = () => {
+        if (!this._open) return
+        if (this._focusChain >= n - 1) {
+          clearTimeout(this._autoCloseTimer)
+          this._autoCloseTimer = setTimeout(() => this.fadeOutClose(), 3200)
+          return
+        }
+        this._focusChain++
+        this._renderBanner()
+        this._renderChainSwitch()
+        this._fitToChain()
+        this._chainTimer = setTimeout(step, 2600)
+      }
+      this._chainTimer = setTimeout(step, 2600)   // 第 0 条链停留后切下一条
+    }
+    _cancelChainCarousel() {
+      clearTimeout(this._chainTimer)
+      clearTimeout(this._autoCloseTimer)
+    }
+
+    /** 节点选取模式（2026-09，自由模式手动选取引用）：
+     *  开启后提示条切换为「单击看详情 · 双击选取」，双击节点回调 opts.onPick。
+     *  关闭图视图自动退出。 */
+    setPickMode(on) {
+      this._pickMode = !!on
+      const hint = this.container && this.container.querySelector('.gv-hint')
+      if (hint) {
+        hint.textContent = this._pickMode
+          ? '单击查看详情 · 双击选取为引用'
+          : '滚轮缩放 · 拖空白平移 · 悬停节点看名称 · 点选看详情'
       }
     }
 
@@ -372,10 +589,16 @@
       if (!n) return
       const result = computePath(this.run.nodes, this.run.edges, [nodeId])
       this.setHighlight(result, mode || 'manual', '')
-      if (mode === 'simulate') this.fitToNodes(result.ordered.map((id) => this.run.byId.get(id)).filter(Boolean), true)
+      if (mode === 'simulate') this._fitToChain()   // 演示命中：按链聚焦
     }
 
     setHighlight(result, mode, reason) {
+      // 聚焦前相机快照：只在非 manual 时保存（2026-09 修复——manual 是临时预览，
+      // 若覆盖快照，之后隐藏命中脉络会恢复到 manual 聚焦后的状态，而不是命中前的状态）
+      if (mode !== 'manual') this._preFocusCam = { x: this.cam.x, y: this.cam.y, scale: this.cam.scale }
+      // 新命中/选取（消息级状态）覆盖一切：清掉暂存的旧状态。
+      // search 不清——搜索是临时定位，暂存由输入处负责，"清除搜索"时恢复。
+      if (mode === 'hit' || mode === 'picked') this._savedState = null
       const hl = {
         mode: mode || 'manual',
         ids: new Set(result.ordered),
@@ -387,8 +610,15 @@
         at: Date.now(),
       }
       this.hl = hl
+      this._hlHidden = false   // 新命中/搜索/手动高亮：总是先显示
+      // 命中按链分组（自动弹出 / 模拟 / 手动高亮 / 手动选取统一按链展示与聚焦）
+      hl.chains = (mode === 'hit' || mode === 'simulate' || mode === 'manual' || mode === 'picked')
+        ? computeChains(this.run ? this.run.nodes : [], this.run ? this.run.edges : [], result.recent)
+        : null
+      this._focusChain = 0
       this._pulseUntil = Date.now() + 1600
       this._renderBanner()
+      this._renderChainSwitch()
       this._ensureLoop()
     }
     recomputeHighlight() {
@@ -399,16 +629,55 @@
       this.hl.edges = new Set(result.pathEdges)
       this.hl.roots = result.roots
       this.hl.recent = result.recent
+      // 图重载后链按新图重算；聚焦下标越界则回 0
+      this.hl.chains = computeChains(this.run.nodes, this.run.edges, this.hl.targets)
+      if (this._focusChain >= (this.hl.chains || []).length) this._focusChain = 0
+      this._pendingChainFit = true   // 图重载后物理重跑，收敛时同样校准链聚焦（2026-10）
       this._renderBanner()
+      this._renderChainSwitch()
     }
     clearHighlight() {
       this.hl = null
+      this._hlHidden = false
+      this._focusChain = 0
+      this._preFocusCam = null
+      this._savedState = null
+      this._pendingChainFit = false
       this._renderBanner()
+      this._renderChainSwitch()
       this.render()
     }
 
+    /** 横幅按钮：显示 / 隐藏当前讨论命中高亮（hl 数据保留，隐藏只是不渲染——恢复显示
+     *  不依赖重新命中；下一次命中/搜索/手动高亮会自动回到显示态）。
+     *  聚焦语义：显示 → 聚焦当前链；隐藏 → 取消聚焦（相机回到整体视图）。 */
+    toggleHighlightHidden() {
+      this._hlHidden = !this._hlHidden
+      this._cancelChainCarousel()   // 用户主动操作：取消轮播与自动渐隐（图保持打开）
+      this._renderBanner()
+      this._renderChainSwitch()
+      this.render()
+      if (this._hlHidden) {
+        // 取消聚焦：回到聚焦前用户的缩放状态（2026-09 用户定调，不再默认回整体最小视图）
+        if (this._preFocusCam) this._animCam(this._preFocusCam)
+        else if (this.run) this.fitToNodes(this.run.nodes, true)
+      } else {
+        this._fitToChain()   // 恢复显示：聚焦当前链
+      }
+    }
+
     selectNode(id) {
+      // 单击预览（manual）：若当前有消息级高亮（hit / picked / search），整个暂存起来，
+      // 点空白取消时原样恢复——单击聚焦是临时预览，不销毁命中态（2026-09 用户定调修复：
+      // 否则取消聚焦后命中横幅与非聚焦标识会一起消失）
+      if (!this._savedState && this.hl && this.hl.mode !== 'manual') {
+        this._savedState = { hl: this.hl, focusChain: this._focusChain, hidden: this._hlHidden }
+      }
       this.sel = id
+      // 单击节点：高亮并聚焦它的临时讨论脉络（root→recent，2026-09 用户定调——
+      // 替代详情面板里已删除的「高亮此节点路径」按钮）
+      this.highlightFrom(id, 'manual')
+      this._fitToChain()
       this._renderDetail()
       this.render()
     }
@@ -452,7 +721,11 @@
         from: e.from, to: e.to,
         kind: e.kind === 'derived' ? 'derived' : 'user',
       }))
-      this.run = { nodes, edges, byId: new Map(nodes.map((n) => [n.id, n])) }
+      const byId = new Map(nodes.map((n) => [n.id, n]))
+      // 邻接表（角分辨率约束 AI-037 用）：nodeId → Set(邻居 nodeId)，忽略方向（无自环）
+      const adj = new Map(nodes.map((n) => [n.id, new Set()]))
+      for (const e of edges) { adj.get(e.from).add(e.to); adj.get(e.to).add(e.from) }
+      this.run = { nodes, edges, byId, adj }
       this._nodeDim.clear(); this._edgeDim.clear(); this._mag.clear()   // 新图重置悬停过渡（AI-027）
     }
 
@@ -469,6 +742,9 @@
       const t = this._physics.tick
       const heat = Math.max(0.25, 1 - t / TICKS)
       const ns = run.nodes
+      // 弹性联动判定（AI-037）：仅在「真正拖动已移动过的节点」时才关闭静止摩擦，
+      // 让相连子图随目标弹性联动；单纯按下/点击/平移不解除摩擦 → 图不漂、不聚拢。
+      const elasticDragging = !!(this._dragging && this._dragging.kind === 'node' && this._dragging.moved)
       // 重心
       let cx = 0, cy = 0
       for (const n of ns) { cx += n.x; cy += n.y }
@@ -498,6 +774,42 @@
         if (!a.pinned) { a.vx += fx; a.vy += fy }
         if (!b.pinned) { b.vx -= fx; b.vy -= fy }
       }
+      // 角分辨率约束（AI-037）：节点处把「入射/出射射线夹角」约束进可读带 [ANG_MIN, π-ANG_MIN]。
+      // 防两类退化：①近乎重合/折返（夹角≈0，两条边叠成一根）→ 掰开拉大；
+      // ②链式直穿（三点共线单调链，夹角≈180）→ 仅在纯链节点（度=2）弯折。
+      // 切向力与径向弹簧/斥力正交，不破坏边长；只推邻居节点、枢纽 B 不动；
+      // 夹角入带即停（不再施力）→ 收敛为可读布局，静止期不抖。
+      for (const b of ns) {
+        const neigh = run.adj.get(b.id)
+        if (!neigh || neigh.size < 2) continue
+        const deg = neigh.size
+        const angMin = Math.min(ANG_MIN, Math.PI / deg)   // 高自由度用更小最小角，保证可满足
+        const isChain = deg === 2
+        const list = [...neigh]
+        for (let i = 0; i < list.length; i++) {
+          for (let j = i + 1; j < list.length; j++) {
+            const u = run.byId.get(list[i]), v = run.byId.get(list[j])
+            if (!u || !v || (u.pinned && v.pinned)) continue
+            const duX = u.x - b.x, duY = u.y - b.y, dvX = v.x - b.x, dvY = v.y - b.y
+            const lu = Math.hypot(duX, duY), lv = Math.hypot(dvX, dvY)
+            if (lu < 1e-3 || lv < 1e-3) continue
+            const dot = clamp((duX * dvX + duY * dvY) / (lu * lv), -1, 1)
+            const ang = Math.acos(dot)
+            if (ang >= angMin && ang <= Math.PI - ANG_MIN) continue   // 已可读
+            if (ang > Math.PI - ANG_MIN && !isChain) continue          // 高自由度节点不纠直穿
+            const cross = duX * dvY - duY * dvX
+            const phi = Math.atan2(cross, dot)
+            const sp = phi !== 0 ? Math.sign(phi) : (u.id < v.id ? 1 : -1)
+            const tuX = -duY / lu, tuY = duX / lu, tvX = -dvY / lv, tvY = dvX / lv
+            const dirU = ang < angMin ? -sp : sp
+            const dirV = ang < angMin ? sp : -sp
+            const deficit = ang < angMin ? (angMin - ang) : (ang - (Math.PI - ANG_MIN))
+            const F = Math.min(deficit * ANG_GAIN, ANG_PUSH_MAX)
+            if (!u.pinned) { u.vx += tuX * dirU * F; u.vy += tuY * dirU * F }
+            if (!v.pinned) { v.vx += tvX * dirV * F; v.vy += tvY * dirV * F }
+          }
+        }
+      }
       // 重心引力 + 积分
       let energy = 0
       for (const n of ns) {
@@ -509,7 +821,7 @@
           if (sp > MAX_SPEED) { n.vx = n.vx / sp * MAX_SPEED; n.vy = n.vy / sp * MAX_SPEED }
           // 静止摩擦（AI-024）：未拖拽时低速额外耗散 → 静止安静不发飘；
           // 拖拽中不启用摩擦 → 即使慢慢拖动，邻接节点也能弹性联动。
-          if (sp < FRICTION_V && !this._dragging) { n.vx *= FRICTION_K; n.vy *= FRICTION_K }
+          if (sp < FRICTION_V && !elasticDragging) { n.vx *= FRICTION_K; n.vy *= FRICTION_K }
           n.x += n.vx; n.y += n.vy
           energy += n.vx * n.vx + n.vy * n.vy
         }
@@ -678,7 +990,8 @@
       const tx = (x) => (x - cam.x) * cam.scale + W / 2
       const ty = (y) => (y - cam.y) * cam.scale + H / 2
 
-      const hl = this.hl
+      const hl = this._hlHidden ? null : this.hl   // 手动隐藏：跳过高亮渲染（数据保留）
+      const hlHidden = this._hlHidden && this.hl ? this.hl : null   // 隐藏模式的残留标识数据源
       const hlIds = hl ? hl.ids : null
       const hlEdges = hl ? hl.edges : null
       // 悬停邻接子图（有路径高亮时不压暗，悬停只出标签/提示）；压暗强度走缓动值（AI-027）
@@ -690,20 +1003,31 @@
         if (!a || !b) continue
         let alpha = 0.62
         let onPath = false
+        let faintChain = false   // 隐藏模式：链内连接线标记
         if (hlIds) { onPath = hlEdges.has(e); alpha = onPath ? 1 : 0.16 }
+        else if (hlHidden) { faintChain = hlHidden.edges.has(e); alpha = faintChain ? 0.9 : 0.62 }
         else if (hoverOn) alpha = 0.62 - (this._edgeDim.get(e.from + '>' + e.to) || 0) * 0.5
         ctx.globalAlpha = alpha
-        ctx.strokeStyle = onPath && hlIds ? COLORS.pathAccent : (e.kind === 'user' ? COLORS.edgeUser : COLORS.edgeDerived)
-        ctx.lineWidth = onPath && hlIds ? 2.2 : 1.4
+        ctx.strokeStyle = faintChain ? COLORS.pathAccent : (onPath && hlIds ? COLORS.pathAccent : (e.kind === 'user' ? COLORS.edgeUser : COLORS.edgeDerived))
+        ctx.lineWidth = faintChain ? 2 : (onPath && hlIds ? 2.2 : 1.4)
         const x1 = tx(a.x), y1 = ty(a.y), x2 = tx(b.x), y2 = ty(b.y)
+        // 曲边（AI-034）：从圆心直线改成二次贝塞尔，控制点沿 from→to 方向的垂线偏移。
+        // 关键：偏移只由「边的方向」决定（取一致的旋转侧）→ 同一对节点的正反向边
+        // （X→Y 与 Y→X）、折返链（A→B→C 且近似共线）因方向反转而自动弯向相反侧，
+        // 不再共用同一条线段「两条线重合」；单调链则轻微蛇形，读起来更顺。
+        const ddx = x2 - x1, ddy = y2 - y1
+        const segLen = Math.hypot(ddx, ddy) || 1
+        const bendMag = EDGE_CURVE * Math.min(segLen, EDGE_CURVE_MAX)
+        const cx = (x1 + x2) / 2 + (-ddy / segLen) * bendMag
+        const cy = (y1 + y2) / 2 + ( ddx / segLen) * bendMag
         ctx.beginPath()
         ctx.moveTo(x1, y1)
-        ctx.lineTo(x2, y2)
+        ctx.quadraticCurveTo(cx, cy, x2, y2)
         ctx.stroke()
-        // 方向箭头（有向图：引用方向 from → to；低缩放/短边不画，防噪）
-        const segLen = Math.hypot(x2 - x1, y2 - y1)
+        // 方向箭头（有向图：引用方向 from → to；低缩放/短边不画，防噪）。
+        // 曲边下箭头沿曲线末端切线（控制点 → 端点），而非弦方向。
         if (cam.scale > 0.45 && segLen > 44) {
-          const ang = Math.atan2(y2 - y1, x2 - x1)
+          const ang = Math.atan2(y2 - cy, x2 - cx)
           const arr = clamp(cam.scale, 0.5, 1.3) * 4.5
           const ax = x2 - Math.cos(ang) * (b.r * cam.scale + 6)
           const ay = y2 - Math.sin(ang) * (b.r * cam.scale + 6)
@@ -752,8 +1076,9 @@
           ctx.stroke()
           ctx.setLineDash([])
         }
-        // recent 深绿实环 + 脉冲（命中节点 = 当前讨论所在节点）
-        if (hl && hl.recent.includes(n.id)) {
+        // recent 深绿实环 + 脉冲（命中节点 = 当前讨论所在节点）。
+        // 单击选中（manual）不用 recent 表示——选中只是脉络标记 + sel 粗圈，不冒充命中（2026-09 用户定调）
+        if (hl && hl.mode !== 'manual' && hl.recent.includes(n.id)) {
           const k = clamp(1 - (Date.now() - hl.at) / 1400, 0, 1)
           ctx.globalAlpha = alpha * (0.45 + 0.55 * k)
           ctx.strokeStyle = COLORS.recentMark
@@ -762,6 +1087,17 @@
           ctx.arc(px, py, r + 4.5 + (1 - k) * 8, 0, Math.PI * 2)
           ctx.stroke()
           ctx.globalAlpha = alpha
+        }
+        // 隐藏（非聚焦）模式残留标识：本次命中节点细环（2026-09 用户定调加回——
+        // 隐藏高亮后仍能看到命中节点在哪；链内连接线由上方 faintChain 标记，
+        // 与显示态同色同粗，仅去掉脉冲与压暗）
+        if (hlHidden && hlHidden.recent.includes(n.id)) {
+          ctx.globalAlpha = alpha
+          ctx.strokeStyle = COLORS.pathAccent
+          ctx.lineWidth = 2.2
+          ctx.beginPath()
+          ctx.arc(px, py, r + 3.5, 0, Math.PI * 2)
+          ctx.stroke()
         }
         // 选中外圈（比普通路径描边更粗）
         if (this.sel === n.id) {
@@ -821,24 +1157,30 @@
       const target = { x: (minX + maxX) / 2, y: (minY + maxY) / 2, scale }
       if (animated) this._animCam(target)
       else {
+        this._anim = null   // 非动画适配直接落位：清掉可能挂起的相机动画，防残留插值乱跳（2026-10）
         this.cam = target
         if (!this._baseScale) this._baseScale = target.scale   // 记录初始 fit 基准（内容长度分级用）
         this.render()
       }
     }
     _animCam(to) {
-      this._anim = { from: { ...this.cam }, to, t0: Date.now(), dur: 360 }
+      // 2026-09 用户定调：聚焦/取消聚焦动画舒缓——时长 360 → 720ms，缓动 easeInOutCubic
+      this._anim = { from: { ...this.cam }, to, t0: Date.now(), dur: 720 }
       this._ensureLoop()
     }
     _stepAnim() {
       const a = this._anim
       if (!a) return
       const k = clamp((Date.now() - a.t0) / a.dur, 0, 1)
-      const e = 1 - Math.pow(1 - k, 3)
+      const e = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2   // easeInOutCubic：两端缓起缓收
       this.cam.x = a.from.x + (a.to.x - a.from.x) * e
       this.cam.y = a.from.y + (a.to.y - a.from.y) * e
       this.cam.scale = a.from.scale + (a.to.scale - a.from.scale) * e
       if (k >= 1) this._anim = null
+      // 注：不做"动画结束即时校准"（2026-10 试过又去掉）——动画播完（720ms）
+      // 时物理仍在收敛，节点还在移动，此刻直接落位只会造成突兀跳变且位置仍偏；
+      // 校准统一交给物理收敛那一刻（_ensureLoop 的 _pendingChainFit 分支），
+      // 收敛后节点基本静止，落位一次即准确稳定。
     }
 
     _ensureLoop() {
@@ -852,9 +1194,17 @@
           else {
             // 常驻弹性（AI-024）：收敛后不再停止物理——静止时接近不动（安静），
             // 但拖拽/点按任一节点时，整张图会弹性联动再缓缓收敛。
-            if (!this._settleFitted && this.run) {
-              this._settleFitted = true
-              this.fitToNodes(this.run.nodes, true)
+            // 注意：收敛后不再自动 fitToNodes（2026-09 用户定调删掉）——
+            // 否则打开图几秒后相机被强拉回初始整体缩放，打断用户正在进行的查看。
+            // 例外（2026-10）：挂起的命中聚焦校准——新命中/打开图恢复命中时，
+            // 物理收敛的这一刻用最终坐标把相机落位到链上（打开图聚焦错位的
+            // 根因：动画目标取的是环形初始布局的瞬时坐标，收敛后节点已移动）
+            if (this._pendingChainFit) {
+              this._pendingChainFit = false
+              if (this._open && this.hl && !this._hlHidden && (this.hl.mode === 'hit' || this.hl.mode === 'picked') && this.hl.chains) {
+                this._anim = null   // 取消可能进行中的聚焦动画，直接落位（防动画插值打架）
+                this._fitToChain(true)
+              }
             }
             busy = true
           }
@@ -880,7 +1230,7 @@
     _stepHoverFx() {
       const run = this.run
       if (!run || !run.nodes.length) return
-      const hlIds = this.hl ? this.hl.ids : null
+      const hlIds = !this._hlHidden && this.hl ? this.hl.ids : null
       const hoverOn = !!this.hover && !hlIds   // 有路径高亮时不压暗（只出标签）
       let neigh = null, edges = null
       if (hoverOn) {
@@ -916,22 +1266,24 @@
         '<div class="gv-toolbar">' +
           '<span class="gv-title">◎ 会意图<span class="gv-badge" id="gv-demo-badge" hidden>演示数据</span></span>' +
           '<input class="gv-search" id="gv-search" placeholder="搜索知识点…" spellcheck="false">' +
-          '<button class="gv-btn" id="gv-fit" title="适配全部节点">适应</button>' +
           '<button class="gv-btn" id="gv-legend-btn" title="图例">图例</button>' +
           '<button class="gv-btn gv-close" id="gv-close" title="关闭">✕</button>' +
         '</div>' +
         '<div class="gv-banner" id="gv-banner" hidden>' +
           '<span class="gv-banner-text" id="gv-banner-text"></span>' +
-          '<button class="gv-btn gv-banner-clear" id="gv-banner-clear">清除高亮</button>' +
+          '<button class="gv-btn gv-banner-clear" id="gv-banner-clear">隐藏当前讨论命中高亮</button>' +
         '</div>' +
         '<div class="gv-canvas-wrap" id="gv-wrap">' +
           '<canvas id="gv-canvas"></canvas>' +
           '<div class="gv-hint">滚轮缩放 · 拖空白平移 · 悬停节点看名称 · 点选看详情</div>' +
+          '<div class="gv-chain-switch" id="gv-chain-switch" hidden></div>' +
           '<div class="gv-legend" id="gv-legend" hidden>' +
             '<div><span class="sw" style="background:#6d72e8"></span>user 边 · 用户引用</div>' +
             '<div><span class="sw" style="background:#8a92a6"></span>derived 边 · 对话衍生</div>' +
-            '<div><span class="ring" style="border-color:#9aa3f2"></span>root · 路径起点（无入边）</div>' +
-            '<div><span class="ring" style="border-color:#3f45cd"></span>recent · 当前命中节点</div>' +
+            '<div class="gv-lg-title">命中高亮 · 三种圈</div>' +
+            '<div><span class="ring" style="border-color:#5b5fe8"></span>path · 命中路径上的节点</div>' +
+            '<div><span class="ring dashed" style="border-color:#9aa3f2"></span>root · 路径起点（无入边）</div>' +
+            '<div><span class="ring thick" style="border-color:#3f45cd"></span>recent · 当前命中节点</div>' +
             '<div class="gv-lg-title">节点颜色 · 所属书籍</div>' +
             '<div id="gv-legend-books"></div>' +
           '</div>' +
@@ -940,17 +1292,13 @@
               '<span class="gd-fsgroup"><button class="gd-fsbtn" id="gv-d-fs-down" title="缩小字号">A−</button><button class="gd-fsbtn" id="gv-d-fs-up" title="放大字号">A＋</button></span>' +
               '<button class="gd-close" id="gv-d-close" title="关闭">✕</button></div>' +
             '<div class="gd-body">' +
-              '<div class="gd-label">能指</div>' +
+              '<div class="gd-label">相关说法</div>' +
               '<div id="gv-d-aliases"></div>' +
               '<div class="gd-discs-zone" id="gv-d-zone">' +
                 '<div class="gd-label">专题化讨论</div>' +
                 '<div id="gv-d-discs"></div>' +
               '</div>' +
-              '<div class="gd-actions">' +
-                '<button class="gv-btn primary" id="gv-d-path">高亮此节点路径</button>' +
-                '<button class="gv-btn" id="gv-d-sim" title="模拟一次引用解析命中，演示命中高亮">模拟命中（演示）</button>' +
-              '</div>' +
-              '<div class="gd-note" id="gv-d-note" hidden>演示数据：节点只有知识点表述（point）。能指与专题化讨论由会意系统在真实讨论收口固化时生成，真实图写入后此处会显示。</div>' +
+              '<div class="gd-note" id="gv-d-note" hidden>演示数据：节点只有知识点表述（point）。相关说法与专题化讨论由会意系统在真实讨论收口固化时生成，真实图写入后此处会显示。</div>' +
             '</div>' +
             '<div class="gd-pip-tip" id="gv-d-pip-tip"></div>' +   // 轮次 pip 详情 tooltip（AI-035）
           '</div>' +
@@ -969,6 +1317,7 @@
       this.wrap = this.container.querySelector('#gv-wrap')
       this.banner = this.container.querySelector('#gv-banner')
       this.bannerText = this.container.querySelector('#gv-banner-text')
+      this.bannerClearBtn = this.container.querySelector('#gv-banner-clear')
       this.tooltip = this.container.querySelector('#gv-tooltip')
       this.detail = this.container.querySelector('#gv-detail')
       this.emptyEl = this.container.querySelector('#gv-empty')
@@ -1030,15 +1379,67 @@
         if (d && d.kind === 'node') {
           const n = this.run && this.run.byId.get(d.id)
           if (n) n.pinned = false
-          if (!d.moved) this.selectNode(d.id)
-          else this.render()
+          if (!d.moved) {
+            if (this._pickMode) {
+              // 选取模式：单击延迟 300ms 打开详情——给双击留出窗口。若双击发生，
+              // dblclick 处理器会 clearTimeout 取消这次详情打开；否则双击的第二击
+              // 会被右侧详情面板挡住（面板不跟随节点，宽度 360px，覆盖右侧区域），
+              // 导致选取失效（2026-09 实测修复）。
+              clearTimeout(this._pickSelectTimer)
+              this._pickSelectTimer = setTimeout(() => {
+                if (this._open) this.selectNode(d.id)
+              }, 300)
+            } else {
+              this.selectNode(d.id)
+            }
+          } else this.render()
         } else if (d && d.kind === 'pan' && !d.moved) {
-          // 点击空白（未拖动）→ 取消选中，回到浏览态
-          if (this.sel) this.closeDetail()
+          // 点击空白（未拖动）→ 取消选中与手动聚焦，回到浏览态（2026-09 用户定调）。
+          // 条件不依赖 sel：详情关闭（sel 置空）后，只要还有单击选中（manual）的
+          // 高亮，点空白依然取消聚焦。
+          // 若 manual 之前暂存了消息级高亮（hit/picked/search）→ 原样恢复它
+          // （横幅 + 高亮 + 相机），不销毁；否则才真正清除高亮。
+          if (this.sel || (this.hl && this.hl.mode === 'manual')) {
+            if (this.hl && this.hl.mode === 'manual') {
+              if (this._savedState) {
+                const st = this._savedState
+                this._savedState = null
+                this.hl = st.hl
+                this._focusChain = st.focusChain
+                this._hlHidden = st.hidden
+                this.recomputeHighlight()   // 按当前图重算路径/链并重渲染横幅
+                // 相机：显示态聚焦回命中链；隐藏态回命中前（与 toggleHighlightHidden 一致）
+                if (this._hlHidden) {
+                  if (this._preFocusCam) this._animCam(this._preFocusCam)
+                  else if (this.run) this.fitToNodes(this.run.nodes, true)
+                } else {
+                  this._fitToChain()
+                }
+              } else {
+                const back = this._preFocusCam
+                this.clearHighlight()
+                // 取消聚焦：恢复聚焦前用户的缩放状态（2026-09 用户定调）
+                if (back) this._animCam(back)
+                else if (this.run) this.fitToNodes(this.run.nodes, true)
+              }
+            }
+            this.closeDetail()
+          }
         }
       }
       cv.addEventListener('pointerup', endDrag)
       cv.addEventListener('pointercancel', endDrag)
+      // 选择模式双击：选取节点为引用（自由模式手动选取，2026-09）。
+      // 双击优先于单击：取消挂起的"单击打开详情"（否则双击后详情面板弹出干扰）。
+      cv.addEventListener('dblclick', (e) => {
+        if (!this._pickMode || !this.run) return
+        clearTimeout(this._pickSelectTimer)
+        const p = this._pos(e)
+        const n = this._hitTest(p.x, p.y)
+        if (n && this.onPick) {
+          this.onPick({ id: n.id, point: n.point, aliases: n.aliases || [], discussions: n.discussions || [] })
+        }
+      })
       cv.addEventListener('pointerleave', () => {
         if (!this._dragging && this.hover) {
           this.hover = null
@@ -1059,7 +1460,6 @@
       }, { passive: false })
 
       this.container.querySelector('#gv-close').addEventListener('click', () => this.close())
-      this.container.querySelector('#gv-fit').addEventListener('click', () => this.fitToNodes(this.run ? this.run.nodes : [], true))
       const legendBtn = this.container.querySelector('#gv-legend-btn')
       legendBtn.addEventListener('click', () => {
         const el = this.container.querySelector('#gv-legend')
@@ -1067,45 +1467,52 @@
         el.hidden = !show
         legendBtn.textContent = show ? '图例 ✓' : '图例'
       })
-      this.container.querySelector('#gv-banner-clear').addEventListener('click', () => this.clearHighlight())
+      this.container.querySelector('#gv-banner-clear').addEventListener('click', () => this._onBannerBtn())
       this.container.querySelector('#gv-d-close').addEventListener('click', () => this.closeDetail())
       this._applyDetailFont()
       const fsUp = this.container.querySelector('#gv-d-fs-up')
       const fsDown = this.container.querySelector('#gv-d-fs-down')
       if (fsUp) fsUp.addEventListener('click', () => this._setDetailFont(1))
       if (fsDown) fsDown.addEventListener('click', () => this._setDetailFont(-1))
-      this.container.querySelector('#gv-d-path').addEventListener('click', () => {
-        if (this.sel) this.highlightFrom(this.sel, 'manual')
-      })
-      this.container.querySelector('#gv-d-sim').addEventListener('click', () => {
-        if (this.sel) this.highlightFrom(this.sel, 'simulate')
-      })
-      this.container.querySelector('#gv-empty-demo').addEventListener('click', () => this.loadGraph(true))
-      this.container.querySelector('#gv-empty-retry').addEventListener('click', () => this.loadGraph(this._demo))
+      this.container.querySelector('#gv-empty-demo').addEventListener('click', () => this.loadGraph(true, false))
+      this.container.querySelector('#gv-empty-retry').addEventListener('click', () => this.loadGraph(this._demo, this._free))
 
       const search = this.container.querySelector('#gv-search')
       search.addEventListener('input', () => {
         const q = search.value.trim()
         if (!q) {
-          if (this.hl && this.hl.mode === 'search') this.clearHighlight()
-          this.render()
+          // 手动清空搜索框 = 清除搜索（恢复搜索前状态 / 关无匹配横幅）
+          this._clearSearch()
           return
         }
         const run = this.run
         if (!run) return
-        const matches = run.nodes.filter((n) => {
-          const hay = [n.point].concat(n.aliases, n.discussions.map((d) => d.question)).join(' ').toLowerCase()
-          return hay.includes(q.toLowerCase())
-        })
+        const matches = this._searchMatches(q)
         if (!matches.length) {
-          if (this.hl && this.hl.mode === 'search') this.clearHighlight()
+          // 无匹配：只退出搜索高亮，不用 clearHighlight（它会把"清除搜索"要恢复的
+          // 暂存一起清掉）；横幅 = 无匹配 + 清除搜索按钮
+          if (this.hl && this.hl.mode === 'search') {
+            this.hl = null
+            this._hlHidden = false
+            this._focusChain = 0
+            this._renderBanner()
+            this._renderChainSwitch()
+          }
+          this.render()
           this._setBanner('🔍 无匹配「' + q + '」', '')
+          this._setBannerBtn('clear')   // 无匹配横幅按钮 = 清除搜索
+          if (this.sel) this._renderDetail()   // 搜索词变化 → 详情高亮同步刷新
           return
         }
         const ids = matches.map((n) => n.id)
         const result = computePath(run.nodes, run.edges, ids)
+        // 搜索是临时定位：暂存当前消息级高亮（hit/picked 等），"清除搜索"时原样恢复
+        if (!this._savedState && this.hl && this.hl.mode !== 'search') {
+          this._savedState = { hl: this.hl, focusChain: this._focusChain, hidden: this._hlHidden }
+        }
         this.setHighlight(Object.assign({}, result, { recent: [] }), 'search', '🔍 搜索「' + q + '」命中 ' + ids.length + ' 个节点')
         this.fitToNodes(matches, true)
+        if (this.sel) this._renderDetail()   // 详情开着：搜索词变化 → 高亮同步刷新
       })
       search.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
@@ -1156,25 +1563,167 @@
     }
 
     // ── 面板 / 横幅 / 空态 ────────────────────────────────────────────────
+    // 搜索匹配：搜索词落在 节点名/相关说法/讨论问题 里即命中（与搜索框 input 逻辑一致）
+    _searchMatches(q) {
+      if (!q || !this.run) return []
+      const low = q.toLowerCase()
+      return this.run.nodes.filter((n) => {
+        const hay = [n.point].concat(n.aliases, n.discussions.map((d) => d.question)).join(' ').toLowerCase()
+        return hay.includes(low)
+      })
+    }
     _renderBanner() {
       const hl = this.hl
+      // 图视图从未打开（DOM 未构建，this.banner 为空）时直接跳过横幅操作：
+      // 退出自由模式会经 syncPickHighlight → clearHighlight 走到这里，
+      // 若在未构建状态下访问 this.banner 会抛 TypeError，中断侧栏恢复流程（2026-09 修复）
+      if (!this.banner) return
+      // 搜索框非空 → 搜索横幅无条件接管（2026-10 用户定调）：只要搜索框还有词，
+      // 横幅就显示"搜索命中/无匹配"，与 hl 处于什么态无关（manual 点详情不吞、
+      // hit 命中也不压）——需求 2 的规则是"搜索框有词 → 横幅不消失"
+      const search = this.container ? this.container.querySelector('#gv-search') : null
+      const sq = search ? search.value.trim() : ''
+      if (sq) {
+        console.log('[CoRead][gv] banner: search-mode (sq=' + sq.slice(0, 10) + ')')
+        const matches = this._searchMatches(sq)
+        this._setBannerLines(['🔍 ' + (matches.length ? '搜索「' + sq + '」命中 ' + matches.length + ' 个节点' : '无匹配「' + sq + '」')], '')
+        this._setBannerBtn('clear')   // 搜索横幅按钮 = 清除搜索
+        return
+      }
+      console.log('[CoRead][gv] banner: hl-mode=', hl && hl.mode)
       if (!hl) {
         this.banner.hidden = true
         return
       }
+      const hidden = this._hlHidden
       let text = ''
-      if (hl.mode === 'search') text = hl.reason || '搜索命中'
-      else if (hl.mode === 'simulate') text = '🔗 模拟命中（演示）：高亮「' + nodePoint(this, hl.targets[0]) + '」的 root→recent 路径（' + hl.ids.size + ' 节点）'
-      else if (hl.mode === 'manual') text = '◎ 已高亮「' + nodePoint(this, hl.targets[0]) + '」的 root→recent 路径（' + hl.ids.size + ' 节点）'
-      else text = '🔗 会话命中：引用解析命中 ' + hl.targets.length + ' 个节点 → 高亮 root→recent 路径并集（' + hl.ids.size + ' 节点）'
-      if (hl.reason && hl.mode !== 'search') text += ' · ' + hl.reason
-      this._setBanner(text, hl.mode === 'hit' || hl.mode === 'simulate' ? 'hit' : '')
+      if (hl.mode === 'search') {
+        // 搜索是用户主动操作，无需解释
+        text = (hidden ? '〔高亮已隐藏〕' : '') + (hl.reason || '搜索命中')
+        this._setBannerLines([text], '')
+        this._setBannerBtn('clear')   // 搜索横幅按钮 = 清除搜索
+      } else if (hl.mode === 'simulate') {
+        text = (hidden ? '〔高亮已隐藏〕' : '') + '🔗 模拟命中（演示）：高亮「' + nodePoint(this, hl.targets[0]) + '」的讨论脉络（' + hl.ids.size + ' 节点）'
+        this._setBannerLines([text], 'hit')
+        this._setBannerBtn('hl')
+      } else if (hl.mode === 'manual') {
+        // 单击节点预览：manual 不显示自己的横幅，也不吞掉之前的横幅
+        //（2026-10：预览前若有 hit/search 横幅，原样保留——点开详情不再让
+        // 命中横幅消失；点空白恢复 _savedState 时会重渲染横幅回到原内容）
+        return
+      } else {
+        // 会话命中（hit）/ 手动选取（picked）：横幅统一分行（2026-09 用户定调）——
+        // 指示行 + 每个标题各占一行；单脉络（单链）同样分行，不做单行省略。
+        // 每行由 .gv-banner-line 强制单行（nowrap + ellipsis），标题行内部不再被拆断。
+        const chains = hl.chains || []
+        const idx = chains.length ? Math.min(this._focusChain, chains.length - 1) : 0
+        const cur = chains.length ? chains[idx] : null
+        const hitIds = cur ? cur.hits : hl.targets
+        const titles = hitIds.map((id) => {
+          const n = this.run ? this.run.byId.get(id) : null
+          const p = String(n && n.point ? n.point : id)
+          return p.length > 30 ? p.slice(0, 30) + '…' : p
+        })
+        // 隐藏态前缀："高亮已隐藏"——隐藏的是高亮显示，命中事实不变；
+        // 与横幅按钮文案"隐藏当前讨论命中高亮"用词一致，宾语明确（2026-09 用户定调）
+        const prefix = (hidden ? '〔高亮已隐藏〕' : '')
+        // 指示行统一主词"命中知识脉络"（2026-09 用户定调——不用"旧知识点"）；
+        // 多链且显示态时括号标注当前展示的是第几条知识脉络（主词即链，1/2 指脉络
+        // 序号，无"把链当知识点"的歧义），与右下角"脉络 N"悬浮按钮呼应。
+        // 隐藏态不写（X/N）——隐藏时没有聚焦任何脉络，进度标注不成立（2026-09 修复）。
+        const head = !hidden && chains.length > 1
+          ? '命中知识脉络（' + (idx + 1) + '/' + chains.length + '）'
+          : '命中知识脉络'
+        // 隐藏态只保留指示行（2026-09 修复：隐藏时没有聚焦任何脉络，
+        // 标题行和（X/N）都没有着落，一并去掉）；显示态 = 指示行 + 标题分行
+        this._setBannerLines(
+          hidden
+            ? [prefix + head]
+            : [prefix + head, ...titles.map((t) => '「' + t + '」')],
+          !hidden ? 'hit' : ''
+        )
+        // 横幅按钮：hit/picked 态 = 高亮显隐开关（不"清除"数据，只是渲染切换）
+        this._setBannerBtn('hl')
+      }
+    }
+    // 横幅按钮（2026-09 用户定调）：
+    // - 'hl'：hit/picked/simulate 态——当前讨论命中高亮的显示/隐藏开关
+    // - 'clear'：search / 无匹配——清除搜索（清空搜索框、退出搜索命中、恢复搜索前状态）
+    _setBannerBtn(kind) {
+      if (!this.bannerClearBtn) return
+      this._bannerBtnKind = kind
+      if (kind === 'clear') {
+        this.bannerClearBtn.textContent = '清除搜索'
+        this.bannerClearBtn.title = '清空搜索框，退出搜索命中'
+      } else {
+        const hidden = this._hlHidden
+        this.bannerClearBtn.textContent = hidden ? '显示当前讨论命中高亮' : '隐藏当前讨论命中高亮'
+        this.bannerClearBtn.title = hidden ? '恢复显示本次命中的路径高亮' : '暂时隐藏本次命中的路径高亮（数据保留，可随时恢复）'
+      }
+    }
+    _onBannerBtn() {
+      if (this._bannerBtnKind === 'clear') this._clearSearch()
+      else this.toggleHighlightHidden()
+    }
+    // 清除搜索：清空搜索框 + 退出搜索命中。搜索前若有消息级高亮（hit/picked 等），
+    // 原样恢复它（搜索输入时暂存）；否则清高亮并恢复搜索前相机。
+    _clearSearch() {
+      const search = this.container && this.container.querySelector('#gv-search')
+      if (search) search.value = ''
+      if (this._savedState) {
+        const st = this._savedState
+        this._savedState = null
+        this.hl = st.hl
+        this._focusChain = st.focusChain
+        this._hlHidden = st.hidden
+        this.recomputeHighlight()   // 按当前图重算路径/链并重渲染横幅
+        if (this._hlHidden) {
+          if (this._preFocusCam) this._animCam(this._preFocusCam)
+          else if (this.run) this.fitToNodes(this.run.nodes, true)
+        } else {
+          this._fitToChain()
+        }
+      } else if (this.hl && this.hl.mode === 'search') {
+        const back = this._preFocusCam
+        this.clearHighlight()
+        if (back) this._animCam(back)   // 恢复搜索前相机
+        else if (this.run) this.fitToNodes(this.run.nodes, true)
+      } else {
+        this._setBannerLines(null, '')   // 无匹配横幅：只关横幅，不动其他高亮
+        this.render()
+      }
+      if (this.sel) this._renderDetail()   // 清空搜索词 → 详情高亮同步消失（2026-10）
+    }
+    // 悬浮链切换按钮（2026-09）：多链命中时显示在画布右下角，点击聚焦对应链；
+    // 无链 / 单链 / 高亮隐藏时隐藏。
+    _renderChainSwitch() {
+      const el = this.container && this.container.querySelector('#gv-chain-switch')
+      if (!el) return
+      const chains = this.hl && this.hl.chains
+      if (!chains || chains.length <= 1 || this._hlHidden) { el.hidden = true; return }
+      el.hidden = false
+      el.innerHTML = chains.map((c, i) =>
+        '<button class="gv-chain-btn' + (i === this._focusChain ? ' sel' : '') + '" data-chain="' + i +
+        '" title="聚焦第 ' + (i + 1) + ' 条讨论脉络（' + c.hits.length + ' 个命中节点）">脉络 ' + (i + 1) + '</button>'
+      ).join('')
+      for (const b of el.querySelectorAll('.gv-chain-btn')) {
+        b.addEventListener('click', () => this.focusChain(Number(b.dataset.chain)))
+      }
+    }
+    /** 按行渲染横幅：每行一个 <div class="gv-banner-line">（nowrap + ellipsis，
+     *  2026-09 用户定调——命中横幅分行展示，且标题行内部不被 CSS 拆断）。 */
+    _setBannerLines(lines, kind) {
+      if (!lines || !lines.length || !lines.some(Boolean)) { this.banner.hidden = true; return }
+      this.banner.hidden = false
+      this.banner.className = 'gv-banner' + (kind === 'hit' ? ' hit' : '')
+      this.bannerText.innerHTML = lines
+        .filter(Boolean)
+        .map((l) => '<div class="gv-banner-line">' + escHtml(l) + '</div>')
+        .join('')
     }
     _setBanner(text, kind) {
       if (!text) { this.banner.hidden = true; return }
-      this.banner.hidden = false
-      this.banner.className = 'gv-banner' + (kind === 'hit' ? ' hit' : '')
-      this.bannerText.textContent = text
+      this._setBannerLines([text], kind)
     }
     // 书籍图例（AI-025）：按书名分组列出 书籍 → 颜色，随图数据更新
     _renderBookLegend() {
@@ -1199,6 +1748,7 @@
       const s = this._source
       if (s === 'demo') { badge.hidden = false; badge.textContent = '演示数据'; badge.title = '演示拓扑：由 knowledge-graph-demo.json 重建' }
       else if (s === 'results') { badge.hidden = false; badge.textContent = '冒烟结果'; badge.title = '有效图：由冒烟/派生脚本产出（knowledge-graph-results.json）' }
+      else if (s === 'free') { badge.hidden = false; badge.textContent = '自由模式'; badge.title = '自由模式沙盒图：测试对话的固化产物，不进入正式图' }
       else { badge.hidden = true }
     }
     _setLoading(text) {
@@ -1229,7 +1779,7 @@
       const discs = (n.discussions || []).length
       let html = '<b>' + escHtml(n.point) + '</b>'
       if (n.books.length) html += '<div style="color:#9fb0c3">' + escHtml(n.books.join(' · ')) + '</div>'
-      html += '<div>' + discs + ' 次专题化讨论 · ' + (n.aliases || []).length + ' 条能指</div>'
+      html += '<div>' + discs + ' 次专题化讨论 · ' + (n.aliases || []).length + ' 条相关说法</div>'
       this.tooltip.innerHTML = html
       this.tooltip.classList.add('show')   // CSS 过渡淡入（AI-027）
       const tw = this.tooltip.offsetWidth || 200
@@ -1245,12 +1795,16 @@
       if (!n) { this.detail.hidden = true; return }
       this.detail.hidden = false
       this._applyDetailFont()   // 详情正文缩放变量（AI-032）
+      // 搜索命中高亮（2026-10）：搜索框有词时，详情里出现的命中关键词包 <mark>；
+      // 点开详情/换节点时按当前搜索词重算（搜索词变化 → 详情同步更新）
+      const search = this.container ? this.container.querySelector('#gv-search') : null
+      const q = search ? search.value.trim().toLowerCase() : ''
       const isDemo = !!(this.graph && this.graph.demo)
-      this.detail.querySelector('#gv-d-point').textContent = n.point
+      this.detail.querySelector('#gv-d-point').innerHTML = hlText(n.point, q)
       const aliasEl = this.detail.querySelector('#gv-d-aliases')
       aliasEl.innerHTML = (n.aliases && n.aliases.length)
-        ? n.aliases.map((a) => '<div class="gd-alias">' + escHtml(a) + '</div>').join('')
-        : '<div class="gd-none">' + (isDemo ? '（演示数据无能指）' : '（无能指）') + '</div>'
+        ? n.aliases.map((a) => '<div class="gd-alias">' + hlText(a, q) + '</div>').join('')
+        : '<div class="gd-none">' + (isDemo ? '（演示数据无相关说法）' : '（无相关说法）') + '</div>'
       // 专题化讨论：每个 question 是一个可折叠条目（默认折叠，点开看书/章/交锋原文）。
       // AI-034：每条讨论自带轮次导航（>1 轮显示序号），几条讨论就是几个独立导航，
       // 无需再做「哪根条对应哪条讨论」的跨讨论映射。
@@ -1266,12 +1820,12 @@
             ? '<div class="gd-round-nav">' + excerpts.map((e, i) => '<span class="gd-pip" data-r="' + i + '">' + (i + 1) + '</span>').join('') + '</div>'
             : ''
           const exHtml = excerpts.map((e) => {
-            const q = e && e.q ? '<div class="gd-ex"><span class="gxl">问</span><span class="gd-ext">' + escHtml(String(e.q)) + '</span></div>' : ''
-            const a = e && e.a ? '<div class="gd-ex gd-ex-a"><span class="gxl">答</span><span class="gd-ext">' + escHtml(String(e.a)) + '</span></div>' : ''
-            return '<div class="gd-round">' + q + a + '</div>'
+            const qq = e && e.q ? '<div class="gd-ex"><span class="gxl">问</span><span class="gd-ext">' + hlText(String(e.q), q) + '</span></div>' : ''
+            const aa = e && e.a ? '<div class="gd-ex gd-ex-a"><span class="gxl">答</span><span class="gd-ext">' + hlText(String(e.a), q) + '</span></div>' : ''
+            return '<div class="gd-round">' + qq + aa + '</div>'
           }).join('')
           return '<div class="gd-disc">' +
-            '<div class="gd-q"><span class="gd-caret">▸</span><span class="gd-qtext">' + escHtml(d.question || '') + '</span></div>' +
+            '<div class="gd-q"><span class="gd-caret">▸</span><span class="gd-qtext">' + hlText(d.question || '', q) + '</span></div>' +
             pipHtml +   // AI-036：标题下方始终可见（不藏在可折叠体里，选中即可看到排号）
             '<div class="gd-qbody" hidden>' + (meta ? '<div class="meta">' + meta + '</div>' : '') + exHtml + '</div>' +
             '</div>'
@@ -1378,6 +1932,17 @@
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
+  }
+  // 搜索命中高亮（详情面板用，2026-10）：把文本按查询切分，命中的片段包 <mark>。
+  // 分段后各自 esc，避免先整体转义再套标签时把 &lt; 等实体的中间部分误当命中打坏。
+  function hlText(text, q) {
+    if (!q) return escHtml(text)
+    const safeQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = new RegExp('(' + safeQ + ')', 'i')
+    return String(text).split(re).map((p) => {
+      if (p && p.toLowerCase() === q.toLowerCase()) return '<mark>' + escHtml(p) + '</mark>'
+      return escHtml(p)
+    }).join('')
   }
   /**
    * 按「固定字符数」分行——折行点只由字符数决定，与字号/缩放完全解耦。

@@ -6,8 +6,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { createGraph, addNode, findNode } from '../lib/knowledge-graph.js'
-import { consolidateDiscussion, addDerivedEdge, addCitationEdges, nextNodeId, groupExcerpts } from '../lib/graph-consolidate.js'
+import { createGraph, addNode, findNode, addEdge } from '../lib/knowledge-graph.js'
+import { consolidateDiscussion, addDerivedEdge, addCitationEdges, nextNodeId, groupExcerpts, cloneGraph } from '../lib/graph-consolidate.js'
 
 // 假 LLM：按队列吐预设文本（与 knowledge-graph 测试同款）
 function makeLLM(results) {
@@ -87,4 +87,24 @@ test('groupExcerpts：user/assistant 配对成 {q, a}，无回复的提问舍弃
     { role: 'user', content: 'Q3' },  // 未配对（最后一条 user）
   ]), [{ q: 'Q1', a: 'A1' }, { q: 'Q2', a: 'A2' }])
   assert.deepEqual(groupExcerpts([]), [])
+})
+
+test('cloneGraph：深拷贝副本，固化沙盒互不影响（自由模式用）', () => {
+  const g = createGraph()
+  addNode(g, { id: 'n_a', point: 'A', aliases: ['能指A'], discussions: [{ question: 'Q？', excerpts: [{ q: 'Q', a: 'A' }] }] })
+  addNode(g, { id: 'n_b', point: 'B' })
+  addEdge(g, { from: 'n_a', to: 'n_b' })
+  const copy = cloneGraph(g)
+  assert.deepEqual(copy.nodes, g.nodes, '副本内容与原图一致')
+  assert.deepEqual(copy.edges, g.edges)
+  // 改副本（模拟自由模式固化）不碰原图
+  addNode(copy, { id: 'n_c', point: 'C' })
+  addEdge(copy, { from: 'n_a', to: 'n_c' })
+  copy.nodes[0].point = '被改了'
+  assert.equal(g.nodes.length, 2, '原图节点数不变')
+  assert.equal(g.edges.length, 1, '原图边数不变')
+  assert.equal(findNode(g, 'n_a').point, 'A', '原图节点内容不被副本改动污染')
+  assert.equal(findNode(copy, 'n_c').point, 'C', '副本可独立新建节点')
+  // 无图/空图 → 空副本
+  assert.deepEqual(cloneGraph(null), { nodes: [], edges: [] })
 })

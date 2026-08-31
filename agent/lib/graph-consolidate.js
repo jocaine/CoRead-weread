@@ -24,6 +24,20 @@ export function nextNodeId(now = Date.now()) {
 }
 
 /**
+ * 深拷贝整张图（nodes + edges）。自由模式沙盒用（2026-09 定调：自由模式的固化
+ * 完整链路跑在正式图的副本上，测试产物不碰正式图）。节点/边都是纯 JSON 结构，
+ * 深拷贝后副本与原件互不影响。
+ * @param {object} graph 会意图（{nodes, edges}）
+ * @returns {{nodes: Array, edges: Array}} 独立副本
+ */
+export function cloneGraph(graph) {
+  return {
+    nodes: JSON.parse(JSON.stringify(Array.isArray(graph?.nodes) ? graph.nodes : [])),
+    edges: JSON.parse(JSON.stringify(Array.isArray(graph?.edges) ? graph.edges : [])),
+  }
+}
+
+/**
  * 固化一条收口讨论：派生 point → 拾取被卸除的能指 → 新建节点（节点不可变）。
  * @param {object} graph 会意图（{nodes, edges}）
  * @param {object} discussion { question（收口时归纳，必填）, book?, chapter?, excerpts? }

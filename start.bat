@@ -10,7 +10,7 @@ for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":7239.*LISTENING"') d
 powershell -c "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -like '*index.js*' -and $_.CommandLine -notlike '*receiver*' -and $_.CommandLine -notlike '*playwright*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" >nul 2>&1
 
 :: Start receiver in background (hidden)
-start "CoRead Receiver" /MIN cmd /c "cd /d %~dp0 && node receiver\index.js"
+start "CoRead Receiver" /MIN cmd /c "cd /d %~dp0 && node receiver\index.js > receiver.out 2>&1"
 echo Receiver started...
 
 :: Run agent in this window (blocks here)

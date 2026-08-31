@@ -8,10 +8,9 @@
 import http from 'http'
 import fs from 'fs'
 import path from 'path'
-import { createHash } from 'crypto'
 import { execSync } from 'child_process'
 import { fileURLToPath } from 'url'
-import { GRAPH_FILE, readGraphFile, buildDemoGraph } from './graph-data.js'  // AI-020：会意图图数据
+import { GRAPH_FILE, FREE_GRAPH_FILE, readGraphFile, readFreeGraphFile, buildDemoGraph } from './graph-data.js'  // AI-020：会意图图数据
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = parseInt(process.env.COREAD_PORT || '7239')
@@ -19,6 +18,7 @@ const BOOKS_DIR = path.join(__dirname, 'books')
 const INBOX_DIR = path.join(__dirname, 'inbox')
 const CHAT_OUTPUT = path.join(INBOX_DIR, 'chat_output.jsonl')
 const DEBUG_LOG = path.join(INBOX_DIR, 'debug.jsonl')
+const TOPIC_STACK_FILE = path.join(__dirname, '..', 'agent', 'topic_stack.json')  // 实时讨论栈（/stack-hits 与 stack-updated 轮询的数据源，2026-09）
 
 fs.mkdirSync(BOOKS_DIR, { recursive: true })
 fs.mkdirSync(INBOX_DIR, { recursive: true })
@@ -69,13 +69,35 @@ setInterval(() => {
 
 // AI-020：会意图图文件变化轮询（3s 一次 stat）→ mtime 变化时 SSE graph-updated，
 // 侧栏图视图开着就自动重拉（图由会意系统固化到 agent/data/knowledge-graph.json）。
+// 自由模式沙盒图（knowledge-graph.free.json）单独轮询：测试固化也实时通知，
+// 图视图保持当前模式（正式/自由）重拉。
 let _graphFileMtime = 0
+let _freeGraphFileMtime = 0
 setInterval(() => {
   let m = 0
   try { m = fs.statSync(GRAPH_FILE).mtimeMs } catch {}
   if (m > 0 && m !== _graphFileMtime) {
     _graphFileMtime = m
     pushSSE('graph-updated', {})
+  }
+  let fm = 0
+  try { fm = fs.statSync(FREE_GRAPH_FILE).mtimeMs } catch {}
+  if (fm > 0 && fm !== _freeGraphFileMtime) {
+    _freeGraphFileMtime = fm
+    pushSSE('graph-updated', { free: true })
+  }
+}, 3000)
+
+// 实时讨论栈变化轮询（3s stat agent/topic_stack.json）→ mtime 变化时 SSE
+// stack-updated：侧栏据此重拉 /stack-hits，恢复/清除"当前讨论命中"高亮
+//（2026-09 用户定调：命中 = 当前实时栈 cites 的节点脉络，栈结束即命中结束）。
+let _stackFileMtime = 0
+setInterval(() => {
+  let m = 0
+  try { m = fs.statSync(TOPIC_STACK_FILE).mtimeMs } catch {}
+  if (m > 0 && m !== _stackFileMtime) {
+    _stackFileMtime = m
+    pushSSE('stack-updated', {})
   }
 }, 3000)
 
@@ -258,41 +280,70 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  // 放入的文件列表（GET /documents）
-  // 返回所有通过「放入文件」导入的文档书（meta.source === 'file'），按放入时间倒序，
-  // 供扩展侧栏的文档菜单列出可切换的文档。
-  if (req.method === 'GET' && req.url === '/documents') {
-    // 来源限制：只允许扩展读文档列表（评审 P1 同款）
+  // 已读书籍列表（GET /books）——读书模式「无书默认界面」手动选书的数据源。
+  // 返回 { books: [{ base, bookTitle, wereadBookId, updatedAt }] }，按最近更新倒序。
+  // 数据源：books/<base>/meta.json（每次标注/正文/进度写入都会更新），并用聊天与
+  // 标注存档里出现过的 bookId 兜底——只有聊天记录、没有 meta 的书也能被选中查看。
+  // 侧栏据此列出「已读过的书籍」：读完的书不在微信读书中打开时，也有查看聊天记录的入口。
+  if (req.method === 'GET' && req.url.split('?')[0] === '/books') {
+    // 来源限制：只允许扩展读列表，任意网页不可枚举本地已读书籍（评审 P1 同款）
     if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
-    const docs = []
+    const books = new Map()  // base -> { base, bookTitle, wereadBookId, updatedAt }
+    const touch = (base, bookTitle, wereadBookId, updatedAt) => {
+      if (!base) return
+      const cur = books.get(base) || { base, bookTitle: '', wereadBookId: '', updatedAt: 0 }
+      if (bookTitle) cur.bookTitle = bookTitle
+      if (wereadBookId) cur.wereadBookId = wereadBookId
+      if (updatedAt) cur.updatedAt = Math.max(cur.updatedAt, updatedAt)
+      books.set(base, cur)
+    }
     try {
       for (const name of fs.readdirSync(BOOKS_DIR)) {
+        const dir = path.join(BOOKS_DIR, name)
+        let st
+        try { st = fs.statSync(dir) } catch { continue }
+        if (!st.isDirectory()) continue
         let meta
-        try { meta = JSON.parse(fs.readFileSync(path.join(BOOKS_DIR, name, 'meta.json'), 'utf8')) }
-        catch { continue }
-        if (meta.source !== 'file' || !meta.bookId) continue
-        docs.push({
-          bookId: meta.bookId,
-          bookTitle: meta.bookTitle || '',
-          fileName: meta.fileName || '',
-          fileExt: meta.fileExt || '',
-          importedAt: meta.importedAt || 0,
-          updatedAt: meta.updatedAt || 0,
-        })
+        try { meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8')) } catch { continue }
+        touch(baseBookId(meta.baseBookId || meta.bookId || name),
+          meta.bookTitle || '', meta.wereadBookId || '', meta.updatedAt || 0)
       }
     } catch {}
-    docs.sort((a, b) => (b.importedAt || 0) - (a.importedAt || 0))
+    const scanLines = (file) => {
+      try { return fs.readFileSync(file, 'utf8').split('\n') } catch { return [] }
+    }
+    for (const line of scanLines(path.join(INBOX_DIR, 'chat_input.jsonl'))) {
+      if (!line) continue
+      try {
+        const d = JSON.parse(line)
+        if (d.bookId) touch(baseBookId(d.bookId), d.bookTitle || '', '', d.timestamp || 0)
+      } catch {}
+    }
+    for (const line of scanLines(path.join(INBOX_DIR, 'annotations.jsonl'))) {
+      if (!line) continue
+      try {
+        const d = JSON.parse(line)
+        if (d.bookId) touch(baseBookId(d.bookId), d.bookTitle || '', '', d.receivedAt || 0)
+      } catch {}
+    }
+    const list = [...books.values()]
+      // 与侧栏防御一致：只认形如真实书 ID 的 base（排除测试/垃圾 bookId），
+      // 保证选出的书能通过侧栏的上下文校验；双下划线前缀的哨兵上下文
+      //（如自由模式 __coread_free_mode__）不是真实书籍，一并排除
+      .filter(b => /^[A-Za-z0-9_]{12,}$/.test(b.base) && !b.base.startsWith('__'))
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify(docs))
+    res.end(JSON.stringify({ books: list }))
     return
   }
 
-  // 会意图拓扑图（GET /graph[?demo=1]）——AI-020
-  // 返回 { nodes, edges, updatedAt, demo }：节点 = 知识点（point/aliases/discussions），
+  // 会意图拓扑图（GET /graph[?demo=1][?free=1]）——AI-020
+  // 返回 { nodes, edges, updatedAt, demo, free, source }：节点 = 知识点（point/aliases/discussions），
   // 边 = 用户问题意识轨迹（from → to，kind: user|derived）。数据源 = agent/data/
   // knowledge-graph.json（会意系统固化的图文件，一张图一个文件，§5.3）；?demo=1 时
   // 用演示拓扑（scripts/data/knowledge-graph-demo.json）重建，供侧栏图视图在真实图
-  // 为空时预览交互与命中高亮。
+  // 为空时预览交互与命中高亮；?free=1 时返回自由模式沙盒图（agent/data/
+  // knowledge-graph.free.json，自由模式测试固化产物；文件不存在则回退正式图）。
   if (req.method === 'GET' && req.url.split('?')[0] === '/graph') {
     // 来源限制：只允许扩展读图（评审 P1 同款）
     if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
@@ -301,9 +352,35 @@ const server = http.createServer(async (req, res) => {
     if (u.searchParams.get('demo') === '1') {
       const dg = buildDemoGraph()
       if (dg) out = { nodes: dg.nodes, edges: dg.edges, updatedAt: Date.now(), demo: true }
+    } else if (u.searchParams.get('free') === '1') {
+      const fg = readFreeGraphFile()
+      if (fg) out = fg
     }
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify(out))
+    return
+  }
+
+  // 当前实时栈的引用命中（GET /stack-hits?book=..）——2026-09 用户定调：
+  // 图视图显示的"当前讨论命中" = 实时讨论栈（agent/topic_stack.json）里 user 条目
+  // 挂的 cites（去重）。侧栏打开图 / 收到 stack-updated / 切书时重拉：非空恢复
+  // 高亮 + 横幅；栈收口清空后为空 → 侧栏清除 hit 态高亮。
+  if (req.method === 'GET' && req.url.split('?')[0] === '/stack-hits') {
+    if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
+    const u = new URL(req.url, 'http://localhost')
+    const book = baseBookId(u.searchParams.get('book') || '')
+    const hits = []
+    try {
+      const stacks = JSON.parse(fs.readFileSync(TOPIC_STACK_FILE, 'utf8'))
+      const stack = stacks[book] || []
+      for (const e of stack) {
+        if (e && e.role === 'user' && Array.isArray(e.cites)) {
+          for (const c of e.cites) if (c && !hits.includes(c)) hits.push(c)
+        }
+      }
+    } catch {}
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ hits }))
     return
   }
 
@@ -514,7 +591,7 @@ const server = http.createServer(async (req, res) => {
 
     } else if (url === '/chat') {
       // 来自侧栏或共读弹窗的用户消息
-      const { content, bookId, bookTitle, chapter, chapterUid, selectedText } = data
+      const { content, bookId, bookTitle, chapter, chapterUid, selectedText, refs } = data
       if (!content) { res.writeHead(400); res.end(); return }
       const entry = { role: 'user', content, timestamp: Date.now() }
       if (bookId) {
@@ -524,6 +601,9 @@ const server = http.createServer(async (req, res) => {
         entry.chapterUid = chapterUid || ''
         entry.selectedText = selectedText || ''
       }
+      // 自由模式手动引用（2026-09）：侧栏窗体携带的引用节点 id 清单，原样落库，
+      // agent 收口建边时以它为 cites（是否与语义解析命中合并由 agent 决定）
+      if (Array.isArray(refs)) entry.refs = refs
       fs.appendFileSync(path.join(INBOX_DIR, 'chat_input.jsonl'),
         JSON.stringify(entry) + '\n')
 
@@ -553,48 +633,6 @@ const server = http.createServer(async (req, res) => {
       writeBookMeta(bookId, data)
       console.log(`[content] bookId=${bookId} chapterUid=${chapterUid} (${text.length} chars) ${result}`)
 
-    } else if (url === '/import') {
-      // 放入文件（文档导入）：接收扩展侧栏放入的 .md/.txt 文档，存成一本"文档书"。
-      // 内容写入 books/{bookId}/chapters/e_0.txt，meta 标记 source:'file'，
-      // agent 据此把整篇文档作为上下文（见 agent/index.js fileDocContext）。
-      const { fileName, content } = data
-      if (!fileName || typeof content !== 'string') {
-        res.writeHead(400); res.end(JSON.stringify({ error: 'missing fileName/content' })); return
-      }
-      const ext = path.extname(fileName).toLowerCase()
-      const ALLOWED_DOC_EXT = ['.md', '.markdown', '.txt', '.text']
-      if (!ALLOWED_DOC_EXT.includes(ext)) {
-        res.writeHead(415); res.end(JSON.stringify({ error: '暂不支持 ' + ext + ' 文件，只接受 .md/.txt' })); return
-      }
-      const MAX_DOC_CHARS = 2_000_000
-      if (content.length > MAX_DOC_CHARS) {
-        res.writeHead(413); res.end(JSON.stringify({ error: '文件过大（>2MB）' })); return
-      }
-      const title = path.basename(fileName, ext).trim() || '未命名文档'
-      // 文档书 bookId：doc_ + 文件名 hash。同名文件重复放入 = 覆盖更新同一本文档书。
-      const bookId = 'doc_' + createHash('sha1').update(title.toLowerCase()).digest('hex').slice(0, 24)
-      const dir = bookDir(bookId)
-      fs.writeFileSync(path.join(dir, 'chapters', 'e_0.txt'), content)
-      const metaFile = path.join(dir, 'meta.json')
-      const prevMeta = (() => { try { return JSON.parse(fs.readFileSync(metaFile, 'utf8')) } catch { return {} } })()
-      const updated = !!prevMeta.bookId
-      fs.writeFileSync(metaFile, JSON.stringify({
-        bookId,
-        baseBookId: bookId,
-        bookTitle: title,
-        fileName,
-        fileExt: ext,
-        source: 'file',
-        importedAt: prevMeta.importedAt || Date.now(),
-        updatedAt: Date.now(),
-      }))
-      // 推送事件：已打开的面板实时刷新文档列表（其他面板同步）
-      pushSSE('message', { role: 'file-imported', bookId, bookTitle: title, fileName })
-      console.log('[import] 《' + title + '》' + ext + ' (' + content.length + ' chars) ' + (updated ? 'updated' : 'created'))
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, bookId, bookTitle: title, updated }))
-      return  // 必须 return：否则落到底部公共 res.writeHead(200)，对已结束的响应二次 writeHead 抛 ERR_HTTP_HEADERS_SENT
-
     } else if (url === '/debug') {
       const line = JSON.stringify({ ...data, receivedAt: Date.now() })
       fs.appendFileSync(DEBUG_LOG, line + '\n')
@@ -608,7 +646,7 @@ const server = http.createServer(async (req, res) => {
       const progressFile = path.join(bookDir(bookId), 'progress.json')
       const prev = fs.existsSync(progressFile) ? JSON.parse(fs.readFileSync(progressFile)) : {}
       fs.writeFileSync(progressFile, JSON.stringify({ ...prev, lastChapterUid: chapterUid, updatedAt: Date.now() }))
-      const msg = `【章节完成】《${bookTitle}》${chapterTitle} 已读完，请生成本章摘要并问我这章的 learning。`
+      const msg = `【章节完成】《${bookTitle}》${chapterTitle} 已读完，请问我这章的 learning。`
       triggerInject(msg)
 
     } else if (url === '/progress') {

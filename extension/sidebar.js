@@ -1,4 +1,10 @@
 const RECEIVER = 'http://127.0.0.1:7239'
+// 自由模式哨兵书（2026-09 用户定调）：固定在侧栏的独立上下文（固定空书对象）。
+// 自由模式的对话都是临时测试——引用解析照常命中正式会意图（测试 user 边命中端），
+// 但收口固化跑在正式图副本沙盒上（图视图 ?free=1 查看），正式图零污染、不固化。
+const FREE_KEY = '__coread_free_mode__'
+let _freeMode = false  // 是否处于自由模式（进入后消息区/引用/图视图按哨兵书隔离）
+let _savedReadingAnn = null  // 进入自由模式前暂存的读书模式选中引用（退出自由模式时恢复）
 
 // 侧栏调试上报（与 content.js 的 postDebug 同写 receiver/inbox/debug.jsonl，source=sidebar）
 function postSidebarDebug(data) {
@@ -54,15 +60,20 @@ let _pendingRefSearch = null  // AI-011：划线内容"引用栏搜索"的待搜
 // 当前阅读的书籍（AI-001 隔离）：由 content.js 广播 / 侧栏主动查询获得。
 // 切书后只显示当前书的引用与对话，其他书的上下文隐藏不删除。
 let _currentBook = null  // { base, bookTitle }
+// 手动选书（2026-10）：读书模式未检测到阅读书籍时，从「已读过的书籍」里手动选择
+// 一本书查看它的历史记录——已读完的书在微信读书外没有聊天记录入口，这是查看/
+// 继续讨论的兜底。有效上下文优先级：自由模式 > 手动选书 > 实时检测到的书；
+// 检测到真实阅读上下文后自动退出手动选书，恢复跟随。持久化在 storage（manualBook）。
+let _manualBook = null  // { base, bookTitle }
 // 消息书签（AI-001）：流式回复归属的书。annotation / user-popup / 书绑定聊天设置它，
 // 之后的 assistant 流式气泡继承，用于按书过滤消息区。
 let _thinkingBook = ''
 
-// ── 放入的文件（文档导入） ────────────────────────────────────────────────
-let _docs = []              // receiver /documents 拉取的文档列表 [{bookId, bookTitle, fileName, fileExt, importedAt}]
-let _docContext = null      // { base, bookTitle }：当前选中的文档上下文；null = 微信读书上下文
-let _lastWereadContext = null  // { base, bookTitle }：最近的微信读书上下文（文档模式下切回用）
 let _toastTimer = 0
+// 最近的微信读书上下文（{ base, bookTitle }）：退出自由模式时恢复用（页面广播 / 面板打开时记录）
+let _lastWereadContext = null
+// 文本附件（上传后读取进本次讨论，不落盘保存原文件、不建已上传列表）：读到的文件正文暂存这里
+let _pendingAttachment = null  // { fileName, text } | null
 
 // 消息字号（AI-002）
 const FONT_SIZE_MIN = 11
@@ -142,7 +153,10 @@ function saveState() {
         chapterUidInt: selectedAnn.chapterUidInt || 0,
         bookmarkRange: selectedAnn.bookmarkRange || '', bookmarkId: selectedAnn.bookmarkId || '',
         selectedText: selectedAnn.selectedText, refNum: selectedAnn.refNum
-      } : null
+      } : null,
+      // 2026-10：手动选书持久化——面板重开后保持上次手动查看的书；
+      // refreshCurrentBook 启动时会检测真实阅读上下文，检测到书则自动退出
+      manualBook: _manualBook ? { base: _manualBook.base, bookTitle: _manualBook.bookTitle } : null
     })
   } catch {}
   scheduleRefsSave()
@@ -150,7 +164,7 @@ function saveState() {
 
 async function loadState() {
   try {
-    const data = await chrome.storage.local.get(['refs', 'refNumCounter', 'selectedRef', 'pendingSelectRef', 'fontSize'])
+    const data = await chrome.storage.local.get(['refs', 'refNumCounter', 'selectedRef', 'pendingSelectRef', 'fontSize', 'manualBook'])
     // 恢复用户设定的消息字号（AI-002）
     if (data.fontSize) { _fontSize = data.fontSize; applyFontSize() }
     if (data.refs?.length) {
@@ -180,6 +194,11 @@ async function loadState() {
     if (data.pendingRefSearch) {
       _pendingRefSearch = data.pendingRefSearch
     }
+    // 2026-10：手动选书恢复——启动时先恢复，refreshCurrentBook 检测到真实阅读
+    // 上下文会自动退出手动选书（见 applyBookContext）
+    if (data.manualBook && typeof data.manualBook.base === 'string') {
+      _manualBook = { base: data.manualBook.base, bookTitle: String(data.manualBook.bookTitle || '').trim() }
+    }
   } catch {}
 }
 
@@ -195,8 +214,9 @@ function clearPendingSelect() {
 function applyPendingSelect() {
   if (!_pendingSelectRef) return
   const ref = _pendingSelectRef
-  // AI-001：当前书的待选引用才强制选中；其他书的等切回该书再处理
-  if (_currentBook && _currentBook.base && baseBookId(ref.bookId) !== _currentBook.base) return
+  // AI-001：当前书（有效上下文，含手动选书）的待选引用才强制选中；其他书的等切回该书再处理
+  const effBase = effectiveBookBase()
+  if (effBase && baseBookId(ref.bookId) !== effBase) return
   const found = RECENT_ANNS.find(a => sameRef(a, ref))
   if (found) {
     // 待选引用带整数 chapterUid 时补进列表条目（旧数据可能缺失）
@@ -225,8 +245,10 @@ async function applyPendingRefSearch() {
 function applySetRef(ann) {
   if (!ann || !ann.selectedText) return
   addRecentAnn(ann)
-  // AI-001：当前书之外的引用不强制选中（加入列表即可），避免聊天误绑定旧书
-  if (_currentBook && _currentBook.base && baseBookId(ann.bookId) !== _currentBook.base) {
+  // AI-001：当前书（有效上下文，含手动选书）之外的引用不强制选中（加入列表即可），
+  // 避免聊天误绑定旧书
+  const effBase = effectiveBookBase()
+  if (effBase && baseBookId(ann.bookId) !== effBase) {
     selectedAnn = null
     saveState()
     renderRefUI()
@@ -255,9 +277,9 @@ chrome.runtime.onMessage.addListener((msg) => {
     openDrawerWithSearch(msg.query || '')
   }
   // AI-001：content.js 广播当前阅读书籍（切书 = 页面导航，content.js 重载即广播）。
-  // 页面导航 = 正在读书：退出文档模式，回到微信读书上下文，并记录最近的微信读书上下文
   if (msg?.action === 'coreadBookContext') {
-    _docContext = null
+    // 自由模式期间忽略书页广播：测试上下文不被切书/页面导航打断，退出自由模式时恢复
+    if (_freeMode) return
     if (typeof msg.bookId === 'string') {
       _lastWereadContext = { base: baseBookId(msg.bookId), bookTitle: String(msg.bookTitle || '').trim() }
     }
@@ -352,6 +374,20 @@ function renderCollapsedPreview() {
 function renderCurrentRef() {
   const card = document.getElementById('ref-current')
 
+  // 自由模式隐藏「当前引用」窗体：测试上下文不显示任何引用卡片
+  //（进入/退出自由模式都经 applyBookContext → renderCurrentRef 刷新）
+  if (_freeMode) {
+    card.classList.remove('on')
+    return
+  }
+
+  // 无有效上下文（未检测到阅读书籍、未手动选书）：隐藏引用卡片，消息区由
+  //「无书默认界面」接管——不再残留显示上一本书的选中引用（2026-10）
+  if (!effectiveBookBase()) {
+    card.classList.remove('on')
+    return
+  }
+
   // 没有标注时隐藏卡片
   if (RECENT_ANNS.length === 0) {
     card.classList.remove('on')
@@ -413,10 +449,12 @@ function sortRefsByPositionDesc(list) {
 }
 
 function filterAnns() {
-  // AI-001：引用严格按当前书隔离。未读到书（_currentBook 为 null）时不列任何引用，
+  // AI-001：引用严格按有效上下文隔离。未读到书且未手动选书时不列任何引用，
   // 绝不回退成"全部"，否则抽屉会把多本书的引用混在一起（正是"没隔离"的根因）。
-  if (!_currentBook || !_currentBook.base) return []
-  let list = RECENT_ANNS.filter(a => baseBookId(a.bookId) === _currentBook.base)
+  // 手动选书（2026-10）时按选中的书隔离。
+  const base = effectiveBookBase()
+  if (!base) return []
+  let list = RECENT_ANNS.filter(a => baseBookId(a.bookId) === base)
   const q = drawerSearchQuery.trim().toLowerCase()
   if (q) {
     list = list.filter(a => {
@@ -462,17 +500,19 @@ function matchVisibleInPreview(text, q) {
 function renderDrawer() {
   const list = document.getElementById('drawer-list')
   list.innerHTML = ''
-  // AI-001：标题标注当前隔离范围——在读书籍时只列该书引用，未在读时提示先打开书
+  // AI-001：标题标注当前隔离范围——按有效上下文（实时检测 / 手动选书）列引用，
+  // 未在读且未手动选书时提示先打开书（2026-10 手动选书也在这里）
   const titleEl = document.getElementById('drawer-title')
-  if (titleEl) titleEl.textContent = _currentBook && _currentBook.bookTitle
-    ? `引用 · 《${_currentBook.bookTitle}》`
+  const effBook = effectiveBook()
+  if (titleEl) titleEl.textContent = effBook && effBook.bookTitle
+    ? `引用 · 《${effBook.bookTitle}》`
     : '当前未在读'
 
   const anns = filterAnns()
 
   if (anns.length === 0) {
-    const hint = !_currentBook
-      ? '未在读书籍页，打开一本书后再来切换引用'
+    const hint = !effBook
+      ? '未在读书籍页，打开一本书或从已读书籍中选择'
       : '无匹配引用'
     list.innerHTML = `<div style="text-align:center;color:#bbb;padding:20px;font-size:0.92em;">${hint}</div>`
     return
@@ -559,9 +599,11 @@ function renderDrawer() {
 // 读 /annotations 文件，于是出现「书上有线、抽屉里没有」的不一致。这里主动拉全量补齐，
 // 不依赖 SSE 是否恰好送达。receiver 未启动时静默失败，沿用本地列表。
 async function syncAnnsFromReceiver() {
-  if (!_currentBook || !_currentBook.base) return false
+  // 2026-10：按有效上下文拉取（手动选书时拉手动选中的书）
+  const effBook = effectiveBook()
+  if (!effBook || !effBook.base) return false
   try {
-    const r = await fetch(`${RECEIVER}/annotations?bookId=${encodeURIComponent(_currentBook.base)}`)
+    const r = await fetch(`${RECEIVER}/annotations?bookId=${encodeURIComponent(effBook.base)}`)
     const list = await r.json()
     if (!Array.isArray(list)) return false
     let added = 0
@@ -570,8 +612,8 @@ async function syncAnnsFromReceiver() {
       const exists = RECENT_ANNS.some(a => sameRef(a, d))
       if (!exists) {
         addRecentAnn({
-          bookId: d.bookId || _currentBook.base,
-          bookTitle: d.bookTitle || _currentBook.bookTitle,
+          bookId: d.bookId || effBook.base,
+          bookTitle: d.bookTitle || effBook.bookTitle,
           chapter: d.chapter || '', chapterUid: d.chapterUid || '',
           chapterUidInt: d.chapterUidInt || 0,
           bookmarkRange: d.bookmarkRange || '', bookmarkId: d.bookmarkId || '',
@@ -628,35 +670,86 @@ function setFontSize(n) {
 }
 
 // ── 当前书籍上下文（AI-001）───────────────────────────────────────────────
-// 头部队列显示当前书，无书时回落到格言
+// 有效上下文：自由模式 > 手动选书 > 实时检测到的书。所有"当前书"判定（消息过滤、
+// 引用隔离、命中隔离、发送归属、头部显示）都走这里，保证手动选书时全链路按
+// 选中的书工作（2026-10：无书默认界面 + 已读书籍手动选择）。
+function effectiveBook() {
+  if (_freeMode) return { base: FREE_KEY, bookTitle: '自由模式' }
+  if (_manualBook) return _manualBook
+  return _currentBook
+}
+function effectiveBookBase() {
+  const b = effectiveBook()
+  return b ? b.base : ''
+}
+
+// 头部队列显示有效上下文，无书时回落到格言；自由模式显示「自由模式」不套书名号
 function renderCurrentBook() {
   const el = document.getElementById('current-book')
   if (!el) return
-  if (_currentBook && _currentBook.bookTitle) {
-    el.innerHTML = `《${esc(_currentBook.bookTitle)}》`
-    el.title = _currentBook.bookTitle
+  const book = effectiveBook()
+  if (book && book.bookTitle) {
+    el.innerHTML = book.base === FREE_KEY
+      ? '<span style="font-weight:600">自由模式</span>'
+      : `《${esc(book.bookTitle)}》`
+    el.title = book.bookTitle
   } else {
     el.innerHTML = '<em>We read to know we are not alone.</em>'
     el.title = ''
   }
 }
 
-// 按当前书过滤消息区：只显示标记为当前书的消息。
-// 自由消息也会带上发消息时正在读的书（见 submit），切书后同样不显示。
-// 无当前书（首页等）时全部显示。
+// 按当前上下文过滤消息区：自由模式只显示自由消息（FREE_KEY）；读书模式只显示
+// 有效上下文（实时检测 / 手动选书）的书的消息；无有效上下文（书架/首页等且未
+// 手动选书）时隐藏全部消息，消息区由「无书默认界面」接管——不再像旧逻辑那样
+// 残留显示上一本书/全部书的内容（2026-10 修复）。自由消息（哨兵书 FREE_KEY）
+// 独立，只在自由模式激活时可见。
 function applyBookFilter() {
-  const book = _currentBook ? _currentBook.base : ''
+  const book = effectiveBookBase()
   const msgs = document.getElementById('msgs')
   for (const el of msgs.children) {
     const b = el.dataset.book || ''
-    el.style.display = (!book || b === book) ? '' : 'none'
+    el.style.display = (book && b === book) ? '' : 'none'
   }
   // AI-005：切书后浮窗提问列表同步刷新（只列当前书可见的提问）
   renderJumpBars()
   if (jumpFab && jumpFab.classList.contains('open')) renderJumpList()
 }
 
-// 应用阅读上下文：记录当前书；书变化时取消其他书的选中引用、刷新引用/消息过滤
+// 有效上下文变化时的统一处理：取消异书选中引用、刷新引用/消息过滤、滚到底部、
+// 恢复/清除"当前讨论命中"。切书 / 手动选书 / 退出手动选书 / 进出自由模式共用。
+function onEffectiveContextChange() {
+  const effBase = effectiveBookBase()
+  // 命中脉络按书隔离（2026-09）：每本书的实时栈独立，命中显示只在它所属的上下文
+  // 存在。上下文切换（切书 / 手动选书 / 进出自由模式）后，旧书或旧模式的命中高亮
+  // 与挂起的命中动画不再属于当前上下文——取消动画并清掉高亮（自由模式进出也走
+  // 这里：applyBookContext({bookId: FREE_KEY}) / 恢复读书上下文）
+  if (_hitBook && _hitBook !== effBase) {
+    _hitBook = ''
+    if (graphView) {
+      graphView._cancelAutoDismiss()
+      graphView.clearHighlight()
+    }
+  }
+  // 选中引用属于其他书 → 取消选中（保留在列表里），避免聊天误绑定旧书
+  if (effBase && selectedAnn && baseBookId(selectedAnn.bookId) !== effBase) {
+    selectedAnn = null
+    saveState()
+  }
+  renderCurrentRef()
+  renderDrawer()
+  applyBookFilter()
+  // 上下文切换是明确的动作：滚到底部展示该书最新内容
+  const msgs = document.getElementById('msgs')
+  if (msgs) msgs.scrollTop = msgs.scrollHeight
+  // 2026-09：切换/初始化后恢复新书的"当前讨论命中"高亮（实时栈 cites → /stack-hits）
+  refreshStackHits()
+}
+
+// 应用阅读上下文：记录实时检测到的书；有效上下文变化时取消其他书的选中引用、
+// 刷新引用/消息过滤。手动选书期间，实时上下文不打断手动查看；一旦检测到真实
+// 阅读上下文（任何一本书），自动退出手动选书恢复跟随——手动选书是"无书时查看
+// 历史记录"的兜底入口（2026-10）。
 function applyBookContext(ctx) {
   const rawBase = baseBookId(ctx && ctx.bookId)
   // 防御：只认形如真实书 ID 的 bookId。书架/首页等非阅读页的历史广播可能带
@@ -664,22 +757,20 @@ function applyBookContext(ctx) {
   const base = /^[A-Za-z0-9_]{12,}$/.test(rawBase) ? rawBase : ''
   const bookTitle = String((ctx && ctx.bookTitle) || '').trim()
   const next = base ? { base, bookTitle } : null
-  const changed = !_currentBook || _currentBook.base !== base
+  const prevEffBase = effectiveBookBase()
   _currentBook = next
-  if (changed) {
-    // 选中引用属于其他书 → 取消选中（保留在列表里），避免聊天误绑定旧书
-    if (next && selectedAnn && baseBookId(selectedAnn.bookId) !== next.base) {
-      selectedAnn = null
-      saveState()
-    }
-    renderCurrentRef()
-    renderDrawer()
-    applyBookFilter()
-    // 切书是明确的上下文切换：滚到底部展示当前书的最新内容
-    const msgs = document.getElementById('msgs')
-    if (msgs) msgs.scrollTop = msgs.scrollHeight
+  // 手动选书期间检测到真实阅读（选的就是这本也算"已在读"）：退出兜底的手动
+  // 查看，恢复自动跟随。有效上下文没变（实时书 == 手动书）时不弹提示。
+  if (_manualBook && next && !_freeMode) {
+    const switched = _manualBook.base !== next.base
+    _manualBook = null
+    saveState()
+    if (switched) showToast('检测到正在阅读《' + (next.bookTitle || '…') + '》，已恢复自动跟随')
   }
+  if (!prevEffBase || prevEffBase !== effectiveBookBase()) onEffectiveContextChange()
   renderCurrentBook()
+  renderNoBookView()
+  renderManualBanner()
 }
 
 // 侧栏打开 / 切换 tab 时，向活动的微信读书 tab 查询当前阅读上下文。
@@ -687,10 +778,9 @@ function applyBookContext(ctx) {
 // script 帧抢答、可能绑到非活动 tab 的书，这里点名唯一的目标（AI-008）。
 // bookId 为空（如无活动阅读页）也走 applyBookContext：把当前书重置为无书状态。
 async function refreshCurrentBook() {
-  // 放入文件的文档模式：优先保持文档上下文，不被微信读书页面/面板重开刷新覆盖；
-  // 退出文档模式（页面导航广播 / 菜单切回）后恢复跟随微信读书
-  if (_docContext) {
-    applyBookContext({ bookId: _docContext.base, bookTitle: _docContext.bookTitle })
+  // 自由模式期间保持自由上下文：不被面板重开/活动 tab 变化刷新覆盖（退出时手动恢复）
+  if (_freeMode) {
+    applyBookContext({ bookId: FREE_KEY, bookTitle: '自由模式' })
     return
   }
   try {
@@ -708,7 +798,139 @@ async function refreshCurrentBook() {
   } catch {}
 }
 
-// ── 放入的文件（文档导入） ────────────────────────────────────────────────
+// ── 无书默认界面 / 已读书籍手动选择（2026-10）───────────────────────────────
+// 读书模式未检测到阅读书籍时，消息区显示默认界面（不再残留上一本书的内容），
+// 提供「从已读过的书籍中选择」入口——已读完的书在微信读书外没有聊天记录入口，
+// 从这里手动选书即可查看/继续它的讨论。手动选书期间消息、引用、命中、发送归属
+// 全部按选中的书工作（effectiveBook 统一判定）；检测到真实阅读后自动退出。
+let _bookPickerList = []  // GET /books 的原始结果，供弹窗搜索过滤
+
+// 无书默认界面：显示/隐藏 + 同步禁用聊天输入（无书时发消息没有归属书，历史
+// 回放无从展示，直接禁用输入让行为规范）
+function renderNoBookView() {
+  const view = document.getElementById('no-book-view')
+  const msgs = document.getElementById('msgs')
+  const noBook = !_freeMode && !effectiveBookBase()
+  if (view) view.hidden = !noBook
+  if (msgs) msgs.style.display = noBook ? 'none' : ''
+  // 无书时把所有消息置为隐藏并刷新提问浮窗：applyBookFilter(book='') 全隐藏，
+  // 提问浮窗（jump-fab）随之收起，不残留上一本书的跳转条
+  if (noBook) applyBookFilter()
+  const input = document.getElementById('input')
+  const sendBtn = document.getElementById('send-btn')
+  const attachBtn = document.getElementById('attach-btn')
+  if (input) {
+    input.disabled = noBook
+    input.placeholder = noBook
+      ? '未检测到书籍：打开微信读书中的书，或从已读书籍中选择'
+      : '说点什么…'
+  }
+  if (sendBtn) sendBtn.disabled = noBook
+  if (attachBtn) attachBtn.disabled = noBook
+}
+
+// 手动选书横幅：手动查看期间显示在消息区上方，提供「切换书籍 / 退出手动」入口
+function renderManualBanner() {
+  const banner = document.getElementById('manual-banner')
+  const exitItem = document.getElementById('mm-exit-manual')
+  const show = !!_manualBook && !_freeMode
+  if (banner) banner.hidden = !show
+  if (exitItem) exitItem.hidden = !show
+  if (show && _manualBook) {
+    const nameEl = document.getElementById('manual-book-name')
+    if (nameEl) nameEl.textContent = _manualBook.bookTitle || ''
+  }
+}
+
+// 打开已读书籍选择弹窗：从 receiver 拉书籍列表（按最近更新倒序）
+async function openBookPicker() {
+  const overlay = document.getElementById('book-picker')
+  if (!overlay) return
+  overlay.classList.add('on')
+  const listEl = document.getElementById('bp-list')
+  const emptyEl = document.getElementById('bp-empty')
+  if (listEl) listEl.innerHTML = '<div class="bp-msg">加载中…</div>'
+  if (emptyEl) emptyEl.hidden = true
+  try {
+    const r = await fetch(`${RECEIVER}/books`)
+    const d = await r.json()
+    _bookPickerList = Array.isArray(d.books) ? d.books : []
+  } catch {
+    _bookPickerList = []
+    if (listEl) listEl.innerHTML = '<div class="bp-msg bp-err">接收端未启动，无法读取已读书籍</div>'
+    return
+  }
+  renderBookList()
+  const search = document.getElementById('bp-search')
+  if (search) { search.value = ''; setTimeout(() => search.focus(), 100) }
+}
+
+function renderBookList() {
+  const listEl = document.getElementById('bp-list')
+  const emptyEl = document.getElementById('bp-empty')
+  if (!listEl) return
+  const searchEl = document.getElementById('bp-search')
+  const q = (searchEl ? searchEl.value : '').trim().toLowerCase()
+  const list = _bookPickerList.filter(b => !q || (b.bookTitle || '').toLowerCase().includes(q))
+  listEl.innerHTML = ''
+  if (!list.length) {
+    if (emptyEl) {
+      emptyEl.hidden = false
+      emptyEl.textContent = q ? '没有匹配的书籍' : '还没有已读书籍记录'
+    }
+    return
+  }
+  if (emptyEl) emptyEl.hidden = true
+  for (const b of list) {
+    const item = document.createElement('div')
+    item.className = 'bp-item'
+    const time = b.updatedAt ? new Date(b.updatedAt).toLocaleDateString() : ''
+    item.innerHTML =
+      `<div class="bi-title">${esc(b.bookTitle || '（未知名书籍）')}</div>` +
+      (time ? `<div class="bi-meta">最近更新 ${time}</div>` : '')
+    item.addEventListener('click', () => pickBook(b))
+    listEl.appendChild(item)
+  }
+}
+
+function closeBookPicker() {
+  document.getElementById('book-picker')?.classList.remove('on')
+}
+
+// 手动选一本书：进入「手动查看该书历史记录」状态。_manualBook 优先于实时检测
+//（effectiveBook），实时上下文照常记录在 _currentBook；检测到真实阅读后自动退出。
+function pickBook(book) {
+  if (!book || !book.base) return
+  closeBookPicker()
+  const same = _manualBook && _manualBook.base === book.base
+  _manualBook = { base: book.base, bookTitle: String(book.bookTitle || '').trim() }
+  saveState()
+  if (!same) {
+    // 手动选书是一次明确的上下文切换：引用/消息/命中/滚动全部按新书重算。
+    // 不写 _currentBook（它只记录实时检测），后续实时上下文照常覆盖
+    onEffectiveContextChange()
+    showToast(`已切换到《${_manualBook.bookTitle || '…'}》的历史记录`)
+  }
+  renderCurrentBook()
+  renderNoBookView()
+  renderManualBanner()
+}
+
+// 停止手动选书：恢复自动跟随（实时检测到哪本书就显示哪本）
+function exitManualBook() {
+  if (!_manualBook) return
+  const was = _manualBook
+  _manualBook = null
+  saveState()
+  onEffectiveContextChange()
+  renderCurrentBook()
+  renderNoBookView()
+  renderManualBanner()
+  // 退出后立即向活动 tab 查询真实阅读上下文（可能正在读书）
+  refreshCurrentBook()
+  showToast(`已退出《${was.bookTitle || '…'}》的手动查看`)
+}
+// ── 轻提示 toast ──────────────────────────────────────────────────────────
 function showToast(text, isErr) {
   const el = document.getElementById('toast')
   if (!el) return
@@ -718,101 +940,6 @@ function showToast(text, isErr) {
   clearTimeout(_toastTimer)
   _toastTimer = setTimeout(() => el.classList.remove('on'), 2600)
 }
-
-// 从 receiver 拉取已放入的文档列表（用于文档菜单）
-async function loadDocs() {
-  try {
-    const r = await fetch(`${RECEIVER}/documents`)
-    const list = await r.json()
-    if (!Array.isArray(list)) return
-    _docs = list
-    renderDocMenu()
-  } catch {}  // 接收端未启动：静默，菜单显示空态
-}
-
-function renderDocMenu() {
-  const list = document.getElementById('doc-list')
-  if (!list) return
-  list.innerHTML = ''
-  const inDoc = !!_docContext
-  // 文档模式下提供「返回微信读书」入口（_lastWereadContext 由页面广播/面板打开时记录）
-  if (inDoc && _lastWereadContext) {
-    const back = document.createElement('div')
-    back.className = 'doc-back'
-    back.innerHTML = `<span>📖</span><span class="doc-name">微信读书《${esc(_lastWereadContext.bookTitle || '当前书')}》</span>`
-    back.addEventListener('click', () => {
-      _docContext = null
-      if (_lastWereadContext) applyBookContext({ bookId: _lastWereadContext.base, bookTitle: _lastWereadContext.bookTitle })
-      closeDocMenu()
-      showToast('已切回微信读书')
-    })
-    list.appendChild(back)
-  }
-  if (_docs.length === 0) {
-    list.innerHTML = '<div class="doc-empty">还没有放入文件，点下方按钮放入 .md / .txt 文档</div>'
-    return
-  }
-  for (const d of _docs) {
-    const item = document.createElement('div')
-    item.className = 'doc-item' + (inDoc && _docContext.base === d.bookId ? ' sel' : '')
-    item.innerHTML = `<span class="doc-icon">📄</span><span class="doc-name">${esc(d.bookTitle || d.fileName || '未命名')}</span><span class="doc-ext">${esc((d.fileExt || '').replace(/^\./, ''))}</span>`
-    item.addEventListener('click', () => {
-      _docContext = { base: d.bookId, bookTitle: d.bookTitle || d.fileName || '未命名文档' }
-      applyBookContext({ bookId: _docContext.base, bookTitle: _docContext.bookTitle })
-      closeDocMenu()
-      showToast(`已切到文档《${_docContext.bookTitle}》`)
-    })
-    list.appendChild(item)
-  }
-}
-
-function toggleDocMenu() {
-  const m = document.getElementById('doc-menu')
-  if (!m) return
-  const open = m.classList.toggle('on')
-  if (open) renderDocMenu()
-}
-
-function closeDocMenu() {
-  const m = document.getElementById('doc-menu')
-  if (m) m.classList.remove('on')
-}
-
-// 放入文件：读 .md/.txt 文本 → POST receiver /import → 立即切到该文档的阅读上下文
-async function importFile(file) {
-  const ext = (file.name.split('.').pop() || '').toLowerCase()
-  if (!['md', 'markdown', 'txt', 'text'].includes(ext)) {
-    showToast('暂只支持 .md / .txt 文档文件', true)
-    return
-  }
-  if (file.size > 2 * 1024 * 1024) {
-    showToast('文件超过 2MB，暂不支持', true)
-    return
-  }
-  let content
-  try { content = await file.text() } catch { showToast('读取文件失败', true); return }
-  if (!content.trim()) { showToast('文件内容为空', true); return }
-  try {
-    const r = await fetch(`${RECEIVER}/import`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fileName: file.name, content }),
-    })
-    const d = await r.json().catch(() => ({}))
-    if (!r.ok) {
-      showToast(d && d.error ? `放入失败：${d.error}` : `放入失败（${r.status}）`, true)
-      return
-    }
-    // 导入即共读：切到该文档的上下文，直接开聊
-    _docContext = { base: d.bookId, bookTitle: d.bookTitle }
-    applyBookContext({ bookId: _docContext.base, bookTitle: _docContext.bookTitle })
-    await loadDocs()
-    showToast(d.updated ? `已更新文档《${d.bookTitle}》` : `已放入《${d.bookTitle}》`)
-  } catch {
-    showToast('放入失败：接收端未启动？', true)
-  }
-}
-
 
 // ── 事件绑定 ──────────────────────────────────────────────────────────────
 
@@ -878,20 +1005,6 @@ try {
   applyFontSize()
 } catch {}
 
-// ── 放入文件（文档导入） ─────────────────────────────────────────────────
-document.getElementById('doc-btn')?.addEventListener('click', (e) => { e.stopPropagation(); toggleDocMenu() })
-document.getElementById('doc-import-btn')?.addEventListener('click', () => { document.getElementById('file-input')?.click() })
-document.getElementById('attach-btn')?.addEventListener('click', () => { document.getElementById('file-input')?.click() })
-document.getElementById('file-input')?.addEventListener('change', (e) => {
-  const f = e.target.files && e.target.files[0]
-  if (f) importFile(f)
-  e.target.value = ''  // 清空选择，允许重复放入同一文件
-})
-// 点击菜单外区域关闭文档菜单
-document.addEventListener('click', (e) => {
-  const m = document.getElementById('doc-menu')
-  if (m && m.classList.contains('on') && !m.contains(e.target) && e.target.id !== 'doc-btn') closeDocMenu()
-})
 // ── 消息 ────────────────────────────────────────────────────────────────────
 let thinkingEl = null
 
@@ -915,6 +1028,18 @@ function hideThinking() {
 
 // 去重：跟踪已显示的 assistant 消息（前 200 字指纹）
 const _seenFingerprints = new Set()
+
+// 系统提示气泡（2026-09）：/收口 等系统反馈——区别于普通消息的小号灰字样式
+function renderSystemBubble(content) {
+  const msgs = document.getElementById('msgs')
+  if (!msgs) return
+  const el = document.createElement('div')
+  el.className = 'msg-system'
+  el.innerHTML = `<div class="bubble">${esc(content)}</div>`
+  msgs.appendChild(el)
+  applyBookFilter()
+  maybeAutoScroll(msgs)
+}
 
 function addBubble(role, content, extra, note, bookId) {
   // assistant 消息去重
@@ -1114,12 +1239,27 @@ function connect() {
       if (d.type === 'connected') { setDot(true); return }
       // 会意图刷新（AI-020）：图文件更新 → 图视图开着就重拉
       if (d.type === 'graph-updated') { if (graphView?.isOpen()) graphView.reload(); return }
+      // 2026-09：实时栈变化 → 重拉 /stack-hits，恢复/清除"当前讨论命中"高亮
+      if (d.type === 'stack-updated') { refreshStackHits(); return }
       if (d.type !== 'message') return
 
       // 会意图命中（AI-020）：agent 引用解析命中旧知识点（L3 图路径上下文）→
-      // 图视图高亮各命中节点的 root→recent 路径并集；图未打开时暂存，打开即应用
+      // 图视图高亮各命中节点的 root→recent 路径并集；图未打开时暂存，打开即应用。
+      // 命中按书隔离（2026-09）：graph-hit 带 bookKey（命中所属书），只显示与当前
+      // 上下文匹配的命中——自由模式只收 FREE_KEY 的命中（并入引用窗体），读书模式
+      // 只收当前书的命中；其他书的命中忽略，避免串上下文
       if (d.role === 'graph-hit' && Array.isArray(d.hits) && d.hits.length) {
+        const hitBook = baseBookId(d.bookKey) || ''
+        // 2026-10：命中按有效上下文隔离（手动选书时按手动选中的书）
+        const ctxBook = effectiveBookBase()
+        console.log('[CoRead] graph-hit', d.hits.length, 'hitBook=', hitBook, 'ctxBook=', ctxBook, 'open=', !!graphView && graphView.isOpen())
+        if (hitBook !== ctxBook) return
         graphView?.onHit(d.hits, d.reason || '')
+        _hitBook = hitBook
+        // 自由模式：语义命中自动并入引用窗体（可悬浮取消），随消息提交为 cites
+        if (_freeMode) {
+          for (const id of d.hits) addFreeRef(id, '')
+        }
         return
       }
 
@@ -1180,13 +1320,17 @@ function connect() {
         return
       }
 
-      // 放入文件事件（其他面板导入时同步刷新文档列表；本面板导入走 importFile 直接更新）
-      if (d.role === 'file-imported') {
-        loadDocs()
+      if (_isDuplicate(d)) return
+      // 系统提示（2026-09）：/收口 等指令反馈——toast + 系统样式气泡。
+      // 消费掉对应消息的 pending 配对条目（该条指令消息在发送时入过队），不参与
+      // 引用回复配对；历史回放时 _isDuplicate 已去重，不会重复弹 toast。
+      if (d.role === 'system') {
+        _pendingRefs.shift()
+        hideThinking()
+        showToast(d.content, false)
+        renderSystemBubble(d.content)
         return
       }
-
-      if (_isDuplicate(d)) return
       if (d.role === 'assistant') {
         addBubble('assistant', d.content)
       } else if (d.role === 'user-popup') {
@@ -1211,22 +1355,52 @@ function connect() {
   }
 }
 
+// ── 当前讨论命中（2026-09 用户定调）────────────────────────────────────────
+// 命中 = 当前实时栈（topic_stack）里 user 条目挂的 cites 对应的节点脉络：
+// 打开图 / 收到 stack-updated / 切书时从 receiver 重拉 /stack-hits 恢复高亮；
+// 栈收口清空后 hits 为空 → 图视图清除 hit 态高亮（栈结束即命中结束）。
+async function refreshStackHits() {
+  if (!graphView) return
+  // 2026-10：按有效上下文拉取（手动选书时按手动选中的书）
+  const ctxBook = effectiveBookBase()
+  if (!ctxBook) return
+  try {
+    const r = await fetch(RECEIVER + '/stack-hits?book=' + encodeURIComponent(ctxBook))
+    const d = await r.json()
+    graphView.applyStackHits(Array.isArray(d.hits) ? d.hits : [])
+  } catch {}
+}
+
 // ── 发送 ─────────────────────────────────────────────────────────────────────
 async function submit() {
   const input = document.getElementById('input')
   const content = input.value.trim()
-  if (!content) return
+  const attach = _pendingAttachment
+  // 允许仅附件、无正文：附件正文即本次讨论内容（读取进讨论，不落盘保存原文件）
+  if (!content && !attach) return
   input.value = ''
   input.style.height = 'auto'
-  // AI-001：消息归属当前书——有选中引用归引用书；否则归正在阅读的书，
-  // 自由消息也带上"在哪本书里聊起来的"标记，切书后不显示
-  const msgBook = selectedAnn ? selectedAnn.bookId : (_currentBook ? _currentBook.base : '')
-  addBubble('user', content, null, null, msgBook)
+  _pendingAttachment = null
+  renderAttachChip()
+  // AI-001：消息归属有效上下文——有选中引用归引用书；否则归正在阅读的书 /
+  // 手动选中的书（2026-10），自由消息也带上"在哪本书里聊起来的"标记，切书后不显示
+  const msgBook = selectedAnn ? selectedAnn.bookId : effectiveBookBase()
+  // 气泡预览：附件用「📎 文件名」占位 + 正文（附件正文不整段贴进气泡，只进 agent 上下文）
+  const bubbleText = attach
+    ? ('📎 ' + attach.fileName + (content ? '\n\n' + content : ''))
+    : content
+  addBubble('user', bubbleText, null, null, msgBook)
   showThinking(msgBook)
 
-  const body = { content }
+  // 附件块：作为本次讨论上下文喂给 AI；用后即弃，不落盘、不生成文档书、不建已上传列表
+  const attachBlock = attach ? ('[附件]《' + attach.fileName + '》\n' + attach.text) : ''
+  const body = {}
 
-  if (selectedAnn) {
+  // 自由模式强制走自由消息路径（测试对话不绑定引用；进入自由模式时已清空选中引用，
+  // 这里双保险：即使 selectedAnn 残留也不让消息带 [引用] 前缀/划线上下文）。
+  // 斜杠命令（/收口 等，2026-09）：同样不绑定引用——否则 [引用] 前缀会破坏命令匹配
+  const _isCmd = /^\//.test(content)
+  if (selectedAnn && !_freeMode && !_isCmd) {
     // AI-001：引用回复气泡按 bookId 打书签隔离；入队等最终记录配对（AI-006）
     _pendingRefs.push({ ref: { bookId: selectedAnn.bookId, bookTitle: selectedAnn.bookTitle, chapter: selectedAnn.chapter, selectedText: selectedAnn.selectedText } })
     body.bookId = selectedAnn.bookId
@@ -1240,11 +1414,23 @@ async function submit() {
     // 之前自由消息不入队，若「自由回复流式中途又发引用」，自由回复的最终记录
     // 会错配到新入队的引用（引用条错标）；现在每条消息都有占位，配对不乱。
     _pendingRefs.push({ ref: null })
-    // 自由消息也把当前书标记传给 receiver，落库后历史回放能按书归属（AI-001）
-    if (_currentBook && _currentBook.base) {
-      body.bookId = _currentBook.base
-      body.bookTitle = _currentBook.bookTitle || ''
+    // 自由消息也把当前书标记传给 receiver，落库后历史回放能按书归属（AI-001）；
+    // 2026-10：手动选书时按手动选中的书归属
+    const effBook = effectiveBook()
+    if (effBook && effBook.base) {
+      body.bookId = effBook.base
+      body.bookTitle = effBook.bookTitle || ''
     }
+    // 自由模式：携带引用窗体清单（语义命中 + 手动选取，用户可取消），agent 收口
+    // 以它为 cites 建 user 边（2026-09）
+    if (_freeMode && _freeRefs.length) {
+      body.refs = _freeRefs.map((r) => r.id)
+    }
+    body.content = content
+  }
+  // 附件块前置到发给 agent 的内容（叠加到文本/引用之上）
+  if (attachBlock) {
+    body.content = attachBlock + (body.content ? '\n\n' + body.content : '')
   }
 
   try {
@@ -1265,11 +1451,89 @@ async function submit() {
 
 document.getElementById('send-btn').addEventListener('click', submit)
 document.getElementById('input').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault()
+    const im = document.getElementById('cmd-menu')
+    if (im) im.hidden = true
+    if (document.getElementById('input').value.trim() === '/') return  // 纯 "/" 不发送（斜杠菜单占位）
+    submit()
+  }
 })
 document.getElementById('input').addEventListener('input', function () {
   this.style.height = 'auto'
   this.style.height = Math.min(this.scrollHeight, 120) + 'px'
+})
+
+// ── 斜杠命令菜单（2026-09）：输入 / 弹出可用操作，点击即执行 ──
+const cmdMenu = document.getElementById('cmd-menu')
+if (cmdMenu) {
+  document.getElementById('input').addEventListener('input', () => {
+    cmdMenu.hidden = !(document.getElementById('input').value || '').startsWith('/')
+  })
+  cmdMenu.addEventListener('click', (e) => {
+    const item = e.target.closest('.cmd-item')
+    if (!item) return
+    const el = document.getElementById('input')
+    el.value = item.dataset.cmd || ''
+    cmdMenu.hidden = true
+    submit()
+  })
+  document.addEventListener('click', (e) => {
+    if (!cmdMenu.contains(e.target) && e.target !== document.getElementById('input')) cmdMenu.hidden = true
+  })
+}
+
+// ── 上传文本附件（读取进本次讨论，不落盘保存原文件）──────────────────────────
+// 只接受 .md/.txt，读到的正文暂存 _pendingAttachment，随下一条消息作为讨论上下文
+// 发给 agent；用后即弃——不写盘、不生成文档书、不建"已放入的文件"列表。
+const ATTACH_MAX_CHARS = 50000  // 单次附件正文上限（防撑爆讨论上下文）
+function renderAttachChip() {
+  const chip = document.getElementById('attach-chip')
+  const nameEl = document.getElementById('attach-chip-name')
+  if (!chip || !nameEl) return
+  if (_pendingAttachment) {
+    nameEl.textContent = _pendingAttachment.fileName
+    chip.hidden = false
+  } else {
+    chip.hidden = true
+    nameEl.textContent = ''
+  }
+}
+
+async function pickAttachment(file) {
+  if (!file) return
+  const ext = (file.name.split('.').pop() || '').toLowerCase()
+  if (!['md', 'markdown', 'txt', 'text'].includes(ext)) {
+    showToast('只支持 .md / .txt 文本附件', true)
+    return
+  }
+  if (file.size > 2 * 1024 * 1024) {
+    showToast('附件超过 2MB，暂不支持', true)
+    return
+  }
+  let text
+  try { text = await file.text() } catch { showToast('读取附件失败', true); return }
+  if (!text.trim()) { showToast('附件内容为空', true); return }
+  // 只截取前 ATTACH_MAX_CHARS（带省略说明），避免超大文本直接撑爆讨论上下文
+  if (text.length > ATTACH_MAX_CHARS) {
+    text = text.slice(0, ATTACH_MAX_CHARS) + '\n…[前 ' + ATTACH_MAX_CHARS + ' 字之外已省略]'
+  }
+  _pendingAttachment = { fileName: file.name, text }
+  renderAttachChip()
+  showToast('已添加文本附件：' + file.name)
+}
+
+document.getElementById('attach-btn')?.addEventListener('click', () => {
+  document.getElementById('file-input')?.click()
+})
+document.getElementById('file-input')?.addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0]
+  if (f) pickAttachment(f)
+  e.target.value = ''  // 清空选择，允许重复选择同一文件
+})
+document.getElementById('attach-chip-remove')?.addEventListener('click', () => {
+  _pendingAttachment = null
+  renderAttachChip()
 })
 
 // 从完整 bookId 提取基础 bookId（去掉末尾 k 会话后缀），用于归一化比较
@@ -2167,19 +2431,213 @@ if (jumpListEl) {
   }, { passive: true })
 }
 
+// ── 自由模式（测试沙盒，2026-09）─────────────────────────────────────────
+// 固定在侧栏的独立上下文（哨兵书 FREE_KEY）：消息区按书过滤天然隔离自由对话；
+// 引用解析照常命中正式会意图（graph-hit 高亮、L3 上下文），收口固化跑在
+// 正式图副本沙盒上（图视图切 ?free=1 查看测试产物），正式图零污染。
+// 引用窗体（2026-09）：本次讨论的引用节点清单——语义命中（graph-hit）自动并入 +
+// 手动从拓扑图选取（双击）；条目悬浮可取消；随消息提交（body.refs），agent 收口
+// 以窗体清单为 cites 建 user 边。
+let _freeRefs = []          // [{ id, point }]：自由模式引用清单（去重）
+let _hitBook = ''           // 当前图视图命中显示的来源书（''=无）：按书隔离——切书/切换模式时清理
+let _graphPointCache = null // Map(id → point)：正式图节点缓存（窗体显示 / 命中并入取 point）
+async function ensureGraphPointCache() {
+  if (_graphPointCache) return _graphPointCache
+  const map = new Map()
+  try {
+    const r = await fetch(`${RECEIVER}/graph`)
+    const g = await r.json()
+    if (Array.isArray(g.nodes)) {
+      for (const n of g.nodes) if (n && n.id) map.set(n.id, String(n.point || n.id))
+    }
+  } catch {}
+  _graphPointCache = map
+  return map
+}
+function pointOf(id) {
+  return (_graphPointCache && _graphPointCache.get(id)) || String(id || '')
+}
+// 手动选取高亮同步：已选引用 → 图视图高亮其讨论脉络（横幅 + 隐藏/显示按钮，2026-09）
+function syncPickHighlight() {
+  if (!graphView) return
+  graphView._cancelAutoDismiss()   // 用户手动操作：取消挂起的自动渐隐/轮播（图保持打开）
+  if (_freeRefs.length) {
+    graphView.applyHit(_freeRefs.map((r) => r.id), '', 'picked')
+  } else {
+    graphView.clearHighlight()
+  }
+}
+// 加入引用（语义命中 / 手动选取共用；id 去重）
+async function addFreeRef(id, point) {
+  if (!id) return
+  if (_freeRefs.some((r) => r.id === id)) return
+  _freeRefs.push({ id, point: point || pointOf(id) })
+  await ensureGraphPointCache()   // 补 point（命中并入时可能只有 id）
+  const r = _freeRefs.find((x) => x.id === id)
+  if (r) r.point = point || pointOf(id)
+  renderFreeRefs()
+}
+function removeFreeRef(id) {
+  _freeRefs = _freeRefs.filter((r) => r.id !== id)
+  renderFreeRefs()
+  syncPickHighlight()   // 剩余引用重新高亮（或清空）
+}
+function clearFreeRefs() {
+  _freeRefs = []
+  renderFreeRefs()
+  syncPickHighlight()
+}
+// 渲染自由模式引用窗体（仅自由模式激活时可见）
+function renderFreeRefs() {
+  const box = document.getElementById('free-refs')
+  if (!box) return
+  box.hidden = !_freeMode
+  const list = document.getElementById('fr-list')
+  const empty = document.getElementById('fr-empty')
+  if (!list || !empty) return
+  const label = document.getElementById('fr-label')
+  if (label) label.textContent = '🔗 本次引用' + (_freeRefs.length ? '（' + _freeRefs.length + '）' : '')
+  if (_freeRefs.length) {
+    empty.style.display = 'none'
+    list.innerHTML = _freeRefs.map((r, i) =>
+      '<div class="fr-item" title="' + esc(r.point) + '">' +
+        '<span class="fr-idx">#' + (i + 1) + '</span>' +
+        '<span class="fr-point">' + esc(r.point.length > 40 ? r.point.slice(0, 40) + '…' : r.point) + '</span>' +
+        '<button class="fr-x" data-idx="' + i + '" title="取消引用">✕</button>' +
+      '</div>').join('')
+    for (const b of list.querySelectorAll('.fr-x')) {
+      b.addEventListener('click', () => {
+        const r = _freeRefs[Number(b.dataset.idx)]
+        if (r) removeFreeRef(r.id)
+      })
+    }
+  } else {
+    list.innerHTML = ''
+    empty.style.display = ''
+  }
+}
+// 打开拓扑图进入选取模式（手动选取引用）：正式图 + 单击看详情/双击选取
+function openPickMode() {
+  if (!graphView) return
+  graphView.setMode('formal')
+  graphView.open()
+  refreshStackHits()
+  graphView.setPickMode(true)
+}
+
+function toggleFreeMode() {
+  _freeMode = !_freeMode
+  // iPhone 风格滑动开关：滑块状态 / 轨道颜色 / 两侧文案高亮随模式切换
+  const sw = document.getElementById('free-switch')
+  if (sw) {
+    sw.classList.toggle('on', _freeMode)
+    sw.setAttribute('aria-checked', _freeMode ? 'true' : 'false')
+    const states = sw.querySelectorAll('.ms-state')
+    if (states.length === 2) {
+      states[0].classList.toggle('act', !_freeMode)  // 读书
+      states[1].classList.toggle('act', _freeMode)   // 自由
+    }
+  }
+  if (_freeMode) {
+    // 暂存读书模式的选中引用：进入自由模式会被当作"切书"取消选中，退出时原样恢复
+    _savedReadingAnn = selectedAnn
+    applyBookContext({ bookId: FREE_KEY, bookTitle: '自由模式' })
+    renderFreeRefs()
+    showToast('已进入自由模式：对话为临时测试，不固化进正式会意图')
+  } else {
+    // 退出：先恢复读书上下文——引用窗体由 applyBookContext → renderCurrentRef 重新显示；
+    // 再清理自由态。顺序不能反：图视图同步异常会中断后面的恢复，导致引用窗体不再出现
+    if (_lastWereadContext) {
+      applyBookContext({ bookId: _lastWereadContext.base, bookTitle: _lastWereadContext.bookTitle })
+    } else {
+      applyBookContext({ bookId: '' })
+    }
+    // 恢复后立即向活动 tab 查询真实阅读上下文：_lastWereadContext 是进入自由模式前的
+    // 快照，自由模式期间可能已切书/离开阅读页，快照会过期（2026-09 修复）
+    refreshCurrentBook()
+    // 恢复进入自由模式前暂存的选中引用（引用仍在列表里才重新选中）
+    if (_savedReadingAnn) {
+      const found = RECENT_ANNS.find(a => sameRef(a, _savedReadingAnn))
+      if (found) { selectedAnn = found; saveState() }
+      _savedReadingAnn = null
+    }
+    renderRefUI()
+    // 清除本次引用窗体与图视图已选标记（自由模式上下文独立，下次重新开始）
+    clearFreeRefs()
+    showToast('已退出自由模式')
+  }
+  if (graphView) graphView.setMode(_freeMode ? 'free' : 'formal')
+}
+
 // ── 会意图拓扑视图（AI-020）─────────────────────────────────────────────
 // 图视图（extension/graph-view.js）：Obsidian 式话题拓扑图。常态浏览（缩放/平移/
-// 悬停邻接/点选详情/搜索）；SSE graph-hit 命中 → 高亮 root→recent 路径并集。
-// 数据：GET {receiver}/graph（agent/data/knowledge-graph.json，图空时可 ?demo=1 预览）。
+// 悬停邻接/点选详情/搜索）；SSE graph-hit 命中 → 自动弹出拓扑图并播放命中路径
+// 动画（横幅即命中通知）→ 渐隐关闭；图已打开时直接高亮不自动关闭。
+// 数据：GET {receiver}/graph（agent/data/knowledge-graph.json，图空时可 ?demo=1 预览；
+// 自由模式激活时 ?free=1 看沙盒图）。
 const graphView = typeof CoReadGraphView !== 'undefined'
   ? new CoReadGraphView.GraphView({
       receiver: RECEIVER,
       container: document.getElementById('graph-overlay'),
-      onHitNotify: (count) => showToast('🔗 会话命中会意图 ' + count + ' 个节点，打开「◎」查看拓扑脉络'),
+      // 选择模式双击节点：手动选取为引用（自由模式，2026-09）
+      onPick: (node) => {
+        if (!_freeMode || !node || !node.id) return
+        addFreeRef(node.id, node.point || '')
+        syncPickHighlight()   // 图视图立即高亮已选引用的讨论脉络（横幅 + 隐藏/显示按钮）
+        graphView?.focusNodeChain(node.id)   // 新选节点所在链 → 聚焦过去（多链时）
+      },
     })
   : null
 const graphBtn = document.getElementById('graph-btn')
-if (graphBtn && graphView) graphBtn.addEventListener('click', () => graphView.open())
+if (graphBtn && graphView) graphBtn.addEventListener('click', () => { graphView.open(); refreshStackHits() })
+const pickBtn = document.getElementById('fr-pick-btn')
+if (pickBtn) pickBtn.addEventListener('click', openPickMode)
+const freeSwitch = document.getElementById('free-switch')
+if (freeSwitch) {
+  freeSwitch.addEventListener('click', toggleFreeMode)
+  // 初始同步：默认读书模式（关态），与 _freeMode = false 一致
+  freeSwitch.classList.toggle('on', _freeMode)
+  freeSwitch.setAttribute('aria-checked', _freeMode ? 'true' : 'false')
+  const st = freeSwitch.querySelectorAll('.ms-state')
+  if (st.length === 2) {
+    st[0].classList.toggle('act', !_freeMode)
+    st[1].classList.toggle('act', _freeMode)
+  }
+}
+
+// ── 头部「⋯」更多设置菜单（字号）─────────────────────────────────────
+const moreBtn = document.getElementById('more-btn')
+const moreMenu = document.getElementById('more-menu')
+if (moreBtn && moreMenu) {
+  moreBtn.addEventListener('click', (e) => {
+    e.stopPropagation()  // 避免被下面的 document 点击立即关闭
+    moreMenu.classList.toggle('on')
+  })
+  // 点击菜单外区域关闭
+  document.addEventListener('click', (e) => {
+    if (moreMenu.classList.contains('on') && !moreMenu.contains(e.target) && e.target.id !== 'more-btn') {
+      moreMenu.classList.remove('on')
+    }
+  })
+}
+
+// ── 无书默认界面 / 已读书籍选择的事件绑定（2026-10）────────────────────────
+document.getElementById('nb-pick-btn')?.addEventListener('click', openBookPicker)
+document.getElementById('mm-pick-book')?.addEventListener('click', () => {
+  if (moreMenu) moreMenu.classList.remove('on')
+  openBookPicker()
+})
+document.getElementById('mm-exit-manual')?.addEventListener('click', () => {
+  if (moreMenu) moreMenu.classList.remove('on')
+  exitManualBook()
+})
+document.getElementById('mb-switch-btn')?.addEventListener('click', openBookPicker)
+document.getElementById('mb-exit-btn')?.addEventListener('click', exitManualBook)
+document.getElementById('bp-close-btn')?.addEventListener('click', closeBookPicker)
+document.getElementById('book-picker')?.addEventListener('click', (e) => {
+  if (e.target.id === 'book-picker') closeBookPicker()  // 点击遮罩关闭
+})
+document.getElementById('bp-search')?.addEventListener('input', renderBookList)
 
 // 启动后查询当前阅读书籍（AI-001）：覆盖「切书后重开侧栏」的场景。
 // applyPendingRefSearch 放在 loadHistory 之后：引用列表就绪后再打开抽屉搜索，
@@ -2189,7 +2647,7 @@ loadState()
   .then(applyPendingRefSearch)
   .then(connect)
   .then(() => refreshCurrentBook())
-  .then(loadDocs)  // 启动时拉取已放入的文档列表（文档菜单）
+  .then(() => { renderNoBookView(); renderManualBanner() })  // 2026-10：无书默认界面/手动选书横幅初始态
 loadJumpBack()  // AI-006：面板重开后恢复「↩ 返回」能力（有未过期的跳转记录时）
 
 // 活动 tab 变化时刷新当前书（AI-001）：用户在多本书 / 多个微信读书 tab 间切换

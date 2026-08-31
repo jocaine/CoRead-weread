@@ -53,7 +53,7 @@ function dispatch(prompt) {
     if (p.includes('水兵')) return '{"question":"格里高利为什么杀水兵像没事人？"}'
     return '{"question":"哥萨克在革命中的真实立场是什么？"}'
   }
-  if (p.includes('请按行为规则')) return '好的，我们来讨论这条划线。\n【TAKEAWAY】哥萨克立场是身份问题。'
+  if (p.includes('请按行为规则')) return '好的，我们来讨论这条划线。'
   return '嗯，继续说。'
 }
 
@@ -112,8 +112,10 @@ async function main() {
   const tmpReceiver = path.join(tmp, 'receiver')
   console.log(`[smoke] 临时环境：${tmp}`)
 
-  // 1. 副本（跳过真实数据/密钥/日志）
-  copyDir(AGENT_DIR, tmpAgent, ['data', '.env', '.env.bak', 'session_journal.jsonl', 'session_journal.jsonl.bak-20260807', 'session_journal.jsonl.bak-replay'])
+  // 1. 副本（跳过真实数据/密钥/日志）。topic_stack.json(.bak) 也必须跳过：
+  // 真实环境的会意栈（含用户自由模式栈）一旦被复制，冒烟第一阶段就会把真实讨论
+  // 当测试讨论收口（cites 指向真实节点 → 宁漏勿误丢边），污染断言（2026-09 教训）。
+  copyDir(AGENT_DIR, tmpAgent, ['data', '.env', '.env.bak', 'session_journal.jsonl', 'session_journal.jsonl.bak-20260807', 'session_journal.jsonl.bak-replay', 'topic_stack.json', 'topic_stack.json.bak'])
   fs.mkdirSync(path.join(tmpReceiver, 'inbox'), { recursive: true })
   fs.mkdirSync(path.join(tmpReceiver, 'books'), { recursive: true })
   fs.writeFileSync(path.join(tmpReceiver, 'inbox', 'annotations.jsonl'), '')
@@ -143,7 +145,7 @@ async function main() {
   // 验证：① 收口固化 = 新专题化弹栈旧讨论的时刻（当场聚合，不等 .stop）
   // ② 关闭/启动恢复不做收口固化（进行中的讨论留在栈里，topic_stack.json 跨会话恢复）
   // ③ 跨会话 derived 链（topic_lastgroup.json 的 nodeId）
-  async function runPhase(label, msgs, expectNodes) {
+  async function runPhase(label, msgs, expectNodes, freeExpect) {
     // 追加（真实系统语义）：chat_input 是 append-only，游标按行数推进
     fs.appendFileSync(path.join(tmpReceiver, 'inbox', 'chat_input.jsonl'),
       msgs.map((m) => JSON.stringify(m)).join('\n') + '\n')
@@ -154,10 +156,16 @@ async function main() {
     child.stdout.on('data', (d) => process.stdout.write(`[agent] ${d}`))
     child.stderr.on('data', (d) => process.stdout.write(`[agent-err] ${d}`))
     const graphFile = path.join(dataDir, 'knowledge-graph.json')
+    const freeFile = path.join(dataDir, 'knowledge-graph.free.json')
     console.log(`[smoke] ${label}：index.js 已启动，等待收口固化至 ${expectNodes} 节点（收口即固化，不等 .stop）...`)
     await waitFor(`${label} 图文件达 ${expectNodes} 节点`, () => {
       if (!fs.existsSync(graphFile)) return false
-      return JSON.parse(fs.readFileSync(graphFile, 'utf8')).nodes.length >= expectNodes
+      const okFormal = JSON.parse(fs.readFileSync(graphFile, 'utf8')).nodes.length >= expectNodes
+      if (freeExpect == null) return okFormal
+      // 自由模式阶段：正式图保持 expectNodes 不动，另等沙盒图出现测试固化产物
+      if (!fs.existsSync(freeFile)) return false
+      const fg = JSON.parse(fs.readFileSync(freeFile, 'utf8'))
+      return okFormal && Array.isArray(fg.nodes) && fg.nodes.length >= freeExpect
     })
     console.log(`[smoke] ${label}：✓ 收口固化（图 ${expectNodes} 节点），发送 .stop（关闭不做收口固化）...`)
     fs.writeFileSync(path.join(tmpAgent, '.stop'), '')
@@ -188,6 +196,13 @@ async function main() {
     { content: '那用阶级分析看，格里高利杀水兵算什么？', timestamp: 5 },
     { content: '那中国为什么没有哥萨克？', timestamp: 6 },
   ], 6)
+  // 阶段4（自由模式，2026-09）：消息带哨兵书 bookId=__coread_free_mode__ → 独立栈；
+  // 消息7 带 refs=['n_seed']（侧栏引用窗体手动选取/语义命中的引用清单）→ agent 以
+  // 窗体为 cites；收口固化只建测试占位节点（不派生知识点）+ user 边；正式图零污染。
+  await runPhase('阶段4（自由模式）', [
+    { content: '为什么哥萨克在革命中的立场这么复杂？', timestamp: 7, bookId: '__coread_free_mode__', refs: ['n_seed'] },
+    { content: '那中国为什么没有哥萨克？', timestamp: 8, bookId: '__coread_free_mode__' },
+  ], 6, 7)
   server.close()
 
   // ── 校验 ──
@@ -206,13 +221,37 @@ async function main() {
   check(userEdges.length === 5, `5 条 user 边（各组/段各引用 n_seed，实际 ${userEdges.length}）`)
   check(derEdges.length === 1, `1 条 derived 边（阶段3 收口栈切成 2 段，段间衍生，实际 ${derEdges.length}）`)
 
+  // ── 自由模式校验（阶段4）──
+  // 正式图零污染；沙盒图 = 正式图副本 + 测试占位节点（**不派生知识点**：point 用
+  // 归纳的问题、aliases/discussions 为空）+ user 边（n_seed → 占位节点）；
+  // 自由模式独立栈跨会话持久化（topic_stack.json[__coread_free_mode__]，消息8 讨论未收口）
+  const freeFile = path.join(dataDir, 'knowledge-graph.free.json')
+  const freeGraph = JSON.parse(fs.readFileSync(freeFile, 'utf8'))
+  const freeUserEdges = freeGraph.edges.filter((e) => e.kind === 'user')
+  const formalIds = new Set(graph.nodes.map((n) => n.id))
+  const newIds = freeGraph.nodes.filter((n) => !formalIds.has(n.id)).map((n) => n.id)
+  const testNode = freeGraph.nodes.find((n) => !formalIds.has(n.id)) || {}
+  check(graph.nodes.length === 6 && graph.edges.length === 6, `自由模式后正式图零污染（仍 6 节点 / ${graph.edges.length} 边，实际节点 ${graph.nodes.length}）`)
+  check(freeGraph.nodes.length === 7 && newIds.length === 1, `沙盒图 7 节点（正式图 6 副本 + 1 测试占位节点，实际 ${freeGraph.nodes.length}）`)
+  check(Array.isArray(testNode.aliases) && testNode.aliases.length === 0
+    && Array.isArray(testNode.discussions) && testNode.discussions.length === 0,
+  '测试占位节点不派生知识点（aliases/discussions 为空）')
+  check(freeUserEdges.length === 6 && freeUserEdges.some((e) => e.from === 'n_seed' && newIds.includes(e.to)),
+    `沙盒图 user 边：副本 5 条 + 新增 n_seed → 占位节点（实际 ${freeUserEdges.length} 条）`)
+  const stacks = JSON.parse(fs.readFileSync(path.join(tmpAgent, 'topic_stack.json'), 'utf8'))
+  const freeStack = stacks['__coread_free_mode__']
+  check(Array.isArray(freeStack) && freeStack.length >= 1, `自由模式独立栈持久化（topic_stack.json['__coread_free_mode__'] ${Array.isArray(freeStack) ? freeStack.length : 0} 轮）`)
+  // 自由模式消息不写 journal（不进 profile/soul 记忆固化）
+  const journal = fs.readFileSync(path.join(tmpAgent, 'session_journal.jsonl'), 'utf8')
+  check(!journal.includes('__coread_free_mode__'), '自由模式消息不进 session_journal（不污染记忆固化）')
+
   console.log('')
   if (fails.length) {
     console.log(`❌ 冒烟失败 ${fails.length} 项：\n  - ${fails.join('\n  - ')}`)
     console.log(`临时环境保留：${tmp}`)
     process.exit(1)
   }
-  console.log('✅ 冒烟通过：会意系统已接入 live 工作流（判专题化/同一性 → 收口(问题+衍生+引用暂存) → 固化直建 → 图文件）')
+  console.log('✅ 冒烟通过：会意系统已接入 live 工作流（判专题化/同一性 → 收口(问题+衍生+引用暂存) → 固化直建 → 图文件）；自由模式沙盒固化零污染正式图')
   fs.rmSync(tmp, { recursive: true, force: true })
 }
 

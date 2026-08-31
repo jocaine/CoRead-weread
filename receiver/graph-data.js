@@ -26,6 +26,32 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 export const GRAPH_FILE = path.join(__dirname, '..', 'agent', 'data', 'knowledge-graph.json')
 export const GRAPH_DEMO_FILE = path.join(__dirname, '..', 'agent', 'scripts', 'data', 'knowledge-graph-demo.json')
 export const GRAPH_RESULTS_FILE = path.join(__dirname, '..', 'agent', 'scripts', 'data', 'knowledge-graph-results.json')
+export const FREE_GRAPH_FILE = path.join(__dirname, '..', 'agent', 'data', 'knowledge-graph.free.json')  // 自由模式沙盒图（测试产物）
+
+/**
+ * 读自由模式沙盒图（测试产物，2026-09）：agent 自由模式的收口固化只落在沙盒
+ * （正式图深拷贝），导出到 FREE_GRAPH_FILE 供侧栏图视图查看测试结果。
+ * 文件不存在/非法 → null（调用方回退正式图）。
+ * @returns {{nodes: Array, edges: Array, updatedAt: number, demo: boolean, free: boolean, source: string}|null}
+ */
+export function readFreeGraphFile() {
+  try {
+    const g = JSON.parse(fs.readFileSync(FREE_GRAPH_FILE, 'utf8'))
+    if (!g || !Array.isArray(g.nodes)) return null
+    let updatedAt = 0
+    try { updatedAt = fs.statSync(FREE_GRAPH_FILE).mtimeMs } catch {}
+    return {
+      nodes: g.nodes,
+      edges: Array.isArray(g.edges) ? g.edges : [],
+      updatedAt,
+      demo: false,
+      free: true,
+      source: 'free',
+    }
+  } catch {
+    return null
+  }
+}
 
 /**
  * 读成品图文件（优先固化，回退冒烟有效图）。

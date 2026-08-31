@@ -36,9 +36,8 @@ CoRead 不是这样。
 
 - **划线设为当前引用**：选中文字 → 点击工具栏「共读」→ 该段划入侧栏引用列表并设为当前引用，之后再在侧栏里向 AI 提问
 - **进度门控**：AI 只知道你读过的内容，不剧透后文，是读到同一页的伙伴
-- **跨书记忆**：讨论时自动检索你读过的其他书，有相关就自然带出来
+- **跨书记忆**：换书再聊同一知识点时，引用解析命中旧知识点，自动带回 root→recent 拓扑路径（会意图 L3）
 - **长期记忆生长**：阅读画像（profile）和 agent 自画像（soul）随每次共读更新，越来越懂你
-- **话题追踪**：没聊透的内容进入 open_topics，设定重提条件，不会丢
 - **会意图拓扑视图**：侧栏「◎」打开知识点拓扑图（Obsidian 式浏览：缩放/平移/悬停/点选详情/搜索），对话命中旧知识点时自动高亮 root→recent 拓扑脉络
 - **侧栏 UI**：Chrome Side Panel 原生展示，不遮挡正文
 - **放入文件**：侧栏可直接放入 .md/.txt 文档（「📎」或「📄」菜单），文档存为本地"文档书"，切换后即可与 AI 讨论全文
@@ -63,7 +62,7 @@ Chrome Extension (extension/)
   ▼
 Agent  agent/index.js
   │  轮询 annotations.jsonl（游标跳过已处理）
-  │  recall.js 跨书检索
+  │  会意系统：引用解析命中旧知识点 → L3 路径上下文；收口固化 → 会意图
   │  调用 LLM API（OpenAI 兼容）
   │  写 chat_output.jsonl → SSE → 侧栏显示
   │  会意图 GET /graph → 侧栏拓扑视图（AI-020）
@@ -148,17 +147,14 @@ coread/
 │   └── books/
 │       └── {bookId}/
 │           ├── chapters/       # 章节正文缓存 .txt
-│           ├── summaries.md    # 滚动章节摘要
-│           └── discussions.jsonl   # 讨论 takeaway
+│           └── discussions.jsonl   # 讨论记录（TAKEAWAY 机制已移除，文件仅存历史数据）
 │
 └── agent/              # AI Agent
     ├── index.js        # 主进程：轮询 → LLM → 输出
     ├── AGENT.md        # Agent 行为规则（系统提示词）
     ├── profile.md      # 你的阅读画像（自动维护，gitignored）
     ├── soul.md         # Agent 的立场与记忆（自动维护，gitignored）
-    ├── open_topics.md  # 未聊透的话题
     └── scripts/
-        ├── recall.js       # 跨书记忆检索
         ├── coldstart.js    # 冷启动：从微信读书 API 拉取历史
         └── inject.sh       # tmux 消息注入
 ```
@@ -171,7 +167,7 @@ coread/
 
 - **Inbox 游标**：已处理的标注通过游标跳过，不重复读取
 - **按需加载**：每次讨论只加载当前书的章节窗口（±300字）和摘要，其他书不进上下文
-- **跨书检索**：其他书的记忆通过 `recall.js` 关键词检索，只把命中的 2-3 句 takeaway 带入
+- **跨书检索**：其他书的记忆按需带入——用户引用旧知识点时（引用解析命中），只带命中节点的 root→recent 路径（L3，见 agent/topic-library-design.md §5）；`recall.js` 关键词检索因中文分词无法落地已禁用
 - **记忆合并**：`profile.md` / `soul.md` 每次会话结束合并重写而非追加，长度保持稳定
 
 ---

@@ -37,15 +37,69 @@
     #header {
       background: #fff;
       border-bottom: 1px solid #ececec;
-      padding: 14px 16px;
+      /* 2026-09：去掉书名前 📖 图标后，左右 12px 与下方引用窗体/消息区左缘对齐；
+         上 5px：单行头部纵向留白 */
+      padding: 5px 12px;
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
       flex-shrink: 0;
-      position: relative;   /* 文档菜单（#doc-menu）的定位锚点 */
+      position: relative;   /* #more-menu 的定位锚点 */
     }
-    #header .title { font-weight: 400; font-size: 12px; color: #888; flex: 1; letter-spacing: 0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #header .title { font-weight: 400; font-size: 12px; color: #888; flex: 0 1 auto; min-width: 0; letter-spacing: 0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #dot { width: 7px; height: 7px; border-radius: 50%; background: #ddd; flex-shrink: 0; transition: background 0.3s; }
+    /* 模式开关左侧 auto 边距 → 和后续 ◎ / ⋯ 一起钉到最右 */
+    #header .mode-switch { margin-left: auto; }
+    /* 更多（⋯）按钮：头部右侧的二级入口 */
+    .hdr-icon {
+      flex: 0 0 auto;
+      width: 26px;
+      height: 26px;
+      border: 1px solid #e0e0e0;
+      background: #fff;
+      color: #666;
+      border-radius: 6px;
+      font-size: 15px;
+      line-height: 1;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-family: inherit;
+    }
+    .hdr-icon:hover { border-color: #07c160; color: #07c160; }
+    /* 更多设置菜单（会意图 / 字号） */
+    #more-menu {
+      display: none;
+      position: absolute;
+      top: 100%;
+      right: 10px;
+      margin-top: 6px;
+      min-width: 190px;
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.14);
+      z-index: 90;
+      padding: 6px;
+    }
+    #more-menu.on { display: block; }
+    .mm-font { display: flex; align-items: center; gap: 8px; padding: 8px 10px; }
+    .mm-font-label { font-size: 12px; color: #888; flex: 1; }
+    /* 已读书籍选择 / 停止手动选书（2026-10）：更多菜单二级项 */
+    .mm-item {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      padding: 8px 10px;
+      cursor: pointer;
+      border-top: 1px solid #f2f2f2;
+      margin-top: 4px;
+    }
+    .mm-item:hover { background: #f2f7f5; }
+    .mm-item[hidden] { display: none; }
+    .mm-name { font-weight: 600; color: #07c160; white-space: nowrap; font-size: 12px; }
+    .mm-desc { font-size: 11px; color: #999; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     /* 字号调节按钮（AI-002） */
     .fs-btn {
       flex: 0 0 auto;
@@ -61,92 +115,49 @@
     }
     .fs-btn:hover:not(:disabled) { border-color: #07c160; color: #07c160; }
     .fs-btn:disabled { opacity: 0.35; cursor: default; }
-    /* 文档按钮（放入的文件 / 切换文档）：与字号按钮同排，图标略大 */
-    #doc-btn { font-size: 13px; padding: 3px 6px; line-height: 1; }
-
-    /* ── 放入的文件菜单（文档导入 / 切换） ──────────── */
-    #doc-menu {
-      display: none;
-      position: absolute;
-      top: 100%;
-      right: 8px;
-      width: 260px;
-      max-width: calc(100vw - 24px);
-      margin-top: 6px;
-      background: #fff;
-      border: 1px solid #e5e7eb;
-      border-radius: 10px;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.14);
-      z-index: 90;
-      flex-direction: column;
-      max-height: 62vh;
-    }
-    #doc-menu.on { display: flex; }
-    .doc-menu-head {
-      padding: 10px 12px 8px;
-      font-size: 11px;
-      color: #888;
-      font-weight: 600;
-      border-bottom: 1px solid #f0f0f0;
-      flex-shrink: 0;
-    }
-    .doc-menu-list { overflow-y: auto; padding: 6px; flex: 1; min-height: 0; }
-    /* 文档模式下切回微信读书的入口 */
-    .doc-back {
+    /* 模式切换（读书 / 自由）：iPhone 风格滑动开关（2026-09 用户定调） */
+    .mode-switch {
+      flex: 0 0 auto;
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 7px 10px;
-      border-radius: 8px;
-      cursor: pointer;
-      font-size: 12px;
-      color: #666;
-      margin-bottom: 4px;
-      border-bottom: 1px solid #f0f0f0;
-      padding-bottom: 9px;
-    }
-    .doc-back:hover { background: #f2f3f5; }
-    .doc-item {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 7px 10px;
-      border-radius: 8px;
-      cursor: pointer;
-      font-size: 12px;
-      color: #444;
-    }
-    .doc-item:hover { background: #f2f3f5; }
-    .doc-item.sel { background: #f0faf3; color: #07c160; font-weight: 600; }
-    .doc-item .doc-icon { flex-shrink: 0; }
-    .doc-item .doc-name {
-      flex: 1;
-      min-width: 0;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .doc-item .doc-ext { font-size: 10px; color: #aaa; flex-shrink: 0; }
-    .doc-menu-foot { border-top: 1px solid #f0f0f0; padding: 6px; flex-shrink: 0; }
-    #doc-import-btn {
-      width: 100%;
-      border: 1px dashed #07c160;
-      color: #07c160;
-      background: #fafffb;
-      border-radius: 8px;
-      padding: 7px 0;
-      font-size: 12px;
+      gap: 4px;
+      background: none;
+      border: none;
+      padding: 2px 0;
       cursor: pointer;
       font-family: inherit;
     }
-    #doc-import-btn:hover { background: #eefaf1; }
-    .doc-empty {
-      padding: 14px 10px;
-      text-align: center;
-      font-size: 12px;
-      color: #bbb;
-      line-height: 1.6;
+    .mode-switch .ms-state {
+      font-size: 10px;
+      line-height: 1;
+      color: #8e8e93;
+      transition: color 0.25s;
+      user-select: none;
     }
+    .mode-switch .ms-state.act { color: #07c160; font-weight: 600; }
+    .mode-switch .ms-track {
+      position: relative;
+      width: 40px;
+      height: 22px;
+      border-radius: 11px;
+      background: #e9e9ea;
+      transition: background 0.25s;
+      flex-shrink: 0;
+    }
+    .mode-switch.on .ms-track { background: #34c759; }
+    .mode-switch .ms-thumb {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+      transition: left 0.25s;
+    }
+    .mode-switch.on .ms-thumb { left: 20px; }
+
     .fs-btn:hover:not(:disabled) { border-color: #07c160; color: #07c160; }
     .fs-btn:disabled { opacity: 0.35; cursor: default; }
     /* ── 当前引用卡片 ──────────────────────────── */
@@ -158,6 +169,90 @@
     }
     #ref-current.on { display: block; }
     #ref-current.collapsed .rc-body { display: none; }
+    /* ── 自由模式引用窗体（2026-09）────────────────── */
+    #free-refs {
+      background: #fff;
+      border-bottom: 1px solid #ececec;
+      flex-shrink: 0;
+      font-size: 12px;
+    }
+    #free-refs .fr-head {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 10px 6px 12px;
+      font-size: 11px;
+    }
+    #free-refs .fr-label {
+      flex: 1;
+      min-width: 0;
+      font-weight: 600;
+      color: #666;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #free-refs .fr-pick-btn {
+      flex: 0 0 auto;
+      border: 1px solid #bfe3cc;
+      background: #f0faf3;
+      color: #07c160;
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #free-refs .fr-pick-btn:hover { border-color: #06ad56; color: #06ad56; background: #e0f4e7; }
+    #free-refs .fr-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      padding: 4px 10px 4px 12px;
+      line-height: 1.5;
+      color: #444;
+      border-radius: 4px;
+    }
+    #free-refs .fr-item:hover { background: #f2faf5; }
+    #free-refs .fr-item .fr-idx {
+      flex: 0 0 auto;
+      color: #aaa;
+      font-size: 10px;
+      padding-top: 2px;
+      font-variant-numeric: tabular-nums;
+    }
+    #free-refs .fr-item .fr-point { flex: 1; min-width: 0; word-break: break-word; }
+    #free-refs .fr-item .fr-x {
+      flex: 0 0 auto;
+      border: none;
+      background: none;
+      color: #bbb;
+      font-size: 13px;
+      padding: 0 2px;
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    #free-refs .fr-item:hover .fr-x { opacity: 1; }
+    #free-refs .fr-item .fr-x:hover { color: #e74c3c; }
+    #free-refs .fr-empty {
+      /* 无引用时的单行提示：一行内超长省略，避免撑高窗体（2026-09） */
+      padding: 3px 10px 5px 12px;
+      font-size: 11px;
+      color: #bbb;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #free-refs .fr-clear-all {
+      border: none;
+      background: none;
+      color: #999;
+      font-size: 11px;
+      cursor: pointer;
+      padding: 0 2px;
+    }
+    #free-refs .fr-clear-all:hover { color: #e74c3c; }
     #ref-current .rc-head {
       display: flex;
       align-items: center;
@@ -171,7 +266,7 @@
       flex: 1;
       min-width: 0;
       font-weight: 600;
-      color: #07c160;
+      color: #666;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -248,7 +343,7 @@
     }
     #ref-current.collapsed:not(.empty) .rc-preview { display: block; }
     #ref-current .rc-preview .rcp-book {
-      color: #07c160;
+      color: #444;
       font-weight: 600;
       white-space: nowrap;
       overflow: hidden;
@@ -262,15 +357,17 @@
       word-break: break-word;
     }
     #ref-current .rc-preview:hover .rcp-text { color: #07c160; }
-    /* 空状态：未选中引用时隐藏详情与操作区，显示居中提示 */
+    /* 空状态：未选中引用时隐藏详情与操作区，显示单行提示（2026-09：压低空态高度） */
     #ref-current.empty .rc-body { display: none; }
     #rc-empty {
       display: none;
-      padding: 10px 12px 12px;
-      font-size: 12px;
+      padding: 5px 12px;
+      font-size: 11px;
       color: #aaa;
-      text-align: center;
-      line-height: 1.6;
+      line-height: 1.4;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     #ref-current.empty #rc-empty { display: block; }
 
@@ -358,7 +455,7 @@
     }
     #ref-drawer .drawer-item .di-book {
       font-size: 0.77em;
-      color: #07c160;
+      color: #555;
       font-weight: 600;
       margin-bottom: 2px;
     }
@@ -459,7 +556,7 @@
       align-items: flex-end;
       flex-shrink: 0;
     }
-    /* 放入文件（📎）按钮：输入框左侧的方形附件按钮 */
+    /* 上传文本附件（📎）：读取进本次讨论，不落盘保存原文件、不建已上传列表 */
     #attach-btn {
       flex-shrink: 0;
       width: 36px;
@@ -475,8 +572,40 @@
       justify-content: center;
     }
     #attach-btn:hover { border-color: #07c160; }
-
-    /* ── 轻提示 toast（放入文件结果反馈） ──────────── */
+    /* 待发送附件提示片（选中文件后显示在输入框上方，可移除） */
+    #attach-chip {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: #f0faf3;
+      border: 1px solid #d5f2e1;
+      border-radius: 8px;
+      padding: 5px 10px;
+      margin: 0 12px 6px;
+      font-size: 12px;
+      color: #444;
+      flex-shrink: 0;
+    }
+    #attach-chip[hidden] { display: none; }
+    .attach-chip-name {
+      flex: 1;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #attach-chip-remove {
+      border: none;
+      background: none;
+      color: #999;
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 1;
+      padding: 2px 4px;
+      font-family: inherit;
+    }
+    #attach-chip-remove:hover { color: #e25252; }
+    /* ── 轻提示 toast ──────────────────────────────── */
     #toast {
       position: fixed;
       top: 14px;
@@ -581,7 +710,7 @@
     .ref-bar .ref-book {
       writing-mode: vertical-lr;
       font-size: 11px;
-      color: #07c160;
+      color: #555;
       font-weight: 600;
       line-height: 1.3;
       flex-shrink: 0;
@@ -599,7 +728,7 @@
     .ref-bar .ref-num {
       font-size: 11px;
       font-weight: 700;
-      color: #07c160;
+      color: #444;
       margin-top: auto;
       flex-shrink: 0;
     }
@@ -851,7 +980,9 @@
     /* ── 会意图拓扑视图（AI-020）────────────────────────── */
     /* Obsidian 式话题拓扑图：全面板遮罩，由 graph-view.js 构建 DOM。
        常态观察态：缩放/平移/悬停邻接/点选详情/搜索定位；
-       命中态：会话引用解析命中 → root→recent 路径高亮（横幅 + 提亮 + 压暗）。 */
+       命中态：会话引用解析命中 → root→recent 路径高亮（横幅 + 提亮 + 压暗）。
+       .gv-fading：命中自动弹出后的渐隐关闭（opacity 过渡，transition 时长与
+       graph-view.js fadeOutClose 的 700ms 一致）。 */
     #graph-overlay {
       position: fixed;
       inset: 0;
@@ -859,8 +990,10 @@
       z-index: 1500;
       display: none;
       flex-direction: column;
+      transition: opacity 0.7s ease;
     }
     #graph-overlay.on { display: flex; }
+    #graph-overlay.gv-fading { opacity: 0; pointer-events: none; }
     .gv-toolbar {
       display: flex;
       align-items: center;
@@ -932,7 +1065,10 @@
       line-height: 1.5;
     }
     .gv-banner.hit { background: #e3e7fc; }
-    .gv-banner-text { flex: 1; min-width: 0; word-break: break-word; }
+    .gv-banner-text { flex: 1; min-width: 0; }
+    /* 横幅分行（2026-09 用户定调）：指示行 + 每个标题各占一行；每行 nowrap + ellipsis，
+       标题行内部不被 CSS 拆断，超长省略号 */
+    .gv-banner-line { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.5; }
     .gv-banner-clear { flex-shrink: 0; }
     .gv-canvas-wrap {
       flex: 1;
@@ -950,6 +1086,29 @@
       touch-action: none;
     }
     #gv-canvas.panning { cursor: grabbing; }
+    /* 多链命中时的悬浮聚焦切换按钮（右下角，2026-09） */
+    .gv-chain-switch {
+      position: absolute;
+      right: 10px;
+      bottom: 10px;
+      display: flex;
+      gap: 4px;
+      z-index: 5;
+    }
+    .gv-chain-btn {
+      border: 1px solid #c9cff5;
+      background: #fff;
+      color: #2b2f6e;
+      border-radius: 12px;
+      font-size: 11px;
+      line-height: 1;
+      padding: 5px 9px;
+      cursor: pointer;
+      font-family: inherit;
+      box-shadow: 0 1px 4px rgba(43, 47, 110, 0.12);
+    }
+    .gv-chain-btn:hover { border-color: #5b5fe8; }
+    .gv-chain-btn.sel { background: #e3e7fc; border-color: #5b5fe8; font-weight: 600; }
     .gv-hint {
       position: absolute;
       bottom: 8px;
@@ -990,6 +1149,8 @@
       vertical-align: middle;
       margin-right: 6px;
     }
+    .gv-legend .ring.dashed { border-style: dashed; }
+    .gv-legend .ring.thick { border-width: 3px; }
     .gv-legend .gv-lg-title { margin-top: 8px; font-size: 11px; color: #7c8b9d; }
     .gv-legend .gv-lg-row { display: flex; align-items: center; margin-top: 2px; line-height: 1.6; }
     .gv-legend .gv-lg-name {
@@ -1082,6 +1243,13 @@
       font-size: 0.9em;
       color: #3f4550;
       line-height: 1.7;
+    }
+    /* 详情面板搜索命中高亮（2026-10）：搜索框有词时，详情里出现的命中关键词包 mark */
+    .gv-detail mark {
+      background: #ffe58f;
+      border-radius: 2px;
+      padding: 0 1px;
+      color: inherit;
     }
     .gv-detail .gd-none { color: #bbb; font-size: 0.85em; }
     .gv-detail .gd-disc {
@@ -1254,29 +1422,226 @@
 
     /* AI-021（根因修复）：这些面板用 display:flex/block 定义，会覆盖 UA 的
        [hidden]{display:none}——导致横幅 / 详情 / 空态永远常显（图视图"乱七八糟"的
-       直接原因）。这里强制让 hidden 属性生效：初始隐藏，只在该显示时由 JS 移除 hidden。 */
-    .gv-banner[hidden], .gv-detail[hidden], .gv-empty[hidden], .gv-legend[hidden] {
+       直接原因）。这里强制让 hidden 属性生效：初始隐藏，只在该显示时由 JS 移除 hidden。
+       2026-09：.gv-chain-switch（多链切换按钮）同款——display:flex 覆盖 hidden，
+       高亮隐藏后按钮仍常显。 */
+    .gv-banner[hidden], .gv-detail[hidden], .gv-empty[hidden], .gv-legend[hidden], .gv-chain-switch[hidden] {
       display: none !important;
     }
+
+    /* 系统提示气泡（2026-09）：/收口 等系统反馈，区别于普通消息 */
+    .msg-system { display: flex; justify-content: center; margin: 6px 0; }
+    .msg-system .bubble {
+      background: #f5f7f9;
+      color: #777;
+      font-size: 12px;
+      padding: 4px 12px;
+      border-radius: 12px;
+      max-width: 90%;
+      word-break: break-word;
+      text-align: center;
+    }
+
+    /* 斜杠命令菜单（2026-09）：输入 / 弹出可用操作，点击即执行 */
+    #footer { position: relative; }
+    .cmd-menu {
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 0;
+      right: 0;
+      margin: 0 8px;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      box-shadow: 0 -3px 12px rgba(0, 0, 0, 0.12);
+      z-index: 30;
+      overflow: hidden;
+    }
+    .cmd-menu[hidden] { display: none; }
+    .cmd-item {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      padding: 9px 12px;
+      cursor: pointer;
+    }
+    .cmd-item:hover { background: #f2f7f5; }
+    .cmd-name { font-weight: 600; color: #07c160; white-space: nowrap; font-size: 13px; }
+    .cmd-desc { font-size: 12px; color: #888; }
+
+    /* ── 无书默认界面（2026-10）：读书模式未检测到阅读书籍时显示，不再残留上一本
+       书的内容；提供「从已读过的书籍中选择」入口（已读完的书不在微信读书中打开
+       时查看聊天记录的解决方案）。sidebar.js renderNoBookView 控制显示。 */
+    #no-book-view {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 24px;
+      text-align: center;
+      flex-shrink: 0;
+    }
+    #no-book-view[hidden] { display: none; }
+    .nb-icon { font-size: 36px; line-height: 1; }
+    .nb-title { font-size: 15px; font-weight: 600; color: #444; }
+    .nb-desc { font-size: 12px; color: #999; line-height: 1.7; }
+    .nb-pick-btn {
+      margin-top: 8px;
+      border: 1px solid #bfe3cc;
+      background: #f0faf3;
+      color: #07c160;
+      border-radius: 8px;
+      padding: 9px 20px;
+      font-size: 13px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .nb-pick-btn:hover { border-color: #06ad56; color: #06ad56; background: #e0f4e7; }
+
+    /* ── 手动选书横幅（2026-10）：手动查看某本已读书籍的历史记录时，显示在消息区
+       上方，标明当前不是自动跟随，并提供切换/退出入口 */
+    #manual-banner {
+      background: #f0faf3;
+      border-bottom: 1px solid #d5f2e1;
+      padding: 6px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #2e7d4f;
+      flex-shrink: 0;
+    }
+    #manual-banner[hidden] { display: none; }
+    .mb-book {
+      flex: 1;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 600;
+    }
+    .mb-hint { flex: 0 0 auto; color: #6fb38c; white-space: nowrap; }
+    .mb-btn {
+      flex: 0 0 auto;
+      border: 1px solid #bfe3cc;
+      background: #fff;
+      color: #07c160;
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      font-family: inherit;
+      white-space: nowrap;
+    }
+    .mb-btn:hover { border-color: #06ad56; color: #06ad56; }
+    .mb-exit { color: #999; border-color: #ddd; }
+    .mb-exit:hover { border-color: #e74c3c; color: #e74c3c; }
+
+    /* ── 已读书籍选择弹窗（2026-10）：无书默认界面 / 更多菜单 → 从已读过的书籍中
+       选择，手动查看该书聊天记录（openBookPicker / pickBook） */
+    #book-picker {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.35);
+      z-index: 1100;
+      align-items: center;
+      justify-content: center;
+    }
+    #book-picker.on { display: flex; }
+    .bp-panel {
+      width: min(340px, 86%);
+      max-height: 74%;
+      background: #fff;
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+    }
+    .bp-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-bottom: 1px solid #ececec;
+      flex-shrink: 0;
+    }
+    .bp-title { flex: 1; font-size: 14px; font-weight: 600; color: #333; }
+    .bp-close { border: none; background: none; font-size: 15px; cursor: pointer; color: #aaa; padding: 0 4px; }
+    .bp-close:hover { color: #333; }
+    #bp-search {
+      margin: 8px 12px 0;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 5px 8px;
+      font-size: 12px;
+      outline: none;
+      font-family: inherit;
+      background: #fafafa;
+      color: #333;
+      flex-shrink: 0;
+    }
+    #bp-search:focus { border-color: #07c160; }
+    .bp-list { flex: 1; overflow-y: auto; padding: 8px 12px; min-height: 60px; }
+    .bp-item {
+      padding: 9px 10px;
+      border: 1px solid #eee;
+      border-radius: 8px;
+      margin-bottom: 6px;
+      cursor: pointer;
+    }
+    .bp-item:hover { border-color: #07c160; background: #fafffb; }
+    .bp-item .bi-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #222;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .bp-item .bi-meta { font-size: 11px; color: #999; margin-top: 3px; }
+    .bp-msg { text-align: center; color: #bbb; font-size: 12px; padding: 22px 10px; }
+    .bp-msg.bp-err { color: #e74c3c; }
+
+    /* 无书状态下禁用聊天输入（renderNoBookView） */
+    #input:disabled { background: #f2f2f2; color: #bbb; }
+    #send-btn:disabled { background: #a9e6c5; cursor: default; }
+    #attach-btn:disabled { opacity: 0.45; cursor: default; }
+    #attach-btn:disabled:hover { border-color: #ddd; }
 
   </style>
 </head>
 <body>
   <div id="header">
-    <span style="font-size:15px;line-height:1">📖</span>
     <span class="title" id="current-book"><em>We read to know we are not alone.</em></span>
-    <button class="fs-btn" id="graph-btn" title="会意图（话题拓扑图）">◎</button>
-    <button class="fs-btn" id="doc-btn" title="放入的文件">📄</button>
-    <button class="fs-btn" id="fs-down" title="减小字号">Ａ−</button>
-    <button class="fs-btn" id="fs-up" title="增大字号">Ａ＋</button>
-    <span id="dot"></span>
-  </div>
-
-  <!-- 放入的文件菜单（文档切换 / 放入文件入口） -->
-  <div id="doc-menu">
-    <div class="doc-menu-head">放入的文件</div>
-    <div class="doc-menu-list" id="doc-list"></div>
-    <div class="doc-menu-foot"><button id="doc-import-btn">＋ 放入文件</button></div>
+    <span id="dot" title="与服务连接状态"></span>
+    <button class="mode-switch" id="free-switch" role="switch" aria-checked="false"
+            title="读书模式 / 自由模式（iPhone 滑动开关）：自由模式为临时测试对话，不固化进正式会意图">
+      <span class="ms-state">读书</span>
+      <span class="ms-track"><span class="ms-thumb"></span></span>
+      <span class="ms-state">自由</span>
+    </button>
+    <button class="hdr-icon" id="graph-btn" title="会意图（话题拓扑图）">◎</button>
+    <button class="hdr-icon" id="more-btn" title="更多设置">⋯</button>
+    <!-- 更多设置菜单（字号等）：作为 #header（position:relative）子元素锚定到右上 -->
+    <div id="more-menu">
+      <div class="mm-font">
+        <span class="mm-font-label">消息字号</span>
+        <button class="fs-btn" id="fs-down" title="减小字号">Ａ−</button>
+        <button class="fs-btn" id="fs-up" title="增大字号">Ａ＋</button>
+      </div>
+      <div class="mm-item" id="mm-pick-book" title="查看已读完书籍的讨论记录（不需要在微信读书中打开）">
+        <span class="mm-name">📚 从已读书籍中选择</span>
+        <span class="mm-desc">手动查看某本书的讨论记录</span>
+      </div>
+      <div class="mm-item" id="mm-exit-manual" title="停止手动选书，恢复跟随微信读书当前阅读" hidden>
+        <span class="mm-name">↩ 停止手动选书</span>
+        <span class="mm-desc">恢复自动跟随</span>
+      </div>
+    </div>
   </div>
 
   <!-- 引用列表抽屉 -->
@@ -1303,6 +1668,23 @@
     </div>
   </div>
 
+  <!-- 无书默认界面（2026-10）：读书模式未检测到阅读书籍时显示，替代"残留上一本书
+       内容"的旧行为；「从已读过的书籍中选择」= 已读完书籍聊天记录的查看入口 -->
+  <div id="no-book-view" hidden>
+    <div class="nb-icon">📖</div>
+    <div class="nb-title">未检测到正在阅读的书籍</div>
+    <div class="nb-desc">打开微信读书中的书籍后自动同步该书讨论；<br>已读完的书可手动选择查看历史记录</div>
+    <button class="nb-pick-btn" id="nb-pick-btn">📚 从已读过的书籍中选择</button>
+  </div>
+
+  <!-- 手动选书横幅（2026-10）：手动查看某本已读书籍时显示在消息区上方 -->
+  <div id="manual-banner" hidden>
+    <span class="mb-book">📌 手动查看《<b id="manual-book-name"></b>》的历史记录</span>
+    <span class="mb-hint">未在微信读书中打开</span>
+    <button class="mb-btn" id="mb-switch-btn" title="切换另一本书">切换书籍</button>
+    <button class="mb-btn mb-exit" id="mb-exit-btn" title="恢复跟随微信读书当前阅读">退出手动</button>
+  </div>
+
   <div id="msgs"></div>
 
   <!-- 当前选中的引用卡片（AI-003：固定在底部输入框上方，随当前书切换） -->
@@ -1323,20 +1705,59 @@
       <div class="rc-text" id="rc-text"></div>
       <div class="rc-meta" id="rc-meta"></div>
     </div>
-    <div class="rc-empty" id="rc-empty">暂无选中的引用，点「切换引用」选择一条划线</div>
+    <div class="rc-empty" id="rc-empty">暂无选中引用，点「切换引用」选择一条划线</div>
   </div>
 
+  <!-- 自由模式引用窗体（2026-09）：当前讨论的引用节点（语义命中自动并入 + 手动选取），
+       条目悬浮可取消；「＋ 拓扑图选取」打开图视图选择模式，单击看详情、双击选取。
+       仅自由模式激活时显示（sidebar.js toggleFreeMode / renderFreeRefs 控制）。 -->
+  <div id="free-refs" hidden>
+    <div class="fr-head">
+      <span class="fr-label" id="fr-label">🔗 本次引用</span>
+      <button class="fr-pick-btn" id="fr-pick-btn" title="打开拓扑图：单击查看详情，双击选取为引用">＋ 拓扑图选取</button>
+    </div>
+    <div class="fr-list" id="fr-list"></div>
+    <div class="fr-empty" id="fr-empty">还没有引用：自动命中并入，或「＋ 拓扑图选取」手动选</div>
+  </div>
+
+  <!-- 待发送附件提示片（上传文本附件后显示；读取进讨论，不保存原文件） -->
+  <div id="attach-chip" hidden>
+    <span>📎</span>
+    <span class="attach-chip-name" id="attach-chip-name"></span>
+    <button id="attach-chip-remove" title="移除附件">✕</button>
+  </div>
   <div id="footer">
-    <button id="attach-btn" title="放入文件（.md / .txt）">📎</button>
+    <!-- 斜杠命令菜单（2026-09）：输入 / 弹出可用操作，点击即执行 -->
+    <div id="cmd-menu" class="cmd-menu" hidden>
+      <div class="cmd-item" data-cmd="/收口" title="收口本书讨论（读完时手动使用）">
+        <span class="cmd-name">/收口</span>
+        <span class="cmd-desc">收口本书讨论（读完时手动使用）</span>
+      </div>
+    </div>
+    <button id="attach-btn" title="上传文本附件（.md / .txt）：读取进本次讨论，不保存原文件">📎</button>
     <input type="file" id="file-input" accept=".md,.markdown,.txt,.text" hidden>
     <textarea id="input" placeholder="说点什么…" rows="1"></textarea>
     <button id="send-btn">发送</button>
   </div>
 
+  <!-- 已读书籍选择弹窗（2026-10）：列出 receiver /books 返回的已读书籍，点击手动
+       选书（pickBook）。无书默认界面「从已读过的书籍中选择」/ 更多菜单 打开 -->
+  <div id="book-picker">
+    <div class="bp-panel">
+      <div class="bp-head">
+        <span class="bp-title">已读过的书籍</span>
+        <button class="bp-close" id="bp-close-btn" title="关闭">✕</button>
+      </div>
+      <input type="text" id="bp-search" placeholder="搜索书名…">
+      <div class="bp-list" id="bp-list"></div>
+      <div class="bp-msg" id="bp-empty" hidden>还没有已读书籍记录</div>
+    </div>
+  </div>
+
   <!-- 会意图拓扑视图（AI-020）：Obsidian 式话题拓扑图，全面板遮罩（DOM 由 graph-view.js 构建） -->
   <div id="graph-overlay"></div>
 
-  <!-- 轻提示（放入文件结果反馈） -->
+  <!-- 轻提示 toast -->
   <div id="toast"></div>
 
   <!-- 提问位置浮窗（AI-005）：一张卡片。折叠态右缘几条小横杠（最多 10 条，AI-014 起为
