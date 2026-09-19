@@ -997,19 +997,22 @@
       // 悬停邻接子图（有路径高亮时不压暗，悬停只出标签/提示）；压暗强度走缓动值（AI-027）
       const hoverOn = !!this.hover && !hlIds
 
-      // 边
+      // 边：线照旧先画；箭头只算几何收进 arrows，等节点/标签都画完再统一画——
+      // 箭头贴目标圆外缘，先画会被节点自己的标签 pill（白底）或其他标签盖住（用户反馈：箭头被题目挡住）。
+      const arrows = []
       for (const e of run.edges) {
         const a = run.byId.get(e.from), b = run.byId.get(e.to)
         if (!a || !b) continue
-        let alpha = 0.62
+        let alpha = 0.75            // 常态边不透明度（曾 0.62 太淡；0.78+粗线又显笨，收回到 0.75）
         let onPath = false
         let faintChain = false   // 隐藏模式：链内连接线标记
         if (hlIds) { onPath = hlEdges.has(e); alpha = onPath ? 1 : 0.16 }
-        else if (hlHidden) { faintChain = hlHidden.edges.has(e); alpha = faintChain ? 0.9 : 0.62 }
-        else if (hoverOn) alpha = 0.62 - (this._edgeDim.get(e.from + '>' + e.to) || 0) * 0.5
+        else if (hlHidden) { faintChain = hlHidden.edges.has(e); alpha = faintChain ? 0.9 : 0.75 }
+        else if (hoverOn) alpha = 0.75 - (this._edgeDim.get(e.from + '>' + e.to) || 0) * 0.63   // 压暗下限 ~0.12
         ctx.globalAlpha = alpha
-        ctx.strokeStyle = faintChain ? COLORS.pathAccent : (onPath && hlIds ? COLORS.pathAccent : (e.kind === 'user' ? COLORS.edgeUser : COLORS.edgeDerived))
-        ctx.lineWidth = faintChain ? 2 : (onPath && hlIds ? 2.2 : 1.4)
+        const edgeColor = faintChain ? COLORS.pathAccent : (onPath && hlIds ? COLORS.pathAccent : (e.kind === 'user' ? COLORS.edgeUser : COLORS.edgeDerived))
+        ctx.strokeStyle = edgeColor
+        ctx.lineWidth = faintChain ? 2 : (onPath && hlIds ? 2 : 1.6)
         const x1 = tx(a.x), y1 = ty(a.y), x2 = tx(b.x), y2 = ty(b.y)
         // 曲边（AI-034）：从圆心直线改成二次贝塞尔，控制点沿 from→to 方向的垂线偏移。
         // 关键：偏移只由「边的方向」决定（取一致的旋转侧）→ 同一对节点的正反向边
@@ -1026,21 +1029,26 @@
         ctx.stroke()
         // 方向箭头（有向图：引用方向 from → to；低缩放/短边不画，防噪）。
         // 曲边下箭头沿曲线末端切线（控制点 → 端点），而非弦方向。
+        // 这里只算几何入队：fillStyle 必须显式用边色——原来直接 ctx.fill() 会沿用
+        // 上一帧残留的 fillStyle（通常是标签文字色/上一节点色），箭头颜色错乱、不显眼；
+        // 绘制统一延后到节点/标签之后，保证箭头在最上层（详见下方收尾循环）。
         if (cam.scale > 0.45 && segLen > 44) {
           const ang = Math.atan2(y2 - cy, x2 - cx)
-          const arr = clamp(cam.scale, 0.5, 1.3) * 4.5
-          const ax = x2 - Math.cos(ang) * (b.r * cam.scale + 6)
-          const ay = y2 - Math.sin(ang) * (b.r * cam.scale + 6)
-          ctx.save()
-          ctx.translate(ax, ay)
-          ctx.rotate(ang)
-          ctx.beginPath()
-          ctx.moveTo(arr, 0)
-          ctx.lineTo(-arr * 0.55, -arr * 0.7)
-          ctx.lineTo(-arr * 0.55, arr * 0.7)
-          ctx.closePath()
-          ctx.fill()
-          ctx.restore()
+          // 箭头尺寸与 cam.scale 线性同步、不封顶：放大查看时箭头跟着节点一起长大，
+          // 任何缩放级别都醒目（v39 封顶在 ~1.4 倍，深放大后箭头相对节点反而显小）。
+          // v40 收敛：比 v39 小一档（v39 过大显笨），仍比最初的 ~7px 大一截。
+          const S = cam.scale * 6.4    // scale≈1 时：全长 ~9px、宽 ~9px
+          // 填充用比边色略深的同色（×0.85）：无描边也清晰，颜色语言与边保持一致
+          const rgb = hexToRgb(edgeColor)
+          arrows.push({
+            x: x2 - Math.cos(ang) * (b.r * cam.scale + 4),   // 尖端与目标圆边留 4px
+            y: y2 - Math.sin(ang) * (b.r * cam.scale + 4),
+            ang,
+            len: 1.45 * S,       // 尖端 → 底边
+            half: 0.68 * S,      // 半宽
+            color: 'rgb(' + Math.round(rgb.r * 0.85) + ',' + Math.round(rgb.g * 0.85) + ',' + Math.round(rgb.b * 0.85) + ')',
+            alpha,
+          })
         }
       }
 
@@ -1131,6 +1139,24 @@
           const pillFade = magnify ? magAmt : 1   // 悬停/选中的 pill 淡入淡出（AI-027）
           drawLabel(ctx, n.point, px, py + rDraw + 4, alpha, labelChars, magnify || searchHit || (hl && onPath), labelFontPx, labelLines, pillFade)
         }
+      }
+
+      // 方向箭头统一收尾画（最上层）：节点圆、标签文字与白底 pill 都在其下，
+      // 箭头不会被「题目」/标签盖住。纯填充无描边（v39 的 1px 深描边轮廓感太硬、
+      // 显糙）；略深于边色的同色系填充在浅底上轮廓自然清晰。
+      for (const ar of arrows) {
+        ctx.globalAlpha = ar.alpha
+        ctx.fillStyle = ar.color
+        ctx.save()
+        ctx.translate(ar.x, ar.y)   // 尖端位置
+        ctx.rotate(ar.ang)          // +x = 朝向目标圆心的切线方向
+        ctx.beginPath()
+        ctx.moveTo(0, 0)
+        ctx.lineTo(-ar.len, -ar.half)
+        ctx.lineTo(-ar.len, ar.half)
+        ctx.closePath()
+        ctx.fill()
+        ctx.restore()
       }
       ctx.globalAlpha = 1
     }
@@ -1226,7 +1252,7 @@
 
     // 悬停过渡（AI-027）：每帧把 压暗强度 / 放大强度 向目标缓动（指数趋近，约 200ms 内稳定）。
     // 进入/离开/在节点间快速扫过都是平滑渐变，不闪变。目标值与原行为一致：
-    // 非邻接节点/边压暗（1→0.22 / 0.62→0.12），悬停/选中节点放大 1.2 倍 + pill 淡入。
+    // 非邻接节点/边压暗（1→0.22 / 0.75→0.12），悬停/选中节点放大 1.2 倍 + pill 淡入。
     _stepHoverFx() {
       const run = this.run
       if (!run || !run.nodes.length) return
@@ -1983,6 +2009,6 @@
     ctx.textBaseline = 'top'
     for (let i = 0; i < lines.length; i++) ctx.fillText(lines[i], x, y + i * lineH)
   }
-  console.log('[CoRead] graph-view v38 已加载：每张讨论卡片显示轮次排号（AI-038）')
+  console.log('[CoRead] graph-view v40 已加载：箭头增强终版——最上层绘制、同色系加深填充无描边、尺寸随缩放（2026-11）')
   global.CoReadGraphView = { GraphView, utils: { computePath, topoSort, hashStr, mulberry32, clamp, wrapText, bookName, colorDist, assignBookColors } }
 })(typeof window !== 'undefined' ? window : globalThis)

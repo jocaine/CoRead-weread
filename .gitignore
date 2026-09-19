@@ -44,6 +44,12 @@ npm-debug.log*
 *.out
 *.err
 .playwright-mcp/
+# 历史截尾游标（运行时个人数据，随会话推进变化）
+agent/hist_cursors.json
+# 评审批次 diff 转储、DOM 转储、采样文本
+.review*/
+_dom.txt
+agent/scripts/_*.txt
 
 # macOS
 .DS_Store

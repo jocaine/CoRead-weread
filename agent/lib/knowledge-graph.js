@@ -34,6 +34,7 @@
  */
 
 import { extractJsonObject } from './topicize.js'
+import { buildConsolidatePrompt } from './discussion-text.js'
 
 export const MAX_ATTEMPTS = 3
 
@@ -133,8 +134,8 @@ function normalizeDiscussion(d) {
 /**
  * 建边：记录知识点之间的拓扑关系。两种来源（kind）：
  * - "user"：用户的显式引用（"我想到我们之前说的X"）
- * - "derived"：系统从对话连续性识别的衍生关联（后一讨论从前一讨论的思考中衍生，
- *   即使没有显式引用句式）
+ * - "derived"：同一栈收口切出的相邻段之间无条件建立的对话连续性边（2026-10 用户
+ *   定调：去 LLM 判定——同栈相邻段是思维连续链的机械产物，不替用户思考）
  * 2026-08-27 用户定调：**去掉 quote 字段**——追溯与删改触发均未实现，字段暂不落库；
  * 引用短语不落库、不进解析协议（协议只返回命中节点 id 列表，2026-08-29 加强后
  * 命中与建边解耦，边只记 from/to/kind）。
@@ -215,6 +216,38 @@ export function findNodesByPoint(graph, point) {
   const p = String(point || '').trim()
   if (!p) return []
   return graph.nodes.filter((n) => n.point === p)
+}
+
+/**
+ * 判 fromId 是否能沿边（含 user 与 derived 全部 kind）到达 toId。
+ *
+ * 口径与 contextOf / 前端图视图的"脉络"一致：边方向 = 引用方向（from = root 侧
+ * 被引用节点，to = recent 侧引用节点），root→recent 路径 = 脉络；能沿边从 X 到达
+ * Y ⟺ X 是 Y 脉络上的较早节点（X 的 root→自身路径已被 Y 的内容完整包含，
+ * 见 contextOf 注释——Y 的反向可达集必然覆盖 X）。
+ *
+ * @param {object} graph
+ * @param {string} fromId 起点节点 id
+ * @param {string} toId   终点节点 id
+ * @returns {boolean} from === to 或任一节点缺失 → false；否则沿边 DFS 判可达
+ */
+export function isReachable(graph, fromId, toId) {
+  const from = String(fromId || '').trim()
+  const to = String(toId || '').trim()
+  if (!from || !to || from === to) return false
+  if (!findNode(graph, from) || !findNode(graph, to)) return false
+  const stack = [from]
+  const seen = new Set([from])
+  while (stack.length) {
+    const cur = stack.pop()
+    for (const e of graph.edges) {
+      if (e.from !== cur || seen.has(e.to)) continue
+      if (e.to === to) return true
+      seen.add(e.to)
+      stack.push(e.to)
+    }
+  }
+  return false
 }
 
 // ───────────────────────── 2. 路径上下文（root → recent） ─────────────────────────
@@ -351,19 +384,17 @@ export function buildPointInstruction() {
  */
 export function buildPointPrompt(input) {
   const question = String(input?.question || '').trim()
-  const lines = [buildPointInstruction(), '', `讨论的具体问题："${question}"`]
   const excerpts = Array.isArray(input?.excerpts) ? input.excerpts.filter((e) => e?.q || e?.a) : []
-  if (excerpts.length > 0) {
-    lines.push('', '讨论内容（供提取语境——主体是谁、什么背景、矛盾双方是什么）：')
-    for (const e of excerpts.slice(-2)) {
-      const q = String(e?.q || '').trim()
-      const a = String(e?.a || '').trim()
-      if (q) lines.push(`用户："${q.slice(0, 200)}"`)
-      if (a) lines.push(`AI："${a.slice(0, 300)}"`)
-    }
-    lines.push('', '注意：point 的语境必须来自上面的讨论内容，不许发明讨论里没有的背景。')
-  }
-  return lines.join('\n')
+  // 2026-10 结构定调：公共前缀 + 段全文（全量，point 改吃全文语境——矛盾结构常在中段）
+  // + 任务尾（question 锚 + 语境纪律 + 指令）。全文与归纳/能指同字节前置，命中同一缓存前缀。
+  const tail = [
+    `讨论的具体问题："${question}"`,
+    '',
+    '注意：point 的语境必须来自上面的讨论内容，不许发明讨论里没有的背景。',
+    '',
+    buildPointInstruction(),
+  ].join('\n')
+  return buildConsolidatePrompt(excerpts, tail)
 }
 
 /**
@@ -462,20 +493,24 @@ export function buildAliasInstruction() {
  */
 export function buildAliasPrompt(input) {
   const point = String(input?.point || '').trim()
-  const lines = [buildAliasInstruction(), '', `条目 point："${point}"`]
   const question = String(input?.question || '').trim()
-  if (question) lines.push(`讨论问题："${question}"`)
   const excerpts = Array.isArray(input?.excerpts) ? input.excerpts.filter((e) => e?.q || e?.a) : []
-  if (excerpts.length > 0) {
-    lines.push('', '讨论内容（全量提供，不截取——背景事物及其展开内容都在这里找；不许发明讨论里没有的内容）：')
-    for (const e of excerpts) {
-      const q = String(e?.q || '').trim()
-      const a = String(e?.a || '').trim()
-      if (q) lines.push(`用户："${q}"`)
-      if (a) lines.push(`AI："${a}"`)
-    }
-  }
-  return lines.join('\n')
+  // 2026-10 结构定调：公共前缀 + 段全文（全量，不截取）+ 任务尾（point/question 锚 + 指令）。
+  // 全文与归纳/point 同字节前置，命中同一缓存前缀。
+  // 2026-10 覆盖修复：长判据被压到全文之后会降低"覆盖展开面"的遵从（实测条数减半、丢
+  // 文本锚面）——任务尾开头加一条浓缩要点（内容与判据正文重复，重复在文后正是为加强遵从）。
+  const tail = [`条目 point："${point}"`]
+  if (question) tail.push(`讨论问题："${question}"`)
+  tail.push(
+    '',
+    '【要点】数量不限：讨论里展开过几个背景面就写几条，宁可多写、不要为了精简合并掉独立的面；',
+    '每条写清"对象是什么 + 讨论展开的内容"，能单独指认；不许压缩成看不出内容的短提法；',
+    '只写讨论里实际展开过的，不许发明。',
+    '讨论中实际展开过的具体人物、历史文本、国别/制度对比对象也都是独立的背景面，各成一条，不要漏掉或合并掉。',
+    '',
+    buildAliasInstruction(),
+  )
+  return buildConsolidatePrompt(excerpts, tail.join('\n'))
 }
 
 /**
@@ -569,8 +604,7 @@ export function buildReferenceInstruction() {
     '- 找出发言中所有指认旧知识点的说法并匹配到节点（找引用和匹配是一件事）：一个说法被判定为指认旧知识点，当且仅当它同时满足下面三点——',
     '  ① 指认性表述：用户用指认性表述提到之前聊过的知识点（"之前/上次/我们聊过/那个……"）；只是恰好提到相关词、没有指认意图的，不是引用。',
     '  ② 内容线索（底线）：说法透露了指认的是哪个知识点的信息——能指词（point/aliases/讨论过的问题里的词）、话题词、或对讨论内容的描述；纯指示代词（"上次那个""那个问题"）或纯时间指代（"就和我们上次聊的一样"）没透露任何线索 → 不解析、不匹配。',
-    '  ③ 语义匹配：线索与节点身份是同一个知识点（例："苏联工业化" 与节点「苏联的工业化史」是同一个；"聊过的那个货币和政权信用的事" 与节点「顿河流通券信用背后的政权存亡逻辑」是同一个）——允许同义、简称、换表述、话题描述、概括转述，能指词面命中不是必要条件。',
-    '  ④ 复述结论/立场/转变（2026-09 修订）：用户用指认性表述（"我之前和你提过的""上次说的""我们聊过的"）复述之前讨论中得出的结论、立场、转变或做法，即使措辞与节点完全不同，只要内容线索能对应某节点 point/能指描述的话题，也应判定命中。例："这也是我之前和你提过的我的转变——摒弃启蒙的思想" 与节点 n_d_xue_4 的能指"能做的是\'启蒙以外\'的工作：共同性+物质性"是同一个知识点（都是"不对他人做启蒙式教导、做启蒙以外的工作"）。',
+    '  ③ 语义匹配：线索与节点身份是同一个知识点（例："苏联工业化" 与节点「苏联的工业化史」是同一个；"聊过的那个货币和政权信用的事" 与节点「顿河流通券信用背后的政权存亡逻辑」是同一个）——允许同义、简称、换表述、话题描述、概括转述，能指词面命中不是必要条件。复述结论/立场/转变也算命中（2026-09 修订）：用户用指认性表述（"我之前和你提过的""上次说的""我们聊过的"）复述之前讨论中得出的结论、立场、转变或做法，即使措辞与节点完全不同，只要内容线索能对应某节点 point/能指描述的话题，也应判定命中。例："这也是我之前和你提过的我的转变——摒弃启蒙的思想" 与节点 n_d_xue_4 的能指"能做的是\'启蒙以外\'的工作：共同性+物质性"是同一个知识点（都是"不对他人做启蒙式教导、做启蒙以外的工作"）。',
     '- 匹配必须逐条通读每个节点的"能指"（aliases）全文：大量结论性说法只存在于能指里、不在 point 中（例：n_d_xue_4 的 point 是"阶级关系定位"，"启蒙以外的工作"只在能指里）。不能只盯着 point 找词面或语义对应。',
     '- 一次发言可指认多个，全部找出，不要只取第一个。',
     '- 未命中：说法匹配不上任何节点（用户可能记错、节点尚未建立、或线索不属于任何节点）→ 不输出该条。',
@@ -689,11 +723,14 @@ export async function resolveReferences(input, deps = {}) {
 }
 
 // ───────────────────────── 4.5 衍生关联（对话连续性的拓扑边） ─────────────────────────
+// 2026-10 用户定调：live 收口路径已去掉本判定——同栈收口切出的相邻段之间**无条件**建
+// derived 边（思维连续链的机械产物，不替用户思考）。judgeDerivation 保留：供离线重判/
+// 历史工具使用，live 固化不再调用。
 
 /**
- * 衍生关联的判据提示词。拓扑边的第二条来源：**对话连续性**——后一条讨论从前一条
- * 讨论的思考中衍生出来（追问、延伸、对比、联想），即使用户没有说"我们之前说过A"
- * 这类显式引用句式。例：「为什么列宁最初分化哥萨克的策略没有奏效？」讨论中想到
+ * 衍生关联的判据提示词（离线/历史判定用）。拓扑边的第二条来源：**对话连续性**——后一条
+ * 讨论从前一条讨论的思考中衍生出来（追问、延伸、对比、联想），即使用户没有说"我们之前
+ * 说过A"这类显式引用句式。例：「为什么列宁最初分化哥萨克的策略没有奏效？」讨论中想到
  * 「中国为什么没孕育出哥萨克式角色」——后者的提问显然从前者的思考中长出来。
  * 宁漏勿误：拿不准 → 不建边（漏了无痛，用户以后显式引用时补上；错了污染拓扑）。
  */

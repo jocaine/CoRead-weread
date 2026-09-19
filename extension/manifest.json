@@ -10,6 +10,8 @@
   "host_permissions": [
     "https://weread.qq.com/*",
     "https://*.weread.qq.com/*",
+    "https://www.marxists.org/*",
+    "https://www.bilibili.com/*",
     "http://127.0.0.1:7239/*"
   ],
   "background": {
@@ -27,6 +29,12 @@
     {
       "matches": ["https://weread.qq.com/*"],
       "js": ["content.js"],
+      "run_at": "document_end",
+      "all_frames": true
+    },
+    {
+      "matches": ["https://www.marxists.org/chinese/*", "https://www.bilibili.com/*"],
+      "js": ["source-mia.js"],
       "run_at": "document_end",
       "all_frames": true
     }

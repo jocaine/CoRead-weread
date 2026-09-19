@@ -5,6 +5,7 @@ const RECEIVER = 'http://127.0.0.1:7239'
 const FREE_KEY = '__coread_free_mode__'
 let _freeMode = false  // 是否处于自由模式（进入后消息区/引用/图视图按哨兵书隔离）
 let _savedReadingAnn = null  // 进入自由模式前暂存的读书模式选中引用（退出自由模式时恢复）
+let _savedExitCtx = null  // 进入自由模式前 _currentBook 的快照（退出时恢复实时上下文用）
 
 // 侧栏调试上报（与 content.js 的 postDebug 同写 receiver/inbox/debug.jsonl，source=sidebar）
 function postSidebarDebug(data) {
@@ -130,6 +131,7 @@ function serializeRefs() {
     bookId: a.bookId, bookTitle: a.bookTitle, chapter: a.chapter,
     chapterUid: a.chapterUid, chapterUidInt: a.chapterUidInt || 0,
     bookmarkRange: a.bookmarkRange || '', bookmarkId: a.bookmarkId || '',
+    sourceUrl: a.sourceUrl || '',
     selectedText: a.selectedText, refNum: a.refNum
   }))
 }
@@ -152,6 +154,7 @@ function saveState() {
         chapter: selectedAnn.chapter, chapterUid: selectedAnn.chapterUid,
         chapterUidInt: selectedAnn.chapterUidInt || 0,
         bookmarkRange: selectedAnn.bookmarkRange || '', bookmarkId: selectedAnn.bookmarkId || '',
+        sourceUrl: selectedAnn.sourceUrl || '',
         selectedText: selectedAnn.selectedText, refNum: selectedAnn.refNum
       } : null,
       // 2026-10：手动选书持久化——面板重开后保持上次手动查看的书；
@@ -267,7 +270,19 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.action === 'coreadSetRefApply' && msg.ref) {
     const r = msg.ref
     applySetRef({ bookId: r.bookId, bookTitle: r.bookTitle, chapter: r.chapter || '',
-      chapterUid: r.chapterUid || '', chapterUidInt: r.chapterUidInt || 0, selectedText: r.selectedText })
+      chapterUid: r.chapterUid || '', chapterUidInt: r.chapterUidInt || 0, selectedText: r.selectedText,
+      sourceUrl: r.sourceUrl || '' })
+  }
+  // AI-021 网页阅读源：读者在网页上手动建书/绑定页面后，把该书设为手动查看的书
+  //（绑定是用户主动动作，非自动跟随；退出自由模式限制同 coreadBookContext）
+  if (msg?.action === 'coreadManualBook') {
+    if (_freeMode) return
+    const base = String(msg.bookId || '')
+    if (!/^[A-Za-z0-9_]{12,}$/.test(base)) return
+    const title = String(msg.bookTitle || '').trim()
+    _manualBook = { base: base, bookTitle: title }
+    saveState()
+    applyBookContext({ bookId: base, bookTitle: title })
   }
   // AI-011：划线内容 → 引用栏搜索（来自 content.js 工具栏按钮，侧栏已打开时的实时通道）。
   // 同时清掉 storage 待搜词，避免面板后续加载再重复开一次抽屉。
@@ -716,8 +731,18 @@ function applyBookFilter() {
   if (jumpFab && jumpFab.classList.contains('open')) renderJumpList()
 }
 
-// 有效上下文变化时的统一处理：取消异书选中引用、刷新引用/消息过滤、滚到底部、
+// 滚到底部展示当前上下文最新内容。必须在 #msgs 可见后调用：无书状态下
+// renderNoBookView 把消息区设为 display:none，此时设置 scrollTop 是 no-op
+//（恢复显示时会被重置为 0）——所以上下文切换的滚动统一放在调用方的
+// renderNoBookView() 之后执行（applyBookContext / pickBook / exitManualBook）。
+function scrollMsgsToBottom() {
+  const msgs = document.getElementById('msgs')
+  if (msgs) msgs.scrollTop = msgs.scrollHeight
+}
+
+// 有效上下文变化时的统一处理：取消异书选中引用、刷新引用/消息过滤、
 // 恢复/清除"当前讨论命中"。切书 / 手动选书 / 退出手动选书 / 进出自由模式共用。
+// 滚动到底部由各调用方在 renderNoBookView 恢复消息区可见之后调用 scrollMsgsToBottom。
 function onEffectiveContextChange() {
   const effBase = effectiveBookBase()
   // 命中脉络按书隔离（2026-09）：每本书的实时栈独立，命中显示只在它所属的上下文
@@ -739,9 +764,6 @@ function onEffectiveContextChange() {
   renderCurrentRef()
   renderDrawer()
   applyBookFilter()
-  // 上下文切换是明确的动作：滚到底部展示该书最新内容
-  const msgs = document.getElementById('msgs')
-  if (msgs) msgs.scrollTop = msgs.scrollHeight
   // 2026-09：切换/初始化后恢复新书的"当前讨论命中"高亮（实时栈 cites → /stack-hits）
   refreshStackHits()
 }
@@ -767,10 +789,14 @@ function applyBookContext(ctx) {
     saveState()
     if (switched) showToast('检测到正在阅读《' + (next.bookTitle || '…') + '》，已恢复自动跟随')
   }
-  if (!prevEffBase || prevEffBase !== effectiveBookBase()) onEffectiveContextChange()
+  const ctxChanged = !prevEffBase || prevEffBase !== effectiveBookBase()
+  if (ctxChanged) onEffectiveContextChange()
   renderCurrentBook()
   renderNoBookView()
   renderManualBanner()
+  // 滚动必须等 renderNoBookView 恢复 #msgs 可见之后（无书→有书切换时，
+  // 此前消息区是 display:none，在那之前设 scrollTop 会被重置为 0）
+  if (ctxChanged) scrollMsgsToBottom()
 }
 
 // 侧栏打开 / 切换 tab 时，向活动的微信读书 tab 查询当前阅读上下文。
@@ -827,6 +853,44 @@ function renderNoBookView() {
   }
   if (sendBtn) sendBtn.disabled = noBook
   if (attachBtn) attachBtn.disabled = noBook
+  refreshWebBindEntry()  // AI-021：无书状态时按活动 tab 显示/隐藏网页绑定入口
+}
+
+// ── AI-021 网页阅读源：无书视图的『绑定当前网页页面』入口 ────────────────
+// 仅当：处于无书状态（本函数由 renderNoBookView 调用）+ 活动 tab 是文库网页
+// + 该页尚未绑定（向页面适配器查询）。绑定由页面上的对话框完成，绑定后
+// storage 变更（miaBindings）触发本函数刷新，入口消失，页面右下角胶囊常驻。
+const WEB_PAGE_RE = /^https:\/\/(www\.marxists\.org\/chinese|www\.bilibili\.com)\//
+async function refreshWebBindEntry() {
+  const card = document.getElementById('nb-web-card')
+  const urlEl = document.getElementById('nb-web-url')
+  if (!card) return
+  card.hidden = true
+  if (_freeMode || effectiveBookBase()) return
+  let tab = null
+  try {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+    tab = tabs && tabs[0]
+  } catch (e) { return }
+  if (!tab || !tab.id || !WEB_PAGE_RE.test(String(tab.url || ''))) return
+  let ans = null
+  try { ans = await chrome.tabs.sendMessage(tab.id, { action: 'coreadBindingQuery' }, { frameId: 0 }).catch(() => null) } catch (e) {}
+  if (!(ans && ans.ok)) {
+    try {
+      const resps = await chrome.tabs.sendMessage(tab.id, { action: 'coreadBindingQuery' })
+      const arr = Array.isArray(resps) ? resps : []
+      ans = arr.find(function (x) { return x && x.ok }) || null
+    } catch (e) {}
+  }
+  if (!ans || ans.bound) return
+  // 路径独占一行 chip：取末尾两段并做中间省略，长路径也不会撑破布局
+  const full = String(ans.pageUrl || tab.url || '')
+  const path = full.replace(/^https?:\/\/[^/]+/, '')
+  const segs = path.split('/').filter(Boolean)
+  let show = '…/' + (segs.length > 2 ? segs.slice(-2).join('/') : segs.join('/') || path.replace(/^\//, ''))
+  if (show.length > 46) show = show.slice(0, 20) + '…' + show.slice(-20)
+  if (urlEl) { urlEl.textContent = show; urlEl.title = full }
+  card.hidden = false
 }
 
 // 手动选书横幅：手动查看期间显示在消息区上方，提供「切换书籍 / 退出手动」入口
@@ -886,11 +950,66 @@ function renderBookList() {
     item.className = 'bp-item'
     const time = b.updatedAt ? new Date(b.updatedAt).toLocaleDateString() : ''
     item.innerHTML =
-      `<div class="bi-title">${esc(b.bookTitle || '（未知名书籍）')}</div>` +
-      (time ? `<div class="bi-meta">最近更新 ${time}</div>` : '')
+      `<div class="bi-main">` +
+        `<div class="bi-title">${esc(b.bookTitle || '（未知名书籍）')}</div>` +
+        (time ? `<div class="bi-meta">最近更新 ${time}</div>` : '') +
+      `</div>` +
+      `<button class="bi-del" title="删除这本书的记录">${ICON_TRASH}</button>`
     item.addEventListener('click', () => pickBook(b))
+    item.querySelector('.bi-del').addEventListener('click', (e) => {
+      e.stopPropagation()  // 不触发行点击的选书
+      deleteBook(b)
+    })
     listEl.appendChild(item)
   }
+}
+
+// 删除一本书：确认后调 receiver /book-delete 清理该书全部存档（划线/章节缓存/聊天），
+// 并同步清理侧栏本地状态——引用列表（removeAnns 统一清选中态）、消息区残留气泡、
+// 手动选书/当前上下文（删的是当前上下文则重置为无书），最后刷新「已读过的书籍」列表。
+async function deleteBook(b) {
+  if (!b || !b.base) return
+  const title = b.bookTitle || '这本书'
+  const ok = await showConfirm(`删除《${title}》？`,
+    '将删除该书的所有划线、章节缓存与聊天记录（含「已读过的书籍」列表），此操作不可恢复。')
+  if (!ok) return
+  try {
+    const resp = await fetch(`${RECEIVER}/book-delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base: b.base }),
+    })
+    if (!resp.ok) throw new Error('bad status')
+  } catch {
+    showToast('删除失败：接收端未响应', true)
+    return
+  }
+  // 删除的是当前有效上下文（正在阅读/手动查看的书）→ 重置为无书状态，
+  // 避免残留上下文继续绑定已删除的书（消息区/引用/命中都按书隔离）
+  if (effectiveBookBase() === b.base) {
+    if (_manualBook && _manualBook.base === b.base) _manualBook = null
+    if (_currentBook && _currentBook.base === b.base) _currentBook = null
+    saveState()
+  }
+  // 本地引用列表清理（removeAnns 统一处理"移除的是当前选中引用 → 清空选中态"）
+  removeAnns(a => baseBookId(a.bookId) === b.base)
+  // 移除消息区残留的该书气泡：loadHistory 回放出的 DOM 还在，书已删不可再展示
+  const msgs = document.getElementById('msgs')
+  for (const el of Array.from(msgs ? msgs.children : [])) {
+    if ((el.dataset.book || '') === b.base) el.remove()
+  }
+  saveState()
+  onEffectiveContextChange()
+  renderCurrentBook()
+  renderNoBookView()
+  renderManualBanner()
+  // 刷新已读书籍列表
+  _bookPickerList = _bookPickerList.filter(x => x.base !== b.base)
+  renderBookList()
+  // AI-021：广播删除事件，网页适配器（source-mia.js）据此清理本地页面→书绑定，
+  // 避免残留绑定下次访问页面时把已删的书重新建出来
+  try { chrome.runtime.sendMessage({ action: 'coreadBookDeleted', base: b.base }) } catch {}
+  showToast(`已删除《${title}》`)
 }
 
 function closeBookPicker() {
@@ -914,6 +1033,8 @@ function pickBook(book) {
   renderCurrentBook()
   renderNoBookView()
   renderManualBanner()
+  // 手动选书切换同样在消息区恢复可见后再滚到底部（无书状态进入时 #msgs 是隐藏的）
+  if (!same) scrollMsgsToBottom()
 }
 
 // 停止手动选书：恢复自动跟随（实时检测到哪本书就显示哪本）
@@ -926,6 +1047,7 @@ function exitManualBook() {
   renderCurrentBook()
   renderNoBookView()
   renderManualBanner()
+  scrollMsgsToBottom()
   // 退出后立即向活动 tab 查询真实阅读上下文（可能正在读书）
   refreshCurrentBook()
   showToast(`已退出《${was.bookTitle || '…'}》的手动查看`)
@@ -1007,22 +1129,59 @@ try {
 
 // ── 消息 ────────────────────────────────────────────────────────────────────
 let thinkingEl = null
+// 「正在…」文案按 agent 处理步骤更新（2026-10）：agent 经 receiver 推 SSE
+// type=agent-state（step: resolve=引用解析 / answer=生成回复），气泡文案跟着换；
+// 状态迟迟未到（agent 正在处理上一条/排队）则按等待时长走兜底文案。
+const THINKING_COPY = {
+  init: '正在理解你的提问',
+  resolve: '正在检索我们聊过的旧知识点',
+  answer: '正在组织回答',
+  fallback1: '正在结合上下文思考',
+  fallback2: '内容较多，还在思考中',
+}
+const _thinkingFallbacks = []  // 兜底文案定时器（hideThinking / 步骤到达时清除）
+let _thinkingStepArrived = false  // 是否已收到 agent 步骤（收到后兜底不再覆盖）
+
+function setThinkingLabel(text) {
+  if (!thinkingEl) return
+  const label = thinkingEl.querySelector('.bubble > span:first-child')
+  if (label) label.textContent = text
+}
+function clearThinkingFallbacks() {
+  for (const t of _thinkingFallbacks) clearTimeout(t)
+  _thinkingFallbacks.length = 0
+}
+function scheduleThinkingFallback(delay, text) {
+  const t = setTimeout(() => {
+    if (thinkingEl && !_thinkingStepArrived) setThinkingLabel(text)
+  }, delay)
+  _thinkingFallbacks.push(t)
+}
 
 function showThinking(bookId) {
   hideThinking()
+  _recoverAnswerSeen = false  // 新一轮提问：允许在需要时重新弹思考气泡
   // AI-001：记录本次回复归属的书，后续 assistant 流式气泡继承此书签
   _thinkingBook = baseBookId(bookId) || ''
   const msgs = document.getElementById('msgs')
   thinkingEl = document.createElement('div')
   thinkingEl.className = 'msg-thinking'
   thinkingEl.dataset.book = _thinkingBook  // AI-001：跟随本次回复的书
-  thinkingEl.innerHTML = `<div class="bubble"><span>思考中</span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`
+  thinkingEl.innerHTML = `<div class="bubble"><span>正在理解你的提问</span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`
   msgs.appendChild(thinkingEl)
   applyBookFilter()
   maybeAutoScroll(msgs)
+  // 兜底文案：agent 状态未在预期时间内到达（排队/长思考）时逐步换文案
+  _thinkingStepArrived = false
+  scheduleThinkingFallback(5000, THINKING_COPY.fallback1)
+  scheduleThinkingFallback(15000, THINKING_COPY.fallback2)
 }
 
 function hideThinking() {
+  // 有回复开始渲染（流式分片 / 完整记录 / 历史补渲染）→ 本打开会话里不再由
+  // 「未回复提问恢复」逻辑重新弹思考气泡（否则已出现的回复旁会再挂一个思考中）
+  _recoverAnswerSeen = true
+  clearThinkingFallbacks()
   if (thinkingEl) { thinkingEl.remove(); thinkingEl = null }
 }
 
@@ -1114,6 +1273,38 @@ function _isDuplicate(d) {
   return false
 }
 
+// ── 历史渲染幂等 + 未回复提问的恢复 ──────────────────────────────────────
+// 面板在 AI 回复期间被关闭再打开（2026-11 用户反馈）：
+// 关闭侧栏会销毁文档，重开是新会话——loadHistory 只看到"提问"看不到"回复"，
+// 既不显示思考状态，还可能漏掉恰在「loadHistory 抓取」与「SSE 注册」之间落库的
+// 回复（SSE 新连接 lastId=0 不回放缓冲、/history 又已抓过）——只能靠再次重载
+// 才看到答案。这里做三件事：
+//  1) loadHistory 幂等：_histKeys 记录已渲染条目，重复执行只补渲染增量；
+//  2) 打开时检测「最新提问无回复」→ 恢复思考气泡（该提问的回复在实时流 /
+//     轮询补渲染到达时按既有流程正常显示；历史回放只在单趟内部做 [引用] 配对，
+//     绝不向实时队列 _pendingRefs 入队——历史里永无回复的旧提问若占着队位，
+//     会把之后实时到达的回复劫持成旧书的引用气泡，按书过滤后直接消失）；
+//  3) 挂轻量轮询（2s/趟）补渲染间隙里落库的回复，直到回复落库或超上限。
+//     实时流（SSE）照常推送，轮询只是兜底，二者都经 _histKeys / 指纹去重互斥。
+const _histKeys = new Set()   // 已渲染的历史条目 key（role|ts|内容前40字）
+let _recoverTimer = 0         // 未回复提问的恢复轮询定时器
+let _recoverTicks = 0         // 已轮询趟数（上限保护）
+const RECOVER_MAX_TICKS = 60  // ≈2 分钟；正常几趟内结束
+let _recoverAnswerSeen = false  // 本会话是否已有回复开始渲染（此后恢复逻辑不再重弹思考气泡）
+
+// 历史条目 key：与 /history 条目（role/_ts）及 SSE 最终记录（timestamp）对齐，
+// 让「历史增量渲染」与「实时流收尾渲染」对同一条记录互斥。
+function msgHistKey(role, ts, content) {
+  return `${role}|${ts || 0}|${String(content || '').slice(0, 40)}`
+}
+
+// 完整回复指纹登记（口径与 addBubble 的 assistant 去重一致：前 200 字）。
+// 流式收尾渲染时登记，历史增量渲染就不会再渲染同一条回复。
+function rememberAssistant(content) {
+  _seenFingerprints.add(String(content || '').slice(0, 200))
+  if (_seenFingerprints.size > 200) _seenFingerprints.clear()
+}
+
 // ── 流式渲染 ──────────────────────────────────────────────────────────────
 // 不变量：一条回复只产生一个气泡。chunk 合并进同一个 _streamEl；-1 标记只置
 // 完成标志（保留 _streamEl 供最终记录升级/补齐）；最终记录处理后置空 _streamEl。
@@ -1138,7 +1329,9 @@ function _handleStream(d) {
     const msgs = document.getElementById('msgs')
     _streamEl = document.createElement('div')
     _streamEl.className = 'msg-assistant'
-    _streamEl.dataset.book = _thinkingBook  // AI-001：继承本次回复归属的书
+    // AI-001：继承本次回复归属的书。优先用回复自带的 bookKey（agent 落库即打标，
+    // 与提问书一致），面板重开恢复的提问若历史记录缺 bookId，也能正确归属
+    _streamEl.dataset.book = baseBookId(d.bookKey) || _thinkingBook
     _streamEl.innerHTML = `<div class="bubble"></div>`
     msgs.appendChild(_streamEl)
     applyBookFilter()
@@ -1241,6 +1434,20 @@ function connect() {
       if (d.type === 'graph-updated') { if (graphView?.isOpen()) graphView.reload(); return }
       // 2026-09：实时栈变化 → 重拉 /stack-hits，恢复/清除"当前讨论命中"高亮
       if (d.type === 'stack-updated') { refreshStackHits(); return }
+      // agent 处理步骤（2026-10）：思考气泡按步骤换文案（resolve / answer）。
+      // 无气泡（回复已开始渲染/历史回放）时忽略；按书匹配防串上下文（命中按书隔离同款）。
+      if (d.type === 'agent-state') {
+        const stateBook = baseBookId(d.bookKey) || ''
+        if (thinkingEl && (!stateBook || !thinkingEl.dataset.book || stateBook === thinkingEl.dataset.book)) {
+          const label = d.step === 'resolve' ? THINKING_COPY.resolve : (d.step === 'answer' ? THINKING_COPY.answer : '')
+          if (label) {
+            _thinkingStepArrived = true
+            clearThinkingFallbacks()
+            setThinkingLabel(label)
+          }
+        }
+        return
+      }
       if (d.type !== 'message') return
 
       // 会意图命中（AI-020）：agent 引用解析命中旧知识点（L3 图路径上下文）→
@@ -1274,12 +1481,27 @@ function connect() {
       if (_streamDone && d.role === 'assistant') {
         _streamDone = false
         _seenMsgs.add(_msgKey(d))  // 登记，防 SSE 回放重复
+        // 指纹去重检查必须在 rememberAssistant 登记之前：若这条回复已由
+        // 「未回复提问恢复轮询」的历史增量渲染过（完整气泡已在屏），这里只丢弃
+        // 流式占位气泡即可——不得再 shift 队列（配对条目已被增量渲染消费）
+        const dupAlreadyRendered = _seenFingerprints.has(String(d.content || '').slice(0, 200))
+        // 登记历史/指纹：恢复轮询的增量历史重拉不会把这条回复再渲染一遍
+        _histKeys.add(msgHistKey('assistant', d.timestamp, d.content))
+        rememberAssistant(d.content)
+        if (dupAlreadyRendered) {
+          if (_streamEl) { _streamEl.remove(); _streamEl = null }
+          return
+        }
         const entry = _pendingRefs.shift()  // 队列非空才渲染引用气泡，内部按序 shift
         if (entry && entry.ref) {
           if (_streamEl) upgradeStreamToRefReply(_streamEl, entry.ref, d.content)
           else _renderEntry(entry, d.content)  // 空回复等无流式气泡时兜底
-        } else {
+        } else if (_streamEl) {
           patchStreamedComplete(_streamEl, d.content)
+        } else {
+          // 流式分片全部错过（面板关闭期间落库 / loadHistory↔SSE 间隙）、只收到
+          // -1 + 最终记录：没有气泡可补齐，直接按完整回复渲染，避免本次打开漏答案
+          addBubble('assistant', d.content)
         }
         _streamEl = null
         return
@@ -1289,7 +1511,8 @@ function connect() {
       // 该事件无 timestamp/content，去重 key 恒为常量，会误伤第 2 次起的设置。
       if (d.role === 'annotation-select') {
         applySetRef({ bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter,
-          chapterUid: d.chapterUid, chapterUidInt: d.chapterUidInt || 0, selectedText: d.selectedText })
+          chapterUid: d.chapterUid, chapterUidInt: d.chapterUidInt || 0, selectedText: d.selectedText,
+          sourceUrl: d.sourceUrl || '' })
         return
       }
 
@@ -1300,7 +1523,7 @@ function connect() {
           applySetRef({ bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter || '',
             chapterUid: '', chapterUidInt: d.chapterUidInt || 0,
             bookmarkRange: d.bookmarkRange || '', bookmarkId: d.bookmarkId || '',
-            selectedText: d.selectedText })
+            selectedText: d.selectedText, sourceUrl: d.sourceUrl || '' })
         }
         return
       }
@@ -1340,7 +1563,7 @@ function connect() {
         // 弹窗发送的标注要实时加入引用列表（标注走 annotation-select 事件，不产生消息气泡）
         if (d.bookId && d.selectedText) {
           addRecentAnn({ bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter,
-            chapterUid: d.chapterUid, selectedText: d.selectedText })
+            chapterUid: d.chapterUid, selectedText: d.selectedText, sourceUrl: d.sourceUrl || '' })
         }
       }
       // AI-010：不再处理 role='annotation'——标注一律是引用（走 annotation-select/annotation-sync），
@@ -1360,15 +1583,22 @@ function connect() {
 // 打开图 / 收到 stack-updated / 切书时从 receiver 重拉 /stack-hits 恢复高亮；
 // 栈收口清空后 hits 为空 → 图视图清除 hit 态高亮（栈结束即命中结束）。
 async function refreshStackHits() {
-  if (!graphView) return
-  // 2026-10：按有效上下文拉取（手动选书时按手动选中的书）
   const ctxBook = effectiveBookBase()
   if (!ctxBook) return
+  // 图视图不可用时：读书模式不拉；自由模式仍拉——窗体锁定条目（栈命中并入）不依赖图
+  if (!graphView && !_freeMode) return
+  let hits = null
   try {
     const r = await fetch(RECEIVER + '/stack-hits?book=' + encodeURIComponent(ctxBook))
     const d = await r.json()
-    graphView.applyStackHits(Array.isArray(d.hits) ? d.hits : [])
+    hits = Array.isArray(d.hits) ? d.hits : []
   } catch {}
+  // 自由模式（2026-10 用户定调）：同一份栈命中并入窗体为锁定条目（历史消息已提交的
+  // 引用，不可删，随栈自动更新）——图上栈命中高亮与窗体显示同源，保持两边一致。
+  // 栈收口/清空后 hits 为空 → 锁定条目清空、图按 applyStackHits 的空结果规则清除。
+  if (_freeMode && hits) setFreeStackCites(hits)
+  if (!graphView || !hits) return
+  graphView.applyStackHits(hits)
 }
 
 // ── 发送 ─────────────────────────────────────────────────────────────────────
@@ -1434,11 +1664,21 @@ async function submit() {
   }
 
   try {
-    await fetch(`${RECEIVER}/chat`, {
+    const resp = await fetch(`${RECEIVER}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
+    if (resp.ok) {
+      // 把这条提问注册为"历史已渲染"（_histKeys，key 与 /history 条目一致：
+      // role=user + receiver 落库 timestamp + 落库 content）：面板打开期间若有
+      // 回复恢复轮询在跑（此前有提问在 AI 回复中），增量历史重拉不会把刚发的
+      // 提问再渲染一遍
+      try {
+        const j = await resp.json()
+        if (j && j.timestamp) _histKeys.add(msgHistKey('user', j.timestamp, body.content))
+      } catch {}
+    }
   } catch (e) {
     console.warn('[CoRead] chat POST failed:', e.message)
     // 发送失败：这条消息没到 receiver、agent 不会回复。弹掉刚入队的自己的条目，
@@ -1707,6 +1947,45 @@ async function jumpToAnnotation(ann) {
   try {
     const base = baseBookId(ann.bookId)
     if (!base) { console.warn('[CoRead] jump: missing bookId'); return }
+
+    // 网页阅读源（AI-021，mia_* 书）：跳转 = 打开标注所在网页并滚动到原文。
+    // 目标 URL 带 #coread=<encodeURIComponent(selectedText)>，source-mia.js 加载后定位滚动；
+    // 已在同一页则直接发 coread-scroll 消息，不重载。↩ 返回记录原 tab（URL 级恢复）。
+    if (base.indexOf('mia_') === 0) {
+      const srcUrl = String(ann.sourceUrl || '')
+      if (!srcUrl || !ann.selectedText) {
+        showToast('该网页源引用缺少页面地址，无法跳转', true)
+        return
+      }
+      const baseUrl = srcUrl.split('#')[0]
+      const [cur] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+      const onSamePage = !!(cur && cur.url && cur.url.split('#')[0] === baseUrl)
+      if (onSamePage && cur.id) {
+        try {
+          await chrome.tabs.sendMessage(cur.id, { action: 'coread-scroll', text: ann.selectedText })
+        } catch {}
+        return
+      }
+      // 记住当前位置供「↩ 返回」（URL 级）
+      if (cur && cur.id && cur.url) {
+        jumpBackPos = { url: cur.url, tabId: cur.id, ts: Date.now() }
+        await persistJumpBack()
+        renderJumpBack()
+      }
+      const target = baseUrl + '#coread=' + encodeURIComponent(ann.selectedText)
+      // 复用同作品的已开 tab（按目录前缀），否则新开 tab（不劫持其他书页面）
+      const dirPrefix = new URL(baseUrl).pathname.replace(/[^/]*$/, '')
+      const mTabs = await chrome.tabs.query({ url: 'https://www.marxists.org/chinese/*' })
+      const mtab = mTabs.find(function (t) {
+        try { return t.url && new URL(t.url).pathname.indexOf(dirPrefix) === 0 } catch (e) { return false }
+      })
+      if (mtab) {
+        await chrome.tabs.update(mtab.id, { url: target, active: true })
+      } else {
+        await chrome.tabs.create({ url: target, active: true })
+      }
+      return
+    }
 
     // 多 tab 时跳到正确的那一个：优先正打开该书（或处于活动状态）的 weread tab，
     // 其次任意 weread tab，再无则新建。避免跳进多个 tab 里错误的那一个。
@@ -2037,14 +2316,64 @@ async function deleteRef(ann) {
   }
 }
 
+// ── 未回复提问的恢复轮询 ──────────────────────────────────────────────
+// loadHistory 末尾发现最新提问无回复时开启：每 2s 重拉一次 /history（loadHistory
+// 幂等，只补增量渲染）。目的：覆盖"回复恰在 loadHistory 抓取与 SSE 注册之间落库"
+// 的漏网窗口——那次回复既不在历史快照里、SSE 新连接（lastId=0）也不回放，不轮询
+// 就只能等下次重载才看到答案。回复落库（下一次扫描不再是 pending）即停。
+function scheduleRecoverPoll() {
+  clearTimeout(_recoverTimer)
+  if (_recoverTicks >= RECOVER_MAX_TICKS) return
+  _recoverTimer = setTimeout(async () => {
+    _recoverTicks++
+    await loadHistory()  // loadHistory 尾部会再次调用本函数决定续期或停止
+  }, 2000)
+}
+function stopRecoverPoll() {
+  clearTimeout(_recoverTimer)
+  _recoverTicks = 0
+}
+
+// 完整 assistant 记录的直接渲染（历史增量 / 轮询补渲染专用）。与 addBubble 的
+// 区别：绝不触碰正在进行的实时流气泡（_streamEl）与实时提交队列（_pendingRefs）——
+// 历史增量渲染可能发生在实时流中间（未回复提问的恢复轮询期间 AI 正在流式输出），
+// 若走 addBubble / _renderRefReply 会把历史里较早的回复错补到当前流式气泡上、
+// 或把实时队列里新提问的配对条目错误消费掉。引用条配对只接受本趟历史遍历内部
+// 的局部条目（histRef），绝不从全局队列取。指纹与实时流收尾渲染互斥。
+function renderCompleteAssistant(content, bookId, histRef) {
+  const fp = String(content || '').slice(0, 200)
+  if (_seenFingerprints.has(fp)) return  // 已被实时流/历史渲染过
+  _seenFingerprints.add(fp)
+  if (_seenFingerprints.size > 200) _seenFingerprints.clear()
+  if (histRef) {
+    _renderEntry({ ref: histRef }, content)  // 本趟局部配对：历史里的引用回复带引用条
+    return
+  }
+  hideThinking()
+  const msgs = document.getElementById('msgs')
+  const el = document.createElement('div')
+  el.className = 'msg-assistant'
+  if (bookId) el.dataset.book = baseBookId(bookId)
+  el.innerHTML = `<div class="bubble">${esc(content)}</div>`
+  msgs.appendChild(el)
+  applyBookFilter()
+  maybeAutoScroll(msgs)
+}
+
 async function loadHistory() {
+  // 遍历结束时若 pendingUser 仍非空 = 最新一条提问还没有回复落库（AI 仍在回复中，
+  // 或回复恰在「loadHistory 抓取」与「SSE 注册」之间落库、本趟没抓到）——据此恢复
+  // "思考中"状态并挂轮询补渲染（见函数尾部）。
+  let pendingUser = null
+  let loadFailed = false  // /history 抓取失败（接收端暂不可用）：轮询不能停，等恢复
   try {
     const items = await fetch(`${RECEIVER}/history`).then(r => r.json())
     // 引用列表已由 loadState() 从本地恢复；这里把历史里尚未加入的标注补进来
     // （例如侧栏关闭期间新增的标注）。addRecentAnn 内部按 bookId+selectedText 去重，
     // 已存在的引用不会重排/重新编号，select:false 也不会覆盖恢复的选中状态。
-    let histPendingRef = null
+    // 本函数幂等：_histKeys 记录已渲染条目，重复执行（恢复轮询）只补渲染增量。
     let histBook = ''  // AI-001：历史游走中当前的书上下文，assistant 回复继承
+    let histPendingRef = null  // 本趟局部单槽配对（[引用] 提问 → 本趟内到达的回复）
     for (const d of items) {
       if (d.role === 'graph-hit') continue  // AI-020：会意图命中事件不渲染为消息
       if (d.role === 'annotation') {
@@ -2058,22 +2387,40 @@ async function loadHistory() {
           addRecentAnn({ bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter,
             chapterUid: d.chapterUid, chapterUidInt: d.chapterUidInt || 0,
             bookmarkRange: d.bookmarkRange || '', bookmarkId: d.bookmarkId || '',
+            sourceUrl: d.sourceUrl || '',
             selectedText: d.selectedText }, { select: false })
         }
       }
       else if (d.role === 'user') {
         if (d.bookId) histBook = baseBookId(d.bookId)
+        pendingUser = { bookId: d.bookId || histBook, content: d.content }
+        // 幂等：已渲染过的提问（本会话发送/上一趟已渲染）直接跳过，不重复渲染
+        const key = msgHistKey('user', d._ts, d.content)
+        if (_histKeys.has(key)) continue
+        _histKeys.add(key)
         // 无 bookId 的旧自由消息：沿用当前书上下文做最佳归属（AI-001），
         // 不切断书签链——它是在该书讨论期间发出的
         addBubble('user', d.content, null, null, d.bookId || histBook)
-        // 解析 [引用] 标记，关联后续 assistant 回复
+        // 本趟局部配对（histPendingRef，单槽、仅 [引用] 提问）：它的回复在本趟
+        // 遍历里到达时带引用条渲染。绝不入 _pendingRefs（实时提交队列）——
+        // 历史里"永远没被回复"的旧提问（如被截断/agent 漏答）若占着实时队位，
+        // 会劫持之后实时到达的回复（把新回复渲染成旧书的引用气泡，按书过滤后
+        // 直接消失；自由模式提问的回复就是这么丢的）。
         const ref = parseRefFromContent(d.content)
-        if (ref) { histPendingRef = ref; if (d.bookId) histPendingRef.bookId = d.bookId }
+        if (ref) {
+          histPendingRef = ref
+          if (d.bookId) histPendingRef.bookId = d.bookId
+        }
       }
       else if (d.role === 'assistant') {
-        _pendingRefs = histPendingRef ? [{ ref: histPendingRef }] : []
+        pendingUser = null  // 此前的提问已有回复落库
+        const key = msgHistKey('assistant', d._ts, d.content)
+        if (_histKeys.has(key)) continue
+        _histKeys.add(key)
+        // 走 renderCompleteAssistant：历史渲染不碰实时流气泡与实时队列（见上），
+        // 引用条配对只用本趟局部 histPendingRef；指纹与实时流收尾渲染互斥
+        renderCompleteAssistant(d.content, histBook, histPendingRef)
         histPendingRef = null
-        addBubble('assistant', d.content, null, null, histBook)
       }
     }
     // 对账清理：划线同步来的引用（带 bookmarkRange）必然存在于 annotations.jsonl，
@@ -2099,7 +2446,7 @@ async function loadHistory() {
       selectedAnn = RECENT_ANNS[0]
       saveState()
     }
-  } catch {}
+  } catch { loadFailed = true }
   // 划线共读"设为当前引用"：无论 /history 是否成功都尝试应用待选引用。
   // 引用列表已由 loadState() 从本地恢复，待选引用若就在本地引用里可直接选中；
   // /history 失败（receiver 未启动）或标注尚未入库时保留待选标记，下次加载再试。
@@ -2109,6 +2456,23 @@ async function loadHistory() {
   // AI-011：/history 刷新了 RECENT_ANNS 后，若引用抽屉已开着（划线内容搜索可能
   // 在面板加载期间由实时消息提前打开），重渲染一次让搜索结果显示最新数据
   renderDrawer()
+
+  // ── 未回复提问的恢复（面板在 AI 回复期间被关闭再打开）────────────────
+  // 历史里最新一条是提问且无回复落库：恢复"思考中"气泡 + 挂恢复轮询，
+  // 补渲染间隙里落库的回复。该提问的实时回复到达时按既有流程渲染（流式分片
+  // 直接建气泡、最终记录走收尾分支；无配对条目时渲染普通气泡，绝不会因本趟
+  // 历史没有入队而丢回复）；回复落库 / 回复已实时渲染后轮询即停。
+  if (loadFailed) {
+    // 抓取失败：接收端暂不可用，回答无法送达，保住轮询等它恢复
+    scheduleRecoverPoll()
+  } else if (pendingUser) {
+    // 只有当思考气泡已被清掉、且本会话还没有回复开始渲染时才恢复它——
+    // 回复已在流式渲染中（气泡正打字）时不再弹一个"思考中"在它后面
+    if (!thinkingEl && !_recoverAnswerSeen) showThinking(pendingUser.bookId)
+    scheduleRecoverPoll()
+  } else {
+    stopRecoverPoll()
+  }
 }
 
 // ── 提问位置浮窗（AI-005）───────────────────────────────────────────────────
@@ -2438,7 +2802,12 @@ if (jumpListEl) {
 // 引用窗体（2026-09）：本次讨论的引用节点清单——语义命中（graph-hit）自动并入 +
 // 手动从拓扑图选取（双击）；条目悬浮可取消；随消息提交（body.refs），agent 收口
 // 以窗体清单为 cites 建 user 边。
-let _freeRefs = []          // [{ id, point }]：自由模式引用清单（去重）
+// 2026-10 用户定调：窗体 = 待提交（可删）+ 锁定（栈命中并入，不可删）——
+// 实时栈命中（/stack-hits，历史消息已提交的 cites）同时进图高亮与窗体锁定条目，
+// 二者同源保持一致；锁定条目只作显示，不随消息提交（agent 以 body.refs 为 cites，
+// 历史 cites 已由各自消息提交过，重复提交无意义）。
+let _freeRefs = []          // [{ id, point }]：待提交引用清单（手动选取 + 语义命中并入，可删）
+let _stackCiteIds = []      // 锁定引用 id[]：实时栈命中（历史消息已提交的 cites），随 /stack-hits 自动更新、不可删
 let _hitBook = ''           // 当前图视图命中显示的来源书（''=无）：按书隔离——切书/切换模式时清理
 let _graphPointCache = null // Map(id → point)：正式图节点缓存（窗体显示 / 命中并入取 point）
 async function ensureGraphPointCache() {
@@ -2457,15 +2826,23 @@ async function ensureGraphPointCache() {
 function pointOf(id) {
   return (_graphPointCache && _graphPointCache.get(id)) || String(id || '')
 }
-// 手动选取高亮同步：已选引用 → 图视图高亮其讨论脉络（横幅 + 隐藏/显示按钮，2026-09）
+// 窗体全集 id（显示与图高亮共用）：待提交在前，锁定栈命中去重在后
+function freeDisplayIds() {
+  const pendIds = _freeRefs.map((r) => r.id)
+  return [...pendIds, ..._stackCiteIds.filter((id) => !pendIds.includes(id))]
+}
+// 手动选取高亮同步：窗体全集（待提交 + 锁定）→ 图视图高亮其讨论脉络（横幅 +
+// 隐藏/显示按钮，2026-09）。取消完待提交项后锁定命中仍高亮——窗体与图一致。
 function syncPickHighlight() {
   if (!graphView) return
   graphView._cancelAutoDismiss()   // 用户手动操作：取消挂起的自动渐隐/轮播（图保持打开）
-  if (_freeRefs.length) {
-    graphView.applyHit(_freeRefs.map((r) => r.id), '', 'picked')
-  } else {
-    graphView.clearHighlight()
-  }
+  const ids = freeDisplayIds()
+  if (!ids.length) { graphView.clearHighlight(); return }
+  // 图未加载（如刚打开）时 noFit：物理收敛后由 _pendingChainFit 落位，避免对未稳定
+  // 的初始坐标播聚焦动画（与 applyStackHits 同一保护）
+  const needLoad = !graphView.graph
+  if (needLoad) graphView._pendingChainFit = true
+  graphView.applyHit(ids, '', 'picked', needLoad)
 }
 // 加入引用（语义命中 / 手动选取共用；id 去重）
 async function addFreeRef(id, point) {
@@ -2484,10 +2861,26 @@ function removeFreeRef(id) {
 }
 function clearFreeRefs() {
   _freeRefs = []
+  _stackCiteIds = []   // 锁定命中只在自由模式会话内显示；退出时一并清空
   renderFreeRefs()
   syncPickHighlight()
 }
-// 渲染自由模式引用窗体（仅自由模式激活时可见）
+// 栈命中并入窗体（锁定）：/stack-hits 返回当前实时栈里历史 user 消息已提交的 cites。
+// 调用点：refreshStackHits（自由模式；打开图 / 收到 stack-updated / 模式切换都会走到）。
+function setFreeStackCites(hits) {
+  if (!_freeMode) return   // fetch 异步返回时可能已退出自由模式
+  const ids = []
+  for (const id of hits || []) if (id && !ids.includes(id)) ids.push(id)
+  _stackCiteIds = ids
+  // 已提交进栈的待提交项升为锁定（从待提交移除，避免重复提交与重复显示）
+  if (ids.length) _freeRefs = _freeRefs.filter((r) => !ids.includes(r.id))
+  ensureGraphPointCache()
+    .then(() => { if (_freeMode) renderFreeRefs() })
+    .catch(() => { if (_freeMode) renderFreeRefs() })
+}
+// 渲染自由模式引用窗体（仅自由模式激活时可见）。结构：
+//   [锁定组]  📌 讨论命中（已提交，不可删）→ 🔒 条目（无 ✕，随栈自动更新）
+//   [待提交组] #n 条目（语义命中 / 手动选取，可 ✕ 取消，随消息提交 body.refs）
 function renderFreeRefs() {
   const box = document.getElementById('free-refs')
   if (!box) return
@@ -2496,25 +2889,37 @@ function renderFreeRefs() {
   const empty = document.getElementById('fr-empty')
   if (!list || !empty) return
   const label = document.getElementById('fr-label')
-  if (label) label.textContent = '🔗 本次引用' + (_freeRefs.length ? '（' + _freeRefs.length + '）' : '')
-  if (_freeRefs.length) {
-    empty.style.display = 'none'
-    list.innerHTML = _freeRefs.map((r, i) =>
-      '<div class="fr-item" title="' + esc(r.point) + '">' +
-        '<span class="fr-idx">#' + (i + 1) + '</span>' +
-        '<span class="fr-point">' + esc(r.point.length > 40 ? r.point.slice(0, 40) + '…' : r.point) + '</span>' +
-        '<button class="fr-x" data-idx="' + i + '" title="取消引用">✕</button>' +
-      '</div>').join('')
-    for (const b of list.querySelectorAll('.fr-x')) {
-      b.addEventListener('click', () => {
-        const r = _freeRefs[Number(b.dataset.idx)]
-        if (r) removeFreeRef(r.id)
-      })
+  const pendIds = _freeRefs.map((r) => r.id)
+  // 显示去重：同一节点既是锁定又是待提交时按待提交渲染（可取消本次重新引用）
+  const locked = _stackCiteIds.filter((id) => !pendIds.includes(id))
+  const total = _freeRefs.length + locked.length
+  if (label) label.textContent = '🔗 本次引用' + (total ? '（' + total + '）' : '')
+  let html = ''
+  if (locked.length) {
+    html += '<div class="fr-locked-hd" title="实时讨论栈命中的节点（历史消息已提交的引用），随讨论自动更新，不可删除">' +
+      '📌 讨论命中（已提交 · 不可删）</div>'
+    for (const id of locked) {
+      const point = pointOf(id)
+      html += '<div class="fr-item fr-locked" title="' + esc(point) + '">' +
+        '<span class="fr-idx">🔒</span>' +
+        '<span class="fr-point">' + esc(point.length > 40 ? point.slice(0, 40) + '…' : point) + '</span>' +
+      '</div>'
     }
-  } else {
-    list.innerHTML = ''
-    empty.style.display = ''
   }
+  html += _freeRefs.map((r, i) =>
+    '<div class="fr-item" title="' + esc(r.point) + '">' +
+      '<span class="fr-idx">#' + (i + 1) + '</span>' +
+      '<span class="fr-point">' + esc(r.point.length > 40 ? r.point.slice(0, 40) + '…' : r.point) + '</span>' +
+      '<button class="fr-x" data-idx="' + i + '" title="取消引用">✕</button>' +
+    '</div>').join('')
+  list.innerHTML = html
+  for (const b of list.querySelectorAll('.fr-x')) {
+    b.addEventListener('click', () => {
+      const r = _freeRefs[Number(b.dataset.idx)]
+      if (r) removeFreeRef(r.id)
+    })
+  }
+  empty.style.display = total ? 'none' : ''
 }
 // 打开拓扑图进入选取模式（手动选取引用）：正式图 + 单击看详情/双击选取
 function openPickMode() {
@@ -2541,19 +2946,37 @@ function toggleFreeMode() {
   if (_freeMode) {
     // 暂存读书模式的选中引用：进入自由模式会被当作"切书"取消选中，退出时原样恢复
     _savedReadingAnn = selectedAnn
+    // 快照进入前的实时检测上下文（_currentBook）：applyBookContext(FREE_KEY) 会
+    // 把它覆写成自由哨兵书，退出自由模式时靠这份快照恢复，不依赖可能陈旧/为空的
+    // _lastWereadContext（手动选书期间它常常不是"进入前正在读的书"）
+    _savedExitCtx = _currentBook ? { ..._currentBook } : null
     applyBookContext({ bookId: FREE_KEY, bookTitle: '自由模式' })
+    // _freeMode 已先置位，applyBookContext 里 ctxChanged 判定失效（进出前后
+    // effectiveBookBase 都是 FREE_KEY），onEffectiveContextChange 被跳过——读书模式
+    // 的「当前引用」卡片残留 .on 不隐藏，与「本次引用」窗体叠成两栏（2026-10 修复）。
+    // 这里与切书/手动选书一致，强制整链刷新：隐藏当前引用卡片、消息区/引用抽屉按
+    // 哨兵书隔离、清掉跨上下文命中高亮并取消选中（已暂存，退出时恢复）。
+    onEffectiveContextChange()
     renderFreeRefs()
     showToast('已进入自由模式：对话为临时测试，不固化进正式会意图')
   } else {
-    // 退出：先恢复读书上下文——引用窗体由 applyBookContext → renderCurrentRef 重新显示；
-    // 再清理自由态。顺序不能反：图视图同步异常会中断后面的恢复，导致引用窗体不再出现
-    if (_lastWereadContext) {
-      applyBookContext({ bookId: _lastWereadContext.base, bookTitle: _lastWereadContext.bookTitle })
-    } else {
-      applyBookContext({ bookId: '' })
-    }
-    // 恢复后立即向活动 tab 查询真实阅读上下文：_lastWereadContext 是进入自由模式前的
-    // 快照，自由模式期间可能已切书/离开阅读页，快照会过期（2026-09 修复）
+    // 退出自由模式：恢复到进入前的上下文。不用 applyBookContext 恢复——它带
+    // 「检测到真实阅读即退出手动选书」规则，而 _lastWereadContext 只是历史快照
+    //（手动选书期间常常不是"进入前正在读的书"），用它恢复会把手动选书悄悄清掉；
+    // 且恢复目标与退出前有效上下文相同时（手动书 M → 自由 → M，进出前后
+    // effectiveBookBase 都是 M）applyBookContext 的 ctxChanged 判定为 false，
+    // 不会重刷消息过滤——消息区停留在自由模式内容上（2026-11 用户反馈）。
+    // 实时阅读检测由随后的 refreshCurrentBook 重做：真的在读书才自动退手动选书。
+    _currentBook = _savedExitCtx || null  // 进入自由模式前的实时检测快照
+    _savedExitCtx = null
+    onEffectiveContextChange()  // 无条件整链刷新：过滤切回手动书/快照书、清跨上下文命中
+    renderCurrentBook()
+    renderNoBookView()
+    renderManualBanner()
+    // 消息区由 renderNoBookView 恢复可见后滚到底部（无有效上下文时 #msgs 隐藏，跳过）
+    if (effectiveBookBase()) scrollMsgsToBottom()
+    // 恢复后立即向活动 tab 查询真实阅读上下文：快照是进入自由模式前的，期间可能
+    // 已切书/离开阅读页，会过期（2026-09 修复）
     refreshCurrentBook()
     // 恢复进入自由模式前暂存的选中引用（引用仍在列表里才重新选中）
     if (_savedReadingAnn) {
@@ -2647,8 +3070,53 @@ loadState()
   .then(applyPendingRefSearch)
   .then(connect)
   .then(() => refreshCurrentBook())
-  .then(() => { renderNoBookView(); renderManualBanner() })  // 2026-10：无书默认界面/手动选书横幅初始态
+  .then(() => {
+    renderNoBookView()
+    renderManualBanner()
+    // 初始化加载完对话后滚到底部：loadHistory 历史回放期间 maybeAutoScroll 只在
+    // 接近底部时跟随，长对话会停在最上方；此前靠 refreshCurrentBook 的上下文切换
+    // 触发滚动，但手动选书恢复等「上下文未变化」场景不会触发。初始化是明确的
+    // 「打开对话」动作，直接滚到最新消息（横幅渲染后再滚，避免其高度挤压错位）。
+    const msgs = document.getElementById('msgs')
+    if (msgs) msgs.scrollTop = msgs.scrollHeight
+  })
 loadJumpBack()  // AI-006：面板重开后恢复「↩ 返回」能力（有未过期的跳转记录时）
 
 // 活动 tab 变化时刷新当前书（AI-001）：用户在多本书 / 多个微信读书 tab 间切换
-try { chrome.tabs.onActivated.addListener(() => refreshCurrentBook()) } catch {}
+try {
+  chrome.tabs.onActivated.addListener(function () { refreshCurrentBook(); refreshWebBindEntry() })
+  // 同一 tab 内导航（文库章节间跳转）也刷新网页绑定入口
+  chrome.tabs.onUpdated.addListener(function (tabId, info) {
+    if (info.url || info.status === 'complete') refreshWebBindEntry()
+  })
+} catch {}
+
+// AI-021：『绑定当前网页页面到书…』按钮 —— 唤起页面上的绑定对话框
+document.getElementById('nb-bind-btn')?.addEventListener('click', async () => {
+  let tab = null
+  try {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+    tab = tabs && tabs[0]
+  } catch (e) {}
+  if (!tab || !tab.id) return
+  let ok = false
+  try {
+    const r = await chrome.tabs.sendMessage(tab.id, { action: 'coreadOpenBindDialog' }, { frameId: 0 }).catch(() => null)
+    if (r && r.ok) ok = true
+  } catch (e) {}
+  if (!ok) {
+    try {
+      const resps = await chrome.tabs.sendMessage(tab.id, { action: 'coreadOpenBindDialog' })
+      const arr = Array.isArray(resps) ? resps : []
+      ok = arr.some(function (x) { return x && x.ok })
+    } catch (e) {}
+  }
+  if (!ok) showToast('无法唤起绑定框：请刷新文库页面后重试', true)
+})
+
+// AI-021：绑定/解除后（页面或其它上下文写入 miaBindings）刷新入口
+try {
+  chrome.storage.onChanged.addListener(function (changes, area) {
+    if (area === 'local' && changes && changes.miaBindings) refreshWebBindEntry()
+  })
+} catch {}

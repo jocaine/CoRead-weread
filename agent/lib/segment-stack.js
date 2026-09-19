@@ -64,7 +64,7 @@ export function buildSegmentSamePrompt(message, group) {
     formatStackContext(group.slice(0, 1)),
     '',
     `当前组最近 ${Math.min(group.length, STACK_CONTEXT_ROUNDS)} 轮：`,
-    formatStackContext(group),
+    formatStackContext(group, STACK_CONTEXT_ROUNDS),
     '',
     `新消息："${userNote}"`,
   ]

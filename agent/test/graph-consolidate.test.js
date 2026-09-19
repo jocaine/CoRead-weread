@@ -6,8 +6,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { createGraph, addNode, findNode, addEdge } from '../lib/knowledge-graph.js'
-import { consolidateDiscussion, addDerivedEdge, addCitationEdges, nextNodeId, groupExcerpts, cloneGraph } from '../lib/graph-consolidate.js'
+import { createGraph, addNode, findNode, addEdge, contextOf } from '../lib/knowledge-graph.js'
+import { consolidateDiscussion, addDerivedEdge, addCitationEdges, pruneRedundantCitationEdges, nextNodeId, groupExcerpts, cloneGraph } from '../lib/graph-consolidate.js'
 
 // 假 LLM：按队列吐预设文本（与 knowledge-graph 测试同款）
 function makeLLM(results) {
@@ -70,6 +70,131 @@ test('固化：derived 边（跳过缺失/同节点）；user 引用边（from �
   assert.equal(addCitationEdges(g, ['n_a', 'n_a', 'n_b', 'n_不存在'], 'n_b'), 1, '重复引用同节点只建一条（去重）')
   assert.equal(addCitationEdges(g, ['n_a'], 'n_b'), 0, '同 pair 已存在则跳过')
   assert.equal(g.edges.filter((e) => e.kind === 'user').length, 1)
+})
+
+// ── user 边：同脉络多命中折叠（2026-09 用户定调：一个节点命中同一条脉络多个节点，
+//    只按脉络上最后（recent 侧）的一个命中节点建边；只在本次命中列表内折叠，
+//    绝不越过命中列表接到脉络更晚的节点——脉络自身的边原样保留）──────────────
+
+test('user 边：同脉络多命中只按最后命中节点建边（收口分段 A 场景，不越过命中列表接 c）', () => {
+  const g = createGraph()
+  for (const id of ['n_a', 'n_b', 'n_c', 'n_A', 'n_B']) addNode(g, { id, point: id })
+  addEdge(g, { from: 'n_a', to: 'n_b', kind: 'derived' })  // 脉络 M：a→b→c
+  addEdge(g, { from: 'n_b', to: 'n_c', kind: 'derived' })
+  // 收口分段 A 命中脉络 M 上的 a、b → 只按最后命中节点 b 建边（b→A）
+  assert.equal(addCitationEdges(g, ['n_a', 'n_b'], 'n_A'), 1)
+  assert.equal(g.edges.filter((e) => e.to === 'n_A').length, 1)
+  assert.equal(g.edges.some((e) => e.from === 'n_b' && e.to === 'n_A'), true, '只建最后命中节点 b 的边')
+  assert.equal(g.edges.some((e) => e.from === 'n_a' && e.to === 'n_A'), false, '较早命中节点 a 被折叠（内容已被 b 包含）')
+  assert.equal(g.edges.some((e) => e.from === 'n_c' && e.to === 'n_A'), false, '绝不越过命中列表把脉络更晚的 c 直接接 A')
+  // 同栈另一段 B 命中 c → B 自己建 c→B（互不串扰；c 不由 A 代接）
+  assert.equal(addCitationEdges(g, ['n_c'], 'n_B'), 1)
+  assert.equal(g.edges.some((e) => e.from === 'n_c' && e.to === 'n_B'), true)
+  // 脉络自身边（a→b、b→c）原样保留
+  assert.equal(g.edges.filter((e) => e.kind === 'derived').length, 2)
+})
+
+test('user 边：命中整条脉络只建一条（最晚节点）；跨脉络互不可达的命中各自建边', () => {
+  const g = createGraph()
+  for (const id of ['n_a', 'n_b', 'n_c', 'n_d', 'n_e', 'n_x', 'n_y']) addNode(g, { id, point: id })
+  addEdge(g, { from: 'n_a', to: 'n_b' })  // 脉络一（user 边成链）：a→b→c
+  addEdge(g, { from: 'n_b', to: 'n_c' })
+  addEdge(g, { from: 'n_d', to: 'n_e', kind: 'derived' })  // 脉络二：d→e
+  // 命中整条脉络 a、b、c → 只建最后节点 c 的一条边
+  assert.equal(addCitationEdges(g, ['n_a', 'n_b', 'n_c'], 'n_x'), 1)
+  assert.equal(g.edges.some((e) => e.from === 'n_c' && e.to === 'n_x'), true)
+  assert.equal(g.edges.filter((e) => e.to === 'n_x').length, 1)
+  // 跨两条脉络命中（b 在脉络一、e 在脉络二，互不可达、内容互不包含）→ 各建一条
+  assert.equal(addCitationEdges(g, ['n_b', 'n_e'], 'n_y'), 2)
+  assert.equal(g.edges.some((e) => e.from === 'n_b' && e.to === 'n_y'), true)
+  assert.equal(g.edges.some((e) => e.from === 'n_e' && e.to === 'n_y'), true)
+})
+
+test('user 边：脉络祖先关系隔未命中中间节点也折叠；分支互不可达的命中不折叠', () => {
+  const g = createGraph()
+  for (const id of ['n_a', 'n_x', 'n_c', 'n_m', 'n_n', 'n_t']) addNode(g, { id, point: id })
+  addEdge(g, { from: 'n_a', to: 'n_x' })  // 脉络：a→x→c（x 未被命中）
+  addEdge(g, { from: 'n_x', to: 'n_c' })
+  addEdge(g, { from: 'n_a', to: 'n_m' })  // a 的另一分支：m→n
+  addEdge(g, { from: 'n_m', to: 'n_n' })
+  // 命中 a、c（中间节点 x 未命中）：a 经 x 仍可达 c → 折叠成 c 一条边
+  assert.equal(addCitationEdges(g, ['n_a', 'n_c'], 'n_t'), 1)
+  assert.equal(g.edges.some((e) => e.from === 'n_c' && e.to === 'n_t'), true)
+  assert.equal(g.edges.some((e) => e.from === 'n_a' && e.to === 'n_t'), false)
+  // 命中 a、x、n：a 是 x 的祖先被折叠（内容被 x 包含）；n 与 x 互不可达 → 两条边
+  const before = g.edges.length
+  assert.equal(addCitationEdges(g, ['n_a', 'n_x', 'n_n'], 'n_t'), 2)
+  assert.equal(g.edges.length - before, 2)
+  assert.equal(g.edges.some((e) => e.from === 'n_x' && e.to === 'n_t'), true)
+  assert.equal(g.edges.some((e) => e.from === 'n_n' && e.to === 'n_t'), true)
+  assert.equal(g.edges.some((e) => e.from === 'n_a' && e.to === 'n_t'), false, 'a 的内容已被 x 包含，不重复建边')
+})
+
+// ── 冗余 user 边清理（2026-09 用户定调：段间 derived 链覆盖上游命中 → 该 user 边
+//    与 b→A+A→B 效果相同，删除；derived 边与其它节点一律不动）──────────────
+
+test('冗余清理：脉络 a→c→b（c 在 b 上游），A 命中 {a,b}→b→A，B 命中 c 且 A→B 衍生成立 → 删 c→B', () => {
+  const g = createGraph()
+  for (const id of ['n_a', 'n_c', 'n_b', 'n_A', 'n_B']) addNode(g, { id, point: id })
+  addEdge(g, { from: 'n_a', to: 'n_c', kind: 'derived' })  // 脉络 M：a→c→b
+  addEdge(g, { from: 'n_c', to: 'n_b', kind: 'derived' })
+  // 收口分段：A 命中 a、b（折叠只建最后命中节点 b）；B 命中 c
+  assert.equal(addCitationEdges(g, ['n_a', 'n_b'], 'n_A'), 1)
+  assert.equal(g.edges.some((e) => e.from === 'n_b' && e.to === 'n_A'), true)
+  assert.equal(addCitationEdges(g, ['n_c'], 'n_B'), 1)
+  assert.equal(g.edges.some((e) => e.from === 'n_c' && e.to === 'n_B'), true, '先建 c→B（此时 A→B 尚未判定）')
+  addDerivedEdge(g, 'n_A', 'n_B')  // 段间衍生判定成立
+  // 清理：c 已能沿 c→b→A→B 到达 B → c→B 冗余
+  assert.equal(pruneRedundantCitationEdges(g, ['n_A', 'n_B']), 1)
+  assert.equal(g.edges.some((e) => e.from === 'n_c' && e.to === 'n_B'), false, '删 c→B（不建，效果由 b→A+A→B 达成）')
+  assert.equal(g.edges.some((e) => e.from === 'n_b' && e.to === 'n_A'), true, 'b→A 保留')
+  assert.equal(g.edges.some((e) => e.from === 'n_A' && e.to === 'n_B' && e.kind === 'derived'), true, 'derived A→B 保留')
+  assert.equal(g.edges.filter((e) => e.kind === 'derived').length, 3, '脉络自身边 + derived A→B 原样')
+  // 效果相同：清理前后 B 的 L3 上下文（root→recent 路径并集）逐 id 一致
+  const before = contextOf(g, ['n_B']).map((n) => n.id)
+  g.edges.push({ from: 'n_c', to: 'n_B', kind: 'user' })  // 模拟不清理的旧状态
+  const after = contextOf(g, ['n_B']).map((n) => n.id)
+  assert.deepEqual(before, after, '删 c→B 后上下文不变（内容已被 A→B 链覆盖）')
+})
+
+test('冗余清理：脉络 a→b→c（c 在 b 下游）时 c→B 不删（A→B 覆盖不到 c 的内容）', () => {
+  const g = createGraph()
+  for (const id of ['n_a', 'n_b', 'n_c', 'n_A', 'n_B']) addNode(g, { id, point: id })
+  addEdge(g, { from: 'n_a', to: 'n_b', kind: 'derived' })  // 脉络 M：a→b→c
+  addEdge(g, { from: 'n_b', to: 'n_c', kind: 'derived' })
+  addCitationEdges(g, ['n_a', 'n_b'], 'n_A')
+  addCitationEdges(g, ['n_c'], 'n_B')
+  addDerivedEdge(g, 'n_A', 'n_B')
+  assert.equal(pruneRedundantCitationEdges(g, ['n_A', 'n_B']), 0, 'c 无替代路径到达 B，c→B 必须保留')
+  assert.equal(g.edges.some((e) => e.from === 'n_c' && e.to === 'n_B'), true, '下游命中 c→B 不删（上轮定调）')
+})
+
+test('冗余清理：段间衍生判定不成立（无 A→B）时上游命中边不删（宁漏勿删）', () => {
+  const g = createGraph()
+  for (const id of ['n_a', 'n_c', 'n_b', 'n_A', 'n_B']) addNode(g, { id, point: id })
+  addEdge(g, { from: 'n_a', to: 'n_c', kind: 'derived' })  // 脉络 M：a→c→b
+  addEdge(g, { from: 'n_c', to: 'n_b', kind: 'derived' })
+  addCitationEdges(g, ['n_a', 'n_b'], 'n_A')
+  addCitationEdges(g, ['n_c'], 'n_B')
+  // 无 derived A→B（衍生判定不成立/失败）：c 到 B 只有 c→B 一条路 → 不删
+  assert.equal(pruneRedundantCitationEdges(g, ['n_A', 'n_B']), 0)
+  assert.equal(g.edges.some((e) => e.from === 'n_c' && e.to === 'n_B'), true)
+  assert.equal(g.edges.some((e) => e.from === 'n_b' && e.to === 'n_A'), true)
+})
+
+test('冗余清理：只处理指定新节点，老节点入边与 derived 边不动', () => {
+  const g = createGraph()
+  for (const id of ['n_x', 'n_y', 'n_old', 'n_new']) addNode(g, { id, point: id })
+  addEdge(g, { from: 'n_x', to: 'n_y', kind: 'derived' })  // 脉络：x→y
+  addEdge(g, { from: 'n_x', to: 'n_old' })                 // 老节点既有 user 边
+  addCitationEdges(g, ['n_y'], 'n_new')                   // 新节点入边
+  addDerivedEdge(g, 'n_old', 'n_new')
+  assert.equal(pruneRedundantCitationEdges(g, ['n_new']), 0, 'n_new 无冗余（n_y 到 n_new 无替代路径）')
+  assert.equal(g.edges.some((e) => e.from === 'n_y' && e.to === 'n_new'), true)
+  assert.equal(g.edges.some((e) => e.from === 'n_x' && e.to === 'n_old'), true, '老节点入边不受清理影响')
+  assert.equal(pruneRedundantCitationEdges(g, ['n_old']), 0, '把老节点当目标也不删（其边是历史事实）')
+  assert.equal(g.edges.some((e) => e.from === 'n_x' && e.to === 'n_old'), true)
+  assert.equal(pruneRedundantCitationEdges(g, []), 0, '空目标列表 → 0')
 })
 
 test('固化：缺 question / 未注入 callLLM 抛 TypeError', async () => {

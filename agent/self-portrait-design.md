@@ -61,6 +61,8 @@
 
 输出协议：`{"situation":["..."],"events":["..."],"thoughts":["..."],"belief":["..."]}`，都为空 = 无新信息，零写入。
 
+**prompt 顺序（2026-10 缓存定调：材料在前、消息在后）**：组装顺序 = 指令 → 现有画像（稳定材料，只在画像更新时变化）→ 对话脉络 → 划线 → 用户消息（最后）。与判同一性/引用解析同款模式——稳定材料紧跟指令，静态前缀从"仅指令"扩到"指令 + 现有画像"（实测 ~900 → ~2.8K token 可命中段，每轮省 ~2K miss）；可变材料与判定对象全部沉到尾部。画像追加条目会让 existing 尾部顺移 → 当条消息破前缀、下一条恢复（低频，可接受）。
+
 总结原则（钉死）：
 
 - **归纳成简洁陈述句**（一句一事），画像语言，不抄用户原话、不流水账。
@@ -88,15 +90,14 @@ self-portrait.md（新路径）      有新信息才追加条目；旧条目不�
 - profile.md = 用户的长期画像（合并式重写，头部上下文）——不变。
 - self-portrait.md = 用户情况与观念画像（总结式追加维护，不进头部）——新增。
 - soul.md = AI 自己的立场与相处方式——不变。
-- 话题库 = 用户追的问题——不变。
+- 会意图 = 用户追的问题（知识点节点 + 引用边）——不变。
 
 ## 8. 实现落点（已实现）
 
-- `agent/lib/self-portrait.js`：judgeSelfPortrait（判 + 总结），输出 situation/belief；callLLM 注入；重试/解析容错与话题库同款。
+- `agent/lib/self-portrait.js`：judgeSelfPortrait（判 + 总结），输出 situation/belief；callLLM 注入；重试/解析容错与判专题化模块（lib/topicize.js）同款。
 - `agent/scripts/backfill-self-portrait.mjs`：全量历史数据（session_journal + chat_input）→ 逐条判定（带现有画像去重参照）→ 生成 self-portrait.md。
 - `agent/index.js`：driveSelfPortrait 后台维护（不阻塞主回复，shutdown 等待）；两处消息入口挂接。
 
 ## 9. 待定项
 
 - 条目合并与精炼：条目增多后是否定期压缩合并（注意：合并不等于 profile 模式，可低频整理）。
-- 观念与话题库的界线：阅读讨论中的立场既进 belief 也影响话题库判挂钩，两者关系待观察。

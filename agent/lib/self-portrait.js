@@ -73,19 +73,25 @@ export function buildSelfPortraitPrompt(input, existing, context) {
   if (userNote.length > MAX_NOTE_CHARS) {
     userNote = userNote.slice(0, MAX_NOTE_CHARS) + '\n\n……（消息过长，已截断；以截断部分为准判定与总结）'
   }
-  const lines = [buildSelfPortraitInstruction(), '', `用户消息："${userNote}"`]
-  const sel = String(input.selected?.text || '').trim()
-  if (sel) lines.push('', `划线内容（仅用于解析消息中的指代）："${sel}"`)
+  // 2026-10 缓存定调（材料在前、消息在后，与判同一性/引用解析同款）：
+  // 稳定材料（现有画像——只在画像更新时变化）紧跟指令，静态前缀从"仅指令"扩到
+  // "指令 + 现有画像"（实测 ~900 → ~2.8K token 可命中段）；可变部分（对话脉络/
+  // 划线/用户消息）全部沉到尾部——用户消息放最后（判定对象在后）。
+  // 画像追加条目会让 existing 尾部顺移 → 当条消息破前缀，下一条恢复（低频，可接受）。
+  const lines = [buildSelfPortraitInstruction(), '']
+  const ex = String(existing || '').trim()
+  if (ex) {
+    lines.push('现有画像（仅作去重参照，不要重复输出已覆盖的信息）：')
+    lines.push(ex.length > MAX_EXISTING_CHARS ? ex.slice(-MAX_EXISTING_CHARS) : ex)
+  }
   const ctx = String(context || '').trim()
   if (ctx) {
     lines.push('', '对话脉络（该消息前后的 AI 回复，仅用于理解事件来龙去脉与用户动机）：')
     lines.push(ctx.length > MAX_CONTEXT_CHARS ? ctx.slice(-MAX_CONTEXT_CHARS) : ctx)
   }
-  const ex = String(existing || '').trim()
-  if (ex) {
-    lines.push('', '现有画像（仅作去重参照，不要重复输出已覆盖的信息）：')
-    lines.push(ex.length > MAX_EXISTING_CHARS ? ex.slice(-MAX_EXISTING_CHARS) : ex)
-  }
+  const sel = String(input.selected?.text || '').trim()
+  if (sel) lines.push('', `划线内容（仅用于解析消息中的指代）："${sel}"`)
+  lines.push('', `用户消息："${userNote}"`)
   return lines.join('\n')
 }
 

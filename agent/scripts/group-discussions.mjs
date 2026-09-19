@@ -29,7 +29,6 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { judgeSameProblem, buildSameProblemInstruction } from '../lib/topic-stack.js'
 import { consolidateThreadQuestion, buildQuestionInstruction } from '../lib/thread-question.js'
-import { judgeDerivation } from '../lib/knowledge-graph.js'
 import { segmentStack } from '../lib/segment-stack.js'
 import { parseMessage, loadReplyByTs } from '../lib/chat-input.js'
 import { reconstructTopicized } from '../lib/results.js'
@@ -177,24 +176,15 @@ async function closeStack(stack, { open = false } = {}) {
     }
     threads.push(thread)
   }
-  // derived 边：**同栈相邻段之间**判定衍生（后一段是否从前一段思考中衍生，无显式
-  // 引用句式也算）。不比对上一个收口专题讨论（2026-08-28 定调）。
+  // derived 边：**同栈相邻段之间无条件建立**（2026-10 用户定调：去掉段间衍生 LLM
+  // 判定——同栈收口弹出的相邻段是思维连续链的机械产物；不替用户思考，user 边仍只来自
+  // 用户显式引用）。不比对上一个收口专题讨论（2026-08-28 定调）。
   for (let i = 1; i < threads.length; i++) {
     const prev = threads[i - 1]
     const next = threads[i]
     if (!prev.question || !next.question) continue
-    try {
-      const r = await judgeDerivation(
-        { prev: { question: prev.question, excerpts: prev.excerpts }, next: { question: next.question, excerpts: next.excerpts } },
-        { callLLM, maxTokens: 1024, attempts: 3, log: () => {} },
-      )
-      if (r.linked) {
-        derivs.push({ from: prev.id, to: next.id, reason: r.reason })
-        console.log(`    └─ 衍生关联（同栈段间）：${prev.id} → ${next.id}（${r.reason.slice(0, 40)}…）`)
-      }
-    } catch (e) {
-      console.log(`    ⚠️ 段间衍生失败（${prev.id} → ${next.id}）: ${e.message.slice(0, 60)}`)
-    }
+    derivs.push({ from: prev.id, to: next.id })
+    console.log(`    └─ derived（同栈相邻段，无条件）：${prev.id} → ${next.id}`)
   }
   // 无内核轮次不做过滤处理（跟随并入当前组，2026-08-28 定调），无滤掉统计
   return { threads, derivations: derivs }
@@ -205,7 +195,7 @@ const ignored = []
 const errors = []
 const sameById = new Map()  // 本次新判的同一性（写回用），与缓存合并
 const newlyQuestion = new Map()  // 本次新归纳的讨论问题（写回用），与缓存合并
-const derivations = []  // 衍生关联（收口时判定）：{ from: d_id, to: d_id, reason }——对话连续性的拓扑边
+const derivations = []  // derived 边（2026-10 起同栈相邻段无条件建立）：{ from: d_id, to: d_id }——对话连续性的拓扑边
 let questionFailures = 0  // 归纳讨论问题失败的讨论组数
 let stack = []
 let curBookKey = null  // 当前消息所属书（换书 → 收口当前栈，跨书不判同一性/衍生）
@@ -316,5 +306,5 @@ for (const d of discussions) {
   const briefs = d.excerpts.map((e) => e.q.length > 22 ? e.q.slice(0, 22) + '…' : e.q).join(' / ')
   console.log(`  ${d.id}${d.open ? ' [进行中]' : ''} [章${d.chapter}] (${d.excerpts.length}条) ${briefs}`)
 }
-for (const dv of derivations) console.log(`  └─ ${dv.from} → ${dv.to}（${dv.reason.slice(0, 50)}…）`)
+for (const dv of derivations) console.log(`  └─ derived：${dv.from} → ${dv.to}`)
 console.log(`\n结果已写回: ${path.relative(process.cwd(), RES)}`)

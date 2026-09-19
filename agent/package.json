@@ -12,9 +12,9 @@
     "smoke:stack": "node --env-file-if-exists=.env scripts/smoke-stack.mjs",
     "backfill:portrait": "node --env-file-if-exists=.env scripts/backfill-self-portrait.mjs",
     "judge:real": "node --env-file-if-exists=.env scripts/judge-real.mjs",
-    "motif:derive": "node scripts/derive-motifs.mjs",
     "graph:derive": "node scripts/derive-knowledge-graph.mjs",
     "graph:real": "node --env-file-if-exists=.env scripts/derive-knowledge-graph.mjs --real",
+    "graph:dedupe": "node scripts/dedupe-graph-edges.mjs",
     "extract:real": "node --env-file-if-exists=.env scripts/extract-real-cases.mjs",
     "group:discussions": "node --env-file-if-exists=.env scripts/group-discussions.mjs"
   }

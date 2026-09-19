@@ -17,6 +17,7 @@ const PORT = parseInt(process.env.COREAD_PORT || '7239')
 const BOOKS_DIR = path.join(__dirname, 'books')
 const INBOX_DIR = path.join(__dirname, 'inbox')
 const CHAT_OUTPUT = path.join(INBOX_DIR, 'chat_output.jsonl')
+const AGENT_STATE_FILE = path.join(INBOX_DIR, 'agent_state.jsonl')  // agent 处理步骤（2026-10：侧栏"正在…"文案）
 const DEBUG_LOG = path.join(INBOX_DIR, 'debug.jsonl')
 const TOPIC_STACK_FILE = path.join(__dirname, '..', 'agent', 'topic_stack.json')  // 实时讨论栈（/stack-hits 与 stack-updated 轮询的数据源，2026-09）
 
@@ -49,6 +50,10 @@ function pushSSE(type, data) {
 let chatOutputLastLine = (() => {
   try { return fs.readFileSync(CHAT_OUTPUT, 'utf8').trim().split('\n').filter(Boolean).length } catch { return 0 }
 })()
+// agent 处理步骤游标（agent_state.jsonl）：跳过已有内容，只推送新步骤（2026-10）
+let agentStateLastLine = (() => {
+  try { return fs.readFileSync(AGENT_STATE_FILE, 'utf8').trim().split('\n').filter(Boolean).length } catch { return 0 }
+})()
 
 // 每 100ms 轮询 chat_output.jsonl，有新行就推送给所有 SSE 客户端。
 // 流式中间记录（_stream）也原样推送，侧栏据此渲染打字机效果；/history 仍过滤它们。
@@ -63,6 +68,19 @@ setInterval(() => {
     // 侧栏已通过 /history 加载历史；重复再由侧栏 _seenMsgs 去重。
     for (const line of fresh) {
       try { pushSSE('message', JSON.parse(line)) } catch {}
+    }
+  } catch {}
+  // agent 处理步骤（agent_state.jsonl）→ SSE type=agent-state：侧栏思考气泡按步骤换文案。
+  // agent 端裁剪重写会让行数回缩 → 游标复位（旧行不回放——状态是瞬态的，只关心当轮）
+  try {
+    const sl = fs.readFileSync(AGENT_STATE_FILE, 'utf8').trim().split('\n').filter(Boolean)
+    if (sl.length < agentStateLastLine) agentStateLastLine = sl.length
+    if (sl.length > agentStateLastLine) {
+      const freshState = sl.slice(agentStateLastLine)
+      agentStateLastLine = sl.length
+      for (const line of freshState) {
+        try { pushSSE('agent-state', JSON.parse(line)) } catch {}
+      }
     }
   } catch {}
 }, 100)
@@ -125,8 +143,19 @@ function sanitizePathPart(id) {
 // GET 数据接口只允许扩展来源调用：阻止任意网页触发本地端扫描/建目录/读数据。
 // 扩展页面因 host_permissions 绕过 CORS，请求不带 Origin 头（实测 Sec-Fetch-Mode:cors / Sec-Fetch-Dest:empty）。
 // 任意网页的 fetch 必带 Origin（白名单拦）；<img>/导航/脚本客户端(curl) 的 Sec-Fetch 值不同（no-cors/image/navigate/缺失）。
+// 网页阅读源（AI-021 网页源适配器）来源白名单：只认精确/子域匹配的 host，
+// 避免伪造相近域名。新增阅读源站点在这里登记（同时需 manifest 匹配 + 适配器 SITES）。
+function isPageSourceOrigin(origin) {
+  try {
+    const host = String(new URL(String(origin || '')).hostname).toLowerCase()
+    return host === 'marxists.org' || host.endsWith('.marxists.org')
+      || host === 'bilibili.com' || host === 'www.bilibili.com'
+  } catch { return false }
+}
+
 function originAllowed(origin, req) {
   if (String(origin || '').includes('weread.qq.com')
+    || isPageSourceOrigin(origin)
     || String(origin || '').startsWith('chrome-extension://')) return true
   // 无 Origin：仅放行扩展页/内容脚本发起的浏览器请求指纹
   if (!origin) {
@@ -246,6 +275,7 @@ const server = http.createServer(async (req, res) => {
         bookId: d.bookId, bookTitle: d.bookTitle,
         chapter: d.chapter || '', chapterUid: d.chapterUid || '', chapterUidInt: d.chapterUidInt || 0,
         bookmarkRange: d.bookmarkRange || '', bookmarkId: d.bookmarkId || '',
+        sourceUrl: d.sourceUrl || '',
         _ts: d.receivedAt || d.timestamp * 1000 })
     }
     const chatItems = []
@@ -451,6 +481,7 @@ const server = http.createServer(async (req, res) => {
               bookmarkRange: d.bookmarkRange || '',
               bookmarkId: d.bookmarkId || '',
               userNote: d.userNote || '',
+              sourceUrl: d.sourceUrl || '',
               timestamp: d.receivedAt || (d.timestamp ? d.timestamp * 1000 : 0),
             })
           }
@@ -490,9 +521,10 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  // POST 只允许 weread.qq.com 和 扩展 sidebar（chrome-extension://）
+  // POST 只允许 weread.qq.com、网页阅读源（marxists.org / bilibili.com）和 扩展 sidebar
   if (req.method === 'POST' && origin
     && !origin.includes('weread.qq.com')
+    && !isPageSourceOrigin(origin)
     && !origin.startsWith('chrome-extension://')) {
     res.writeHead(403); res.end('Forbidden'); return
   }
@@ -525,6 +557,7 @@ const server = http.createServer(async (req, res) => {
           chapter: data.chapter || '',
           chapterUid: data.chapterUid || '',
           chapterUidInt: data.chapterUidInt || 0,
+          sourceUrl: data.sourceUrl || '',
         })
       } else if (data.source === 'bookmark-sync') {
         // 微信读书划线同步：静默入库（不触发 agent），推送轻量事件让侧栏实时把
@@ -538,6 +571,7 @@ const server = http.createServer(async (req, res) => {
           chapterUidInt: data.chapterUidInt || 0,
           bookmarkRange: data.bookmarkRange || '',
           bookmarkId: data.bookmarkId || '',
+          sourceUrl: data.sourceUrl || '',
         })
       }
 
@@ -589,6 +623,106 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ deleted }))
       return  // 必须 return：否则会落到底部公共 res.writeHead(200)，对已结束的响应二次 writeHead 抛 ERR_HTTP_HEADERS_SENT，导致进程崩溃
 
+    } else if (url === '/book-delete') {
+      // 删除一本书（侧栏「已读过的书籍」列表的删除操作）。清理四处：
+      // 1) books/<base>/ 目录（meta/章节缓存/discussions/progress，含书籍足迹数据源）；
+      // 2) annotations.jsonl 中该书标注（引用列表数据源，删净后不再出现在 /history）；
+      // 3) chat_input.jsonl 中该书用户消息；
+      // 4) chat_output.jsonl：新数据（agent 已打标）按 bookKey 精确删；
+      //    旧数据（未打标）按「最近前序 user 提问归属」配对兜底——每条回复归属
+      //    时间上最近的前一条带书 user 消息，归属该书才删。自由模式（FREE_KEY）
+      //    提问同样参与配对，但删除书籍的 base 校验排除 __ 前缀，自由模式回复不会误删。
+      const { base } = data
+      if (!base || !/^[A-Za-z0-9_]{12,}$/.test(base) || base.startsWith('__')) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'invalid base' })); return
+      }
+      const norm = sanitizePathPart(base) || base
+      const chatInFile = path.join(INBOX_DIR, 'chat_input.jsonl')
+      // 先读原始 chat_input 构建「提问序列」用于回复配对（必须在过滤之前，
+      // 过滤后该书记录已不存在，且配对需要全部书的提问边界）
+      const userSeq = []
+      try {
+        for (const line of fs.readFileSync(chatInFile, 'utf8').split('\n')) {
+          if (!line.trim()) continue
+          try {
+            const d = JSON.parse(line)
+            if (d.bookId && d.timestamp) userSeq.push({ ts: d.timestamp, base: baseBookId(d.bookId) })
+          } catch {}
+        }
+        userSeq.sort((a, b) => a.ts - b.ts)
+      } catch {}
+      // 归属判定：时间上最近的前序带书 user 提问（二分查找）
+      const ownerOf = (ts) => {
+        let lo = 0, hi = userSeq.length - 1, idx = -1
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1
+          if (userSeq[mid].ts <= ts) { idx = mid; lo = mid + 1 } else hi = mid - 1
+        }
+        return idx >= 0 ? userSeq[idx].base : ''
+      }
+      // 按 bookId 过滤 jsonl 存档（文件不存在时跳过，不新建空文件）
+      const filterByBook = (file) => {
+        let raw = null
+        try { raw = fs.readFileSync(file, 'utf8') } catch { return 0 }
+        let removed = 0
+        const kept = []
+        for (const line of raw.split('\n')) {
+          if (!line.trim()) continue
+          let d
+          try { d = JSON.parse(line) } catch { kept.push(line); continue }
+          if (d.bookId && baseBookId(d.bookId) === base) { removed++; continue }
+          kept.push(line)
+        }
+        fs.writeFileSync(file, kept.join('\n') + (kept.length ? '\n' : ''))
+        return removed
+      }
+      const annRemoved = filterByBook(path.join(INBOX_DIR, 'annotations.jsonl'))
+      const chatInRemoved = filterByBook(chatInFile)
+      // chat_output：打标数据（assistant 流式/完整 + graph-hit）按 bookKey 精确删；
+      // 未打标旧数据按前序提问配对兜底
+      let chatOutRemoved = 0
+      try {
+        const outFile = path.join(INBOX_DIR, 'chat_output.jsonl')
+        const raw = fs.readFileSync(outFile, 'utf8')
+        const kept = []
+        for (const line of raw.split('\n')) {
+          if (!line.trim()) continue
+          let d
+          try { d = JSON.parse(line) } catch { kept.push(line); continue }
+          if (String(d.bookKey || '') === base) { chatOutRemoved++; continue }
+          if (!d.bookKey && ownerOf(Number(d.timestamp) || 0) === base) { chatOutRemoved++; continue }
+          kept.push(line)
+        }
+        fs.writeFileSync(outFile, kept.join('\n') + (kept.length ? '\n' : ''))
+      } catch {}
+      let dirRemoved = false
+      try {
+        fs.rmSync(path.join(BOOKS_DIR, norm), { recursive: true, force: true })
+        dirRemoved = true
+      } catch {}
+      console.log('[book-delete] base=' + norm.slice(0, 16) + '… dir=' + dirRemoved + ' ann=' + annRemoved + ' chatIn=' + chatInRemoved + ' chatOut=' + chatOutRemoved)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, dirRemoved, annRemoved, chatInRemoved, chatOutRemoved }))
+      return
+
+    } else if (url === '/book-create') {
+      // 网页阅读源：读者手动建书（AI-021 用户定调：不做 URL 自动归书，
+      // 由读者在网页上建书并把页面绑定到书；书名由读者输入，不抓远程页面，
+      // 避免旧页面 GB2312/GBK 按 UTF-8 误读造成的乱码）
+      const title = String((data && data.bookTitle) || '').trim()
+      if (!title || title.length > 200) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad title' })); return }
+      let bookId = ''
+      for (let tries = 0; tries < 5 && !bookId; tries++) {
+        const cand = 'mia_' + Array.from({ length: 20 }, function () { return '0123456789abcdef'.charAt(Math.floor(Math.random() * 16)) }).join('')
+        if (!fs.existsSync(path.join(BOOKS_DIR, cand))) bookId = cand
+      }
+      if (!bookId) { res.writeHead(500); res.end(JSON.stringify({ error: 'id exhausted' })); return }
+      writeBookMeta(bookId, { bookId: bookId, baseBookId: bookId, bookTitle: title })
+      console.log('[book-create] ' + bookId + ' 《' + title + '》')
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, bookId: bookId, bookTitle: title }))
+      return
+
     } else if (url === '/chat') {
       // 来自侧栏或共读弹窗的用户消息
       const { content, bookId, bookTitle, chapter, chapterUid, selectedText, refs } = data
@@ -621,6 +755,12 @@ const server = http.createServer(async (req, res) => {
       }
 
       console.log(`[chat] ${content.slice(0, 50)}`)
+
+      // 返回落库 timestamp：侧栏据此把本地渲染的提问注册为"历史已渲染"（_histKeys），
+      // 使面板打开期间的增量历史重拉（回复恢复轮询）不会把用户刚发的提问重复渲染一遍
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, timestamp: entry.timestamp }))
+      return
 
     } else if (url === '/content') {
       // 章节正文缓存

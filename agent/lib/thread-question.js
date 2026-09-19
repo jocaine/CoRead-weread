@@ -14,8 +14,9 @@
  * 缓存：与判同一性同款——指令文本哈希（qInstHash）作版本，版本变了旧归纳失效全量重做；
  * 同版本内按讨论组栈内容哈希命中复用（重跑零调用）。
  */
-import { formatStackContext, MAX_ATTEMPTS } from './topic-stack.js'
+import { MAX_ATTEMPTS } from './topic-stack.js'
 import { extractJsonObject } from './topicize.js'
+import { groupExcerpts, buildConsolidatePrompt } from './discussion-text.js'
 
 // 归纳讨论问题的标准提示词：把整场讨论追的具体问题归纳成一句提问
 export function buildQuestionInstruction() {
@@ -36,15 +37,11 @@ export function buildQuestionInstruction() {
 
 // 组装归纳 prompt：指令 + 讨论内容（复用 formatStackContext 的 user/AI 对话渲染）。
 // 归纳用**整场讨论**，不做判同一性那种窗口截断——具体问题由开头确立、后续推进修正，
-// 截掉开头会丢失讨论锚点（长讨论尤其）。maxRounds 可显式限制，默认全量。
-export function buildQuestionPrompt(stack, maxRounds) {
-  const limit = Number.isFinite(maxRounds) ? maxRounds : stack.length
-  return [
-    buildQuestionInstruction(),
-    '',
-    `讨论内容（${limit} 轮）：`,
-    formatStackContext(stack, limit),
-  ].join('\n')
+// 截掉开头会丢失讨论锚点（长讨论尤其）。2026-10 结构定调：公共前缀 + 段全文（全量，
+// 由 groupExcerpts 统一成与 point/aliases 同字节的材料）+ 归纳指令尾——三次调用共享
+// 同一全文前缀，缓存命中（收口固化三段判定的缓存优化）。
+export function buildQuestionPrompt(stack) {
+  return buildConsolidatePrompt(groupExcerpts(stack), buildQuestionInstruction())
 }
 
 // 解析归纳结果：{"question":"..."}；容忍前言回显/围栏/多余字段。

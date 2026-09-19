@@ -53,7 +53,10 @@ test('归纳 prompt：携带讨论内容（user + AI 对话），划线不带', 
 })
 
 test('归纳 prompt：整场讨论不做窗口截断（长讨论保留开头锚点）', () => {
-  const long = Array.from({ length: 20 }, (_, i) => ({ role: 'user', content: `轮${i}` }))
+  const long = []
+  for (let i = 0; i < 20; i++) {
+    long.push({ role: 'user', content: `轮${i}` }, { role: 'assistant', content: `回复${i}` })
+  }
   const p = buildQuestionPrompt(long)
   assert.ok(p.includes('轮0'), '讨论开头应保留（开头确立具体问题，截掉会丢锚点）')
   assert.ok(p.includes('轮19'), '讨论结尾应保留')

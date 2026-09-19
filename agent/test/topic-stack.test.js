@@ -83,9 +83,17 @@ test('prompt 携带当前讨论（最近几轮）+ 新消息；划线带上', ()
   assert.ok(p.includes('新消息："不对，我觉得制度自身的惯性才是关键"'))
 })
 
-test('formatStackContext 窗口化：只取最近 N 轮', () => {
+test('formatStackContext 默认全栈（2026-10：判同一性全栈追加，缓存前缀连续）', () => {
   const long = Array.from({ length: 20 }, (_, i) => ({ role: 'user', content: `轮${i}` }))
   const ctx = formatStackContext(long)
+  const lines = ctx.split('\n')
+  assert.equal(lines.length, 20, '默认取全部轮次')
+  assert.ok(ctx.includes('轮0') && ctx.includes('轮19'), '最早的轮次也保留')
+})
+
+test('formatStackContext 显式传 maxRounds 才窗口化（收口分段等一次性场景）', () => {
+  const long = Array.from({ length: 20 }, (_, i) => ({ role: 'user', content: `轮${i}` }))
+  const ctx = formatStackContext(long, STACK_CONTEXT_ROUNDS)
   const lines = ctx.split('\n')
   assert.equal(lines.length, STACK_CONTEXT_ROUNDS, '最多取 STACK_CONTEXT_ROUNDS 轮')
   assert.ok(ctx.includes('轮12') && ctx.includes('轮19'), '取的是最近的轮次')

@@ -20,6 +20,7 @@ import {
   removeEdge,
   updateEdge,
   findNode,
+  isReachable,
   contextOf,
   derivePoint,
   deriveAliases,
@@ -115,6 +116,25 @@ test('图结构：删边（按 from+to，同 pair 全删）与改边', () => {
   assert.equal(updateEdge(g, { from: 'n_a', to: 'n_b', newFrom: 'n_c' }), 1)
   assert.equal(g.edges[0].from, 'n_c')
   assert.throws(() => updateEdge(g, { from: 'n_a', to: 'n_c' }), /newFrom|newTo/)
+})
+
+test('图结构：isReachable（沿边可达 = 同脉络祖先，user/derived 全算）', () => {
+  const g = createGraph()
+  for (const id of ['n_a', 'n_b', 'n_c', 'n_x', 'n_y']) addNode(g, { id, point: id })
+  addEdge(g, { from: 'n_a', to: 'n_b', kind: 'derived' })  // 脉络：a→b→c（derived 链）
+  addEdge(g, { from: 'n_b', to: 'n_c', kind: 'derived' })
+  addEdge(g, { from: 'n_a', to: 'n_x' })                   // user 边（引用方向）：x 引用 a
+  assert.equal(isReachable(g, 'n_a', 'n_c'), true, '同脉络祖先可达（隔中间节点）')
+  assert.equal(isReachable(g, 'n_b', 'n_c'), true)
+  assert.equal(isReachable(g, 'n_c', 'n_a'), false, '方向不对（沿边方向不可达）')
+  assert.equal(isReachable(g, 'n_a', 'n_x'), true, 'user 边也构成脉络')
+  assert.equal(isReachable(g, 'n_b', 'n_x'), false, '不同脉络分支互不可达')
+  assert.equal(isReachable(g, 'n_a', 'n_a'), false, '自身不算可达（同节点不构成祖先）')
+  assert.equal(isReachable(g, 'n_a', 'n_missing'), false, '缺失节点返回 false')
+  assert.equal(isReachable(g, null, 'n_a'), false)
+  // 无边的孤立节点
+  addNode(g, { id: 'n_alone', point: 'A' })
+  assert.equal(isReachable(g, 'n_alone', 'n_a'), false)
 })
 
 // ── 路径上下文（root → recent） ───────────────────────────────────────────────

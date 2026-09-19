@@ -20,8 +20,8 @@
  * - 同一性 = 二元等价判断：只判"新消息和当前讨论是不是同一个问题"，不命名、不归类。
  *   识别接续不靠显式指代——无"那/这/它"的新观点/反驳/理解延伸，只要承接上一轮就是同一问题。
  * - 没有独立的"讨论结束"判断：出现新的专题化讨论才收口；没开新专题就一直留在栈里。
- * - 入栈 ≠ 转正：入栈只是 Q2 初判；防止一次性好奇由收口后复核（待归类桶）承担。
- * - 挂钩/派生母题不在收口时立刻做（观察推进后合适时机做）——本模块不管挂钩。
+ * - 入栈 ≠ 转正：入栈只是延续性初判；是否构成知识点由收口固化时的逐段判专题化复核。
+ * - 本模块不做任何跨讨论归属：节点间连接只来自用户引用（引用解析命中建边）与同栈段间衍生。
  *
  * 实现要点：
  * - callLLM(prompt, maxTokens) 由调用方注入，与 judgeTopicization 同模式（测试插假函数，接入包真调用）。
@@ -38,7 +38,7 @@ import {
 } from './topicize.js'
 
 export const MAX_ATTEMPTS = 3
-export const STACK_CONTEXT_ROUNDS = 8  // 同一性判断取栈内最近 N 轮，控制上下文量
+export const STACK_CONTEXT_ROUNDS = 8  // 窗口上限（2026-10 起只用于收口分段等一次性场景；判同一性已改全栈追加）
 
 // ── 判同一性（Q2.5 核心新判断）───────────────────────────────────────────────
 
@@ -68,9 +68,18 @@ export function buildSameProblemInstruction() {
   ].join('\n')
 }
 
-// 栈内累积内容 → 同一性判断的上下文（最近 N 轮，窗口化防膨胀）
-export function formatStackContext(stack, maxRounds = STACK_CONTEXT_ROUNDS) {
-  const recent = Array.isArray(stack) ? stack.slice(-maxRounds) : []
+// 栈内累积内容 → 对话渲染。maxRounds<=0 = 全栈（2026-10 判同一性默认：全栈追加——
+// 滑动窗口每轮滑 1 条，前缀位置全错位，判定输入几乎每次全部重新算（缓存 ~10%）；
+// 全栈 = 上一轮判定输入 + 本轮新消息，前缀连续命中（缓存 90%+ 的前提是 prompt 头
+// 字节稳定：头部不许带轮数等每轮变化的计数——2026-10 实测，'当前讨论（N 轮）'
+// 让 N 每轮 +2，前缀在指令后就分叉，44 条真实栈 ~25K token 每轮 0% 命中全价重算；
+// 去计数后同形状 99.6% 命中），栈在收口时弹栈清空不会无限增长）；
+// maxRounds>0 = 取最近 N 轮（收口分段/归纳问题等一次性场景，内容每次全新、
+// 无缓存复用，窗口化控制量即可）。
+export function formatStackContext(stack, maxRounds = 0) {
+  const recent = maxRounds > 0 && Array.isArray(stack)
+    ? stack.slice(-maxRounds)
+    : (Array.isArray(stack) ? stack : [])
   return recent
     .map((e) => {
       const who = e.role === 'assistant' ? 'AI' : '用户'
@@ -80,13 +89,17 @@ export function formatStackContext(stack, maxRounds = STACK_CONTEXT_ROUNDS) {
     .join('\n')
 }
 
-// 组装判同一性 prompt：指令 + 当前讨论（栈内累积）+ 新消息
+// 组装判同一性 prompt：指令 + 当前讨论（栈内累积，全栈追加——缓存前缀连续，
+// 每轮 = 上轮判定输入 + 本轮新消息）+ 新消息（2026-10）
+// 2026-10 缓存修复（实测 0% → 99.6%）：头部不许带 `当前讨论（N 轮）` 这类随轮次
+// 变化的计数字节——N 每轮 +2，前缀在指令后第一处就分叉，全栈追加的缓存收益全丢
+// （真实栈 44 条约 25K token 每轮全价重算）。模型不需要知道轮数，口径在指令里。
 export function buildSameProblemPrompt(message, stack) {
   const userNote = String(message.userNote || '').trim()
   const lines = [
     buildSameProblemInstruction(),
     '',
-    `当前讨论（最近 ${Math.min(stack.length, STACK_CONTEXT_ROUNDS)} 轮）：`,
+    '当前讨论：',
     formatStackContext(stack),
     '',
     `新消息："${userNote}"`,

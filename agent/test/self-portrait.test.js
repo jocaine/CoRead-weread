@@ -129,3 +129,21 @@ test('prompt 组装：含指令、用户消息、situation/belief 定义', () =>
   assert.ok(p.includes('thoughts（对事件的思考）'))
   assert.ok(p.includes('我最近在换工作'))
 })
+
+test('prompt 组装（2026-10 缓存定调：材料在前、消息在后）：现有画像/脉络/划线先于用户消息', () => {
+  const p = buildSelfPortraitPrompt(
+    { userNote: '我最近在换工作', selected: { text: '划线文本' } },
+    '现有画像条目甲\n现有画像条目乙',
+    '脉络内容'
+  )
+  const idx = (s) => { const i = p.indexOf(s); assert.ok(i !== -1, '应包含：' + s.slice(0, 20)); return i }
+  const iInst = idx('你是 CoRead 的「用户画像」维护员')
+  const iExisting = idx('现有画像（仅作去重参照，不要重复输出已覆盖的信息）：')
+  const iCtx = idx('对话脉络（该消息前后的 AI 回复，仅用于理解事件来龙去脉与用户动机）：')
+  const iSel = idx('划线内容（仅用于解析消息中的指代）：')
+  const iUser = idx('用户消息："我最近在换工作"')
+  assert.ok(iInst < iExisting, '指令在最前')
+  assert.ok(iExisting < iCtx, '现有画像（稳定材料）应先于可变材料——静态前缀可扩展')
+  assert.ok(iCtx < iUser && iSel < iUser, '可变材料与划线都在用户消息前（判定对象在后）')
+  assert.ok(p.trim().endsWith('用户消息："我最近在换工作"'), '用户消息应位于 prompt 末尾')
+})

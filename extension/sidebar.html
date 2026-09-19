@@ -253,6 +253,21 @@
       padding: 0 2px;
     }
     #free-refs .fr-clear-all:hover { color: #e74c3c; }
+    /* 锁定条目（2026-10）：实时栈命中并入窗体 = 历史消息已提交的引用，随讨论自动
+       更新、不可删除——与图上的栈命中高亮同一数据源（/stack-hits），窗体与图一致 */
+    #free-refs .fr-locked-hd {
+      padding: 6px 10px 1px 12px;
+      font-size: 10px;
+      font-weight: 600;
+      color: #b9b9b9;
+      letter-spacing: 0.2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #free-refs .fr-item.fr-locked .fr-idx { font-size: 9px; color: #c9a06a; }
+    #free-refs .fr-item.fr-locked .fr-point { color: #8d8d8d; }
+    #free-refs .fr-item.fr-locked:hover { background: #f7f7f7; }
     #ref-current .rc-head {
       display: flex;
       align-items: center;
@@ -945,7 +960,7 @@
       position: fixed;
       inset: 0;
       background: rgba(0, 0, 0, .35);
-      z-index: 1000;
+      z-index: 1200;  /* 高于 #book-picker(1100)：书籍选择弹窗里的删除确认要盖在弹窗之上 */
       align-items: center;
       justify-content: center;
     }
@@ -1482,6 +1497,7 @@
       padding: 24px;
       text-align: center;
       flex-shrink: 0;
+      overflow-y: auto;
     }
     #no-book-view[hidden] { display: none; }
     .nb-icon { font-size: 36px; line-height: 1; }
@@ -1498,6 +1514,42 @@
       cursor: pointer;
       font-family: inherit;
     }
+    /* 网页阅读源入口卡（AI-021）：路径独占一行 chip，文案与按钮分开，避免长句换行难看 */
+    .nb-web-card {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px dashed #e3e3e3;
+      width: 100%;
+      max-width: 280px;
+      text-align: left;
+      box-sizing: border-box;
+    }
+    .nb-web-eyebrow { font-size: 11px; font-weight: 600; color: #aaa; letter-spacing: .4px; margin-bottom: 6px; }
+    .nb-web-url {
+      font-size: 11.5px;
+      color: #555;
+      background: #f4f4f4;
+      border-radius: 6px;
+      padding: 5px 8px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .nb-web-desc { font-size: 12px; color: #888; line-height: 1.6; margin-top: 6px; }
+    .nb-web-act {
+      margin-top: 8px;
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #ecd9a0;
+      background: #fffaf0;
+      color: #a07600;
+      border-radius: 8px;
+      padding: 8px 14px;
+      font-size: 13px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .nb-web-act:hover { background: #fdf3d8; }
     .nb-pick-btn:hover { border-color: #06ad56; color: #06ad56; background: #e0f4e7; }
 
     /* ── 手动选书横幅（2026-10）：手动查看某本已读书籍的历史记录时，显示在消息区
@@ -1592,8 +1644,29 @@
       border-radius: 8px;
       margin-bottom: 6px;
       cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
     .bp-item:hover { border-color: #07c160; background: #fafffb; }
+    .bp-item .bi-main { flex: 1; min-width: 0; }
+    /* 删除书籍按钮（renderBookList 注入）：悬停变红，不干扰整行点击选书 */
+    .bp-item .bi-del {
+      flex: 0 0 auto;
+      width: 24px;
+      height: 24px;
+      border: none;
+      background: none;
+      cursor: pointer;
+      color: #bbb;
+      border-radius: 5px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .bp-item .bi-del:hover { color: #e74c3c; background: #fdf0ee; }
+    .bp-item .bi-del svg { width: 13px; height: 13px; }
     .bp-item .bi-title {
       font-size: 13px;
       font-weight: 600;
@@ -1675,6 +1748,12 @@
     <div class="nb-title">未检测到正在阅读的书籍</div>
     <div class="nb-desc">打开微信读书中的书籍后自动同步该书讨论；<br>已读完的书可手动选择查看历史记录</div>
     <button class="nb-pick-btn" id="nb-pick-btn">📚 从已读过的书籍中选择</button>
+    <div class="nb-web-card" id="nb-web-card" hidden>
+      <div class="nb-web-eyebrow">网页阅读源</div>
+      <div class="nb-web-url" id="nb-web-url"></div>
+      <div class="nb-web-desc">把当前页面加入一本书后，在这页选中文字即可划线共读。</div>
+      <button class="nb-web-act" id="nb-bind-btn" title="把当前文库页面加入一本书">加入一本书</button>
+    </div>
   </div>
 
   <!-- 手动选书横幅（2026-10）：手动查看某本已读书籍时显示在消息区上方 -->
