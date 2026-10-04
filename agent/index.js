@@ -6,8 +6,8 @@
  * 与用户实时讨论标注，调用 LLM API 生成回应。不依赖任何外部 CLI。
  *
  * 启动：
- *   cp .env.example .env  # 填入 COREAD_API_KEY 等配置
- *   npm start
+ *   npm start            # 模型 API 在插件侧栏「⋯ → 模型 API 配置」里填（推荐）
+ *   cp .env.example .env # 或在 .env 里填 COREAD_API_KEY 等配置（CLI / 无插件场景）
  */
 
 import fs from 'fs'
@@ -15,12 +15,26 @@ import path from 'path'
 import readline from 'readline'
 import { fileURLToPath } from 'url'
 import { judgeSelfPortrait } from './lib/self-portrait.js'
-import { processStackMessage, makeStackEntry } from './lib/topic-stack.js'
-import { createGraph, addNode, contextOf, resolveReferences } from './lib/knowledge-graph.js'
+import { processStackMessage, makeStackEntry, collectStackCites } from './lib/topic-stack.js'
+import { createGraph, userAncestry, resolveReferences } from './lib/knowledge-graph.js'
 import { consolidateThreadQuestion } from './lib/thread-question.js'
-import { consolidateDiscussion, addDerivedEdge, addCitationEdges, pruneRedundantCitationEdges, groupExcerpts, cloneGraph, nextNodeId } from './lib/graph-consolidate.js'
+import { consolidateDiscussion, addDerivedEdge, addCitationEdges, pruneRedundantCitationEdges, groupExcerpts } from './lib/graph-consolidate.js'
 import { segmentStack } from './lib/segment-stack.js'
+import { l3Block } from './lib/l3-context.js'  // L3 上下文渲染（2026-10 定调：来源见模块头）
 import { parseMessage } from './lib/chat-input.js'  // 引用解析输入剥离引文：只认用户自己的话（见 resolveCitations）
+import { resolveApiConfig, isConfigured } from './lib/api-config.js'  // 模型 API 配置：插件侧栏可写，.env 为回退
+// 聊天存储（2026-10-02 方案 B）：SQLite 取代 chat_input/chat_output.jsonl + 游标 + 指纹台账。
+// id = 队列游标；status = 已回复/待重试；reply_to = 提问↔回答的直接引用。见 lib/chat-store.js 头部。
+import { openChatStore } from './lib/chat-store.js'
+// 自由模式多对话（2026-11 用户定调）：每个自由对话 = 一个独立 bookKey（隔离链路复用
+// "按书隔离"），注册表管标题/活跃时间/归档状态；归档时可选择保存记忆、收编进正式拓扑图。
+import { isFreeKey, LEGACY_FREE_KEY, archiveConversation } from './lib/free-conversation.js'
+// 错误分类（2026-10）：网络层失败（fetch failed / ECONNRESET / 超时）此前一次都不重试，
+// 成因与机制见 lib/error-classify.js 头部注释
+import { canRetryError, isNetworkError, networkErrorMessage, isFatalConfigError, fatalErrorMessage } from './lib/error-classify.js'
+// 收件箱去重台账 + 游标语义（2026-09-30 机制级修复）已随 SQLite 存储层退役：
+// "这条处理过没有"现在是 messages.status 一列，"到哪了"是自增 id——游标文件、指纹台账、
+// decideCursor 判定全部不再需要。lib/inbox-dedupe.js 仍留着（迁移脚本用），运行时不再引用。
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const AGENT_DIR = __dirname
@@ -29,74 +43,82 @@ const INBOX_DIR = path.join(RECEIVER_DIR, 'inbox')
 const BOOKS_DIR = path.join(RECEIVER_DIR, 'books')
 const ANNOTATIONS = path.join(INBOX_DIR, 'annotations.jsonl')
 const CURSOR_FILE = path.join(INBOX_DIR, '.agent_cursor')
-const CHAT_INPUT = path.join(INBOX_DIR, 'chat_input.jsonl')
-const CHAT_INPUT_CURSOR = path.join(INBOX_DIR, '.chat_input_cursor')
-const CHAT_OUTPUT = path.join(INBOX_DIR, 'chat_output.jsonl')
-// 处理步骤状态（2026-10）：侧栏"正在…"文案数据源。独立文件——不混入 chat_output，
-// 避免被其消费方（receiver /history、loadReplyByTs、restoreHistories）当成 assistant 消息。
-const AGENT_STATE_FILE = path.join(INBOX_DIR, 'agent_state.jsonl')
-const REPLIED_FINGERPRINT_FILE = path.join(INBOX_DIR, '.chat_input_replied')
-// 去重：防止同一消息被重复回复。指纹落盘（启动时加载），进程重启后仍能跳过已回复过的消息，
-// 不会因游标异常被重置而把旧提问重放一遍（AI-011 同款教训，chat 侧）。
-const _repliedFingerprints = new Set(
-  (readIfExists(REPLIED_FINGERPRINT_FILE) || '').split('\n').filter(Boolean)
-)
-// 首次运行种子：老版本没有指纹文件，把 chat_input 里已处理过的旧消息指纹补齐
-if (_repliedFingerprints.size === 0) {
-  try {
-    for (const l of (readIfExists(CHAT_INPUT) || '').trim().split('\n').filter(Boolean)) {
-      try {
-        const d = JSON.parse(l)
-        if (typeof d.timestamp === 'number') {
-          _repliedFingerprints.add(`${d.timestamp}|${(d.content || '').slice(0, 80)}`)
-        }
-      } catch {}
-    }
-    if (_repliedFingerprints.size > 0) {
-      fs.writeFileSync(REPLIED_FINGERPRINT_FILE, [..._repliedFingerprints].join('\n') + '\n')
-    }
-  } catch {}
+// 聊天存储（方案 B）：唯一真源。旧 chat_input.jsonl / chat_output.jsonl 迁移后原样保留，
+// 只作历史备份，不再读写（见 lib/chat-migrate.js）。
+const CHAT_DB = path.join(INBOX_DIR, 'chat.db')
+// 瞬态打字机通道：流式累计文本走这里（侧栏据此渲染），**不入档**——旧结构里它占了
+// chat_output 97.1% 的字节（31919 条快照，全是最终回复的前缀，零信息量）。
+// 启动时清空；接收端按字节偏移 tail，文件被清空时靠"长度回缩"识别并复位。
+const STREAM_FILE = path.join(INBOX_DIR, 'stream.jsonl')
+let _store = null
+function chatStore() {
+  if (!_store) _store = openChatStore(CHAT_DB)
+  return _store
 }
-function persistRepliedFingerprint(fp) {
-  _repliedFingerprints.add(fp)
-  try {
-    fs.appendFileSync(REPLIED_FINGERPRINT_FILE, fp + '\n')
-    if (_repliedFingerprints.size > 2000) {
-      // 防文件无限增长：保留最近 1000 条指纹重写（正常不会触发）
-      const keep = [..._repliedFingerprints].slice(-1000)
-      _repliedFingerprints.clear()
-      for (const k of keep) _repliedFingerprints.add(k)
-      fs.writeFileSync(REPLIED_FINGERPRINT_FILE, keep.join('\n') + '\n')
-    }
-  } catch {}
+/**
+ * 退出前关掉聊天库。**每次退出都必须走这里。**
+ * 为什么：SQLite 在最后一个连接正常 close() 时，会自动把暂存本（-wal）搬回主库、
+ * 并删掉 -wal 与 -shm。不 close 直接 process.exit(0) 的话这两个文件会一直留着，
+ * 主库停在旧版本（本机实测过：300 条插入全留在 1.2 MB 的暂存本里）。
+ * 数据不会因此损坏（下次连接会自动恢复），但"干净退出"这道安全网就失效了。
+ */
+function closeChatStore() {
+  if (!_store) return
+  try { _store.close() } catch (e) { console.error(`⚠️ 关闭聊天库失败：${e.message}`) }
+  _store = null
+}
+function resetStreamFile() {
+  try { fs.writeFileSync(STREAM_FILE, '') } catch {}
+}
+// 处理步骤状态（2026-10）：侧栏"正在…"文案数据源。独立文件——不入库，纯瞬态。
+const AGENT_STATE_FILE = path.join(INBOX_DIR, 'agent_state.jsonl')
+// 致命故障（余额/鉴权）暂存：say() 捕获时登记，poller 读到后中止本轮队列并暂停。
+// 用"取走即清空"的语义，避免一次故障被后续消息重复归因。
+let _lastFatalError = null
+function takeFatalError() {
+  const e = _lastFatalError
+  _lastFatalError = null
+  return e
 }
 const STOP_FILE = path.join(AGENT_DIR, '.stop')  // stop.bat 写入哨兵 → poller 检测后优雅保存退出
 const JOURNAL_FILE = path.join(AGENT_DIR, 'session_journal.jsonl')  // 会话流水账：强杀/断电后启动时恢复记忆
 const TOPIC_STACK_FILE = path.join(AGENT_DIR, 'topic_stack.json')  // 会意讨论栈：跨会话持久化（进行中的讨论跨会话恢复），按书隔离 { bookKey: 栈 }
 const GRAPH_FILE = path.join(AGENT_DIR, 'data', 'knowledge-graph.json')  // 会意图持久文件（§5.3：一张图一个文件）
 const RESULTS_GRAPH_FILE = path.join(AGENT_DIR, 'scripts', 'data', 'knowledge-graph-results.json')  // 离线固化产物（loadGraph 回退源，与 receiver /graph 一致）
-// 自由模式（测试沙盒，2026-09 用户定调）：固定在侧栏的独立上下文，对话内容都是
-// 临时测试、不固化进正式图。哨兵书 key（固定空书对象）+ 独立沙盒图文件。
-const FREE_KEY = '__coread_free_mode__'
-const FREE_GRAPH_FILE = path.join(AGENT_DIR, 'data', 'knowledge-graph.free.json')
+// 自由模式（2026-09 定调；2026-11 扩为多对话）：侧栏里的独立上下文，每个自由对话
+// 一个 bookKey（__coread_free_<8hex>__，默认对话沿用历史哨兵 __coread_free_mode__，
+// 见 lib/free-conversation.js），对话之间历史/讨论栈/命中全隔离。对话内容默认是
+// 临时的（不写 journal、不收口固化）——归档时由用户勾选：保存记忆（profile/soul）、
+// 收编进正式拓扑图（完整固化）、或都不留（见 archiveFreeConversation）。
+const FREE_KEY = LEGACY_FREE_KEY
 const SELF_PORTRAIT_FILE = path.join(AGENT_DIR, 'self-portrait.md')  // 用户情况与观念画像：总结式维护，不进头部
 
-const API_KEY = process.env.COREAD_API_KEY
-const API_BASE = (process.env.COREAD_API_BASE || '').replace(/\/$/, '')
-const MODEL = process.env.COREAD_MODEL || 'gpt-4o'
-
-if (!API_KEY) {
-  console.error('❌ 请设置 COREAD_API_KEY 环境变量')
-  process.exit(1)
-}
-if (!API_BASE) {
-  console.error('❌ 请设置 COREAD_API_BASE 环境变量（如 https://api.openai.com/v1）')
-  process.exit(1)
+// 模型 API 配置（2026-10）：真源 = agent/api-config.json（插件侧栏「⋯ → 模型 API 配置」
+// 经 receiver 写入），.env 的 COREAD_* 作为回退（见 lib/api-config.js）。
+// 每次 LLM 调用前重读 → 插件里改完立即生效，不需要重启 agent。
+// 未配置时**不再启动即退出**：旧行为会让 agent 直接死掉，用户在插件里填好配置也没人应答；
+// 现在改为启动告警 + 调用时报错（requireApiConfig），配置补齐后下一次提问即可用。
+if (!isConfigured(resolveApiConfig())) {
+  console.warn('⚠️  模型 API 未配置：请在插件侧栏右上角「⋯ → 模型 API 配置」里填写；')
+  console.warn('    或在 agent/.env 里设置 COREAD_API_BASE / COREAD_API_KEY（可选 COREAD_MODEL）。')
 }
 
 // ── 文件读取 ────────────────────────────────────────────────────────────────
 function readIfExists(p) {
   try { return fs.readFileSync(p, 'utf8') } catch { return '' }
+}
+// 「读失败」与「文件不存在 / 内容为空」必须分开（2026-09-30 机制级修复）：
+// 瞬时故障（Windows 共享冲突 / 权限 / rename 空窗）返回 null，调用方据此**跳过本轮**；
+// 绝不能像 readIfExists 那样把它们吞成 ''，再被下游兜底成 0——0 在队列语义里等于
+// "从第 0 行重扫"，2026-09-28 正是这样重放了 288 条旧提问（见 lib/inbox-dedupe.js 头部）。
+function readOrNull(p) {
+  try {
+    return fs.readFileSync(p, 'utf8')
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return ''    // 文件不存在 = 空，不是故障
+    console.log(`  ⚠️ 读取失败（按"未知"处理，不当作空值）: ${p} — ${(e && (e.code || e.message)) || e}`)
+    return null
+  }
 }
 
 // ── 用户书籍足迹（跨书联动的轻量数据源） ──────────────────────────────────
@@ -144,18 +166,34 @@ function personaBlock() {
     `【用户阅读画像】\n${profile}\n\n【你的自画像】\n${soul}${bookSection}`
 }
 
-// ── 侧栏聊天 I/O ─────────────────────────────────────────────────────────────
-function appendChatOutput(role, content, bookKey) {
-  // bookKey：AI-xxx 书删除支持——回复落库带归属书标记，receiver /book-delete 可精确清理。
-  // 自由模式（FREE_KEY）也打标；删除书籍的 base 校验排除 __ 前缀，不会误删自由模式。
-  try { fs.appendFileSync(CHAT_OUTPUT, JSON.stringify({ role, content: stripCodeBlocks(content), timestamp: Date.now(), ...(bookKey ? { bookKey } : {}) }) + '\n') } catch {}
+// ── 侧栏聊天 I/O（SQLite）────────────────────────────────────────────────────
+// 一条消息 = 库里一行。bookKey 就是 conversations.key（删除据此精确清理，不再靠 bookKey 过滤重写文件）。
+// opts: { status='ok'|'failed', error, replyTo, bookId/bookTitle/chapter/chapterUid/selectedText }
+function appendChatOutput(role, content, bookKey, opts = {}) {
+  try {
+    return chatStore().insertMessage({
+      conv: String(bookKey || '_common'),
+      role,
+      content: stripCodeBlocks(content),
+      ts: Date.now(),
+      status: opts.status || 'ok',
+      error: opts.error,
+      replyTo: opts.replyTo,
+      bookId: opts.bookId, bookTitle: opts.bookTitle, chapter: opts.chapter,
+      chapterUid: opts.chapterUid, selectedText: opts.selectedText,
+    })
+  } catch (e) {
+    console.log(`  ⚠️ 写库失败：${e.message}`)
+    return 0
+  }
 }
 
-// 流式记录：content 存累计文本，侧栏据此渲染打字机（_stream 存在即流式中间记录）
+// 流式快照 → 瞬态通道（不入档）。content 存累计文本，侧栏据 _stream 渲染打字机；
+// 接收端按字节偏移 tail，收到 seq=-1 把气泡标记完成。
 let _streamSeq = 0
 function appendChatOutputStream(content, bookKey) {
   try {
-    fs.appendFileSync(CHAT_OUTPUT, JSON.stringify({
+    fs.appendFileSync(STREAM_FILE, JSON.stringify({
       role: 'assistant',
       content: stripCodeBlocks(content),
       _stream: _streamSeq++,
@@ -167,24 +205,23 @@ function appendChatOutputStream(content, bookKey) {
 // 流结束标记：侧栏收到 _stream === -1 后把该条流标记为完成
 function appendChatOutputStreamEnd(bookKey) {
   try {
-    fs.appendFileSync(CHAT_OUTPUT, JSON.stringify({
+    fs.appendFileSync(STREAM_FILE, JSON.stringify({
       role: 'assistant', content: '', _stream: -1, timestamp: Date.now(),
       ...(bookKey ? { bookKey } : {}),
     }) + '\n')
   } catch {}
 }
 
-// 会意图命中事件（topic-library-design.md §5.4④）：引用解析命中旧知识点 → 写一行
-// graph-hit 到 chat_output（不带 content/_stream——侧栏不渲染为消息、loadReplyByTs
-// 不参与回复配对），receiver 按既有通道转发为 SSE message，侧栏图视图据此高亮
-// 命中节点的 root→recent 路径并集。bookKey = 命中所属书（消息归属书；自由模式 =
-// FREE_KEY）——每本书的实时栈隔离，侧栏据此只显示当前上下文的命中（2026-09）。
+// 会意图命中事件（topic-library-design.md §5.4④）：引用解析命中旧知识点 → 记一条事件
+// （events 表，不进 messages——它没有正文，混在消息里会污染配对与 /history）。
+// bookKey = 命中所属书；侧栏图视图据此高亮命中节点的 root→recent 路径并集。
 function appendGraphHit(hits, reason, bookKey) {
   try {
-    fs.appendFileSync(CHAT_OUTPUT, JSON.stringify({
-      role: 'graph-hit', hits, reason: String(reason || '').slice(0, 200), timestamp: Date.now(),
-      bookKey: String(bookKey || ''),
-    }) + '\n')
+    chatStore().insertEvent({
+      conv: String(bookKey || ''),
+      kind: 'graph-hit',
+      payload: { hits: hits || [], reason: String(reason || '').slice(0, 200), bookKey: String(bookKey || '') },
+    })
   } catch {}
 }
 
@@ -201,18 +238,18 @@ function appendAgentState(step, bookKey) {
     }
   } catch {}
 }
-function readChatInputs() {
-  const raw = readIfExists(CHAT_INPUT)
-  if (!raw) return []
-  return raw.trim().split('\n').filter(Boolean).map(l => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+// 侧栏消息队列 = 库里"待处理"的行。旧实现读文件 + 游标 + 指纹台账三件套来判断"哪条还没答"，
+// 现在就是一条 SQL：status IN ('pending','failed') 按 id 升序（id 即到达顺序）。
+// failed 也入队 = 失败会重试（旧实现"调用前记指纹"导致失败的消息永不重试，2026-09-28 的 213 条就是这样）。
+function readPendingMessages(limit = 10) {
+  try { return chatStore().listPending({ limit }) } catch (e) {
+    console.log(`  ⚠️ 读取待处理消息失败：${e.message}`)
+    return []
+  }
 }
-
-function getChatInputCursor() {
-  const v = parseInt(readIfExists(CHAT_INPUT_CURSOR), 10)
-  return Number.isFinite(v) ? v : 0
+function markMessage(id, fields) {
+  try { chatStore().updateMessage(id, fields) } catch (e) { console.log(`  ⚠️ 更新消息状态失败：${e.message}`) }
 }
-
-function setChatInputCursor(n) { fs.writeFileSync(CHAT_INPUT_CURSOR, String(n)) }
 
 // ── 标注队列 ────────────────────────────────────────────────────────────────
 function readAnnotations() {
@@ -526,58 +563,27 @@ function totalHistoryLength() {
 // （system 已画像下沉，静态稳定）。
 function restoreHistories() {
   try {
-    const msgs = []
-    const collect = (file, role) => {
-      for (const line of readIfExists(file).split('\n')) {
-        if (!line.trim()) continue
-        let d
-        try { d = JSON.parse(line) } catch { continue }
-        if (typeof d.timestamp !== 'number') continue
-        if (role === 'assistant') {
-          msgs.push({ role, ts: d.timestamp, content: d.content, hasStream: typeof d._stream === 'number' })
-        } else {
-          msgs.push({ role, ts: d.timestamp, d })
-        }
-      }
-    }
-    collect(CHAT_INPUT, 'user')
-    collect(CHAT_OUTPUT, 'assistant')
-    msgs.sort((a, b) => a.ts - b.ts)
-
-    const turnsByBook = new Map()   // bookKey -> [{role, content}]
-    for (let i = 0; i < msgs.length; i++) {
-      if (msgs[i].role !== 'user') continue
-      const u = msgs[i].d
-      let reply = ''
-      for (let j = i + 1; j < msgs.length; j++) {
-        const n = msgs[j]
-        if (n.role === 'user') break            // 下一条用户消息 → 本条无后续回复
-        if (n.hasStream) continue               // 流式快照 / 结束标记 → 非完整回复
-        if (n.content) { reply = n.content; break }
-      }
-      if (!reply) continue
-      // 归属书：与消息循环一致（无 bookId → '_common'；自由模式 = FREE_KEY）
-      const key = u.bookId ? baseBookId(u.bookId) : '_common'
-      // storeText 与 say() 同款构造（AI-017：不含章节窗口，防书摘录当用户的话）
-      const storeText = u.selectedText
-        ? `【划线】《${u.bookTitle || ''}》${u.chapter || ''}\n划线原文：${u.selectedText}\n我的提问：${u.content}`
-        : u.content
-      const list = turnsByBook.get(key) || []
-      list.push({ role: 'user', content: storeText })
-      list.push({ role: 'assistant', content: stripCodeBlocks(stripMemorize(reply)) })
-      turnsByBook.set(key, list)
-    }
-    for (const [key, list] of turnsByBook) {
+    const store = chatStore()
+    const convs = Object.keys(store.countByConv())
+    // storeText 与 say() / 旧文件版完全同款构造（AI-017：不含章节窗口，防书摘录当用户的话）
+    const storeTextOf = (u) => (u.selectedText
+      ? `【划线】《${u.bookTitle || ''}》${u.chapter || ''}\n划线原文：${u.selectedText}\n我的提问：${u.content}`
+      : u.content)
+    for (const key of convs) {
       if (key === '_meta') continue
+      // 库里直接取"成轮的最近 N 轮"：提问 + 它的回答（reply_to 直连，未配对的回答不成轮）
+      const turns = store.loadTurns(key, { limit: 60 })
+      if (!turns.length) continue
+      const list = []
+      for (const t of turns) {
+        list.push({ role: 'user', content: storeTextOf(t.user) })
+        list.push({ role: 'assistant', content: stripCodeBlocks(stripMemorize(t.assistant.content)) })
+      }
       const hist = histFor(key)
-      // 2026-10 游标方案（用户定调）：截尾点已由 trimHistoryByBudget 落盘（累计切掉
-      // 条数）——chat 文件里游标之后的轮次 = 在线截尾后的全部内容（在线截尾后只做
-      // 纯追加，游标与文件尾部之间不会再截），直接从游标处续推即可，恢复结果 =
-      // 在线末尾状态，跨会话前缀可命中。不再全量重建后逐轮重放截尾。
+      // 2026-10 游标方案（用户定调）：截尾点已由 trimHistoryByBudget 落盘（累计切掉条数）——
+      // 从游标处续推即得在线末尾状态，跨会话前缀可命中（不再全量重建后逐轮重放截尾）。
       const skip = Math.min(histCutCursors[key] || 0, list.length)
       for (let i = skip; i < list.length; i++) hist.push(list[i])
-      // 兜底 trim：游标后内容理论上 ≤ 预算（在线截尾后纯追加，超了会再截并更新游标）；
-      // 仅当文件清理/配对差异等边缘场景才可能触发（触发时游标同步更新，自洽）
       trimHistoryByBudget(key, hist)
       if (hist.length) console.log(`  [hist] ${key} 启动恢复 ${hist.length} 条（${Math.round(hist.length / 2)} 轮，游标 ${histCutCursors[key] || 0}）`)
     }
@@ -595,7 +601,18 @@ function htmlTitle(text) {
   return match ? match[1].replace(/<[^>]+>/g, '').trim() : ''
 }
 
+// 取当前生效的模型 API 配置；未配置时给出可操作的报错（侧栏按普通回复失败展示）。
+// 每次调用现取：插件里改完配置，下一次提问就生效。
+function requireApiConfig() {
+  const cfg = resolveApiConfig()
+  if (!isConfigured(cfg)) {
+    throw new Error('模型 API 未配置：请在侧栏右上角「⋯ → 模型 API 配置」里填写 API 地址与 Key')
+  }
+  return cfg
+}
+
 async function callLLMOnce(maxTokens = 8192, hist = [], opts = {}) {
+  const { apiKey, apiBase, model } = requireApiConfig()
   const system = opts.system !== undefined ? opts.system : SYSTEM  // 判定调用可覆盖 SYSTEM（避免阅读助手指令干扰判定）
   // 截断机制（2026-08-28，lib/llm-api.js 同款）：finish_reason:length 视为失败——
   // 预算不足 → 升级到 MAX_JUDGE_TOKENS 重发同 body 一次；仍截断 → 抛错（宁漏勿误，
@@ -604,7 +621,7 @@ async function callLLMOnce(maxTokens = 8192, hist = [], opts = {}) {
   let budget = maxTokens
   for (let round = 1; round <= 2; round++) {
     const body = JSON.stringify({
-      model: MODEL,
+      model,
       messages: [{ role: 'system', content: system }, ...hist],
       max_tokens: budget,
       ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
@@ -617,11 +634,11 @@ async function callLLMOnce(maxTokens = 8192, hist = [], opts = {}) {
 
     let resp
     try {
-      resp = await fetch(`${API_BASE}/chat/completions`, {
+      resp = await fetch(`${apiBase}/chat/completions`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'authorization': `Bearer ${API_KEY}`,
+          'authorization': `Bearer ${apiKey}`,
         },
         body,
         signal: controller.signal,
@@ -663,8 +680,9 @@ async function callLLMOnce(maxTokens = 8192, hist = [], opts = {}) {
 
 // ── 流式调用 LLM ────────────────────────────────────────────────────────────
 async function* callLLMStream(maxTokens = 8192, hist = []) {
+  const { apiKey, apiBase, model } = requireApiConfig()
   const body = JSON.stringify({
-    model: MODEL,
+    model,
     messages: [{ role: 'system', content: SYSTEM }, ...hist],
     max_tokens: maxTokens,
     stream: true,
@@ -676,11 +694,11 @@ async function* callLLMStream(maxTokens = 8192, hist = []) {
 
   let resp
   try {
-    resp = await fetch(`${API_BASE}/chat/completions`, {
+    resp = await fetch(`${apiBase}/chat/completions`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'authorization': `Bearer ${API_KEY}`,
+        'authorization': `Bearer ${apiKey}`,
       },
       body,
       signal: controller.signal,
@@ -765,11 +783,11 @@ async function callLLM(maxTokens = 8192, hist = [], opts = {}) {
     try {
       return await callLLMOnce(maxTokens, hist, opts)
     } catch (e) {
-      lastErr = e
-      // 超时、网络错误、服务端错误均可重试
-      const canRetry = e.name === 'AbortError'
-        || [429, 500, 502, 503, 504].includes(e.status)
-      if (!canRetry || attempt === 3) break
+      // 网络层失败原样抛出 → 抛前换成中文可诊断文案（带 cause.code），
+      // 否则侧栏只会出现 `⚠️ fetch failed` 这种既看不懂也无法定位的串
+      lastErr = isNetworkError(e) ? new Error(networkErrorMessage(e)) : e
+      // 超时、网络错误、服务端错误均可重试（判定见 lib/error-classify.js）
+      if (!canRetryError(e) || attempt === 3) break
       console.log(`  ⚠️ API 调用失败 (attempt ${attempt}/3): ${e.message}`)
       await sleep(1500 * attempt)
     }
@@ -781,7 +799,7 @@ function stripCodeBlocks(text) {
   return text.replace(/```[\s\S]*?```/g, '').replace(/^\s*\n/gm, '\n').trim()
 }
 
-// 带重试的流式调用：只在「一个 chunk 都没产出」前重试（429/5xx/超时/空流），
+// 带重试的流式调用：只在「一个 chunk 都没产出」前重试（429/5xx/超时/网络层失败/空流），
 // 已经吐出部分内容后的失败不重试（重发会造成内容错乱），直接向上抛。
 async function* callLLMStreamWithRetry(maxTokens, hist) {
   let lastErr
@@ -802,12 +820,10 @@ async function* callLLMStreamWithRetry(maxTokens, hist) {
         yield value
       }
     } catch (e) {
-      lastErr = e
-      if (yielded) throw e  // 中途失败：不重试
-      const canRetry = e.name === 'AbortError'
-        || [429, 500, 502, 503, 504].includes(e.status)
-        || /空流|模型无回应/.test(e.message || '')
-      if (!canRetry || attempt === 3) throw e
+      if (yielded) throw e  // 中途失败：不重试（canRetryError 的 yielded 形参同样兜底）
+      // 网络层失败：抛前换成中文可诊断文案（带 cause.code）；已是本模块产物则不重复包装
+      lastErr = isNetworkError(e) ? new Error(networkErrorMessage(e)) : e
+      if (!canRetryError(e) || attempt === 3) throw lastErr
       console.log(`  ⚠️ 流式调用失败 (attempt ${attempt}/3): ${e.message}`)
       await sleep(1500 * attempt)
       continue
@@ -832,9 +848,10 @@ async function say(userText, options = {}) {
   const storeText = options.storeText != null ? options.storeText : userText
   hist.push({ role: 'user', content: storeText })
   trimHistoryByBudget(key, hist)  // 2026-09 惰性截尾：追加式保缓存前缀，超预算才从最老切
-  // 自由模式（FREE_KEY）不写 journal：测试对话不进 session_journal，从而不进
-  // profile/soul 记忆固化（saveSessionMemory 只吃 journal 未合并消息）
-  if (key !== '_meta' && key !== FREE_KEY) journalAppend({ kind: 'msg', bookKey: key, role: 'user', content: storeText })  // 同步落盘，强杀也不丢
+  // 自由模式（任意自由对话 key）不写 journal：对话内容默认是临时的，不进
+  // session_journal（从而不进 profile/soul 记忆固化）；归档时勾选「保存记忆」才
+  // 单独把这场对话喂给记忆合并（见 archiveFreeConversation）。
+  if (key !== '_meta' && !isFreeKey(key)) journalAppend({ kind: 'msg', bookKey: key, role: 'user', content: storeText })  // 同步落盘，强杀也不丢
   let fullContent = ''
   let displayContent = ''  // 剥掉 MEMORIZE 标记后的展示文本
   let started = false  // 是否已写过流式记录
@@ -856,7 +873,15 @@ async function say(userText, options = {}) {
     const anchored = key !== '_meta'
       ? '【本轮消息】（上面历史与【背景档案】都只是背景——本行以下是用户当前要你直接回应的内容：若含引文+提问，先围绕引文本身回答）\n' + userText
       : userText
-    const callHist = [...hist, { role: 'user', content: persona }, { role: 'user', content: anchored }]
+    // L3 图路径上下文（可选）：独立成一条消息插在锚定消息**之前**——生成点前最后读到
+    // 的永远是 anchored（本轮问题/划线本身），而不是一大段旧讨论（2026-10 定调）。
+    const l3Ctx = String(options.l3 || '').trim()
+    const callHist = [
+      ...hist,
+      { role: 'user', content: persona },
+      ...(l3Ctx ? [{ role: 'user', content: l3Ctx }] : []),
+      { role: 'user', content: anchored },
+    ]
     const stream = callLLMStreamWithRetry(options.maxTokens || 8192, callHist)
     let lastWrite = 0
     let result
@@ -878,33 +903,26 @@ async function say(userText, options = {}) {
       }
     }
 
-    // 2026-09 自愈守卫（09-07 两次跑题教训：引文类提问被答成"旧话题/人生叙事"）：
-    // 带 options.quote 的轮次，先让判卷 LLM 检查回复是否完全没碰引文；命中则用
-    // 无历史、无画像的加固 prompt 重答一次。坏版本只留过流式快照（侧栏最终记录会
-    // 覆盖气泡文本），不进 final/历史/journal/记忆合并——防止跑题内容污染长期记忆
-    // （13:49 实例：跑题回复带 MEMORIZE 标记，把编造的"材料归档法"写进了 profile.md）。
-    if (options.quote) {
-      const derailed = await judgeReplyDerailed(stripMemorize(fullContent), options)
-      if (derailed === true) {
-        console.log('  ⚠️ 回复被判定为跑题（未针对引文），正在用加固 prompt 重答...')
-        try {
-          fullContent = await hardenedRetry(options)
-          console.log('  ✓ 重答完成（原跑题内容未入库）')
-        } catch (e) {
-          console.log(`  ⚠️ 重答失败，保留原回复: ${e.message}`)
-        }
-      } else if (derailed === null) {
-        console.log('  ⚠️ 跑题判定调用失败，跳过自愈')
-      }
-    }
+    // 2026-10 移除"引用跑题自愈"（用户定调：流式已显示的内容不能被事后替换）：
+    // 原机制在答完后用**无历史**的判定 LLM 复查"回复有没有碰引文"，判成跑题就用
+    // **无历史、无画像**的加固 prompt 重答一次、覆盖已显示的气泡。实测两个结构性问题：
+    //   ① 判定输入没有历史，分不出"接着说上一轮"和"跑到别的话题"，且结论靠"输出里
+    //      第一个 是/否 字符"取（推理型模型把思考写进 content 时近乎掷硬币）→ 误判；
+    //   ② 重答刻意剥离历史与画像（当初跑题根因是长上下文的旧主题磁吸），一旦误判，
+    //      用户看到的就是"答案突然换成另一段、且只对着引文讲，像忘了刚才在聊什么"
+    //      （2026-09-24 14:33《大国大城》实例：a 1350 字接着用户的话讲，35 秒后被
+    //      874 字的"冷启动式"引文解释覆盖）。
+    // 现在**答完即定稿**：流式显示什么、最终记录就是什么（除下面的 MEMORIZE 标记剥离）。
+    // 防跑题回到事前：AGENT.md 的【本轮消息】规则 + say() 里的 persona/anchored 锚定块。
 
     // 收尾展示文本：剥掉 MEMORIZE 标记
     displayContent = stripMemorize(fullContent)
 
     if (key !== '_meta') {
       // 会话中实时记忆：检测【MEMORIZE】标记 → 就地合并进 profile/soul → 追加确认反馈。
-      // 自由模式跳过（测试对话不进长期记忆）：标记剥离照常（显示层），合并不执行。
-      const memorize = key !== FREE_KEY ? extractMemorize(fullContent) : null
+      // 自由模式跳过（对话内容默认不进长期记忆）：标记剥离照常（显示层），合并不执行；
+      // 归档时勾选「保存记忆」由 archiveFreeConversation 统一合并。
+      const memorize = !isFreeKey(key) ? extractMemorize(fullContent) : null
       if (memorize) {
         try {
           const ok = await runMemoryMerge(memorize.target, memorize.content)
@@ -917,18 +935,24 @@ async function say(userText, options = {}) {
         }
       }
       // 合并完成后把最终内容（含确认反馈）作为流式末段补写进现有气泡，再 -1。
-      // 普通回复：末段直接更新气泡；引用回复：侧栏忽略流式末段，走下面最终记录。
       if (memorize) appendChatOutputStream(displayContent, key)
       appendChatOutputStreamEnd(key)
-      appendChatOutput('assistant', displayContent, key)
+      appendChatOutput('assistant', displayContent, key, { replyTo: options.replyTo })
     }
   } catch (e) {
     // 出错也要收尾：流已吐过一部分时补 -1 + 错误记录，避免侧栏气泡卡在思考动画。
-    // 元任务（_meta）不写 chat_output，避免在侧栏产生记忆合并过程的伪气泡
+    // 元任务（_meta）不写库，避免在侧栏产生记忆合并过程的伪气泡。
+    // 失败回答以 status='failed' 入库：它不参与配对（pairReplies 跳过 ⚠️/failed），
+    // 也不影响提问的重试状态（提问的 status 由 poller 决定）。
     if (key !== '_meta') {
       if (started) appendChatOutputStreamEnd(key)
-      appendChatOutput('assistant', `⚠️ ${e.message}`, key)
+      appendChatOutput('assistant', `⚠️ ${e.message}`, key, {
+        status: 'failed', error: String(e.message).slice(0, 200), replyTo: options.replyTo,
+      })
     }
+    // 余额/鉴权类致命错误：登记给 poller → 中止本轮队列 + 暂停（否则队列里每条消息都会
+    // 各写一个 ⚠️ 气泡，2026-09-28 一次刷了 213 个）
+    if (isFatalConfigError(e)) _lastFatalError = e
     hist.pop()
     return `⚠️ ${e.message}`
   }
@@ -936,7 +960,7 @@ async function say(userText, options = {}) {
   hist.push({ role: 'assistant', content: stripCodeBlocks(displayContent) })
   // 注意：历史里的 assistant 与 chat_output 落盘/启动恢复保持一致（都 stripCodeBlocks）——
   // 否则回复含代码块时，跨会话恢复的历史与在线历史从那条起失配，缓存前缀全部断裂（2026-10）
-  if (key !== '_meta' && key !== FREE_KEY) journalAppend({ kind: 'msg', bookKey: key, role: 'assistant', content: displayContent, ...(options.assistantSelected ? { assistantSelected: options.assistantSelected } : {}) })
+  if (key !== '_meta' && !isFreeKey(key)) journalAppend({ kind: 'msg', bookKey: key, role: 'assistant', content: displayContent, ...(options.assistantSelected ? { assistantSelected: options.assistantSelected } : {}) })
   return stripCodeBlocks(displayContent)
 }
 
@@ -958,52 +982,6 @@ function judgeLLM(prompt, maxTokens) {
   return callLLM(maxTokens || 2048, [{ role: 'user', content: prompt }], { system: JUDGE_SYSTEM, temperature: 0 })
 }
 
-// ── 跑题自愈：判定 + 加固重答（2026-09）─────────────────────────────────────
-// 判定：AI 回复是否完全没碰用户引文（顺着旧话题/档案叙事代答 = 跑题，09-07 两次实例）。
-// 返回 true=跑题 / false=正常 / null=判定调用失败（调用方按正常处理，宁可不误伤）。
-function judgeReplyDerailed(reply, options) {
-  const quote = String(options.quote || '').replace(/\s+/g, '').slice(0, 600)
-  const question = questionFromContent(options.question).replace(/\s+/g, '').slice(0, 300)
-  const ans = String(reply || '').replace(/\s+/g, '').slice(0, 1100)
-  // 引文或回复过短时不判：避免把简短的正常交流误伤成跑题去重答
-  if (quote.length < 40 || ans.length < 60) return false
-  const prompt =
-    '判断 AI 的回复是否针对用户给出的引文做了直接回应（只输出"是"或"否"）。\n' +
-    '判定"是"：回复围绕引文本身展开（解释、讨论或点评引文、回答了用户的提问），即使质量不高也算"是"。\n' +
-    '判定"否"：回复完全没有碰引文内容——在回答另一个问题、顺着更早的话题或档案内容发挥、把档案当用户发言。\n\n' +
-    `用户引文："""${quote}"""\n\n` +
-    (question ? `用户提问："""${question}"""\n\n` : '（用户没有附提问，要求直接讨论这条引文/划线）\n\n') +
-    `AI 回复："""${ans}"""\n\n输出：是/否`
-  return judgeLLM(prompt, 512)  // 512：推理模型思考链会吃预算，64 会触发 length 重试变两次调用
-    .then(t => String(t || '').trim().replace(/^[^\u662f\u5426]*/, '')[0] === '否')  // 首个有效字符是"否"才算跑题
-    .catch(() => null)
-}
-
-// 从聊天内容里剥出"问题本身"：去掉 [引用]《书》标题行与 > "…" 块引用行，剩下的才是提问。
-function questionFromContent(content) {
-  const lines = String(content || '').split('\n').filter(l => !/^\s*>/.test(l))
-  if (lines[0] && lines[0].trim().startsWith('[引用]')) lines.shift()
-  return lines.join('\n').trim()
-}
-
-// 加固重答：不带历史、不带画像，只给引文+出处+用户问题（对照实验：该形态对引文
-// 解释稳定在点——跑题根因在长上下文里旧主题与画像的磁吸，剥离后即消失）。
-async function hardenedRetry(options) {
-  const quote = String(options.quote || '').slice(0, 1500)
-  const question = (questionFromContent(options.question) || '这段话到底在说什么？请解释引文本身。').slice(0, 500)
-  const where = [options.bookTitle, options.chapter].filter(Boolean).join('')
-  const prompt =
-    '【本轮消息】请用大白话解释下面这段引文到底在说什么。若句子长或角色多，逐句拆开讲：' +
-    '先说这段话是谁在说（或谁被引用、被反驳），再说它反驳谁、整体在论证什么，最后落到它想说明的道理。\n\n' +
-    `引文出处：${where || '（未知出处，按引文内容判断）'}\n` +
-    `引文：\n"""${quote}"""\n\n` +
-    `用户的问题："""${question}"""\n\n` +
-    '要求：只围绕上面的引文与问题展开，不要谈与引文无关的话题；直接给判断，不绕弯子。'
-  const text = await callLLM(8192, [{ role: 'user', content: prompt }])
-  if (!String(text || '').trim()) throw new Error('空回复')
-  return text
-}
-
 // 从聊天消息提取划线结构体 { text, book, chapter }（无划线返回 undefined）。供 selected / journal 记录复用。
 function selectionFromMsg(msg) {
   return msg && msg.selectedText
@@ -1013,8 +991,8 @@ function selectionFromMsg(msg) {
 
 // ── 会意图运行时态：图加载/保存 + 引用解析（L3 上下文） ──
 let graph = createGraph()  // 会意图（§5.3）：启动时从 GRAPH_FILE 加载，收口固化时写回
-let freeGraph = null       // 自由模式沙盒图：首次自由模式消息时从正式图深拷贝；收口固化
-                           // 完整链路（节点/user 边/derived 边）只落在沙盒，正式图零污染
+//（2026-11 自由模式多对话：自由对话不再有独立沙盒图——收编进正式图与否由归档弹窗
+//  决定，见 archiveFreeConversation；沙盒只服务引用解析的只读基线，已无写入方）
 
 // 读图文件：主文件损坏/缺失 → 回退 .bak（写盘总是先备份，读取失败用备份闭环）。
 // 返回 null = 文件不存在或结构不可用（调用方决定下一步）。
@@ -1074,50 +1052,13 @@ function saveGraph() {
   }
 }
 
-// 自由模式沙盒图导出（供 receiver /graph?free=1 → 侧栏图视图查看测试结果）。
-// 测试产物独立落盘，可随时手动删除；不进正式图、不影响固化图的备份闭环。
-function saveFreeGraph() {
-  if (!freeGraph) return
-  try {
-    fs.mkdirSync(path.dirname(FREE_GRAPH_FILE), { recursive: true })
-    fs.writeFileSync(FREE_GRAPH_FILE, JSON.stringify({ nodes: freeGraph.nodes, edges: freeGraph.edges }, null, 2))
-  } catch (e) {
-    console.log(`  ⚠️ 自由模式沙盒图写入失败: ${e.message}`)
-  }
-}
+// 说明（2026-11 自由模式多对话）：自由对话**不再**产出沙盒图产物——收编与否由归档
+// 弹窗决定，收编就直接写正式图（见 archiveFreeConversation）。receiver 的
+// `/graph?free=1` 与 knowledge-graph.free.json 只作为旧产物的只读入口保留
+//（历史文件可随时手删；文件不存在时该入口回退正式图）。
 
 // 从收口组 entries（user/assistant 轮次）提取交锋轮次 {q, a}（lib/graph-consolidate.js 导出）
 
-// L3 上下文块：命中节点的 root→recent 路径并集（拓扑序；内容 = node.point + 全部
-// discussions 的 excerpts 全文，全量进入不截断——设计文档 §5.4④）。
-// 2026-09：附"使用方式"指令（TAKEAWAY 机制移除后，L3 是承接旧知识点的唯一通道，
-// 让模型按路径延续/修正/反驳，不复述）。
-function l3Block(nodes) {
-  const lines = [
-    '[图路径上下文]（你引用/联想到了之前聊过的知识点，root→recent 路径不截断）：',
-    '使用方式：用户消息里的指认说法已匹配到下列旧知识点。回答时——',
-    '① 先正面回答用户的问题本身，不要被下文带跑；',
-    '② 用户引用旧知识点时，把它当作"我们之前共同建立的理解"，在此基础上延续、修正或反驳，给出实质推进（新例证、新区分、明确反驳），不要复述原文；',
-    '③ 命中多个节点时注意它们之间的路径关系（谁引用谁）；',
-    '④ 图路径只是背景资料，用户没引用到的节点不要硬提。',
-    '知识点路径：',
-  ]
-  for (const n of nodes) {
-    lines.push(`- ${n.point}`)
-    for (const d of n.discussions || []) {
-      const book = d?.book ? `《${d.book}》` : ''
-      lines.push(`  · ${book}${d?.chapter || ''}：${d?.question || ''}`)
-      const exs = Array.isArray(d.excerpts) ? d.excerpts.filter((e) => e && (e.q || e.a)) : []
-      for (const e of exs) {
-        const q = String(e.q || '').trim()
-        const a = String(e.a || '').trim()
-        if (q) lines.push(`    用户："${q}"`)
-        if (a) lines.push(`    AI："${a}"`)
-      }
-    }
-  }
-  return lines.join('\n')
-}
 
 // 会话中引用解析：发言 → 命中节点 id[] + L3 块。图空 / 异常 → 空，不影响主回复。
 // 命中只取上下文 + 暂存引用；**不建边**（建边在固化时，2026-08-27 定调命中与建边解耦）。
@@ -1144,24 +1085,24 @@ async function resolveCitations(userText, bookKey) {
       maxTokens: 16384,
       log: (m) => console.log(`  [引用解析] ${m}`),
     })
-    if (!hits.length) return { hits: [], l3: '' }
-    const pathNodes = new Map()  // id → node，保收集顺序（contextOf 已拓扑序）
-    for (const id of hits) {
-      if (!graph.nodes.some((n) => n.id === id)) continue
-      for (const n of contextOf(graph, id)) pathNodes.set(n.id, n)
-    }
     const valid = hits.filter((id) => graph.nodes.some((n) => n.id === id))
     if (valid.length) {
       // AI-020 命中事件：写 chat_output（role=graph-hit，不带 content/_stream——
       // 不渲染为消息、不参与回复配对），receiver 按既有通道转发为 SSE，侧栏图视图
-      // 据此高亮命中节点的 root→recent 路径并集。reason = 命中的知识点 point 列表；
+      // 据此高亮命中节点的闭包。reason = 命中的知识点 point 列表；
       // bookKey = 本次讨论归属书，侧栏按当前上下文过滤（命中脉络按书隔离）。
       const reason = valid
         .map((id) => { const n = graph.nodes.find((x) => x.id === id); return n ? `「${n.point}」` : id })
         .join('、')
       appendGraphHit(valid, reason, bookKey)
     }
-    return { hits: valid, l3: valid.length ? l3Block([...pathNodes.values()]) : '' }
+    // L3 种子 = 本轮命中 ∪ **本场实时栈已挂的全部引用**（2026-10 用户定调）。理由与前端图
+    // 高亮同一条：实时栈收口**之前**它们同属一场讨论——固化时同一段消息的 cites 会一起变成
+    // 同一个节点的 user 边，所以不是两类东西。于是「图上亮的」与「模型拿到的」严格一致
+    // （前端 computeHitLayers 用同一组种子）。种子非空就注入：这场讨论有引用 → 每轮都带上它的来路。
+    const seeds = [...new Set([...valid, ...collectStackCites(topicStacks[bookKey || currentBookKey])])]
+    const ancestry = seeds.length ? userAncestry(graph, seeds) : []
+    return { hits: valid, l3: ancestry.length ? l3Block(ancestry) : '' }
   } catch (e) {
     console.log(`  [引用解析] 本轮跳过（不影响主回复）: ${e.message}`)
     return { hits: [], l3: '' }
@@ -1262,47 +1203,26 @@ let lastReplyByBook = {}  // 每本书最近一轮 AI 回复 { bookKey: { conten
 // 边 → 冗余 user 边清理（上游命中被段间 derived 链覆盖则删，内容不变）→ 写图。
 // 返回 { keptClosed }：0 节点产出且非 noTopicized（LLM 故障）时保留
 // 被收口讨论，调用方压回栈顶下次重试；noTopicized（整栈无专题化）不保留。
-async function consolidateClosed(closed, isFree, targetGraph) {
+//
+// 目标图由 opts 决定（2026-11 自由模式多对话）：
+//   · 读书模式：（默认）正式图 graph —— 完整固化
+//   · 自由对话归档 + 用户勾选「收口进拓扑图」：同样落**正式图**（isFree:false），并且
+//     跑的是**同一套正常程序**（判专题化 → 判同一性分段 → 逐段归纳/派生/建边）——
+//     产出是"分段那么多个"知识点节点，不是压成一个占位节点。
+//   · 自由对话不勾选收口：零产物（连线都不建），对话内容随归档一并删除。
+async function consolidateClosed(closed, opts = {}) {
+  const { isFree = false, targetGraph = graph, logTag = '' } = opts
   let keptClosed = null
       if (isFree) {
-        // 自由模式（测试沙盒）：**不派生知识点**（2026-09 用户定调：测试对话不固化——
-        // 不派生 point/能指、不挂讨论内容、不判段间衍生）。收口只做一件事：
-        // 收集整场讨论挂的引用（cites）→ 建一个"测试占位节点"（point = 归纳的问题，
-        // 仅作识别，不带任何讨论内容）→ 建 user 边（cites → 占位节点）。
-        // 无引用命中 → 零产物（正常收口，不重试）。user 边的建立机制（from 有效过滤、
-        // 方向、同 pair 去重）在此完整测试。
-        try {
-          const cites = []
-          for (const e of closed.entries) {
-            if (e.role === 'user' && Array.isArray(e.cites) && e.cites.length) cites.push(...e.cites)
-          }
-          if (!cites.length) {
-            console.log('  [会意栈][自由模式] 收口无引用命中：零产物（测试对话不固化）')
-          } else {
-            let question = ''
-            try {
-              const qr = await consolidateThreadQuestion(closed.entries, {
-                callLLM: judgeLLM, maxTokens: 384, attempts: 5, log: () => {},
-              })
-              question = qr.question
-            } catch (e) {
-              console.log(`  [会意栈][自由模式] 问题归纳失败，占位节点用默认名: ${e.message}`)
-            }
-            const newId = nextNodeId()
-            addNode(targetGraph, { id: newId, point: question || '[自由模式测试]', aliases: [], discussions: [] })
-            const n = addCitationEdges(targetGraph, cites, newId)
-            console.log(`  [会意栈][自由模式] 测试占位节点 ${newId}（${(question || '[自由模式测试]').slice(0, 40)}…）+ user 边 ×${n}（不派生知识点，对话内容不落图）`)
-          }
-          saveFreeGraph()
-        } catch (e) {
-          console.log(`  [会意栈][自由模式] 测试固化失败（不影响主回复）: ${e.message}`)
-        }
+        // 自由对话且用户没勾"收口进拓扑图"：什么都不做。2026-11 用户定调——自由对话
+        // 默认是临时的，只有归档时勾了才走正常收口程序；不勾就零产物。
+        console.log(`  [会意栈]${logTag} 自由对话不收编：零产物（对话内容不落图）`)
       } else {
       // ① 固化后分段：先判专题化（识别知识点轮次；无内核轮次**不做过滤处理**，跟随并入
       //    当前组，2026-08-28 定调），再判同一性（细切发散的具体问题）
       const { segments, noTopicized } = await segmentStack(closed.entries, {
         callLLM: judgeLLM,
-        log: (m) => console.log(`  [会意栈] ${m}`),
+        log: (m) => console.log(`  [会意栈]${logTag} ${m}`),
       })
       console.log(`  [会意栈] 收口弹出 ${closed.entries.length} 轮 → 分段 ${segments.length} 个不可分割组`)
       // ② 每段：归纳问题（分段之后）→ 固化（派生 point/能指 → 新建节点，节点不可变）→ user 边
@@ -1376,7 +1296,7 @@ async function consolidateClosed(closed, isFree, targetGraph) {
           console.log(`  [会意栈] ⚠️ 收口固化 0 节点产出，被收口讨论保留回栈（${closed.entries.length} 轮，下次收口重试）`)
         }
       }
-      // 正式图收口固化 → 写正式图文件；自由模式 → 只导出沙盒图（receiver /graph?free=1）
+      // 正式图收口固化 → 写正式图文件（自由对话归档勾选"收编"时同样落正式图）
       saveGraph()
       }
   return { keptClosed }
@@ -1387,10 +1307,12 @@ async function consolidateClosed(closed, isFree, targetGraph) {
 async function forceConsolidate(bookKey) {
   const stack = topicStacks[bookKey] || []
   if (!stack.length) return { reply: '当前没有进行中的讨论可收口。' }
-  if (bookKey === FREE_KEY) return { reply: '自由模式不固化（测试对话）；退出自由模式后对正式书使用 /收口。' }
+  // 自由对话（任意自由 key）：收编与否是**归档时的用户选择**，不走 /收口 ——
+  // 否则会出现"没勾选收编却在对话中偷偷写图"的隐性固化。
+  if (isFreeKey(bookKey)) return { reply: '自由对话请在「归档」时选择要不要收口进拓扑图（对话条右侧 ⤓ 归档）。' }
   const closed = { ts: Date.now(), entries: stack }
   try {
-    const { keptClosed } = await consolidateClosed(closed, false, graph)
+    const { keptClosed } = await consolidateClosed(closed, { isFree: false, targetGraph: graph })
     if (keptClosed && keptClosed.length) {
       topicStacks[bookKey] = keptClosed
       saveTopicStacks(topicStacks)
@@ -1408,19 +1330,16 @@ async function forceConsolidate(bookKey) {
 async function driveTopicStack(bookKey, unit, reply, cites) {
   try {
     const stack = topicStacks[bookKey] || []
-    // 自由模式（测试沙盒）：收口固化完整链路跑在沙盒图上——首次自由模式消息时从
-    // 正式图深拷贝（此后正式图的变化不回灌沙盒：沙盒是测试基线快照），新建节点、
-    // user 边、derived 边只落在沙盒；正式图与长期记忆零污染
-    const isFree = bookKey === FREE_KEY
-    if (isFree && !freeGraph) {
-      freeGraph = cloneGraph(graph)
-      console.log(`  [会意栈][自由模式] 沙盒图初始化：从正式图复制 ${freeGraph.nodes.length} 节点 / ${freeGraph.edges.length} 边（测试产物不固化进正式图）`)
-    }
-    const targetGraph = isFree ? freeGraph : graph
+    // 自由对话（任意自由 key）：对话进行中**不做任何图固化**，只维护讨论栈
+    //（2026-11 用户定调）——收藏与否在归档时由用户勾选决定。这里把收口的固化分支
+    // 直接短路成"不固化"，弹栈的旧讨论就此结束，产物只可能在归档时生成。
+    const isFree = isFreeKey(bookKey)
+    const freeTag = isFree ? '[自由模式]' : ''
+    const logTag = freeTag || (bookKey ? `[${bookKey}]` : '')
     let r = await processStackMessage(stack, unit, {
       callLLM: judgeLLM,
       maxTokens: 2048,
-      log: (m) => console.log(`  [会意栈]${isFree ? '[自由模式]' : bookKey ? `[${bookKey}]` : ''} ${m}`),
+      log: (m) => console.log(`  [会意栈]${logTag} ${m}`),
     })
     // 引用挂消息条目：本消息的 cites 挂到本消息的 user 条目（随栈持久化，跨会话不丢）
     const citesList = Array.isArray(cites) ? cites : []
@@ -1442,13 +1361,124 @@ async function driveTopicStack(bookKey, unit, reply, cites) {
     const savedStack = r.stack.map((e, i) => (i === lastUserIdx && citesList.length ? { ...e, cites: citesList } : e))
     let keptClosed = null  // 收口固化 0 节点产出时保留被收口讨论（压回栈顶，下次收口重试）
     if (r.action === 'closed_and_pushed' && r.closed) {
-      keptClosed = (await consolidateClosed(r.closed, isFree, targetGraph)).keptClosed
+      // 自由对话：弹栈旧讨论不固化（产物只在归档时生成）；读书模式：正式图实时固化
+      if (!isFree) {
+        keptClosed = (await consolidateClosed(r.closed, { isFree: false, targetGraph: graph })).keptClosed
+      } else {
+        console.log(`  [会意栈]${freeTag} 旧讨论弹栈（${r.closed.entries.length} 轮）：不固化——产物在归档时由用户勾选决定`)
+      }
     }
     topicStacks[bookKey] = [...(keptClosed || []), ...savedStack, { role: 'assistant', content: String(reply || '').trim(), ...(unit.selected ? { selected: unit.selected } : {}) }]
     saveTopicStacks(topicStacks)
   } catch (e) {
     console.log(`  [会意栈] 本轮跳过（不影响主回复）: ${e.message}`)
   }
+}
+
+// ── 自由对话归档（2026-11 用户定调）──────────────────────────────────────────
+// 侧栏归档弹窗两项**默认都勾上**（可取消，取消的选择会被记住），随归档请求一并送到：
+//   · 保存记忆 memory：把这场对话（histories[key] 的完整轮次）交给 profile/soul 合并
+//     ——走的就是 saveSessionMemory 的同一套 specs/校验/备份闭环，只是材料换成这场
+//     自由对话（自由对话不进 session_journal，所以不能复用 journal 那条路）。
+//   · 收口进拓扑图 graph：这场讨论跑**读书模式那套一模一样的正常程序**——判专题化 →
+//     判同一性分段 → 逐段归纳问题 → 派生 point/能指 → 新建节点 → 引用边 → 段间
+//     derived 边 → 冗余 user 边清理，写**正式图**（knowledge-graph.json）。
+//     产出是"分段那么多个"知识点节点，**不是压成一个占位节点**（那是 2026-09 测试沙盒
+//     的旧实现，已废弃；UI 文案也已按真实逻辑改写）。
+// 归档即删除：无论勾没勾，归档完成后清空该对话的讨论栈、LLM 历史、会话历史与
+// 聊天库里属于它的消息；注册表只留一条墓碑记录（产物去向说明）。
+async function archiveFreeConversation(key, opts = {}) {
+  const wantMemory = !!(opts && opts.memory)
+  const wantGraph = !!(opts && opts.graph)
+  const lines = []     // 本次归档真正做过/跳过的事（进系统气泡与墓碑记录）
+  const skipped = []   // 用户没勾的项（墓碑里也要写清楚"没做什么"）
+  let memoryOk = false
+  let nodeCount = 0
+  let edgeCount = 0
+  let newPoints = []   // 本次收口新建节点的 point（让用户看见"收出了什么"，而不只是一个数字）
+
+  // ① 记忆：这场对话的全部轮次
+  if (wantMemory) {
+    const hist = (histories.get(key) || []).filter((m) => String(m.content || '').trim())
+    if (hist.length >= 2) {
+      try {
+        const ok = await saveMemoryFromTranscript(
+          hist.map((m) => ({ role: m.role, bookKey: key, content: m.content })),
+          { label: '这场自由对话' },
+        )
+        memoryOk = ok
+        lines.push(ok ? '已保存记忆（profile / soul）' : '记忆合并未通过校验，已保留原文件')
+      } catch (e) {
+        lines.push('记忆保存失败：' + e.message)
+      }
+    } else {
+      lines.push('对话太短，未保存记忆')
+    }
+  } else {
+    skipped.push('未保存记忆')
+  }
+
+  // ② 拓扑图：这场讨论收口 → **读书模式那套一模一样的正常程序**（判专题化 → 判同一性
+  //    分段 → 逐段归纳问题 → 派生 point/能指 → 新建节点 → user 边 → 段间无条件 derived
+  //    边 → 冗余 user 边清理），写正式图。这里不做任何"压成一个占位节点"的简化——
+  //    自由对话的收口产物与读书模式收口出来的东西同构，用户看到的节点数就是分段的段数。
+  const stack = topicStacks[key] || []
+  const nodesBefore = graph.nodes.length
+  const edgeKeysBefore = new Set(graph.edges.map((e) => `${e.from}|${e.to}|${e.kind || 'user'}`))
+  if (wantGraph) {
+    if (!stack.length) {
+      lines.push('无讨论内容可收口（对话太短：栈内没有轮到归纳）')
+    } else {
+      try {
+        const { keptClosed } = await consolidateClosed(
+          { ts: Date.now(), entries: stack },
+          { isFree: false, targetGraph: graph, logTag: '[自由·归档]' },
+        )
+        if (keptClosed && keptClosed.length) {
+          lines.push('收口未完成（固化 0 节点产出）—— 对话内容仍会随归档删除')
+        } else {
+          const newNodes = graph.nodes.slice(nodesBefore)
+          nodeCount = newNodes.length
+          newPoints = newNodes.map((n) => String(n.point || '')).filter(Boolean)
+          // 边没有 id，按 from|to|kind 记差集（同 pair 去重边不会重复计入）
+          edgeCount = graph.edges.filter((e) => !edgeKeysBefore.has(`${e.from}|${e.to}|${e.kind || 'user'}`)).length
+          lines.push(nodeCount
+            ? `已收口进拓扑图（${nodeCount} 个知识点节点 / ${edgeCount} 条边）`
+            : '已收口进拓扑图（整场无专题化轮次，未产出知识点节点）')
+        }
+      } catch (e) {
+        lines.push('收口失败：' + e.message)
+      }
+    }
+  } else {
+    skipped.push('未收口进拓扑图')
+  }
+
+  // ③ 清理 + 墓碑：归档即删除
+  topicStacks[key] = []
+  saveTopicStacks(topicStacks)
+  histories.delete(key)
+  lastReplyByBook && delete lastReplyByBook[key]
+  if (histCutCursors && key in histCutCursors) { delete histCutCursors[key]; saveHistCursors() }
+  // 删这场对话在聊天库里的消息与事件（事务删除；旧实现是整文件重写两遍 jsonl）
+  const del = (() => {
+    try { const r = chatStore().deleteConversation(key); return { input: r.messages, output: r.events } } catch (e) {
+      console.log(`  ⚠️ 归档清理失败：${e.message}`)
+      return { input: 0, output: 0 }
+    }
+  })()
+  const note = lines.join('；') || '已归档'
+  archiveConversation(AGENT_DIR, key, { archive: { memory: memoryOk, graph: wantGraph && nodeCount > 0 }, note, now: Date.now() })
+
+  const head = `对话已归档并删除${skipped.length ? '（' + skipped.join('、') + '）' : ''}。`
+  // 把收口产出的知识点列出来（最多 5 条）：用户要看的是"收成了什么"，
+  // 一个节点数说明不了问题——读书模式收口出来的是分段的多个节点，这里同构。
+  const pointLine = newPoints.length
+    ? `\n收口出的知识点：\n` + newPoints.slice(0, 5).map((p) => '· ' + p).join('\n') +
+      (newPoints.length > 5 ? `\n· …等 ${newPoints.length} 个` : '')
+    : ''
+  console.log(`  [自由模式] 归档 ${key}：${lines.join('；') || '零产物'}（清理消息 input×${del.input} output×${del.output}）`)
+  return { reply: head + (lines.length ? lines.join('；') + '。' : '') + pointLine }
 }
 
 // ── 用户情况与观念画像（self-portrait） ─────────────────────────────────────
@@ -1661,6 +1691,23 @@ async function saveSessionMemory({ minMsgs = 2 } = {}) {
     return
   }
   console.log(`\n正在固化本次会话记忆（${msgs.length} 条对话）...`)
+  // 记忆合并本体抽成 saveMemoryFromTranscript：自由对话归档（勾选「保存记忆」）走
+  // 的是同一套 specs / 校验 / 备份闭环，只是材料换成那一场自由对话的轮次
+  //（自由对话不进 session_journal，不能复用 journal 那条入口）。
+  const anyWritten = await saveMemoryFromTranscript(msgs, { label: '本次会话' })
+  // 至少一个文件成功合并才打 checkpoint；全失败则保留未合并记录，下次启动再试
+  if (anyWritten) {
+    journalCheckpoint()
+  } else {
+    console.log('  ⚠️ 本次未写入任何记忆，未合并对话将保留，下次启动时重试')
+  }
+}
+
+// 记忆合并本体：把 msgs（[{ role:'user'|'assistant', bookKey?, content }]）压成记录文本，
+// 逐个人格文件（profile / soul）提炼 + 合并重写。返回是否有文件被成功写入。
+// 注意：本函数**不打 journal checkpoint**——checkpoint 只对 session_journal 有意义
+//（调用方 saveSessionMemory 负责）；自由对话归档借用本函数时不碰流水账游标。
+async function saveMemoryFromTranscript(msgs, { label = '本次讨论' } = {}) {
   const transcript = transcriptText(msgs)
 
   const specs = MEMORY_SPEC_LIST
@@ -1675,7 +1722,7 @@ async function saveSessionMemory({ minMsgs = 2 } = {}) {
       try { fs.copyFileSync(filePath, filePath + '.bak') } catch {}
     }
 
-    const prompt = `会话即将结束。以下是本次讨论的记录（每条前面已标注来自"用户"还是"AI"）：\n\n${transcript}\n\n` +
+    const prompt = `${label}已结束。以下是讨论的记录（每条前面已标注来自"用户"还是"AI"）：\n\n${transcript}\n\n` +
       `请从上面的讨论中提炼出属于 ${file}（${purpose}）的新内容，与以下原内容合并，` +
       `输出完整的重写版本（删去被覆盖的旧条目，保持精简）。\n\n` +
       `要求：${scope}。\n\n` +
@@ -1692,13 +1739,7 @@ async function saveSessionMemory({ minMsgs = 2 } = {}) {
       console.log(`  ⚠️ ${file} 重试后仍未通过校验，保留旧文件`)
     }
   }
-
-  // 至少一个文件成功合并才打 checkpoint；全失败则保留未合并记录，下次启动再试
-  if (anyWritten) {
-    journalCheckpoint()
-  } else {
-    console.log('  ⚠️ 本次未写入任何记忆，未合并对话将保留，下次启动时重试')
-  }
+  return anyWritten
 }
 
 // 强杀/断电兜底：启动时若发现上次会话有未固化的对话，自动恢复合并
@@ -1786,14 +1827,17 @@ async function buildAnnotationPrompt(ann) {
 
   p += assembleBookContext(bookId, bookTitle, chapter, chapterUid, selectedText)
 
-  // L3 图路径上下文：用户第一反应引用旧知识点时命中（只取上下文，不建边）
+  // L3 图路径上下文：用户第一反应引用旧知识点时命中（只取上下文，不建边）。
+  // 2026-10：L3 不再拼进 prompt 正文，改为独立消息插在【本轮消息】之前（见 say 的
+  // options.l3）——否则生成点前最后读到的是旧讨论，块尾磁吸会带跑本轮回复。
+  let l3Ctx = ''
   if (userNote) {
     const cr = await resolveCitations(userNote)
-    if (cr.l3) p += `\n\n${cr.l3}\n`
+    l3Ctx = cr.l3 || ''
   }
 
   p += `\n请按行为规则开始讨论这条划线。`
-  return p
+  return { text: p, l3: l3Ctx }
 }
 
 // 为带书籍元数据的聊天消息补全上下文（章节窗口、摘要）
@@ -1871,6 +1915,13 @@ async function processNewAnnotations() {
   // setRef/source，改版前创建）会被当成新划线重新触发 LLM 讨论，每次删除都重放。
   // 钳位后新追加的标注照常从末尾处理，不会永久跳过；已处理的旧标注也不再重扫。
   if (cursor > anns.length) {
+    // 读到 0 行但游标 >0（2026-09-30）：几乎一定是写入方（/annotation-delete 重写
+    // annotations.jsonl）造成的半截读——照旧钳位就会把游标写成 0，下一轮把全部旧标注重读
+    // 一遍（与 chat 侧同款缺陷，2026-09-28 的 288 条重放就是这条路径）。这里跳过本轮。
+    if (!anns.length && cursor > 0) {
+      console.log('  ⚠️ annotations 读到 0 行（写入方正在原地重写？）——本轮跳过，游标不动')
+      return false
+    }
     cursor = anns.length
     setCursor(cursor)
   }
@@ -1892,9 +1943,9 @@ async function processNewAnnotations() {
       (ann.userNote ? `\n我的批注：${ann.userNote}` : '')
     // 处理步骤状态：共读弹窗提交的标注在侧栏也有思考气泡，按步骤更新文案
     if (ann.userNote && graph.nodes.length) appendAgentState('resolve', key)
-    const prompt = await buildAnnotationPrompt(ann)
+    const { text: prompt, l3 } = await buildAnnotationPrompt(ann)
     appendAgentState('answer', key)
-    const reply = await say(prompt, { bookKey: key, storeText, quote: ann.selectedText, question: ann.userNote || '', bookTitle: ann.bookTitle, chapter: ann.chapter })
+    const reply = await say(prompt, { bookKey: key, storeText, l3 })
     console.log('\n' + stripCodeBlocks(reply) + '\n')
   }
   setCursor(anns.length)
@@ -1915,9 +1966,21 @@ async function main() {
   // 强杀/断电兜底：上次会话未固化的对话在启动时恢复合并
   await recoverUnmergedMemory()
 
+  // 聊天存储：打开（必要时建表）并把上次崩溃残留的"处理中"状态清干净。
+  // 瞬态打字机通道每次启动清空——它不入档，留着只会让侧栏看到上次的半截气泡。
+  resetStreamFile()
+  try {
+    const st = chatStore().stats()
+    console.log(`   聊天库：${CHAT_DB}（${st.messages} 条消息 / ${st.conversations} 个对话 / 待处理 ${st.pending} / 失败待重试 ${st.failed}）`)
+    if (st.pending || st.failed) console.log(`   队列里有 ${st.pending + st.failed} 条待处理消息（含失败重试）`)
+  } catch (e) {
+    console.log(`  ⚠️ 聊天库打开失败：${e.message}`)
+    console.log('     若还没有迁移，请先跑：node agent/scripts/migrate-chat-to-sqlite.mjs --apply')
+  }
+
   // 2026-09 用户定调（跨会话需要旧消息）：histories 是内存态、重启即空，
   // 跨会话承接会断裂（进行中讨论的轮次在主回复 prompt 里丢失）——
-  // 启动时从 chat_input/chat_output 重建每本书的最近轮次（受 BUDGET 约束）。
+  // 启动时从聊天库重建每本书的最近轮次（受 BUDGET 约束，reply_to 直接配对）。
   // 必须在 processNewAnnotations 之前（新标注讨论要基于恢复的历史）。
   // 截尾游标先加载：恢复从游标处续推，保证与在线末尾一致（2026-10）。
   histCutCursors = loadHistCursors()
@@ -1936,6 +1999,12 @@ async function main() {
   rl.prompt()
 
   let busy = false
+  // 致命故障（401/402/403：余额不足 / 鉴权失败）后暂停队列的截止时间戳。逐条重试只会把同一句
+  // 错误刷满整本书的历史（2026-09-28：重放的 213 条各写一个 ⚠️ 气泡），所以识别到这类错误就
+  // 中止本轮并暂停：充值/改配置后自动继续，重启 agent 立即恢复。
+  const FATAL_PAUSE_MS = 10 * 60 * 1000
+  const RETRY_PAUSE_MS = 60 * 1000   // 非致命失败（网络/截断/空流）也歇一会儿，避免热循环
+  let queuePausedUntil = 0
 
   // 每 3 秒轮询新标注 + 侧栏用户消息
   const poller = setInterval(async () => {
@@ -1950,9 +2019,14 @@ async function main() {
       try { await saveSessionMemory({ minMsgs: 2 }) } catch (e) { console.log(`⚠️ 记忆固化失败: ${e.message}`) }
       // 关闭不做收口固化：进行中的讨论留在栈里（topic_stack.json 已实时保存），下次恢复
       try { fs.unlinkSync(STOP_FILE) } catch {}
+      closeChatStore()
       console.log('👋 已保存，共读会话结束。')
       process.exit(0)
     }
+
+    // 队列暂停中（刚发生致命故障 / 连续失败）：本轮不调模型、不刷气泡。
+    // 停机哨兵在上面已处理，所以暂停期间 stop.bat 照常工作。
+    if (Date.now() < queuePausedUntil) return
 
     // 优先处理新标注：游标与当前行数不一致（新增 / 删除 / 截断）时交给
     // processNewAnnotations 统一处理——它内部会做游标重置 + 指纹去重，
@@ -1968,37 +2042,47 @@ async function main() {
       return
     }
 
-    // 处理来自侧栏的用户消息
-    const inputs = readChatInputs()
-    // 游标超出实际行数（文件被截断/手动清理过）：钳到当前行数，不要归零重扫。
-    // 归零会把全部旧提问重新处理一遍、产生重复回复（AI-011 同款教训，chat 侧）。
-    if (getChatInputCursor() > inputs.length) setChatInputCursor(inputs.length)
-    const chatCursor = getChatInputCursor()
-    if (chatCursor >= inputs.length) return
+    // 处理来自侧栏的用户消息 = 库里 status IN ('pending','failed') 的行（按 id 升序）。
+    // 旧实现要读文件 + 比游标 + 查指纹台账，还要防"读到空文件→游标归零→全量重放"；
+    // 现在"哪条没答"是数据库查询，"答到哪了"是自增 id，那一整类事故从结构上消失。
+    const pending = readPendingMessages()
+    if (!pending.length) return
     busy = true
     rl.pause()
     try {
-      for (let i = chatCursor; i < inputs.length; i++) {
-        const msg = inputs[i]
-        // 去重：指纹 = 时间戳+内容前80字，防止同一消息被重复回复
-        const fp = `${msg.timestamp || 0}|${(msg.content || '').slice(0, 80)}`
-        if (_repliedFingerprints.has(fp)) { console.log(`  [dedup] skip: ${fp.slice(0,50)}`); continue }
-        persistRepliedFingerprint(fp)
+      for (const msg of pending) {
         // AI-001：消息归属当前书——有 bookId 用其书（自由消息也带书签，见 sidebar submit），
         // 无 bookId 则沿用"正在读的书"（currentBookKey），否则进 _common。
-        const key = msg.bookId ? baseBookId(msg.bookId) : (currentBookKey || '_common')
+        const key = msg.bookId ? baseBookId(msg.bookId) : (msg.conv || currentBookKey || '_common')
         // /收口：手动收口本书讨论（2026-09 用户定调——读完一本书时使用）。
         // 指令消息不进栈/不进会话历史/不触发 LLM，只执行收口并回复确认。
         if (String(msg.content || '').trim() === '/收口') {
           const cr = await forceConsolidate(key)
           // 系统提示：role=system（侧栏以系统样式渲染 + toast，不参与引用回复配对）
-          appendChatOutput('system', cr.reply, key)
+          appendChatOutput('system', cr.reply, key, { replyTo: msg.id })
+          markMessage(msg.id, { status: 'ok' })
           console.log('\n[侧栏] ' + cr.reply + '\n')
           continue
         }
-        // 自由模式（FREE_KEY）不改变"正在读的书"：测试对话结束后，后续无 bookId 的
+        // /归档：归档一场自由对话（2026-11 用户定调）。侧栏归档弹窗发出——请求带
+        // archive = { key, memory, graph }（勾选项，现在由「聊天库」承载在 payload 里，
+        // 老版本是顶层 msg.archive，两个位置都认）。归档 = 这场对话结束并删除：默认勾选的
+        // 两项 = 保存记忆 + 收口进正式拓扑图（读书模式那套正常程序）；完成后清栈、清消息、
+        // 注册表留墓碑。
+        if (String(msg.content || '').trim() === '/归档') {
+          const ar = (msg.payload && msg.payload.archive) || msg.archive || {}
+          const target = ar.key ? baseBookId(ar.key) : key
+          const reply = isFreeKey(target)
+            ? (await archiveFreeConversation(target, ar)).reply
+            : '只能归档自由模式的对话（读书模式的讨论用 /收口）。'
+          appendChatOutput('system', reply, target, { replyTo: msg.id })
+          markMessage(msg.id, { status: 'ok' })
+          console.log('\n[侧栏] ' + reply + '\n')
+          continue
+        }
+        // 自由对话（任意自由 key）不改变"正在读的书"：对话结束后，后续无 bookId 的
         // 自由消息仍应归属真实阅读的书，而不是滞留在自由模式
-        if (msg.bookId && key !== currentBookKey && key !== FREE_KEY) {
+        if (msg.bookId && key !== currentBookKey && !isFreeKey(key)) {
           // 切书：旧书的讨论周期结束，避免 currentAnn 残留污染新书
           currentBookKey = key
           currentAnn = null
@@ -2021,12 +2105,11 @@ async function main() {
         if (graph.nodes.length) appendAgentState('resolve', key)
         const citesR = await resolveCitations(msg.content, key)
         let citesFinal = citesR.hits
-        if (key === FREE_KEY && Array.isArray(msg.refs)) {
+        if (isFreeKey(key) && Array.isArray(msg.refs)) {
           citesFinal = msg.refs.filter((id) => graph.nodes.some((n) => n.id === id))
           console.log(`  [自由模式] 引用以窗体为准（${citesFinal.length} 条）${citesFinal.length ? '：' + citesFinal.join('、') : ''}`)
         }
-        let userMsg = enrichChatMessage(msg)
-        if (citesR.l3) userMsg += `\n\n${citesR.l3}\n`
+        const userMsg = enrichChatMessage(msg)
         // AI-017：侧栏入库只留"划线原文(引用) + 你的提问"，不含 [正在共读] 章节窗口；自由消息保持原话。
         // bookTitle 用 || '' 兜底——与 restoreHistories 的 storeText 构造完全一致（否则缺书名时
         // 在线历史《undefined》与恢复历史《》不同，跨会话缓存前缀断裂，2026-10）
@@ -2034,8 +2117,28 @@ async function main() {
           ? `【划线】《${msg.bookTitle || ''}》${msg.chapter || ''}\n划线原文：${msg.selectedText}\n我的提问：${msg.content}`
           : msg.content
         appendAgentState('answer', key)
-        const reply = await say(userMsg, { bookKey: key, storeText, assistantSelected: selectionFromMsg(msg), quote: msg.selectedText, question: msg.content, bookTitle: msg.bookTitle, chapter: msg.chapter })
+        // replyTo = 这条提问的 id：回答入库时直接挂上引用（配对从"时间序推断"变成"外键"）
+        const reply = await say(userMsg, { bookKey: key, storeText, assistantSelected: selectionFromMsg(msg), l3: citesR.l3, replyTo: msg.id })
         _lastReplyCtx = stripCodeBlocks(reply)
+        // 致命配置/额度错误（401/402/403）：中止本轮 + 暂停队列 + 只留一条 system 提示。
+        // 该消息保持 pending（不标 ok）→ 充值/改配置后会重新回答；也不再逐条试
+        // （旧行为会刷出几百个 ⚠️ 气泡，2026-09-28 一次刷了 213 个）。
+        const fatal = takeFatalError()
+        if (fatal) {
+          const note = fatalErrorMessage(fatal)
+          appendChatOutput('system', note, key)
+          console.log('\n[侧栏] ' + note + '\n')
+          queuePausedUntil = Date.now() + FATAL_PAUSE_MS
+          break
+        }
+        if (/^⚠️/.test(reply)) {
+          // 非致命失败（网络/截断/空流）：status=failed → 下一轮/下次启动仍会重试；
+          // 歇 60s 再继续，避免对着一台坏掉的 API 热循环。
+          markMessage(msg.id, { status: 'failed', error: String(reply).slice(0, 200) })
+          queuePausedUntil = Date.now() + RETRY_PAUSE_MS
+          break
+        }
+        markMessage(msg.id, { status: 'ok' })
         // 画像维护（self-portrait）已停用（2026-10 用户定调：画像只写不读、无消费方，展示不需要）。
         // 调用入口注释保留——恢复时取消注释即可；历史条目可用 scripts/backfill-self-portrait.mjs 重建。
         // if (key !== FREE_KEY) {
@@ -2051,7 +2154,6 @@ async function main() {
         await driveTopicStack(key, buildTopicUnit(msg, lastR ? lastR.content : null, lastR ? lastR.selected : undefined), reply, citesFinal)
         lastReplyByBook[key] = { content: stripCodeBlocks(reply), selected: selectionFromMsg(msg) }
       }
-      setChatInputCursor(inputs.length)
     } catch (e) { console.log(`⚠️ ${e.message}\n`) }
     busy = false
     rl.resume()
@@ -2081,9 +2183,7 @@ async function main() {
         // 引用解析（会话中）：命中 → L3 图路径上下文注入；引用挂消息（固化后按组建边）；
         // 命中事件带书归属（key），侧栏按当前上下文过滤显示
         const citesR = await resolveCitations(line, key)
-        let userMsg = line
-        if (citesR.l3) userMsg += `\n\n${citesR.l3}\n`
-        const reply = await say(userMsg, { bookKey: key })
+        const reply = await say(line, { bookKey: key, l3: citesR.l3 })
         _lastReplyCtx = stripCodeBlocks(reply)
         // 画像维护已停用（2026-10 用户定调）：self-portrait 无消费方，调用入口注释保留。
         // driveSelfPortrait(
@@ -2113,12 +2213,14 @@ async function main() {
     try { await Promise.allSettled(_pendingSelfPortrait) } catch (e) { console.log(`⚠️ 画像收尾失败: ${e.message}`) }
     try { await saveSessionMemory({ minMsgs: 2 }) } catch (e) { console.log(`⚠️ 记忆固化失败: ${e.message}`) }
     // 关闭不做收口固化：进行中的讨论留在栈里（已实时保存），下次恢复
+    closeChatStore()
     console.log('👋 共读会话结束。')
     process.exit(0)
   }
 
   rl.on('close', shutdown)
   process.on('SIGINT', shutdown)
+  process.on('SIGTERM', shutdown)
 }
 
-main().catch(e => { console.error('❌', e.message); process.exit(1) })
+main().catch(e => { console.error('❌', e.message); closeChatStore(); process.exit(1) })

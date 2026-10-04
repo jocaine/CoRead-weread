@@ -14,7 +14,10 @@
  *    （from = 被引用的旧知识点，to = 当前讨论所在节点，kind 恒为 "user"）或
  *    段间衍生（kind = "derived"）。root = 无入边的节点；recent = 当前讨论所在节点。
  * 2. 路径上下文（contextOf）：取目标节点的 root→recent 路径（多目标并集、去重、
- *    按拓扑序 root 在前），供 L3 上下文组装（§5.4④）。有界靠选择，不截断。
+ *    按拓扑序 root 在前）。**本函数保留给离线工具/前端**——L3 上下文组装自 2026-10
+ *    起改用 userAncestry（只走 user 入边，见下），不再走混合边的全祖先链。
+ * 2.5 L3 来路闭包（userAncestry）：只沿 user 入边反向递归（"这条讨论当时引用过谁"），
+ *    供 L3 上下文组装（§5.4④）。有界靠选择，不截断。
  * 3. 引用解析（resolveReferences，动作③）：用户发言里引用旧知识点时，找出指认
  *    旧知识点的说法并匹配节点。**纯 LLM 语义判定**（2026-08-27 定调：去掉字符串
  *    粗召回与覆盖判定；2026-08-29 加强：语义匹配——内容线索与节点身份是同一个
@@ -219,29 +222,33 @@ export function findNodesByPoint(graph, point) {
 }
 
 /**
- * 判 fromId 是否能沿边（含 user 与 derived 全部 kind）到达 toId。
+ * 判 fromId 是否能沿边到达 toId。
  *
- * 口径与 contextOf / 前端图视图的"脉络"一致：边方向 = 引用方向（from = root 侧
- * 被引用节点，to = recent 侧引用节点），root→recent 路径 = 脉络；能沿边从 X 到达
- * Y ⟺ X 是 Y 脉络上的较早节点（X 的 root→自身路径已被 Y 的内容完整包含，
- * 见 contextOf 注释——Y 的反向可达集必然覆盖 X）。
+ * 口径：边方向 = 引用方向（from = root 侧被引用节点，to = recent 侧引用节点），
+ * root→recent 路径 = 脉络；能沿边从 X 到达 Y ⟺ X 是 Y 脉络上的较早节点。
  *
  * @param {object} graph
  * @param {string} fromId 起点节点 id
  * @param {string} toId   终点节点 id
+ * @param {Array<string>} [kinds] 只允许走的边 kind（如 ['user']）；省略/空 = 全部 kind。
+ *   **注意（2026-10）**：user 边的折叠判据必须传 `['user']`——L3 只沿 user 入边取来路，
+ *   借道 derived 的"覆盖"关系对 L3 不再成立（详见 graph-consolidate.js 的折叠注释）。
+ *   不传 kinds 的调用方（前端图视图/离线工具）保持"混合边"旧口径。
  * @returns {boolean} from === to 或任一节点缺失 → false；否则沿边 DFS 判可达
  */
-export function isReachable(graph, fromId, toId) {
+export function isReachable(graph, fromId, toId, kinds) {
   const from = String(fromId || '').trim()
   const to = String(toId || '').trim()
   if (!from || !to || from === to) return false
   if (!findNode(graph, from) || !findNode(graph, to)) return false
+  const allow = Array.isArray(kinds) && kinds.length ? new Set(kinds) : null
   const stack = [from]
   const seen = new Set([from])
   while (stack.length) {
     const cur = stack.pop()
     for (const e of graph.edges) {
       if (e.from !== cur || seen.has(e.to)) continue
+      if (allow && !allow.has(e.kind)) continue
       if (e.to === to) return true
       seen.add(e.to)
       stack.push(e.to)
@@ -312,6 +319,78 @@ function topoSortNodes(graph, ids) {
   }
   const ordered = order.length === ids.length ? order : ids.slice().sort()
   return ordered.map((id) => findNode(graph, id)).filter(Boolean)
+}
+
+// ─────────────── 2.5 L3 来路闭包（user 入边，2026-10 定调） ───────────────
+
+/**
+ * L3 上下文可带的最大节点数（命中节点 + 来路）。命中节点一律保留，其余按跳数由近及远取。
+ * user 边当前很稀疏（实测全图 40 条 / 104 节点，反向闭包通常 1~8 个节点），上限只是
+ * 兜底：将来 user 边变密时防止闭包意外膨胀。
+ */
+export const L3_MAX_NODES = 12
+
+/**
+ * 取 L3 的"来路"闭包：沿 **user 入边** 反向递归。
+ *
+ * 方向语义（边的约定：from = 被引用的旧知识点，to = 当前讨论所在节点）：
+ * - **user 入边**：这场讨论**当时引用了**哪些旧知识点 = 这个节点的**来路**（出身）。
+ *   节点不可变 ⇒ 来路边在固化那一刻就定型，之后只减不增（只被冗余清理删除）。
+ * - user 出边（去路）：后来别的讨论引用它才长出来的边。它不是这个节点的出身，是
+ *   **那些下游节点的来路**；且随图增长而漂移 ⇒ L3 不走。
+ * - derived 边（同栈相邻段）：段是判同一性切出来的"不可分割组"，**相邻两段按系统
+ *   自己的判定就不是同一个问题**，只是同一场会话里先后问出来 ⇒ 不是承接对象，L3 不走。
+ *
+ * 2026-10 定调（此前实现走 contextOf 的 user+derived 混合全祖先链）：命中一个节点会把
+ * 整条派生链连同链间 user 桥递归拖进来，实测 51 节点 / 29 万字，块尾落在一条与当前问题
+ * 无关的旧讨论上，导致主回复答非所问（《大国大城》2026-09-26 实例）。改为只走来路后
+ * 同一轮降到 8 节点 / 4.2 万字，块尾即本轮命中节点。
+ *
+ * @param {object} graph
+ * @param {string|Array<string>} targetIds 本轮引用解析命中的节点 id
+ * @param {object} [opts] { maxNodes?: number } 节点上限（默认 L3_MAX_NODES）
+ * @returns {Array<{id: string, node: object, hops: number, hit: boolean}>}
+ *   排序：来路跳数大→小在前，命中节点（hops=0）在最后——命中钉在块尾、紧贴本轮问题。
+ *   目标全不存在 → 空数组。
+ */
+export function userAncestry(graph, targetIds, opts = {}) {
+  const raw = Number(opts?.maxNodes)
+  const maxNodes = Number.isInteger(raw) && raw > 0 ? raw : L3_MAX_NODES
+  const targets = (Array.isArray(targetIds) ? targetIds : [targetIds])
+    .map((id) => String(id || '').trim())
+    .filter((id) => id && findNode(graph, id))
+  if (targets.length === 0) return []
+
+  const hop = new Map()
+  for (const id of targets) hop.set(id, 0)
+  let frontier = [...targets]
+  let h = 0
+  while (frontier.length) {
+    h++
+    const next = []
+    for (const cur of frontier) {
+      for (const e of graph.edges) {
+        if (e.kind !== 'user' || e.to !== cur) continue
+        if (hop.has(e.from) || !findNode(graph, e.from)) continue
+        hop.set(e.from, h)
+        next.push(e.from)
+      }
+    }
+    frontier = next
+  }
+
+  let ids = [...hop.keys()]
+  if (ids.length > maxNodes) {
+    // 超上限：命中节点（0 跳）优先保留，其余由近及远；同跳按 id 稳定序
+    ids = ids
+      .slice()
+      .sort((a, b) => (hop.get(a) - hop.get(b)) || (a < b ? -1 : 1))
+      .slice(0, maxNodes)
+  }
+  const hitIdx = new Map(targets.map((id, i) => [id, i]))
+  return ids
+    .map((id) => ({ id, node: findNode(graph, id), hops: hop.get(id), hit: hop.get(id) === 0 }))
+    .sort((a, b) => (b.hops - a.hops) || ((hitIdx.get(a.id) ?? -1) - (hitIdx.get(b.id) ?? -1)))
 }
 
 // ───────────────────────── 3. 派生 point / 能指（固化用） ─────────────────────────

@@ -21,9 +21,34 @@
  * 不在 chat_input 里，配对不到；修正后孤儿回复不匹配任何 user 消息。）
  */
 import fs from 'node:fs'
+import { openChatStore } from './chat-store.js'
 
-// 从 chat_input.jsonl + chat_output.jsonl 建立 user 消息 ts → AI 回复内容 的映射
-export function loadReplyByTs({ inputPath, outputPath }) {
+/**
+ * user 消息 ts → AI 回复内容 的映射。
+ * 2026-10-02（方案 B）：**优先读聊天库**（SQLite，reply_to 直接配对，⚠️/失败气泡不算回答）；
+ * 传了 dbFile 但没有库时，以及没传 dbFile 时，回退旧的"两个 jsonl 文件 + 时间序配对"实现
+ * （离线脚本与老数据仍可用）。
+ */
+export function loadReplyByTs({ inputPath, outputPath, dbFile } = {}) {
+  if (dbFile) {
+    try {
+      if (fs.existsSync(dbFile)) {
+        const store = openChatStore(dbFile, { readonly: true })
+        const replyByTs = new Map()
+        for (const u of store.listMessages({ roles: ['user'] })) {
+          const rep = store.pairReplies({ conv: u.conv }).get(u.id)
+          if (rep && rep.content) replyByTs.set(u.timestamp, rep.content)
+        }
+        store.close()
+        return replyByTs
+      }
+    } catch {}
+  }
+  return loadReplyByTsFromFiles({ inputPath, outputPath })
+}
+
+/** 旧实现：全时间线按 ts 升序，user 的回复 = 其后、下一条 user 之前第一条不带 _stream 的非空 assistant。 */
+export function loadReplyByTsFromFiles({ inputPath, outputPath }) {
   const msgs = []
   const collect = (file, role) => {
     for (const line of fs.readFileSync(file, 'utf-8').split('\n')) {

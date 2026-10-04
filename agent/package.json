@@ -4,10 +4,15 @@
   "type": "module",
   "description": "CoRead 共读 agent — 自包含交互式会话，调用 Gemini 与用户实时讨论标注",
   "main": "index.js",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "start": "node --env-file-if-exists=.env index.js",
     "coldstart": "node --env-file-if-exists=.env scripts/coldstart.js",
     "test": "node --test",
+    "test:once": "node --test --test-reporter=spec",
+    "test:watch": "node --test --watch",
     "smoke": "node --env-file-if-exists=.env scripts/smoke-topicize.mjs",
     "smoke:stack": "node --env-file-if-exists=.env scripts/smoke-stack.mjs",
     "backfill:portrait": "node --env-file-if-exists=.env scripts/backfill-self-portrait.mjs",
@@ -16,6 +21,8 @@
     "graph:real": "node --env-file-if-exists=.env scripts/derive-knowledge-graph.mjs --real",
     "graph:dedupe": "node scripts/dedupe-graph-edges.mjs",
     "extract:real": "node --env-file-if-exists=.env scripts/extract-real-cases.mjs",
-    "group:discussions": "node --env-file-if-exists=.env scripts/group-discussions.mjs"
+    "group:discussions": "node --env-file-if-exists=.env scripts/group-discussions.mjs",
+    "diag:wal": "node scripts/chat.db.diag-wal.mjs",
+    "backup:chat": "node scripts/backup-chat.mjs"
   }
 }

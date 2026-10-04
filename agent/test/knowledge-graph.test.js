@@ -22,6 +22,8 @@ import {
   findNode,
   isReachable,
   contextOf,
+  userAncestry,
+  L3_MAX_NODES,
   derivePoint,
   deriveAliases,
   updateNodeAliases,
@@ -137,6 +139,20 @@ test('图结构：isReachable（沿边可达 = 同脉络祖先，user/derived �
   assert.equal(isReachable(g, 'n_alone', 'n_a'), false)
 })
 
+test('isReachable：kinds 过滤——只认 user 时 derived 桥不算可达（2026-10 折叠判据用）', () => {
+  const g = createGraph()
+  addNode(g, { id: 'n_a', point: 'A' })
+  addNode(g, { id: 'n_b', point: 'B' })
+  addNode(g, { id: 'n_c', point: 'C' })
+  addEdge(g, { from: 'n_a', to: 'n_b', kind: 'user' })
+  addEdge(g, { from: 'n_b', to: 'n_c', kind: 'derived' })   // 同栈相邻段的桥
+  assert.equal(isReachable(g, 'n_a', 'n_c'), true, '默认（全部 kind）：能过 derived 桥')
+  assert.equal(isReachable(g, 'n_a', 'n_c', ['user']), false, '只认 user：过不了 derived 桥')
+  addEdge(g, { from: 'n_a', to: 'n_c', kind: 'user' })
+  assert.equal(isReachable(g, 'n_a', 'n_c', ['user']), true, '有 user 直连 → 可达')
+  assert.equal(isReachable(g, 'n_a', 'n_b', []), true, '空 kinds = 全部 kind（默认口径）')
+})
+
 // ── 路径上下文（root → recent） ───────────────────────────────────────────────
 test('路径上下文：单链 root→recent 拓扑序，不截断', () => {
   const g = createGraph()
@@ -173,6 +189,61 @@ test('路径上下文：深层引用只取可达祖先（不取无关节点）�
   // n_c 与 n_b 无连接——不应进入 n_b 的路径
   assert.deepEqual(contextOf(g, 'n_b').map((n) => n.id), ['n_a', 'n_b'])
   assert.deepEqual(contextOf(g, 'n_missing'), [], '未命中返回空')
+})
+
+// ── L3 来路闭包（user 入边，2026-10 定调） ───────────────────────────────────
+// 构造：一段 user 来路（old→mid→hit1）、一个 user 旁支（side→hit1）、
+// 一条 derived 边（同栈相邻段，不该走）、一条 user 出边（去路，不该走）、
+// 一个无来路的命中节点（hit2）、一个无关节点（other）。
+function buildAncestryFixture() {
+  const g = createGraph()
+  for (const id of ['n_old', 'n_mid', 'n_side', 'n_derived', 'n_hit1', 'n_hit2', 'n_down', 'n_other']) {
+    addNode(g, { id, point: id, discussion: { question: `${id}？` } })
+  }
+  addEdge(g, { from: 'n_old', to: 'n_mid', kind: 'user' })
+  addEdge(g, { from: 'n_mid', to: 'n_hit1', kind: 'user' })
+  addEdge(g, { from: 'n_side', to: 'n_hit1', kind: 'user' })
+  addEdge(g, { from: 'n_derived', to: 'n_hit1', kind: 'derived' })
+  addEdge(g, { from: 'n_hit1', to: 'n_down', kind: 'user' })   // 去路：后来才长出来
+  return g
+}
+
+test('L3 来路：只递归 user 入边；derived 与 user 出边都不进', () => {
+  const g = buildAncestryFixture()
+  const r = userAncestry(g, ['n_hit1', 'n_hit2'])
+  assert.deepEqual(r.map((x) => x.id), ['n_old', 'n_mid', 'n_side', 'n_hit1', 'n_hit2'],
+    '来路按跳数大→小在前，命中节点在最后')
+  assert.deepEqual(r.map((x) => x.hops), [2, 1, 1, 0, 0])
+  assert.deepEqual(r.map((x) => x.hit), [false, false, false, true, true])
+  assert.ok(!r.some((x) => x.id === 'n_derived'), 'derived 入边不递归（同栈相邻段不是承接对象）')
+  assert.ok(!r.some((x) => x.id === 'n_down'), 'user 出边（去路）不递归')
+  assert.ok(!r.some((x) => x.id === 'n_other'), '无关节点不进')
+})
+
+test('L3 来路：命中节点无来路时闭包只有它自己；目标缺失返回空', () => {
+  const g = buildAncestryFixture()
+  const r = userAncestry(g, 'n_hit2')
+  assert.deepEqual(r.map((x) => x.id), ['n_hit2'])
+  assert.equal(r[0].hit, true)
+  assert.equal(r[0].hops, 0)
+  assert.deepEqual(userAncestry(g, 'n_missing'), [])
+  assert.deepEqual(userAncestry(g, []), [])
+  assert.deepEqual(userAncestry(g, null), [])
+})
+
+test('L3 来路：节点上限优先保留命中节点，其余由近及远', () => {
+  const g = createGraph()
+  for (const id of ['n_0', 'n_1', 'n_2', 'n_3', 'n_4', 'n_5']) {
+    addNode(g, { id, point: id, discussion: { question: `${id}？` } })
+  }
+  for (let i = 1; i <= 5; i++) addEdge(g, { from: `n_${i}`, to: `n_${i - 1}`, kind: 'user' })
+  const r = userAncestry(g, 'n_0', { maxNodes: 3 })
+  assert.equal(r.length, 3)
+  assert.equal(r.at(-1).id, 'n_0', '命中节点永不被上限挤掉，且恒在最后')
+  assert.deepEqual(r.map((x) => x.hops), [2, 1, 0], '保留最近的来路（n_2, n_1）')
+  // 默认上限可用：全图 6 节点 < L3_MAX_NODES
+  assert.equal(userAncestry(g, 'n_0').length, 6)
+  assert.ok(L3_MAX_NODES >= 6)
 })
 
 // ── 派生 point（动作②伴生：新建节点时归纳狭隘范畴） ─────────────────────────

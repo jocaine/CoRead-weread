@@ -4,6 +4,9 @@
   "type": "module",
   "description": "CoRead 本地接收端 — 接收 Chrome 扩展上报的标注和正文",
   "main": "index.js",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "start": "node index.js"
   }

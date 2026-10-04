@@ -17,6 +17,7 @@ import path from 'node:path'
 import http from 'node:http'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { openChatStore } from '../lib/chat-store.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const AGENT_DIR = path.resolve(__dirname, '..')
@@ -115,11 +116,14 @@ async function main() {
   // 1. 副本（跳过真实数据/密钥/日志）。topic_stack.json(.bak) 也必须跳过：
   // 真实环境的会意栈（含用户自由模式栈）一旦被复制，冒烟第一阶段就会把真实讨论
   // 当测试讨论收口（cites 指向真实节点 → 宁漏勿误丢边），污染断言（2026-09 教训）。
-  copyDir(AGENT_DIR, tmpAgent, ['data', '.env', '.env.bak', 'session_journal.jsonl', 'session_journal.jsonl.bak-20260807', 'session_journal.jsonl.bak-replay', 'topic_stack.json', 'topic_stack.json.bak'])
+  // api-config.json 也必须跳过（2026-09-30）：它是插件侧栏写的配置，**优先级高于 .env**，
+  // 一旦被复制进来，下面写的假 .env 就完全失效——冒烟会去打真实 API（又慢又烧额度、阶段超时）。
+  copyDir(AGENT_DIR, tmpAgent, ['data', '.env', '.env.bak', 'api-config.json', 'session_journal.jsonl', 'session_journal.jsonl.bak-20260807', 'session_journal.jsonl.bak-replay', 'topic_stack.json', 'topic_stack.json.bak'])
   fs.mkdirSync(path.join(tmpReceiver, 'inbox'), { recursive: true })
   fs.mkdirSync(path.join(tmpReceiver, 'books'), { recursive: true })
   fs.writeFileSync(path.join(tmpReceiver, 'inbox', 'annotations.jsonl'), '')
-  fs.writeFileSync(path.join(tmpReceiver, 'inbox', 'chat_input.jsonl'), '')
+  // 聊天库（2026-10-02 方案 B）：冒烟环境自带空库，消息直接插库（旧版是追加 chat_input.jsonl）
+  const smokeDb = path.join(tmpReceiver, 'inbox', 'chat.db')
   // 2. 种子图（1 个节点）
   const dataDir = path.join(tmpAgent, 'data')
   fs.mkdirSync(dataDir, { recursive: true })
@@ -132,11 +136,13 @@ async function main() {
     }],
     edges: [],
   }, null, 2))
-  // 3. .env → 假 API
+  // 3. .env → 假 API；同时落一份假 api-config.json（优先级更高，缺了它上面那份跳过就白设了）
   fs.writeFileSync(path.join(tmpAgent, '.env'), `COREAD_API_KEY=fake\nCOREAD_API_BASE=http://127.0.0.1:${PORT}/v1\nCOREAD_MODEL=fake-model\n`)
-  // 预置哑指纹：index.js 首次启动会把 chat_input 现有消息全部当"已回复"跳过（升级兼容逻辑），
-  // 预置一个指纹让种子逻辑跳过，保证预置消息真的被处理
-  fs.writeFileSync(path.join(tmpReceiver, 'inbox', '.chat_input_replied'), '0|dummy\n')
+  fs.writeFileSync(path.join(tmpAgent, 'api-config.json'), JSON.stringify(
+    { apiBase: `http://127.0.0.1:${PORT}/v1`, apiKey: 'fake', model: 'fake-model' }, null, 2) + '\n')
+  // 底线自检：冒烟绝不允许打到真实服务商（一旦解析成真实 base，说明配置优先级又变了）
+  const smokeCfg = JSON.parse(fs.readFileSync(path.join(tmpAgent, 'api-config.json'), 'utf8'))
+  if (!/^http:\/\/127\.0\.0\.1:/.test(smokeCfg.apiBase)) throw new Error('冒烟配置异常：apiBase 不是假 API 地址')
 
   await new Promise((resolve) => server.listen(PORT, resolve))
   console.log(`[smoke] 假 API 已在 :${PORT} 就绪`)
@@ -145,10 +151,20 @@ async function main() {
   // 验证：① 收口固化 = 新专题化弹栈旧讨论的时刻（当场聚合，不等 .stop）
   // ② 关闭/启动恢复不做收口固化（进行中的讨论留在栈里，topic_stack.json 跨会话恢复）
   // ③ 跨会话 derived 链（topic_lastgroup.json 的 nodeId）
-  async function runPhase(label, msgs, expectNodes, freeExpect) {
-    // 追加（真实系统语义）：chat_input 是 append-only，游标按行数推进
-    fs.appendFileSync(path.join(tmpReceiver, 'inbox', 'chat_input.jsonl'),
-      msgs.map((m) => JSON.stringify(m)).join('\n') + '\n')
+  async function runPhase(label, msgs, expectNodes, freeStackRounds) {
+    // 消息直接插库为 pending（旧版：追加到 chat_input.jsonl 并按行数推进游标）
+    {
+      const store = openChatStore(smokeDb)
+      for (const m of msgs) {
+        store.insertMessage({
+          conv: m.bookId || '_common', role: 'user', content: m.content,
+          ts: m.timestamp, status: 'pending',
+          bookId: m.bookId, bookTitle: m.bookTitle, chapter: m.chapter,
+          selectedText: m.selectedText, refs: Array.isArray(m.refs) ? m.refs : undefined,
+        })
+      }
+      store.close()
+    }
     const child = spawn('node', ['--env-file-if-exists=.env', 'index.js'], {
       cwd: tmpAgent,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -156,16 +172,17 @@ async function main() {
     child.stdout.on('data', (d) => process.stdout.write(`[agent] ${d}`))
     child.stderr.on('data', (d) => process.stdout.write(`[agent-err] ${d}`))
     const graphFile = path.join(dataDir, 'knowledge-graph.json')
-    const freeFile = path.join(dataDir, 'knowledge-graph.free.json')
     console.log(`[smoke] ${label}：index.js 已启动，等待收口固化至 ${expectNodes} 节点（收口即固化，不等 .stop）...`)
     await waitFor(`${label} 图文件达 ${expectNodes} 节点`, () => {
       if (!fs.existsSync(graphFile)) return false
       const okFormal = JSON.parse(fs.readFileSync(graphFile, 'utf8')).nodes.length >= expectNodes
-      if (freeExpect == null) return okFormal
-      // 自由模式阶段：正式图保持 expectNodes 不动，另等沙盒图出现测试固化产物
-      if (!fs.existsSync(freeFile)) return false
-      const fg = JSON.parse(fs.readFileSync(freeFile, 'utf8'))
-      return okFormal && Array.isArray(fg.nodes) && fg.nodes.length >= freeExpect
+      if (freeStackRounds == null) return okFormal
+      // 自由模式阶段（2026-11 口径）：正式图不再变、也不写沙盒图，就绪信号改成
+      // "该对话的讨论栈已落盘"——否则本阶段的等待条件一开始就成立，agent 会被提前 .stop。
+      const stackFile = path.join(tmpAgent, 'topic_stack.json')
+      if (!fs.existsSync(stackFile)) return false
+      const s = JSON.parse(fs.readFileSync(stackFile, 'utf8'))['__coread_free_mode__']
+      return okFormal && Array.isArray(s) && s.length >= freeStackRounds
     })
     console.log(`[smoke] ${label}：✓ 收口固化（图 ${expectNodes} 节点），发送 .stop（关闭不做收口固化）...`)
     fs.writeFileSync(path.join(tmpAgent, '.stop'), '')
@@ -196,13 +213,15 @@ async function main() {
     { content: '那用阶级分析看，格里高利杀水兵算什么？', timestamp: 5 },
     { content: '那中国为什么没有哥萨克？', timestamp: 6 },
   ], 6)
-  // 阶段4（自由模式，2026-09）：消息带哨兵书 bookId=__coread_free_mode__ → 独立栈；
-  // 消息7 带 refs=['n_seed']（侧栏引用窗体手动选取/语义命中的引用清单）→ agent 以
-  // 窗体为 cites；收口固化只建测试占位节点（不派生知识点）+ user 边；正式图零污染。
+  // 阶段4（自由模式，2026-09；语义按 2026-11 重构更新）：消息带哨兵书
+  // bookId=__coread_free_mode__ → 独立栈；消息7 带 refs=['n_seed']（侧栏引用窗体清单）→
+  // agent 以窗体为 cites。**自由对话不再写沙盒图**（旧讨论弹栈"不固化——产物在归档时由用户
+  // 勾选决定"，knowledge-graph.free.json 只作旧产物的只读入口）——所以这一阶段等的是
+  // "自由栈落盘"（≥2 条 = 消息8 的 user+assistant），正式图保持 6 节点不变。
   await runPhase('阶段4（自由模式）', [
     { content: '为什么哥萨克在革命中的立场这么复杂？', timestamp: 7, bookId: '__coread_free_mode__', refs: ['n_seed'] },
     { content: '那中国为什么没有哥萨克？', timestamp: 8, bookId: '__coread_free_mode__' },
-  ], 6, 7)
+  ], 6, 2)
   server.close()
 
   // ── 校验 ──
@@ -222,25 +241,15 @@ async function main() {
   check(derEdges.length === 1, `1 条 derived 边（阶段3 收口栈切成 2 段，段间衍生，实际 ${derEdges.length}）`)
 
   // ── 自由模式校验（阶段4）──
-  // 正式图零污染；沙盒图 = 正式图副本 + 测试占位节点（**不派生知识点**：point 用
-  // 归纳的问题、aliases/discussions 为空）+ user 边（n_seed → 占位节点）；
-  // 自由模式独立栈跨会话持久化（topic_stack.json[__coread_free_mode__]，消息8 讨论未收口）
+  // 2026-11 语义：自由对话不再有独立沙盒图——收编进正式图与否由**归档弹窗**决定
+  // （knowledge-graph.free.json 只作旧产物的只读入口）。所以这里断言三件事：
+  // 正式图零污染、**不新写沙盒图**、自由模式独立栈跨会话持久化。
   const freeFile = path.join(dataDir, 'knowledge-graph.free.json')
-  const freeGraph = JSON.parse(fs.readFileSync(freeFile, 'utf8'))
-  const freeUserEdges = freeGraph.edges.filter((e) => e.kind === 'user')
-  const formalIds = new Set(graph.nodes.map((n) => n.id))
-  const newIds = freeGraph.nodes.filter((n) => !formalIds.has(n.id)).map((n) => n.id)
-  const testNode = freeGraph.nodes.find((n) => !formalIds.has(n.id)) || {}
   check(graph.nodes.length === 6 && graph.edges.length === 6, `自由模式后正式图零污染（仍 6 节点 / ${graph.edges.length} 边，实际节点 ${graph.nodes.length}）`)
-  check(freeGraph.nodes.length === 7 && newIds.length === 1, `沙盒图 7 节点（正式图 6 副本 + 1 测试占位节点，实际 ${freeGraph.nodes.length}）`)
-  check(Array.isArray(testNode.aliases) && testNode.aliases.length === 0
-    && Array.isArray(testNode.discussions) && testNode.discussions.length === 0,
-  '测试占位节点不派生知识点（aliases/discussions 为空）')
-  check(freeUserEdges.length === 6 && freeUserEdges.some((e) => e.from === 'n_seed' && newIds.includes(e.to)),
-    `沙盒图 user 边：副本 5 条 + 新增 n_seed → 占位节点（实际 ${freeUserEdges.length} 条）`)
+  check(!fs.existsSync(freeFile), '自由对话不写沙盒图（产物去向由归档弹窗决定，2026-11 口径）')
   const stacks = JSON.parse(fs.readFileSync(path.join(tmpAgent, 'topic_stack.json'), 'utf8'))
   const freeStack = stacks['__coread_free_mode__']
-  check(Array.isArray(freeStack) && freeStack.length >= 1, `自由模式独立栈持久化（topic_stack.json['__coread_free_mode__'] ${Array.isArray(freeStack) ? freeStack.length : 0} 轮）`)
+  check(Array.isArray(freeStack) && freeStack.length >= 1, `自由模式独立栈持久化（topic_stack.json['__coread_free_mode__'] ${Array.isArray(freeStack) ? freeStack.length : 0} 条）`)
   // 自由模式消息不写 journal（不进 profile/soul 记忆固化）
   const journal = fs.readFileSync(path.join(tmpAgent, 'session_journal.jsonl'), 'utf8')
   check(!journal.includes('__coread_free_mode__'), '自由模式消息不进 session_journal（不污染记忆固化）')

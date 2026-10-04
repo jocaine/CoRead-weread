@@ -200,6 +200,31 @@ export function makeStackEntry(message) {
 }
 
 /**
+ * 收集一个栈里**全部**已挂的引用（cites）。
+ *
+ * 栈 = 一场进行中的专题化讨论；固化时同一段消息的 cites 会**一起变成同一个节点的 user 边**
+ * （`addCitationEdges(seg.cites, 新节点)`），所以"这场讨论引用到的旧知识点"就是它们的并集。
+ * 2026-10 用户定调：实时栈的命中引用要**全部带上**（收口前它们同属一场讨论的来路，不是两类东西）
+ * —— L3 的种子与前端图的高亮用的是同一组（`computeHitLayers` 同口径）。
+ *
+ * @param {Array} stack 栈条目数组（每个条目可能带 cites: string[]）
+ * @returns {Array<string>} 去重保序的节点 id
+ */
+export function collectStackCites(stack) {
+  const out = []
+  const seen = new Set()
+  for (const e of Array.isArray(stack) ? stack : []) {
+    for (const id of Array.isArray(e && e.cites) ? e.cites : []) {
+      const s = String(id || '').trim()
+      if (!s || seen.has(s)) continue
+      seen.add(s)
+      out.push(s)
+    }
+  }
+  return out
+}
+
+/**
  * 栈状态机一步：喂一条用户消息，决定它的归属。
  *
  * @param {Array}  stack 当前栈（可为空）

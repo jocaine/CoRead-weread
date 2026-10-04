@@ -21,6 +21,7 @@ import {
   formatStackContext,
   makeStackEntry,
   processStackMessage,
+  collectStackCites,
 } from '../lib/topic-stack.js'
 
 const fixtures = JSON.parse(readFileSync(new URL('./fixtures/topic-stack-fixtures.json', import.meta.url), 'utf-8'))
@@ -307,4 +308,22 @@ test('非空栈换问题分支：剥掉 assistantContext，不触发降级（只
   const r = await processStackMessage(sampleStack, switchedWithAssist, { callLLM: makeLLM(okSame(false), okTopic(true)), log: () => {} })
   assert.equal(r.action, 'closed_and_pushed')
   assert.deepEqual(r.closed.entries, sampleStack)
+})
+
+// ── collectStackCites：本场讨论已挂的引用（L3 种子 / 图高亮种子，2026-10）──────
+test('collectStackCites：汇总栈内全部条目的 cites，去重保序、忽略脏数据', () => {
+  const stack = [
+    { role: 'user', content: 'a' },
+    { role: 'assistant', content: 'b' },                       // 回复不带 cites
+    { role: 'user', content: 'c', cites: ['n_1', 'n_2'] },
+    { role: 'user', content: 'd', cites: ['n_2', 'n_3'] },     // n_2 重复
+    { role: 'user', content: 'e', cites: ['', '  ', 'n_4'] },  // 空串忽略
+    { role: 'user', content: 'f', cites: 'n_5' },              // 非数组忽略（容错）
+  ]
+  assert.deepEqual(collectStackCites(stack), ['n_1', 'n_2', 'n_3', 'n_4'])
+  assert.deepEqual(collectStackCites([]), [])
+  assert.deepEqual(collectStackCites(null), [], '非数组输入不抛')
+  assert.deepEqual(collectStackCites([null, 42, { cites: [] }]), [], '脏条目不抛')
+  // 固化时这些引用会一起变成同一个节点的 user 边（addCitationEdges），
+  // 所以 L3 种子与前端图高亮都用这一组 —— 两边口径必须一致。
 })

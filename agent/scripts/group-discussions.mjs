@@ -48,6 +48,8 @@ const DATA = path.resolve(__dirname, './data/judge-real-cases.json')
 const RES = path.resolve(__dirname, './data/judge-real-results.json')
 const CHAT_IN = path.resolve(__dirname, '../../receiver/inbox/chat_input.jsonl')
 const CHAT_OUT = path.resolve(__dirname, '../../receiver/inbox/chat_output.jsonl')
+// 聊天库（2026-10-02 方案 B）：有库就优先用它配对（reply_to 直连），否则回退旧 JSONL
+const CHAT_DB = path.resolve(__dirname, '../../receiver/inbox/chat.db')
 
 const API_KEY = process.env.COREAD_API_KEY
 const API_BASE = (process.env.COREAD_API_BASE || '').replace(/\/$/, '')
@@ -73,7 +75,7 @@ async function callLLM(prompt, maxTokens = 512) {
 const data = JSON.parse(fs.readFileSync(DATA, 'utf-8'))
 const prevRes = fs.existsSync(RES) ? JSON.parse(fs.readFileSync(RES, 'utf-8')) : {}
 // AI 回复：从聊天流配对（全时间线，user 消息 ts → 紧邻 assistant 内容），excerpt 的 a 字段用
-const replyByTs = loadReplyByTs({ inputPath: CHAT_IN, outputPath: CHAT_OUT })
+const replyByTs = loadReplyByTs({ inputPath: CHAT_IN, outputPath: CHAT_OUT, dbFile: CHAT_DB })
 // 关联键用 timestamp（源时间戳，重提取后 id 会移位但 timestamp 稳定）：
 // 判专题化 verdict 看 results；判同一性已存结论看 sameResults；原文/派生解析看 cases
 const caseById = new Map((data.cases || []).map((c) => [c.id, c]))

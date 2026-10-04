@@ -96,15 +96,17 @@ export function addDerivedEdge(graph, fromNodeId, toNodeId) {
  * user 边：会话中暂存、固化时批量建的引用边（from = 被引用的旧节点，to = 当前固化节点）。
  * 引用短语不落库（2026-08-27 定调），边只记 from/to；同 pair 已存在则跳过（去重）。
  *
- * **同脉络多命中折叠（2026-09 用户定调）**：一个固化节点命中同一条脉络
+ * **同脉络多命中折叠（2026-09 用户定调；2026-10 收窄判据）**：一个固化节点命中同一条脉络
  * （root→recent 路径）上的多个节点时，只按脉络上**最后**（最靠 recent 侧）的一个
- * 命中节点建边——较早命中节点是后者的脉络祖先，内容（root→自身路径，contextOf
- * 口径）已被后者完整包含，多建边只是拓扑图上的视觉噪音（L3 上下文本来就取
- * root→recent 全路径，折叠不影响上下文）。
+ * 命中节点建边——较早命中节点是后者的脉络祖先，多建边只是拓扑图上的视觉噪音。
+ * **判据只认 user 边（2026-10）**：折叠的正当理由是"将来回溯后者时会顺带把前者带出来"，
+ * 而 L3 自 2026-10 起**只沿 user 入边**取来路（lib/knowledge-graph.js userAncestry）。
+ * 若两个命中节点之间靠 derived 边相连（同栈相邻段），回溯时**带不出来** ⇒ 那时不能折叠，
+ * 两条边都要建（宁可拓扑多一条线，不能让 L3 丢来路）。
  * 折叠只在**本次命中列表内**做：绝不越过命中列表接到脉络更靠 recent 的节点——
  * 例：脉络 a→b→c，本段命中 a、b → 只建 b 边，不建 c 边（c 若被同栈其它段命中，
  * 由那段固化时自建自己的边）；脉络自身的边原样保留。
- * @param {object} graph 会意图（{nodes, edges}）——用于沿边判脉络祖先（isReachable）
+ * @param {object} graph 会意图（{nodes, edges}）——用于沿 user 边判脉络祖先（isReachable）
  * @param {Array<string>} fromIds 本次命中的旧节点 id 列表（可含重复/缺失 id）
  * @param {string} toNodeId 当前固化节点 id
  * @returns {number} 建边条数（from 缺失/同节点/已存在/被同脉络更晚命中节点折叠 → 跳过）
@@ -121,9 +123,10 @@ export function addCitationEdges(graph, fromIds, toNodeId) {
     seen.add(from)
     froms.push(from)
   }
-  // ② 同脉络折叠：能沿边到达另一命中节点的 = 较早节点（内容被后者包含）→ 丢弃，
-  //    只保留"最后"命中节点建边。成环等异常图（互相可达）不折叠，退回全建。
-  const keep = froms.filter((f) => !froms.some((g) => g !== f && isReachable(graph, f, g)))
+  // ② 同脉络折叠：能沿 **user 边**到达另一命中节点的 = 较早节点（L3 回溯后者时能带出
+  //    前者）→ 丢弃，只保留"最后"命中节点建边。derived 相连不算（L3 不走 derived）。
+  //    成环等异常图（互相可达）不折叠，退回全建。
+  const keep = froms.filter((f) => !froms.some((g) => g !== f && isReachable(graph, f, g, ['user'])))
   let n = 0
   for (const from of keep.length ? keep : froms) {
     if (graph.edges.some((e) => e.from === from && e.to === toNodeId && e.kind !== 'derived')) continue  // 同 pair 去重
@@ -134,21 +137,21 @@ export function addCitationEdges(graph, fromIds, toNodeId) {
 }
 
 /**
- * 冗余 user 边清理（2026-09 用户定调）：一次收口的全部边（各段 user 边 + 段间
- * derived 边）建完后调用，对本次收口新建的节点做"命中列表外"的最后一层折叠。
+ * 冗余 user 边清理（2026-09 用户定调；2026-10 收窄判据）。
  *
- * 与 addCitationEdges 的折叠同口径（内容是否已被覆盖，contextOf 语义），只是这里的
- * 覆盖关系可能**借道段间 derived 边**：
- *   脉络 a→c→b（c 是 b 的上游，链上有 c→b 边），收口分段 A 命中 {a, b} →
- *   折叠只建 b→A（a 的内容被 b 包含）；B 命中 c，且段间衍生判定成立（A→B
- *   derived）→ c 沿 c→b→A→B 已能到达 B，c 的内容（root→c 路径）已被 B 的上下文
- *   完整包含 → c→B 冗余，删除。拓扑更净，L3 上下文不变（"效果是相同的"）。
- *   反例（不删）：脉络 a→b→c（c 在 b 下游），B 命中 c → c 的内容在 b 之外、
- *   A→B 覆盖不到 → c→B 必须保留。
+ * 对本次收口新建的节点做"命中列表外"的最后一层折叠：一条 user 边 from→to，若去掉它
+ * 之后 from 仍能到达 to，则认为这条边冗余 → 删除（拓扑更净）。**判据只认 user 边
+ * （2026-10）**：原来的理由（借道段间 derived 边也算覆盖）建立在"L3 取 root→recent
+ * 全路径"之上；L3 自 2026-10 起只沿 user 入边取来路，借道 derived 的覆盖不再成立 ⇒
+ * 只有"只沿 user 边仍可达"才可删，否则宁可留着（删了 L3 就永远拿不到这条来路）。
+ *   例（可删）：a→c→b 全是 user 边，A 命中 {a,b} 只建 b→A；B 命中 c 建 c→B →
+ *    c 沿 user 边 c→b→A 已能到达 B → c→B 冗余，删除（L3 回溯 B 时经 A、b 仍能拿到 c）。
+ *   例（不可删，2026-10 修正）：同上但 A→B 是 derived 边 → L3 不走 derived，回溯 B
+ *   时到不了 c → c→B 必须保留。
  *
  * 边界：只处理 nodeIds 指定（本次收口新建）节点的入 user 边；derived 边与其它
- * 节点的边一律不动；段间衍生判定不成立/失败（无 derived 边）时找不到替代路径 →
- * 不删（宁漏勿删：漏了只是多一条边，删错会丢内容）。
+ * 节点的边一律不动；找不到 user 替代路径 → 不删（宁漏勿删：漏了只是多一条边，
+ * 删错会丢来路）。
  * 迭代到不动点：删除一条边可能使另一条边失去替代路径（理论成环场景），逐轮重判。
  * @param {object} graph 会意图（{nodes, edges}）
  * @param {Array<string>} nodeIds 本次收口新建的节点 id（只清理指向它们的 user 边）
@@ -169,9 +172,10 @@ export function pruneRedundantCitationEdges(graph, nodeIds) {
       const e = graph.edges[i]
       if (e.kind !== 'user') continue
       if (!targets.has(e.to)) continue
-      // 去掉本条边后，from 是否仍能沿其它边到达 to（内容已被覆盖 → 本条边冗余）
+      // 去掉本条边后，from 是否仍能沿其它 **user** 边到达 to（来路已被覆盖 → 本条边冗余）。
+      // 只认 user：L3 不走 derived，借道 derived 的覆盖对 L3 不成立（见函数注释）。
       const rest = graph.edges.filter((x, j) => j !== i)
-      if (isReachable({ nodes: graph.nodes, edges: rest }, e.from, e.to)) {
+      if (isReachable({ nodes: graph.nodes, edges: rest }, e.from, e.to, ['user'])) {
         graph.edges = rest
         removed++
         changed = true

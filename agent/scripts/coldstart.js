@@ -12,6 +12,7 @@
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { resolveApiConfig, isConfigured } from '../lib/api-config.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const AGENT_DIR = path.join(__dirname, '..')
@@ -19,20 +20,17 @@ const SKILL_VERSION = '1.0.3'
 const GATEWAY = 'https://i.weread.qq.com/api/agent/gateway'
 
 const WEREAD_KEY = process.env.WEREAD_API_KEY
-const API_KEY = process.env.COREAD_API_KEY
-const API_BASE = (process.env.COREAD_API_BASE || '').replace(/\/$/, '')
-const MODEL = process.env.COREAD_MODEL || 'gpt-4o'
+// 模型 API 配置与 agent 同源（见 lib/api-config.js）：插件侧栏「⋯ → 模型 API 配置」
+// 写下的配置、COREAD_* 环境变量、agent/.env 三级依次生效。
+const { apiKey: API_KEY, apiBase: API_BASE, model: MODEL } = resolveApiConfig()
 
 if (!WEREAD_KEY) {
   console.error('❌ 请设置 WEREAD_API_KEY 环境变量')
   process.exit(1)
 }
-if (!API_KEY) {
-  console.error('❌ 请设置 COREAD_API_KEY 环境变量')
-  process.exit(1)
-}
-if (!API_BASE) {
-  console.error('❌ 请设置 COREAD_API_BASE 环境变量（如 https://api.openai.com/v1）')
+if (!isConfigured({ apiKey: API_KEY, apiBase: API_BASE })) {
+  console.error('❌ 模型 API 未配置：请在插件侧栏「⋯ → 模型 API 配置」里填写，')
+  console.error('   或设置 COREAD_API_KEY / COREAD_API_BASE 环境变量')
   process.exit(1)
 }
 

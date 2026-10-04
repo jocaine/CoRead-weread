@@ -40,6 +40,7 @@ CoRead 不是这样。
 - **长期记忆生长**：阅读画像（profile）和 agent 自画像（soul）随每次共读更新，越来越懂你
 - **会意图拓扑视图**：侧栏「◎」打开知识点拓扑图（Obsidian 式浏览：缩放/平移/悬停/点选详情/搜索），对话命中旧知识点时自动高亮 root→recent 拓扑脉络
 - **侧栏 UI**：Chrome Side Panel 原生展示，不遮挡正文
+- **框选 / 划词翻译**：`Alt+S` 框选屏幕一块区域、`Alt+T` 翻译页面上选中的文字，气泡里出「原文 + 译文」；译文可复制，也可以点「**设为引用**」把这段原文设成侧栏的当前引用（不直接发问，之后在侧栏输入框里自己问；需当前页关联了某本书）。气泡标题显示译文开头一截，一眼能对上是哪一段；可手动拖动、**右下角拖拽调整尺寸**、**📌 固定**（不随滚动、不自动收起，鼠标移开时收成只显示译文的小卡）、折叠成小标记；截图模式的原文可改，改完点「重译」（或 Ctrl+Enter）手动重新翻译——原文没改动时按钮是灰的。**翻过的原文留淡绿高亮**（点高亮展开/收起译文），气泡留在页面上（一页多个并存，各自锚在原文位置，可折叠成小标记、可拖动、鼠标移开后半透明），滚走再滚回来还在；译文同时记进 `receiver/toolbox/history.jsonl`，工具箱里可「贴回页面」或「清除」。走在线多模态模型。入口是侧栏「⋯ → 🧰 工具箱 → 翻译」：里面有启用/禁用开关、快捷键设置，以及可选的自定义模型配置（默认沿用 CoRead 那一份，填哪项覆盖哪项）。工具箱按 tab 分页，以后的小工具都放这里。原先独立的 `screenshot-translate` 扩展已并入本扩展，设计与边界见 `screenshot-translate-design.md`
 - **放入文件**：侧栏可直接放入 .md/.txt 文档（「📎」或「📄」菜单），文档存为本地"文档书"，切换后即可与 AI 讨论全文
 - **完全本地**：所有数据存在你的机器上
 
@@ -98,12 +99,15 @@ node index.js
 ```bash
 cd agent
 npm install
-cp .env.example .env
-# 编辑 .env，填入 API 信息
 npm start
 ```
 
-`.env` 配置示例：
+模型 API 在**插件侧栏**里配置：打开侧栏 → 右上角「⋯」→「🔑 模型 API 配置」→ 填 API 地址 / API Key / 模型
+（当前未配置时，打开侧栏会自动弹出这个弹窗）。保存后立即生效，**不需要重启 agent**。
+配置写在本机 `agent/api-config.json`，支持任何 OpenAI 兼容协议的服务商（GPT-4o、DeepSeek、Kimi、Ollama 本地等）。
+
+也可以继续用 `agent/.env`（CLI / 无插件场景）：`cp .env.example .env`。两侧都填时，
+**插件里保存的配置优先**。`.env` 示例：
 
 ```env
 # DeepSeek
@@ -128,6 +132,8 @@ COREAD_MODEL=qwen2.5:14b
 
 在正文里选中一段文字，点击工具栏「共读」，弹出确认窗口；确认后该段划入侧栏引用列表并设为当前引用（Side Panel 自动打开），之后在侧栏输入框里向 AI 提问即可。
 
+顺带可用：`Alt+S` 框选屏幕一块区域翻译，`Alt+T` 翻译当前选中的文字（快捷键可在 `chrome://extensions/shortcuts` 改）。工具箱入口是侧栏头部的「⋯ → 🧰 工具箱」，翻译是里面的一个 tab。
+
 ---
 
 ## 目录结构
@@ -137,13 +143,19 @@ coread/
 ├── extension/          # Chrome MV3 扩展
 │   ├── manifest.json
 │   ├── content.js      # 标注弹窗、章节切换检测
-│   ├── service_worker.js   # 章节正文网络拦截
-│   ├── sidebar.html/js     # Chrome Side Panel 聊天 UI（含「放入文件」导入 .md/.txt）
-│   └── page_hook.js    # MAIN world 注入，拦截 clipboard
+│   ├── service_worker.js   # 章节正文网络拦截 + 装配翻译能力
+│   ├── sidebar.html/js     # Chrome Side Panel 聊天 UI（含「放入文件」导入 .md/.txt、翻译面板）
+│   ├── page_hook.js    # MAIN world 注入，拦截 clipboard
+│   ├── translate-protocol.js    # 翻译纯函数层：prompt / 请求体 / 回复解析 / 错误分类
+│   ├── translate-background.js  # 翻译的 service worker 部分：截图、调用多模态模型
+│   ├── translate-overlay.js/css # 页面内遮罩框选与译文气泡（按需注入，Shadow DOM）
+│   ├── test/                    # translate-protocol.js 的单测（node:test）
+│   └── THIRD-PARTY.md           # 译文气泡的移植来源与 MIT 声明（源自 bssm-oss/img-to-translate）
 │
 ├── receiver/           # 本地 HTTP 接收端（localhost:7239）
 │   ├── index.js
 │   ├── inbox/          # annotations.jsonl / chat_*.jsonl
+│   ├── toolbox/        # history.jsonl 翻译记录（多气泡「贴回页面」的数据源）
 │   └── books/
 │       └── {bookId}/
 │           ├── chapters/       # 章节正文缓存 .txt
@@ -175,6 +187,8 @@ coread/
 ## 隐私
 
 所有数据（章节正文、标注、对话记录）存储在本地 `receiver/` 目录。LLM API 调用只发送当前讨论片段，不发送完整书库。标注不写入微信读书公开系统。
+
+翻译功能例外：框选截图或划词翻译时，截图内容或选中文字会发往你在「模型 API 配置」里填的模型服务；除此之外不发往任何地址。
 
 ---
 
