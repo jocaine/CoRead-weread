@@ -65,11 +65,12 @@ agent/hist_cursors.json
 _dom.txt
 agent/scripts/_*.txt
 
-# 临时诊断脚本（*.diag-*.mjs / .diag*.cjs）与输出：本机排查用，不入库
+# 临时诊断脚本与输出：以点开头命名（.diag-*.mjs / .diag-*.cjs / .diag-*.out），本机排查用，不入库。
+# 注意必须限定"点开头"：早先写成 *.diag-*.mjs 会误伤正式工具
+# agent/scripts/chat.db.diag-wal.mjs（名字里含 .diag-），导致它无法 git add。
 .diag*.cjs
+.diag*.mjs
 .diag*.out
-*.diag-*.mjs
-*.diag-*.out
 
 # macOS
 .DS_Store
