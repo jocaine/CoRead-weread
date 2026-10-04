@@ -1,5 +1,7 @@
 # API 密钥（绝对不能上传）
 agent/.env
+# 插件侧栏「⋯ → 模型 API 配置」写入的配置（含 API Key 明文，本机真源）
+agent/api-config.json
 
 # 个人阅读数据（隐私）
 agent/profile.md
@@ -13,6 +15,10 @@ receiver/inbox/*
 !receiver/inbox/.gitkeep
 receiver/books/*
 !receiver/books/.gitkeep
+# 翻译记录（个人数据：读过的原文与译文；目录由 receiver 启动时自建，无需 .gitkeep）
+receiver/toolbox/
+# 聊天库备份（个人数据；由 scripts/backup-chat.mjs 生成）
+receiver/backups/
 
 # Agent 标记文件
 agent/.coldstart_skipped
@@ -44,12 +50,26 @@ npm-debug.log*
 *.out
 *.err
 .playwright-mcp/
+# 阅读器自测（无头 Chrome 驱动 + 浏览器 profile + 截图；驱动脚本本身可以留，产物不留）
+.selftest/chrome-profile*/
+.selftest/*.png
+.selftest/last-report.json
+.selftest/last*.out
+.selftest/dbg*.out
+# 下载第三方库时的临时目录（pdfjs-dist 的 tgz 与解包结果）
+.vendor-tmp/
 # 历史截尾游标（运行时个人数据，随会话推进变化）
 agent/hist_cursors.json
 # 评审批次 diff 转储、DOM 转储、采样文本
 .review*/
 _dom.txt
 agent/scripts/_*.txt
+
+# 临时诊断脚本（*.diag-*.mjs / .diag*.cjs）与输出：本机排查用，不入库
+.diag*.cjs
+.diag*.out
+*.diag-*.mjs
+*.diag-*.out
 
 # macOS
 .DS_Store

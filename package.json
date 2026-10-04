@@ -3,7 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
-    "start": "bash -c \"node receiver/index.js & node --env-file-if-exists=agent/.env agent/index.js & wait\""
+    "start": "bash -c \"node receiver/index.js & node --env-file-if-exists=agent/.env agent/index.js & wait\"",
+    "test": "npm --prefix agent run test:once",
+    "test:agent": "npm --prefix agent run test:once",
+    "test:ext": "node extension/test/translate-protocol.test.mjs && node extension/test/reader-anchor.test.mjs",
+    "backup:chat": "node agent/scripts/backup-chat.mjs",
+    "diag:wal": "node agent/scripts/chat.db.diag-wal.mjs"
   }
 }
