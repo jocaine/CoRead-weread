@@ -8,10 +8,23 @@
  * - 观察态（一般情况）：浏览整张拓扑图——滚轮缩放、拖拽空白平移、拖节点微调布局、
  *   悬停高亮邻接子图、点选节点看详情（point / 相关说法 / 节点讨论 / 元信息）、
  *   搜索定位（point / aliases / 讨论问题）、图例（边种类、root、recent）。
- * - 命中态（对话命中）：SSE graph-hit（agent 引用解析命中旧知识点）→ 高亮各命中节点
- *   的 root→recent 路径并集（与 agent/lib/knowledge-graph.js contextOf 同规则：
- *   入边反向可达并集 + 拓扑序 root 在前）；路径节点/边提亮，其余压暗，
- *   命中节点（recent）脉冲环，root 节点虚线环，顶部横幅说明命中来源。
+ * - 命中态（对话命中，2026-10 用户定调）：SSE graph-hit（agent 引用解析命中旧知识点）→
+ *   高亮 = **一场讨论取一次 user 闭包**：种子 = 本轮命中 ∪ 本场实时栈已挂的引用（收口前它们
+ *   同属一场讨论——固化时同一段消息的 cites 会并进同一个节点的 user 边），再从种子沿 **user
+ *   入边**反向递归取全部上游。与 `agent/lib/knowledge-graph.js userAncestry` 同规则（只走 user，
+ *   不走 derived —— derived 连的是判同一性判出来"不是同一个问题"的同栈相邻段）。
+ *   图上亮的就是：这场讨论若收口成一个节点，那个节点的 L3 来路闭包。**一种圈、一个含义。**
+ *   图例只列两条：路径起点（无入边）/ 引用到的知识点（2026-10 用户定调：不要那两行术语）。
+ *   高亮分档（2026-10 修正：只画强边会让节点变成无线孤点，图失去结构）：
+ *   闭包内部的边分"强（user 边，accent）/弱（其余，按边色画满）"两档，只有一端在闭包里的边
+ *   半亮（交代这些圈连到哪去了），两端都不在的边压暗但保留可见。
+ *   标识环每个节点每类只画一道（引用节点 r+3 深蓝 3px 满不透明 + 动画期外扩脉冲 ／ 上游节点
+ *   r+2.5 靛 2px ／ 路径起点 r+6 浅蓝虚线 2px）。
+ *   多脉络（讨论的引用落在多条互不相交的链上）：右下角「全部 / 脉络 N」——点「脉络 N」**只亮
+ *   那一条**，点「全部」回到全部（2026-10 用户定调：切换必须真隔离）。
+ *   搜索与单击预览仍走混合边路径（"浏览这张网"语义，不是"这场讨论引用了什么"）。
+ *   曾经废弃的口径：① user＋derived 混合全祖先路径并集（图 46 节点 / L3 实际 8 节点，误导）；
+ *   ② 把"本轮命中"与"本场已挂"画成两层两色（同一场讨论被拆成两类，用户看不懂）。
  *
  * 数据：GET {receiver}/graph[?demo=1]（receiver 转发 agent/data/knowledge-graph.json；
  * ?demo=1 载入演示拓扑，真实图为空时可预览交互与命中高亮）。
@@ -39,6 +52,42 @@
   const FRICTION_K = 0.45     // 静止摩擦系数：低速每步再乘 0.45，静止时安静不发飘
   const COLLIDE_PAD = 1.0     // 碰撞死区（屏幕 px）：重叠小于此值不推，静止不发飘（亚像素重叠不可见）
   const LABEL_MIN_SCALE = 0.5  // 标签可见/参与碰撞的最低缩放：低于此值不画标签，也不做标签碰撞（防缩小后乱碰）
+  // 标签字号档位（2026-10）：**渲染与碰撞盒子共用同一套**（原来两处各写一份嵌套三元，
+  // 改一处忘一处就会"画的盒子"与"避让的盒子"不一致）。索引 = 缩放档，值 = 每行字数 / 行数。
+  // 高亮节点只比同级**多一档**，不再恒定 13 字 3 行（用户反馈：高亮标签不随视野缩放）。
+  const LABEL_CHARS = [6, 9, 13, 17, 20]
+  const LABEL_LINES = [1, 2, 3, 3, 3]
+  const LABEL_TIER_MAX = LABEL_CHARS.length - 1
+  // 缩放档（ratio = 当前 scale / 初始 fit 基准 scale，与面板尺寸无关）
+  function labelTier(ratio) {
+    return ratio < 0.8 ? 0 : ratio < 1.2 ? 1 : ratio < 1.7 ? 2 : ratio < 2.6 ? 3 : 4
+  }
+  // 某节点标签的字数/行数：**只看缩放**（2026-10 用户定调：高亮状态下的省略逻辑必须与
+  // 非高亮一致——同一缩放、同一截断。高亮与否只体现在圆环/亮度上，不再影响标签长度）。
+  // 唯一的例外是悬停/选中：那是"用户点开这一个看"的临时聚焦，不是缩放分级。
+  function labelShape(ratio) {
+    const t = labelTier(ratio)
+    return { chars: LABEL_CHARS[t], lines: LABEL_LINES[t] }
+  }
+  const LABEL_SHAPE_FULL = { chars: LABEL_CHARS[LABEL_TIER_MAX], lines: LABEL_LINES[LABEL_TIER_MAX] }
+  // 标签底色档（2026-10 性能修正）：**不许再用 strokeText 光晕**——描边字形是 canvas 里最贵的
+  // 操作之一，104 个节点每帧描一遍直接把帧率打下去（用户反馈"进图就卡"）。改成一次性圆角矩形：
+  //   普通标签 0（不画底，和加光晕之前一样）／高亮标签 0.5（半透明，不是原来那块不透明白板）
+  //   ／悬停·选中 0.88（真正的聚焦 pill）。
+  const LABEL_BG_PLAIN = 0
+  const LABEL_BG_HIT = 0.5
+  const LABEL_BG_FOCUS = 0.88
+  // 标签屏幕剔除边距（px）：屏幕外的标签既看不见、也不该参与推挤 —— 直接不进盒子、不画字。
+  const LABEL_CULL_PAD = 140
+  // 多链自动轮播最多播几条（2026-10）：合并口径下链数常到 4~6，逐条播完十几秒太久。
+  const CAROUSEL_MAX_CHAINS = 3
+  // 路径起点虚线环最多画几个（2026-10）：合并口径下一场讨论的闭包可能有十几个无入边的起点
+  //（实测 29 节点里 18 个），全画上是噪声、反而看不出结构；超过就不画这条标识。
+  const ROOT_MARK_MAX = 8
+  // 性能日志（opt-in）：localStorage.coreadGvPerf = '1' → 每 120 帧打印物理/避让/渲染各占多少 ms。
+  let PERF_ON = false
+  try { PERF_ON = typeof localStorage !== 'undefined' && localStorage.getItem('coreadGvPerf') === '1' } catch { /* 隐私模式等 */ }
+  const perf = { phys: 0, sep: 0, render: 0, frames: 0 }
   const MAX_PUSH = 30         // 单对单帧最大推开量（世界单位）：AI-038 略增，缩放时弹开更利落
   const MAX_STEP = 9          // 单节点每帧最大位移预算（世界单位）：AI-038 略增，去重叠更敏捷
   const EDGE_CURVE = 0.16    // 曲边幅度系数（AI-034，占边长比例）：折返/互向边自动弯向相反侧
@@ -111,26 +160,29 @@
   /**
    * root→recent 路径并集（与 agent/lib/knowledge-graph.js contextOf 同规则）：
    * 目标节点沿入边反向收集所有可达祖先（含自身），多目标并集去重，按拓扑序输出。
+   * @param {Array<string>} [kinds] 只走的边 kind（如 ['user']）；省略 = 全部 kind
+   *   （混合边口径留给搜索 / 单击预览——它们是"浏览这张网"的语义，不是"AI 拿到了什么"）
    * @returns {{ordered: string[], roots: string[], recent: string[], pathEdges: Array}}
    *   ordered：拓扑序节点 id；roots：其中无入边的节点（最早追的知识点）；
    *   recent：目标节点（当前讨论所在节点）；pathEdges：两端都在路径上的边。
    */
-  function computePath(nodes, edges, targetIds) {
+  function computePath(nodes, edges, targetIds, kinds) {
     const byId = new Map(nodes.map((n) => [n.id, n]))
     const targets = (Array.isArray(targetIds) ? targetIds : [targetIds])
       .map((id) => String(id || '').trim())
       .filter((id) => id && byId.has(id))
     if (!targets.length) return { ordered: [], roots: [], recent: [], pathEdges: [] }
+    const allow = Array.isArray(kinds) && kinds.length ? new Set(kinds) : null
 
     const seen = new Set(targets)
     const stack = [...targets]
     while (stack.length) {
       const cur = stack.pop()
       for (const e of edges) {
-        if (e.to === cur && !seen.has(e.from) && byId.has(e.from)) {
-          seen.add(e.from)
-          stack.push(e.from)
-        }
+        if (e.to !== cur || seen.has(e.from) || !byId.has(e.from)) continue
+        if (allow && !allow.has(e.kind)) continue
+        seen.add(e.from)
+        stack.push(e.from)
       }
     }
     const ordered = topoSort([...seen], edges)
@@ -143,14 +195,17 @@
   // 路径节点集有交集的命中合并为同一条链（一个命中在另一命中的路径上、或共享
   // root/中间节点），互不相交的命中各自成链。返回
   // [{ hits: [被命中的节点 id...], nodes: [链上全部节点 id，拓扑序], pathEdges: [链内边] }]
-  function computeChains(nodes, edges, targetIds) {
+  // 2026-10：命中态传 kinds=['user'] —— 链按"user 引用的来路"分组，与 L3 取数同口径
+  //（derived 邻段不再算同一条链，所以命中常常各成一条链 → 轮播分组变多，这是对的：
+  //  本轮命中的确实是几条互相独立的问题脉络）。
+  function computeChains(nodes, edges, targetIds, kinds) {
     const byId = new Map(nodes.map((n) => [n.id, n]))
     const targets = (Array.isArray(targetIds) ? targetIds : [targetIds])
       .map((id) => String(id || '').trim())
       .filter((id) => id && byId.has(id))
     const chains = []
     for (const t of targets) {
-      const path = computePath(nodes, edges, [t])
+      const path = computePath(nodes, edges, [t], kinds)
       const pathSet = new Set(path.ordered)
       const overlap = chains.filter((c) => c.nodes.some((id) => pathSet.has(id)))
       if (!overlap.length) {
@@ -170,8 +225,59 @@
     return chains
   }
 
-  // 书名归一（AI-025）：冒烟数据里 book 字段形如「书名  章节」（章节号跟在书名后），
-  // 取色/展示时剥离章节后缀，让同一本书的节点同色；无后缀则原样返回。
+  // 命中高亮（2026-10 用户定调，最终口径）：**一场讨论取一次闭包，一种圈、一个含义**。
+  // 种子 = 本轮命中 ∪ 本场实时栈已挂的引用 —— 收口前它们同属一场讨论：固化时同一段消息的
+  // cites 会一起变成**同一个节点的 user 边**，所以它们不是两类东西，不该画成两层两种圈。
+  // 从种子沿 **user 入边** 反向递归取全部"上游"（该讨论引用过的旧知识点，以及它们各自引用过
+  // 的更早知识点）——与 agent/lib/knowledge-graph.js userAncestry 同规则：只走 user 入边，
+  // 不走 derived（derived 连的是判同一性判出来"不是同一个问题"的同栈相邻段）。
+  // 于是图上亮的就是：**这场讨论若收口成一个节点，那个节点的 L3 来路闭包**。
+  // 曾经废弃的口径：① user＋derived 混合全祖先路径并集（图 46 节点 / L3 实际 8 节点，误导）；
+  // ② 把"本轮命中"与"本场已挂"画成两层两色（同一场讨论被拆成两类，用户反馈看不懂）。
+  function computeHitLayers(nodes, edges, seedIds) {
+    const byId = new Map(nodes.map((n) => [n.id, n]))
+    const seeds = [...new Set((Array.isArray(seedIds) ? seedIds : [seedIds])
+      .map((id) => String(id || '').trim())
+      .filter((id) => id && byId.has(id)))]
+    if (!seeds.length) return { ordered: [], roots: [], recent: [], pathEdges: [], weakEdges: [], ids: new Set() }
+    const ids = new Set(seeds)
+    const q = [...seeds]
+    while (q.length) {
+      const cur = q.pop()
+      for (const e of edges) {
+        if (e.kind !== 'user' || e.to !== cur) continue
+        if (ids.has(e.from) || !byId.has(e.from)) continue
+        ids.add(e.from)
+        q.push(e.from)
+      }
+    }
+    // 边分两档画（2026-10 修正：只画强边会让节点变成"没有线的孤点"，图看不懂）：
+    //   strongEdges（accent）：闭包内部的 user 边；weakEdges（按边色画满）：闭包内部的其余边。
+    // 两者都只表示"图里本来就有这条边"，不宣称进了上下文。
+    const strongEdges = edges.filter((e) => e.kind === 'user' && ids.has(e.from) && ids.has(e.to))
+    const strongSet = new Set(strongEdges)
+    const weakEdges = edges.filter((e) => ids.has(e.from) && ids.has(e.to) && !strongSet.has(e))
+    const ordered = topoSort([...ids], edges)
+    const roots = ordered.filter((id) => !edges.some((e) => e.kind === 'user' && e.to === id && ids.has(e.from)))
+    return { ordered, roots, recent: seeds, pathEdges: strongEdges, weakEdges, ids }
+  }
+
+  // 单链隔离的激活集（纯函数，2026-10）：多链命中时"只看第 N 条"用。
+  // strong = 链内的 user 边（accent）；weak = 链内其余边（保证节点不是无线孤点）。
+  // roots / recent 也必须按链过滤：否则别的脉络的节点照样画虚线环与脉冲环
+  //（2026-10 用户反馈"观察某条脉络时其它节点也高亮"就是这么来的）。
+  function chainActiveSet(edges, chain, roots, recent) {
+    const ids = new Set(chain ? chain.nodes : [])
+    const strong = new Set(edges.filter((e) => e.kind === 'user' && ids.has(e.from) && ids.has(e.to)))
+    const weak = new Set(edges.filter((e) => ids.has(e.from) && ids.has(e.to) && !strong.has(e)))
+    return {
+      ids, strong, weak,
+      roots: (roots || []).filter((id) => ids.has(id)),
+      recent: (recent || []).filter((id) => ids.has(id)),
+    }
+  }
+
+  // 书名归一（AI-025）：冒烟数据里 book 字段形如「书名  章节」（章节号跟在书名后），  // 取色/展示时剥离章节后缀，让同一本书的节点同色；无后缀则原样返回。
   function bookName(bookTitle) {
     return String(bookTitle || '').trim().replace(/\s{2,}.+$/, '').trim()
   }
@@ -269,9 +375,10 @@
       this.graph = null      // { nodes, edges, demo, updatedAt }
       this.run = null        // 运行时：{ nodes:[{id,point,aliases,discussions,books,r,x,y,vx,vy,pinned,color}], edges:[{from,to,kind}], byId }
       this.cam = { x: 0, y: 0, scale: 1 }   // 世界→屏幕：sx = (wx - cam.x)*scale + W/2
-      this.hl = null         // 高亮态：{ mode:'hit'|'manual'|'search', ids:Set, edges:Set, roots:[], recent:[], targets:[], reason, at, chains? }
+      this.hl = null         // 高亮态：{ mode:'hit'|'manual'|'search', ids:Set, edges:Set, weakEdges:Set, roots:[], recent:[], targets:[], reason, at, chains? }
       this._hlHidden = false // 当前讨论命中高亮是否被用户手动隐藏（横幅按钮切换；hl 数据保留，渲染跳过）
-      this._focusChain = 0   // 当前聚焦的链下标（hl.chains 内的索引；0 = 第一条）
+      this._focusChain = -1  // 聚焦的链下标（hl.chains 内）；**-1 = 全部**（2026-10：多链时"切哪条只看哪条"）
+      this._activeHl = null  // 单链聚焦时的激活集 { ids, strong, weak, roots, recent }；null = 全部（见 _updateActiveHl）
       this._chainTimer = 0   // 多链轮播计时器（自动弹出动画：逐链展示横幅 + 聚焦）
       this._pickMode = false // 节点选取模式（自由模式手动选取引用）：单击看详情，双击选取
       this._pickSelectTimer = 0  // 选取模式下单击→详情打开的延迟计时器（防详情面板遮挡双击）
@@ -355,6 +462,7 @@
       const ids = (Array.isArray(hits) ? hits : []).filter(Boolean)
       if (!ids.length) return
       console.log('[CoRead][gv] onHit', ids.length, String(reason || '').slice(0, 24), 'open=', this._open)
+      this._turnHits = ids.slice()   // 本轮命中：合并进种子用（栈数据滞后时防止高亮闪回本场旧值）
       this._cancelAutoDismiss()   // 新命中取消挂起的自动渐隐（旧动画让位）
       if (!this._open) {
         this._autoShowHit(ids, reason || '')
@@ -475,17 +583,26 @@
       }
     }
 
-    /** 命中应用：算 root→recent 路径并集 → 高亮 + 横幅 + 适配相机（手动高亮不动相机）。
+    /** 命中应用：算高亮（一场讨论一次 user 闭包）→ 高亮 + 横幅 + 适配相机
+     *  （手动高亮不动相机）。
      *  noFit=true：不播聚焦动画（打开图场景用——物理未收敛时动画目标基于环形
-     *  初始布局的瞬时坐标，位置不对；聚焦交给物理收敛后的 _pendingChainFit 落位） */
-    async applyHit(hits, reason, mode, noFit) {
+     *  初始布局的瞬时坐标，位置不对；聚焦交给物理收敛后的 _pendingChainFit 落位）
+     *  stackIds：本场实时栈累计命中的引用；命中态会与 hits 合并成同一组种子 */
+    async applyHit(hits, reason, mode, noFit, stackIds) {
       console.log('[CoRead][gv] applyHit', mode, 'hits=', (hits || []).length, 'noFit=', !!noFit)
       if (!this.graph) {
         const g = await this.loadGraph(this._demo, this._free)
         if (!g) return
       }
-      const result = computePath(this.run.nodes, this.run.edges, hits)
-      console.log('[CoRead][gv] applyHit ordered=', result.ordered.length)
+      const m = mode || 'hit'
+      // 种子 = 本轮命中 ∪ 本场栈已挂的引用（2026-10 用户定调：收口前它们是同一场讨论的引用，
+      // 固化后会并进同一个节点的 user 边，所以一起取一次闭包、不分两层）。
+      // 只有命中态合并：picked 要尊重用户的手动选取，simulate 用的是演示图。
+      const seeds = (m === 'hit')
+        ? [...new Set([...(hits || []), ...(this._turnHits || []), ...((stackIds != null ? stackIds : this._stackIds) || [])])]
+        : hits
+      const result = computeHitLayers(this.run.nodes, this.run.edges, seeds)
+      console.log('[CoRead][gv] applyHit 亮=', result.ordered.length, '（引用', result.recent.length, '+ 上游', result.ordered.length - result.recent.length, '）')
       if (!result.ordered.length) {
         return
       }
@@ -501,6 +618,7 @@
      *  （不动 manual / search 高亮）。 */
     applyStackHits(hits) {
       console.log('[CoRead][gv] applyStackHits', Array.isArray(hits) ? hits.length : 'n/a', 'hl=', this.hl && this.hl.mode, 'at-ago=', this.hl ? Math.round((Date.now() - this.hl.at) / 1000) + 's' : '-')
+      this._stackIds = Array.isArray(hits) ? hits.slice() : []   // 本场实时栈累计命中的引用（种子之一）
       if (!Array.isArray(hits) || !hits.length) {
         // 命中动画保护（2026-10）：graph-hit 刚应用（4s 内）时，栈刷新的空结果
         // 不得立刻清除命中横幅——receiver 3s 轮询/栈写入滞后都可能让 /stack-hits
@@ -514,24 +632,49 @@
       // _pendingChainFit 一次性落位。图已加载的栈刷新/切书恢复保持动画聚焦。
       const needLoad = !this.graph
       if (needLoad) this._pendingChainFit = true   // 打开图场景：收敛后落位链聚焦
-      return this.applyHit(hits, '', 'hit', needLoad)
+      // 种子：本轮命中优先（栈数据可能滞后），没有则用栈命中——合并逻辑在 applyHit 里做。
+      const seeds = (this._turnHits && this._turnHits.length) ? this._turnHits : hits
+      return this.applyHit(seeds, '', 'hit', needLoad, hits)
     }
 
-    // 聚焦当前链：相机适配到 _focusChain 指向的链节点；无链/无高亮 → 整体视图。
+    // ── 多链聚焦（2026-10 用户定调：切到某条脉络就**只看那一条**，并新增「全部」） ──
+    // 以前切换脉络只改横幅和相机，其它脉络的节点照样亮着，等于切换没生效（用户反馈"看不懂"）。
+    // 现在：多链 + 指定了某条链 → 只激活该链的节点与边；「全部」(-1) 或单链 → 全部高亮。
+
+    // 是否处于"单链隔离"状态（多链且指定了某条链）
+    _isChainIsolated() {
+      const chains = this.hl && this.hl.chains
+      return !!(chains && chains.length > 1 && this._focusChain >= 0 && this._focusChain < chains.length)
+    }
+    // 重算激活集（只在 hl / _focusChain 变化时调用；render 不重算，避免逐帧分配）。
+    // **恒非 null（hl 存在时）**——统一形状 { ids, strong, weak, roots, recent }：
+    // 「全部」= 直接就是 hl 本身；单链隔离 = 只含该链。render/隐藏态/相机都读它，
+    // 避免"某个渲染分支又去读 hl.ids 全量"这类漏（2026-10 就是漏在节点/环/脉冲上）。
+    _updateActiveHl() {
+      const hl = this.hl
+      if (!hl) { this._activeHl = null; return }
+      this._activeHl = this._isChainIsolated()
+        ? chainActiveSet(this.run ? this.run.edges : [], hl.chains[this._focusChain], hl.roots, hl.recent)
+        : { ids: hl.ids, strong: hl.edges, weak: hl.weakEdges, roots: hl.roots, recent: hl.recent }
+    }
+
+    // 聚焦某条链：相机适配到该链节点；「全部」(-1) 时适配全部高亮节点。
     // noAnim=true：直接落位（物理收敛后/动画结束时的校准用，不再播动画）
     _fitToChain(noAnim) {
       if (!this.run) return
-      const chains = this.hl && this.hl.chains
-      const c = chains && chains.length ? chains[Math.min(this._focusChain, chains.length - 1)] : null
-      const ids = c ? c.nodes : (this.hl ? [...this.hl.ids] : [])
+      const isolate = this._isChainIsolated()
+      const ids = isolate
+        ? this.hl.chains[this._focusChain].nodes
+        : (this.hl ? [...this.hl.ids] : [])
       const nodes = ids.map((id) => this.run.byId.get(id)).filter(Boolean)
       this.fitToNodes(nodes.length ? nodes : this.run.nodes, !noAnim)
     }
 
-    // 用户手动切换聚焦链：取消自动轮播与渐隐（用户在看，不自动关闭），聚焦所选链
+    // 切换聚焦链：i = 链下标，或 -1（全部）。取消自动轮播与渐隐（用户在看，不自动关闭）
     focusChain(i) {
       this._cancelChainCarousel()
       this._focusChain = i
+      this._updateActiveHl()
       this._renderBanner()
       this._renderChainSwitch()
       this._fitToChain()
@@ -546,24 +689,35 @@
       if (ci >= 0 && ci !== this._focusChain) this.focusChain(ci)
     }
 
-    // 多链轮播（自动弹出动画）：依次展示每条链（横幅切换 + 聚焦），每条停留后
-    // 播放下一条；全部播完 → 渐隐关闭。用户交互（切链/隐藏/手动打开）会取消。
+    // 多链轮播（自动弹出动画）：全部 → 逐条 → 回到全部，然后渐隐关闭。
+    // 用户交互（切链/隐藏/手动打开）会取消。
+    // 2026-10：合并口径下一场讨论的引用常落在 4~6 条链上，逐条播完要十几秒 —— 自动轮播
+    // **只播前 CAROUSEL_MAX 条**，其余交给右下角按钮手动切换。
     _startChainCarousel(n) {
       clearTimeout(this._chainTimer)
+      const last = Math.min(n, CAROUSEL_MAX_CHAINS) - 1   // 自动播到第 last 条（下标）
       const step = () => {
         if (!this._open) return
-        if (this._focusChain >= n - 1) {
+        if (this._focusChain >= last) {
+          // 轮播结束：回到「全部」再渐隐——停在最后一条会把其它脉络一直压暗，
+          // 用户回来看到的不是整轮命中
+          this._focusChain = -1
+          this._updateActiveHl()
+          this._renderBanner()
+          this._renderChainSwitch()
+          this._fitToChain()
           clearTimeout(this._autoCloseTimer)
           this._autoCloseTimer = setTimeout(() => this.fadeOutClose(), 3200)
           return
         }
         this._focusChain++
+        this._updateActiveHl()
         this._renderBanner()
         this._renderChainSwitch()
         this._fitToChain()
         this._chainTimer = setTimeout(step, 2600)
       }
-      this._chainTimer = setTimeout(step, 2600)   // 第 0 条链停留后切下一条
+      this._chainTimer = setTimeout(step, 2600)   // 「全部」停留后切第 1 条
     }
     _cancelChainCarousel() {
       clearTimeout(this._chainTimer)
@@ -583,15 +737,25 @@
       }
     }
 
-    /** 手动：高亮某节点的 root→recent 路径（详情面板按钮） */
+    /** 手动：高亮某节点的 root→recent 路径（详情面板按钮）。simulate（演示命中）
+     *  走命中两层口径，与真实命中一致。 */
     highlightFrom(nodeId, mode) {
       const n = this.run && this.run.byId.get(nodeId)
       if (!n) return
-      const result = computePath(this.run.nodes, this.run.edges, [nodeId])
+      const result = (mode === 'simulate')
+        ? computeHitLayers(this.run.nodes, this.run.edges, [nodeId])
+        : computePath(this.run.nodes, this.run.edges, [nodeId])
       this.setHighlight(result, mode || 'manual', '')
       if (mode === 'simulate') this._fitToChain()   // 演示命中：按链聚焦
     }
 
+    // 命中态判定（2026-10）：hit/picked/simulate 走"命中 + user 来路"口径（computeHitLayers）；
+    // manual（单击预览）/ search 走混合边路径（"浏览这张网"语义）。
+    // 判据看 **mode**，不看数据形状——之前用 `hl.stackOnly instanceof Set` 判，而 setHighlight
+    // 给 search/manual 也塞了空 Set，于是重算时它们会被误当命中态、把搜索结果换成 user 来路闭包。
+    _isHitLikeHl(hl) {
+      return !!(hl && (hl.mode === 'hit' || hl.mode === 'picked' || hl.mode === 'simulate'))
+    }
     setHighlight(result, mode, reason) {
       // 聚焦前相机快照：只在非 manual 时保存（2026-09 修复——manual 是临时预览，
       // 若覆盖快照，之后隐藏命中脉络会恢复到 manual 聚焦后的状态，而不是命中前的状态）
@@ -601,8 +765,10 @@
       if (mode === 'hit' || mode === 'picked') this._savedState = null
       const hl = {
         mode: mode || 'manual',
-        ids: new Set(result.ordered),
+        // ids = 高亮全集（引用 + 上游闭包），用于压暗判定；edges 只含内部 user 边
+        ids: (result.ids instanceof Set) ? result.ids : new Set(result.ordered),
         edges: new Set(result.pathEdges),
+        weakEdges: new Set(result.weakEdges || []),
         roots: result.roots,
         recent: result.recent,
         targets: result.recent,
@@ -611,11 +777,14 @@
       }
       this.hl = hl
       this._hlHidden = false   // 新命中/搜索/手动高亮：总是先显示
-      // 命中按链分组（自动弹出 / 模拟 / 手动高亮 / 手动选取统一按链展示与聚焦）
+      // 命中按链分组（自动弹出 / 模拟 / 手动高亮 / 手动选取统一按链展示与聚焦）。
+      // hit/picked/simulate 传 kinds=['user']：链 = user 引用的来路，与 L3 取数同口径。
       hl.chains = (mode === 'hit' || mode === 'simulate' || mode === 'manual' || mode === 'picked')
-        ? computeChains(this.run ? this.run.nodes : [], this.run ? this.run.edges : [], result.recent)
+        ? computeChains(this.run ? this.run.nodes : [], this.run ? this.run.edges : [], result.recent,
+            this._isHitLikeHl(hl) ? ['user'] : undefined)
         : null
-      this._focusChain = 0
+      this._focusChain = -1   // 新命中：默认「全部」（多链时用户再逐条切）
+      this._updateActiveHl()
       this._pulseUntil = Date.now() + 1600
       this._renderBanner()
       this._renderChainSwitch()
@@ -623,15 +792,26 @@
     }
     recomputeHighlight() {
       if (!this.hl || !this.hl.targets || !this.hl.targets.length) return
-      const result = computePath(this.run.nodes, this.run.edges, this.hl.targets)
+      // 命中态（hit/picked/simulate）走"一场讨论一次闭包"口径重算；search / manual 保持混合边路径
+      const isHitLike = this._isHitLikeHl(this.hl)
+      const seeds = isHitLike
+        ? [...new Set([...this.hl.targets, ...(this._stackIds || [])])]
+        : this.hl.targets
+      const result = isHitLike
+        ? computeHitLayers(this.run.nodes, this.run.edges, seeds)
+        : computePath(this.run.nodes, this.run.edges, this.hl.targets)
       if (!result.ordered.length) { this.clearHighlight(); return }
-      this.hl.ids = new Set(result.ordered)
+      this.hl.ids = (result.ids instanceof Set) ? result.ids : new Set(result.ordered)
       this.hl.edges = new Set(result.pathEdges)
+      this.hl.weakEdges = new Set(result.weakEdges || [])
       this.hl.roots = result.roots
       this.hl.recent = result.recent
-      // 图重载后链按新图重算；聚焦下标越界则回 0
-      this.hl.chains = computeChains(this.run.nodes, this.run.edges, this.hl.targets)
-      if (this._focusChain >= (this.hl.chains || []).length) this._focusChain = 0
+      this.hl.targets = result.recent
+      // 图重载后链按新图重算；聚焦下标越界则回「全部」（命中态链按 user 来路分组，与 L3 同口径）
+      this.hl.chains = computeChains(this.run.nodes, this.run.edges, this.hl.targets,
+        isHitLike ? ['user'] : undefined)
+      if (this._focusChain >= (this.hl.chains || []).length) this._focusChain = -1
+      this._updateActiveHl()
       this._pendingChainFit = true   // 图重载后物理重跑，收敛时同样校准链聚焦（2026-10）
       this._renderBanner()
       this._renderChainSwitch()
@@ -639,10 +819,12 @@
     clearHighlight() {
       this.hl = null
       this._hlHidden = false
-      this._focusChain = 0
+      this._focusChain = -1
+      this._activeHl = null
       this._preFocusCam = null
       this._savedState = null
       this._pendingChainFit = false
+      this._turnHits = null   // 本轮命中随命中态一起清（栈命中的恢复由 /stack-hits 重新喂）
       this._renderBanner()
       this._renderChainSwitch()
       this.render()
@@ -681,9 +863,38 @@
       this._renderDetail()
       this.render()
     }
+    // 关闭详情面板（✕ 按钮 / 点空白 / 空态收起）。**不只是清 sel**：单击节点预览会把
+    // 高亮切成 manual（单节点混合路径），关详情时必须把这次预览一并退出——否则
+    // _savedState 里暂存的消息级命中（hit/picked/search）永远回不来：图上留的是单节点
+    // 路径、`hl.chains` 只剩 1 条 → 「全部 / 脉络 N」按钮消失（2026-10 用户报
+    // "点开节点看详情，再退出时脉络选项不见了"）。
+    // 退出规则与点空白一致：有暂存 → 原样恢复消息级命中（横幅 + 两层/链 + 相机）；
+    // 没有暂存 → 真正清掉高亮并恢复聚焦前相机。
     closeDetail() {
       this.sel = null
       this._hideDetail()
+      if (this.hl && this.hl.mode === 'manual') {
+        if (this._savedState) {
+          const st = this._savedState
+          this._savedState = null
+          this.hl = st.hl
+          this._focusChain = st.focusChain
+          this._hlHidden = st.hidden
+          this.recomputeHighlight()   // 按当前图重算两层/链，并重渲染横幅与脉络按钮
+          if (this._hlHidden) {
+            if (this._preFocusCam) this._animCam(this._preFocusCam)
+            else if (this.run) this.fitToNodes(this.run.nodes, true)
+          } else {
+            this._fitToChain()
+          }
+        } else {
+          const back = this._preFocusCam
+          this.clearHighlight()
+          // 取消聚焦：恢复聚焦前用户的缩放状态（2026-09 用户定调）
+          if (back) this._animCam(back)
+          else if (this.run) this.fitToNodes(this.run.nodes, true)
+        }
+      }
       this.render()
     }
 
@@ -833,18 +1044,27 @@
     // 屏幕坐标便于直接比较可见重叠；用 world 位移弹开时再除以 cam.scale。
     _labelBoxScreen(n) {
       const scale = this.cam.scale || 1
+      // 视口剔除（2026-10 性能）：先算屏幕坐标（几次乘加，廉价），出界直接返回零盒 ——
+      // 跳过下面 ctx.font 赋值 + wrapText + measureText（那三样是逐帧热点）。
+      const px = (n.x - this.cam.x) * scale + this._w / 2
+      const py = (n.y - this.cam.y) * scale + this._h / 2
+      if (px < -LABEL_CULL_PAD || px > this._w + LABEL_CULL_PAD ||
+          py < -LABEL_CULL_PAD || py > this._h + LABEL_CULL_PAD) {
+        return { x: 0, y: 0, w: 0, h: 0 }
+      }
       const fontPx = clamp(Math.round(11 * scale), 11, 24)
       const ratio = scale / (this._baseScale || scale || 1)
-      const chars = ratio < 0.8 ? 6 : (ratio < 1.2 ? 9 : (ratio < 1.7 ? 13 : (ratio < 2.6 ? 17 : 20)))
-      const linesN = ratio < 0.8 ? 1 : (ratio < 1.2 ? 2 : 3)
+      // 与渲染同规则（2026-10 共用 labelShape）：悬停/选中 = 临时聚焦满配；其余只看缩放
+      // （高亮节点也一样——同一缩放同一截断，用户定调）
+      const emphasized = this.hover === n.id || this.sel === n.id
+      const shape = emphasized ? LABEL_SHAPE_FULL : labelShape(ratio)
+      const chars = shape.chars, linesN = shape.lines
       this.ctx.font = fontPx + 'px -apple-system, BlinkMacSystemFont, \'PingFang SC\', \'Helvetica Neue\', sans-serif'
       const wrapped = wrapText(n.point, chars, linesN)
       let maxWpx = 0
       for (const l of wrapped) { const w = this.ctx.measureText(l).width; if (w > maxWpx) maxWpx = w }
       const bw = maxWpx + 12
-      const bh = linesN * fontPx * 1.3 + 6
-      const px = (n.x - this.cam.x) * scale + this._w / 2
-      const py = (n.y - this.cam.y) * scale + this._h / 2
+      const bh = wrapped.length * fontPx * 1.3 + 6
       return { x: px - bw / 2, y: py + n.r * scale + 4 - 3, w: bw, h: bh }
     }
 
@@ -902,6 +1122,10 @@
               if (mj) moveNode(b, nx * bv, ny * bv, B)
             }
             // 2) 标签盒子重叠：沿较小穿透轴（MTV）弹开
+            // 2~4 全是"标签盒子 vs 盒子/圆"：两个盒子都被视口剔除（w=0）时整对跳过——
+            // 省掉每对 3 次 clamp + hypot（n=104、最多 12 轮迭代时这是每帧最大的一笔，
+            // 2026-10 性能优化）。2~4 是本层循环体末尾，continue 等价于跳过它们。
+            if (A.w <= 0 && B.w <= 0) continue
             const ox = Math.min(A.x + A.w, B.x + B.w) - Math.max(A.x, B.x)
             const oy = Math.min(A.y + A.h, B.y + B.h) - Math.max(A.y, B.y)
             const overPx = Math.min(ox, oy) - COLLIDE_PAD
@@ -991,9 +1215,15 @@
       const ty = (y) => (y - cam.y) * cam.scale + H / 2
 
       const hl = this._hlHidden ? null : this.hl   // 手动隐藏：跳过高亮渲染（数据保留）
-      const hlHidden = this._hlHidden && this.hl ? this.hl : null   // 隐藏模式的残留标识数据源
-      const hlIds = hl ? hl.ids : null
-      const hlEdges = hl ? hl.edges : null
+      // 激活集（隔离 or 全部）：节点/边/环/脉冲**一律读它**，不许再直接读 hl.ids ——
+      // 2026-10 用户反馈"观察某条脉络时其它节点也高亮"，根因就是节点判定漏读了全量 hl.ids。
+      const A = this.hl ? this._activeHl : null
+      const hh = this._hlHidden ? A : null                 // 隐藏态残留标识数据源（同激活集）
+      const hlIds = hl && A ? A.ids : null
+      const hlEdges = hl && A ? A.strong : null
+      const hlWeakEdges = hl && A ? A.weak : null
+      const hlRoots = hl && A ? (A.roots || []) : []
+      const hlRecent = hl && A ? (A.recent || []) : []
       // 悬停邻接子图（有路径高亮时不压暗，悬停只出标签/提示）；压暗强度走缓动值（AI-027）
       const hoverOn = !!this.hover && !hlIds
 
@@ -1004,15 +1234,31 @@
         const a = run.byId.get(e.from), b = run.byId.get(e.to)
         if (!a || !b) continue
         let alpha = 0.75            // 常态边不透明度（曾 0.62 太淡；0.78+粗线又显笨，收回到 0.75）
-        let onPath = false
+        let onPath = false       // l3 内部的 user 边（AI 本轮走过的来路）→ accent 强调
+        let onWeak = false       // 高亮集内部的其余边（同一条来路上节点之间的连接）→ 边色画满
+        let onEdge = false       // 只有一端在高亮集里 → 半亮：交代"这个圈连到哪去了"，不宣称进了上下文
         let faintChain = false   // 隐藏模式：链内连接线标记
-        if (hlIds) { onPath = hlEdges.has(e); alpha = onPath ? 1 : 0.16 }
-        else if (hlHidden) { faintChain = hlHidden.edges.has(e); alpha = faintChain ? 0.9 : 0.75 }
+        if (hlIds) {
+          onPath = hlEdges.has(e)
+          onWeak = !onPath && !!(hlWeakEdges && hlWeakEdges.has(e))
+          onEdge = !onPath && !onWeak && (hlIds.has(e.from) || hlIds.has(e.to))
+          // 2026-10 修正（用户反馈"看不懂了"）：
+          //   只画 l3 内部边时，橙圈节点成了无线孤点、本轮命中节点（它们的连线都通向
+          //   未高亮的邻居）也成了孤点，整张图失去结构。现在按"边离高亮有多近"分三档：
+          //   两端都在高亮集（强/弱）→ 画满；只有一端在 → 半亮；两端都不在 → 压暗但可见。
+          alpha = onPath ? 1 : (onWeak ? 0.95 : (onEdge ? 0.5 : 0.3))
+        } else if (hh) {
+          // 隐藏态：激活集的边留细标（否则隐藏后看不出命中的圈连到哪）；同样走激活集，
+          // 隔离某条脉络时隐藏，不该把别的脉络的边也标出来
+          faintChain = hh.strong.has(e) || hh.weak.has(e)
+          alpha = faintChain ? 0.9 : 0.75
+        }
         else if (hoverOn) alpha = 0.75 - (this._edgeDim.get(e.from + '>' + e.to) || 0) * 0.63   // 压暗下限 ~0.12
         ctx.globalAlpha = alpha
-        const edgeColor = faintChain ? COLORS.pathAccent : (onPath && hlIds ? COLORS.pathAccent : (e.kind === 'user' ? COLORS.edgeUser : COLORS.edgeDerived))
+        const kindColor = e.kind === 'user' ? COLORS.edgeUser : COLORS.edgeDerived
+        const edgeColor = (onPath || faintChain) ? COLORS.pathAccent : kindColor
         ctx.strokeStyle = edgeColor
-        ctx.lineWidth = faintChain ? 2 : (onPath && hlIds ? 2 : 1.6)
+        ctx.lineWidth = (onPath || faintChain) ? 2 : (onWeak ? 1.9 : 1.6)
         const x1 = tx(a.x), y1 = ty(a.y), x2 = tx(b.x), y2 = ty(b.y)
         // 曲边（AI-034）：从圆心直线改成二次贝塞尔，控制点沿 from→to 方向的垂线偏移。
         // 关键：偏移只由「边的方向」决定（取一致的旋转侧）→ 同一对节点的正反向边
@@ -1052,20 +1298,33 @@
         }
       }
 
-      // 节点（命中高亮分四层：路径节点最亮+绿色外圈；root 浅绿虚线起点；recent 深绿实环+脉冲；
-      // 非路径节点保留 0.32 亮度(背景仍可见)。整条脉络绿色系、层次分明，不再压暗到几乎消失。）
+      // 节点（命中高亮＝一场讨论一次 user 闭包，2026-10 用户定调：
+      //   闭包 = 本场讨论引用到的旧知识点（含本轮） + 它们各自引用过的更早知识点（上游）。
+      //   一类标识（引用节点 深蓝实环+脉冲 ／ 上游节点 靛环 ／ 路径起点 浅蓝虚线）**一律读激活集**，
+      //   不许直接读 hl.ids / hl.roots / hl.recent —— 那会让单链隔离漏成"其它脉络也亮"。
+      //   非高亮节点保留 0.45 亮度（背景仍可见）。）
       for (const n of run.nodes) {
         let alpha = 1
-        const onPath = !!(hl && hl.ids.has(n.id))
-        if (hl) alpha = onPath ? 1 : 0.32
+        const onPath = !!(hlIds && hlIds.has(n.id))   // 激活集（引用 + 上游）
+        if (hl) alpha = onPath ? 1 : 0.45
         else if (hoverOn) alpha = 1 - (this._nodeDim.get(n.id) || 0) * 0.78   // 缓动压暗：1 → 0.22
         const px = tx(n.x), py = ty(n.y)
         const r = n.r * cam.scale
         const magnify = this.hover === n.id || this.sel === n.id
         const magAmt = this._mag.get(n.id) || 0
         const rDraw = r * (1 + 0.2 * magAmt)   // 放大也缓动，不跳变
-        // 路径节点外圈（主绿色粗描边——脉络一眼可辨）
-        if (hl && onPath) {
+        // ── 标识环：**每个节点每类只有一道环，颜色/粗细固定**（2026-10 用户反馈
+        //    "recent 的标识和图例对不上"）。半径/画法：
+        //     引用节点 r+3 深蓝 3px ／ 上游节点 r+2.5 靛 2px ／ 路径起点 r+6 浅蓝虚线 2px
+        //   两条硬规则：
+        //   ① 引用节点**只画深蓝环、不再叠靛环**——两道同色系环套在一起，用户没法判断
+        //      哪个颜色才是"引用到的那个"。
+        //   ② 引用节点的**常驻环满不透明**：以前把脉冲的 0.45 淡出也套在常驻环上，图上那圈
+        //      发灰，而图例是实心 #3f45cd —— 这就是"颜色对不上"。脉冲另画一道外扩环。
+        const isRecent = !!(hl && hl.mode !== 'manual' && hlRecent.includes(n.id))
+        const isRoot = !!(hl && hlRoots.includes(n.id))
+        // 上游节点外圈（靛色）——引用节点除外（见规则①）
+        if (onPath && !isRecent) {
           ctx.globalAlpha = alpha
           ctx.strokeStyle = COLORS.pathAccent
           ctx.lineWidth = 2
@@ -1073,38 +1332,45 @@
           ctx.arc(px, py, r + 2.5, 0, Math.PI * 2)
           ctx.stroke()
         }
-        // root 浅绿虚线环（无入边 = 路径起点 = 最早追的知识点）
-        if (hl && hl.roots.includes(n.id)) {
-          ctx.globalAlpha = alpha * 0.95
+        // 路径起点（无 user 入边）浅蓝虚线环——起点太多时不画（见 ROOT_MARK_MAX，防噪声）
+        if (isRoot && hlRoots.length <= ROOT_MARK_MAX) {
+          ctx.globalAlpha = alpha
           ctx.setLineDash([3, 3])
           ctx.strokeStyle = COLORS.rootMark
-          ctx.lineWidth = 1.2
+          ctx.lineWidth = 2
           ctx.beginPath()
-          ctx.arc(px, py, r + 5.5, 0, Math.PI * 2)
+          ctx.arc(px, py, r + 6, 0, Math.PI * 2)
           ctx.stroke()
           ctx.setLineDash([])
         }
-        // recent 深绿实环 + 脉冲（命中节点 = 当前讨论所在节点）。
+        // recent 深蓝实环（图例色 recentMark，满不透明）+ 动画期外扩脉冲。
         // 单击选中（manual）不用 recent 表示——选中只是脉络标记 + sel 粗圈，不冒充命中（2026-09 用户定调）
-        if (hl && hl.mode !== 'manual' && hl.recent.includes(n.id)) {
-          const k = clamp(1 - (Date.now() - hl.at) / 1400, 0, 1)
-          ctx.globalAlpha = alpha * (0.45 + 0.55 * k)
+        if (isRecent) {
+          ctx.globalAlpha = alpha
           ctx.strokeStyle = COLORS.recentMark
           ctx.lineWidth = 3
           ctx.beginPath()
-          ctx.arc(px, py, r + 4.5 + (1 - k) * 8, 0, Math.PI * 2)
+          ctx.arc(px, py, r + 3, 0, Math.PI * 2)
           ctx.stroke()
-          ctx.globalAlpha = alpha
+          // 脉冲：1.4s 内向外扩一圈渐隐。渐隐只作用于这一道，不影响上面的常驻实环。
+          const k = clamp(1 - (Date.now() - hl.at) / 1400, 0, 1)
+          if (k > 0) {
+            ctx.globalAlpha = alpha * 0.5 * k
+            ctx.beginPath()
+            ctx.arc(px, py, r + 6 + (1 - k) * 9, 0, Math.PI * 2)
+            ctx.stroke()
+            ctx.globalAlpha = alpha
+          }
         }
-        // 隐藏（非聚焦）模式残留标识：本次命中节点细环（2026-09 用户定调加回——
-        // 隐藏高亮后仍能看到命中节点在哪；链内连接线由上方 faintChain 标记，
-        // 与显示态同色同粗，仅去掉脉冲与压暗）
-        if (hlHidden && hlHidden.recent.includes(n.id)) {
+        // 隐藏（非聚焦）模式残留标识：引用节点（2026-09 定调加回——隐藏高亮后仍能看到它们在哪；
+        // 连接线由上方 faintChain 标记）。**颜色/半径与显示态一致**：用 recentMark（原先误用了
+        // pathAccent 的靛色，和图例里的深蓝对不上，用户反馈）。
+        if (hh && hh.recent.includes(n.id)) {
           ctx.globalAlpha = alpha
-          ctx.strokeStyle = COLORS.pathAccent
-          ctx.lineWidth = 2.2
+          ctx.strokeStyle = COLORS.recentMark
+          ctx.lineWidth = 3
           ctx.beginPath()
-          ctx.arc(px, py, r + 3.5, 0, Math.PI * 2)
+          ctx.arc(px, py, r + 3, 0, Math.PI * 2)
           ctx.stroke()
         }
         // 选中外圈（比普通路径描边更粗）
@@ -1125,19 +1391,27 @@
         ctx.strokeStyle = COLORS.nodeStroke
         ctx.lineWidth = 1.4
         ctx.stroke()
-        // 标签：可缩放看更多字——scale≥0.5 常显；路径/搜索/悬停必显示；
-        // 路径节点(150px≈14字)比普通(100px≈9字)更完整；悬停~28字 + 白底 pill。
-        const searchHit = hl && hl.mode === 'search' && hl.ids.has(n.id)
-        if (cam.scale >= LABEL_MIN_SCALE || this.hover === n.id || searchHit || (hl && onPath)) {
+        // 标签（2026-10 用户反馈修正）：
+        //   · **可见性只看缩放**（LABEL_MIN_SCALE）＋ 悬停/选中（单节点，不会互相压）。
+        //     高亮节点不再"任何缩放都强制显示"——低于门槛时标签本来就不参与碰撞避让，
+        //     十几个高亮标签会叠成一团白块（用户原话："不会根据视野缩放显示"）。
+        //   · 字数/行数**只由缩放决定**（labelShape），高亮与非高亮在**同一缩放下完全一致**
+        //     （用户定调：高亮不该让描述省略逻辑变样）。悬停/选中是唯一例外——那是
+        //     "点开这一个看"的临时聚焦。
+        //   · **白底 pill 只留给悬停/选中**；高亮节点走无底光晕，不再糊一块不透明白底
+        //     盖住节点和边（用户原话："文本会有白色不透明的底"）。
+        //   · **白底只按档位画一次**（2026-10 性能修正）：普通标签不画底、高亮标签半透明底、
+        //     悬停/选中才是原来的白 pill。**不要用描边光晕**——strokeText 描字形是 canvas 最贵
+        //     的操作之一，每帧 100+ 个标签各描一遍是"进图就卡"的成因之一。
+        const onScreen = px > -LABEL_CULL_PAD && px < this._w + LABEL_CULL_PAD &&
+          py > -LABEL_CULL_PAD && py < this._h + LABEL_CULL_PAD
+        if (onScreen && (cam.scale >= LABEL_MIN_SCALE || magnify)) {
           // point 显示长度随缩放分级：用「当前 scale / 初始基准」比值判断，与面板尺寸无关。
-          // 初始化(比值≈1)每行 9 字、最多 2 行(标签短、不挤)；放大逐步提升到 13/17/20 字。
           const ratio = cam.scale / (this._baseScale || cam.scale || 1)
-          const baseChars = ratio < 0.8 ? 6 : (ratio < 1.2 ? 9 : (ratio < 1.7 ? 13 : (ratio < 2.6 ? 17 : 20)))
-          const focus = this.hover === n.id || searchHit || (hl && onPath)
-          const labelChars = focus ? Math.max(baseChars, 13) : baseChars
-          const labelLines = focus ? 3 : (ratio < 0.8 ? 1 : (ratio < 1.2 ? 2 : 3))
+          const shape = magnify ? LABEL_SHAPE_FULL : labelShape(ratio)
+          const bgAlpha = magnify ? LABEL_BG_FOCUS : (onPath ? LABEL_BG_HIT : LABEL_BG_PLAIN)
           const pillFade = magnify ? magAmt : 1   // 悬停/选中的 pill 淡入淡出（AI-027）
-          drawLabel(ctx, n.point, px, py + rDraw + 4, alpha, labelChars, magnify || searchHit || (hl && onPath), labelFontPx, labelLines, pillFade)
+          drawLabel(ctx, n.point, px, py + rDraw + 4, alpha, shape.chars, bgAlpha, labelFontPx, shape.lines, pillFade)
         }
       }
 
@@ -1214,6 +1488,7 @@
       const frame = () => {
         this._raf = 0
         let busy = false
+        let tMark = PERF_ON ? performance.now() : 0
         if (this._physics.running) {
           // 每帧 2 子步，加快收敛
           if (this.tickPhysics() | this.tickPhysics()) busy = true
@@ -1239,12 +1514,25 @@
         else this._anim = null
         if (Date.now() < this._pulseUntil) busy = true
         if (this._dragging) busy = true
+        if (PERF_ON) { perf.phys += performance.now() - tMark; tMark = performance.now() }
         // 碰撞弹开（AI-023）：运动期自动推开重叠的节点圆/标签，收敛后不破坏已读布局
         if (this._physics.running || this._anim || this._dragging) {
           if (this._separateLabels()) busy = true
         }
+        if (PERF_ON) { perf.sep += performance.now() - tMark; tMark = performance.now() }
         this._stepHoverFx()   // 悬停压暗/放大缓动（AI-027）
         this.render()
+        if (PERF_ON) {
+          // 性能日志（opt-in，localStorage.coreadGvPerf = '1'）：定位"进图卡"是物理、标签避让
+          // 还是渲染占的——n=104 时三者量级都在 O(n²) 或逐标签文本测量上，不测就是猜。
+          perf.render += performance.now() - tMark
+          perf.frames++
+          if (perf.frames >= 120) {
+            const f = perf.frames
+            console.log(`[CoRead][gv][perf] 近 ${f} 帧均值(ms)：物理/动画 ${(perf.phys / f).toFixed(2)} · 标签避让 ${(perf.sep / f).toFixed(2)} · 渲染 ${(perf.render / f).toFixed(2)}　节点 ${this.run ? this.run.nodes.length : 0} · 缩放 ${this.cam.scale.toFixed(2)} · 画布 ${this._w}×${this._h}`)
+            perf.phys = 0; perf.sep = 0; perf.render = 0; perf.frames = 0
+          }
+        }
         if (busy) this._ensureLoop()
       }
       this._raf = requestAnimationFrame(frame)
@@ -1306,10 +1594,14 @@
           '<div class="gv-legend" id="gv-legend" hidden>' +
             '<div><span class="sw" style="background:#6d72e8"></span>user 边 · 用户引用</div>' +
             '<div><span class="sw" style="background:#8a92a6"></span>derived 边 · 对话衍生</div>' +
-            '<div class="gv-lg-title">命中高亮 · 三种圈</div>' +
-            '<div><span class="ring" style="border-color:#5b5fe8"></span>path · 命中路径上的节点</div>' +
-            '<div><span class="ring dashed" style="border-color:#9aa3f2"></span>root · 路径起点（无入边）</div>' +
-            '<div><span class="ring thick" style="border-color:#3f45cd"></span>recent · 当前命中节点</div>' +
+            // 图例只列两条（2026-10 用户定调：那两层的术语没必要占图例位置）。
+            // 图例色**从 COLORS 取**，不写死十六进制 —— 用户报过"recent 标识和图例对不上"，
+            // 一半是渲染漏读 COLORS（隐藏态用了 pathAccent），一半是图例里硬编码的色值会和
+            // 渲染漂移。写死色值这条路直接堵掉：改 COLORS 图例自动跟着变。
+            // 粗细与渲染一致：路径起点 2px 虚线 / 引用节点 3px（thick）。
+            '<div class="gv-lg-title">命中高亮</div>' +
+            '<div><span class="ring dashed" style="border-color:' + COLORS.rootMark + '"></span>路径起点（无入边）</div>' +
+            '<div><span class="ring thick" style="border-color:' + COLORS.recentMark + '"></span>引用到的知识点</div>' +
             '<div class="gv-lg-title">节点颜色 · 所属书籍</div>' +
             '<div id="gv-legend-books"></div>' +
           '</div>' +
@@ -1423,32 +1715,9 @@
           // 点击空白（未拖动）→ 取消选中与手动聚焦，回到浏览态（2026-09 用户定调）。
           // 条件不依赖 sel：详情关闭（sel 置空）后，只要还有单击选中（manual）的
           // 高亮，点空白依然取消聚焦。
-          // 若 manual 之前暂存了消息级高亮（hit/picked/search）→ 原样恢复它
-          // （横幅 + 高亮 + 相机），不销毁；否则才真正清除高亮。
+          // 退出 manual 预览的逻辑统一在 closeDetail() 里（✕ 按钮与点空白同一条路，
+          // 2026-10 修：两处各写一份曾导致 ✕ 退出时脉络按钮回不来）。
           if (this.sel || (this.hl && this.hl.mode === 'manual')) {
-            if (this.hl && this.hl.mode === 'manual') {
-              if (this._savedState) {
-                const st = this._savedState
-                this._savedState = null
-                this.hl = st.hl
-                this._focusChain = st.focusChain
-                this._hlHidden = st.hidden
-                this.recomputeHighlight()   // 按当前图重算路径/链并重渲染横幅
-                // 相机：显示态聚焦回命中链；隐藏态回命中前（与 toggleHighlightHidden 一致）
-                if (this._hlHidden) {
-                  if (this._preFocusCam) this._animCam(this._preFocusCam)
-                  else if (this.run) this.fitToNodes(this.run.nodes, true)
-                } else {
-                  this._fitToChain()
-                }
-              } else {
-                const back = this._preFocusCam
-                this.clearHighlight()
-                // 取消聚焦：恢复聚焦前用户的缩放状态（2026-09 用户定调）
-                if (back) this._animCam(back)
-                else if (this.run) this.fitToNodes(this.run.nodes, true)
-              }
-            }
             this.closeDetail()
           }
         }
@@ -1520,7 +1789,8 @@
           if (this.hl && this.hl.mode === 'search') {
             this.hl = null
             this._hlHidden = false
-            this._focusChain = 0
+            this._focusChain = -1
+            this._activeHl = null
             this._renderBanner()
             this._renderChainSwitch()
           }
@@ -1642,8 +1912,9 @@
         // 指示行 + 每个标题各占一行；单脉络（单链）同样分行，不做单行省略。
         // 每行由 .gv-banner-line 强制单行（nowrap + ellipsis），标题行内部不再被拆断。
         const chains = hl.chains || []
-        const idx = chains.length ? Math.min(this._focusChain, chains.length - 1) : 0
-        const cur = chains.length ? chains[idx] : null
+        const isolated = this._isChainIsolated()
+        const idx = isolated ? this._focusChain : -1
+        const cur = isolated ? chains[idx] : null
         const hitIds = cur ? cur.hits : hl.targets
         const titles = hitIds.map((id) => {
           const n = this.run ? this.run.byId.get(id) : null
@@ -1654,18 +1925,29 @@
         // 与横幅按钮文案"隐藏当前讨论命中高亮"用词一致，宾语明确（2026-09 用户定调）
         const prefix = (hidden ? '〔高亮已隐藏〕' : '')
         // 指示行统一主词"命中知识脉络"（2026-09 用户定调——不用"旧知识点"）；
-        // 多链且显示态时括号标注当前展示的是第几条知识脉络（主词即链，1/2 指脉络
-        // 序号，无"把链当知识点"的歧义），与右下角"脉络 N"悬浮按钮呼应。
+        // 多链时标注当前是"第 N 条"还是"全部"（2026-10 加「全部」选项），
+        // 与右下角"全部 / 脉络 N"悬浮按钮呼应。
         // 隐藏态不写（X/N）——隐藏时没有聚焦任何脉络，进度标注不成立（2026-09 修复）。
-        const head = !hidden && chains.length > 1
-          ? '命中知识脉络（' + (idx + 1) + '/' + chains.length + '）'
-          : '命中知识脉络'
+        const head = (!hidden && chains.length > 1
+          ? '命中知识脉络（' + (isolated ? (idx + 1) + '/' + chains.length : '全部 ' + chains.length + ' 条') + '）'
+          : '命中知识脉络')
+        // 范围说明独立成行（2026-10）：只把计数塞在指示行尾部时，行宽不够会被省略号吃掉
+        // 后半段——用户反馈"看不懂"。措辞只讲两件事实：现在这条多大、其余为什么不见了；
+        // 不再写「点「全部」看整轮」这类指令（「全部」按钮就在右下角、自带标签，文案里重复
+        // 一遍反而啰嗦——2026-10 用户定调重写）。
+        // 分隔符跟全 app 既有约定一致：半角空格 + 中点 + 半角空格（` · `），不用全角空格——
+        // 图例/hint 等处的既有文案都是这个写法（滚轮缩放 · 拖空白平移 · …）。
+        const legendLine = isolated
+          ? '这条脉络 ' + cur.nodes.length + ' 个节点'
+            + (cur.nodes.length > 1 ? '' : '（没有上游）')
+            + ' · 其余 ' + Math.max(0, chains.length - 1) + ' 条已压暗'
+          : '本场讨论引用到 ' + hl.recent.length + ' 个旧知识点 · 连它们的上游共亮 ' + hl.ids.size + ' 个'
         // 隐藏态只保留指示行（2026-09 修复：隐藏时没有聚焦任何脉络，
-        // 标题行和（X/N）都没有着落，一并去掉）；显示态 = 指示行 + 标题分行
+        // 标题行和（X/N）都没有着落，一并去掉）；显示态 = 指示行 + 配色行 + 标题分行
         this._setBannerLines(
           hidden
-            ? [prefix + head]
-            : [prefix + head, ...titles.map((t) => '「' + t + '」')],
+            ? [prefix + head, legendLine]
+            : [prefix + head, legendLine, ...titles.map((t) => '「' + t + '」')],
           !hidden ? 'hit' : ''
         )
         // 横幅按钮：hit/picked 态 = 高亮显隐开关（不"清除"数据，只是渲染切换）
@@ -1720,7 +2002,8 @@
       }
       if (this.sel) this._renderDetail()   // 清空搜索词 → 详情高亮同步消失（2026-10）
     }
-    // 悬浮链切换按钮（2026-09）：多链命中时显示在画布右下角，点击聚焦对应链；
+    // 悬浮链切换按钮（2026-09；2026-10 加「全部」）：多链命中时显示在画布右下角。
+    // 「全部」= 不隔离（两层照常渲染）；「脉络 N」= 只亮第 N 条（其它脉络压暗）。
     // 无链 / 单链 / 高亮隐藏时隐藏。
     _renderChainSwitch() {
       const el = this.container && this.container.querySelector('#gv-chain-switch')
@@ -1728,9 +2011,11 @@
       const chains = this.hl && this.hl.chains
       if (!chains || chains.length <= 1 || this._hlHidden) { el.hidden = true; return }
       el.hidden = false
-      el.innerHTML = chains.map((c, i) =>
+      const allBtn = '<button class="gv-chain-btn' + (this._focusChain < 0 ? ' sel' : '') + '" data-chain="-1"'
+        + ' title="显示全部 ' + chains.length + ' 条脉络（含本场讨论已挂的知识点）">全部</button>'
+      el.innerHTML = allBtn + chains.map((c, i) =>
         '<button class="gv-chain-btn' + (i === this._focusChain ? ' sel' : '') + '" data-chain="' + i +
-        '" title="聚焦第 ' + (i + 1) + ' 条讨论脉络（' + c.hits.length + ' 个命中节点）">脉络 ' + (i + 1) + '</button>'
+        '" title="只看第 ' + (i + 1) + ' 条脉络（' + c.hits.length + ' 个命中节点，' + c.nodes.length + ' 个节点），其它脉络压暗">脉络 ' + (i + 1) + '</button>'
       ).join('')
       for (const b of el.querySelectorAll('.gv-chain-btn')) {
         b.addEventListener('click', () => this.focusChain(Number(b.dataset.chain)))
@@ -1989,26 +2274,29 @@
     head.push(rem)
     return head
   }
-  function drawLabel(ctx, text, x, y, alpha, charsPerLine, withBg, fontPx, maxLines, fade) {
+  function drawLabel(ctx, text, x, y, alpha, charsPerLine, bgAlpha, fontPx, maxLines, fade) {
     fontPx = fontPx || 12
     if (fade == null) fade = 1
+    bgAlpha = bgAlpha || 0
     ctx.font = fontPx + 'px -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'top'
     const lines = wrapText(text, charsPerLine, maxLines || 3)
     let maxW = 0
     for (const l of lines) { const w = ctx.measureText(l).width; if (w > maxW) maxW = w }
     const lineH = fontPx * 1.3
-    // 重点标签白底 pill：按最长行实际宽度整块覆盖。折行点固定，只随字号整体缩放。
-    if (withBg) {
-      ctx.fillStyle = 'rgba(255, 255, 255, ' + (0.88 * fade).toFixed(3) + ')'
+    // 底色：一次圆角矩形（O(1) 次绘制）。**不要改回"描边光晕"**——strokeText 描字形是 canvas
+    // 最贵的操作之一，逐行描一遍会让每帧成本翻倍（2026-10 用户反馈进图卡顿的成因之一）。
+    // 普通标签 bgAlpha = 0 → 完全不画底，与加光晕之前的表现一致（近白画布上深字本就清楚）。
+    if (bgAlpha > 0) {
+      ctx.fillStyle = 'rgba(255, 255, 255, ' + (bgAlpha * fade).toFixed(3) + ')'
       const bw = maxW + 12, bh = lines.length * lineH + 6
       if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(x - bw / 2, y - 3, bw, bh, 6); ctx.fill() }
       else ctx.fillRect(x - bw / 2, y - 3, bw, bh)
     }
     ctx.fillStyle = 'rgba(30, 34, 40, ' + (0.96 * alpha * fade).toFixed(3) + ')'
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'top'
     for (let i = 0; i < lines.length; i++) ctx.fillText(lines[i], x, y + i * lineH)
   }
-  console.log('[CoRead] graph-view v40 已加载：箭头增强终版——最上层绘制、同色系加深填充无描边、尺寸随缩放（2026-11）')
-  global.CoReadGraphView = { GraphView, utils: { computePath, topoSort, hashStr, mulberry32, clamp, wrapText, bookName, colorDist, assignBookColors } }
+  console.log('[CoRead] graph-view v52 已加载：命中高亮改「一场讨论一次 user 闭包」——本场栈引用与本轮命中合并取闭包、一种圈一个含义（2026-11）')
+  global.CoReadGraphView = { GraphView, COLORS, utils: { computePath, computeChains, computeHitLayers, chainActiveSet, labelShape, labelTier, drawLabel, topoSort, hashStr, mulberry32, clamp, wrapText, bookName, colorDist, assignBookColors } }
 })(typeof window !== 'undefined' ? window : globalThis)

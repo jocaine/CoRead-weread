@@ -1,11 +1,31 @@
 const RECEIVER = 'http://127.0.0.1:7239'
-// 自由模式哨兵书（2026-09 用户定调）：固定在侧栏的独立上下文（固定空书对象）。
-// 自由模式的对话都是临时测试——引用解析照常命中正式会意图（测试 user 边命中端），
-// 但收口固化跑在正式图副本沙盒上（图视图 ?free=1 查看），正式图零污染、不固化。
-const FREE_KEY = '__coread_free_mode__'
-let _freeMode = false  // 是否处于自由模式（进入后消息区/引用/图视图按哨兵书隔离）
+// 自由模式（2026-09 定调；2026-11 扩为多对话）：侧栏里的独立上下文，引用解析照常
+// 命中正式会意图，对话内容默认不留痕（不进长期记忆、不进正式图）。
+// 多对话（2026-11 用户定调）：每个自由对话 = 一个独立 bookKey（__coread_free_<8hex>__；
+// 默认对话沿用历史哨兵 FREE_KEY），历史/消息区/讨论栈/命中全按"按书隔离"这条既有链路
+// 天然互不串味；归档时由用户勾选是否保存记忆、是否走正常收口程序进正式拓扑图。
+const FREE_KEY = '__coread_free_mode__'   // 默认自由对话（历史哨兵书，向后兼容）
+const FREE_KEY_RE = /^__coread_free_/
+let _freeMode = false  // 是否处于自由模式（进入后消息区/引用/图视图按自由对话隔离）
+let _freeKey = FREE_KEY  // 当前自由对话的 key（多对话：每场对话一个 key）
+let _freeConvs = []      // 活动自由对话清单（GET /free-conversations 的 active）
+let _freeArchived = []   // 已归档自由对话（墓碑记录：产物去向说明）
+
+// 当前自由对话持久化：面板重开/切换 tab 后回到上次那场对话（与 manualBook 同款思路）。
+// 读回发生在 loadState()（异步），这里只提供读写两个入口 + 内存值。
+function saveFreeState() {
+  try { chrome.storage.local.set({ freeConvKey: _freeKey || FREE_KEY }) } catch {}
+}
+function restoreFreeKey() {
+  return isFreeConvKey(_freeKey) ? _freeKey : FREE_KEY
+}
 let _savedReadingAnn = null  // 进入自由模式前暂存的读书模式选中引用（退出自由模式时恢复）
 let _savedExitCtx = null  // 进入自由模式前 _currentBook 的快照（退出时恢复实时上下文用）
+
+// 是否自由对话 key（默认哨兵 + 新建对话都算）
+function isFreeConvKey(key) {
+  return FREE_KEY_RE.test(String(key || ''))
+}
 
 // 侧栏调试上报（与 content.js 的 postDebug 同写 receiver/inbox/debug.jsonl，source=sidebar）
 function postSidebarDebug(data) {
@@ -20,11 +40,203 @@ function postSidebarDebug(data) {
 let sseConn = null
 let _lastEventId = 0  // 已收到的最新 SSE 事件 id，断线重连时用于续传（AI-006）
 
+// 不可见双向控制字符（bidi controls）：U+061C 阿拉伯字母标记、U+200E LRM、U+200F RLM、
+// U+202A~U+202E 嵌入/覆盖、U+2066~U+2069 隔离。它们能把一整段文字的方向翻成 RTL，
+// 从而让全角引号 “ ” 被镜像成 ” “（顺序整个反过来），而字符本身在界面上完全看不见。
+// 用户从书籍正文 / 网页粘贴时可能带进来，这里统一在显示层剥掉（正文收发不受影响）。
+const BIDI_INVISIBLE_RE = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g
+
+function stripInvisibleBidi(t) {
+  return String(t == null ? '' : t).replace(BIDI_INVISIBLE_RE, '')
+}
+
 function esc(t) {
-  return String(t)
+  return stripInvisibleBidi(t)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
+}
+
+// 属性值转义（href 等）：esc 之后补引号，避免内容提前闭合属性
+function escAttr(t) {
+  return esc(t).replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+}
+
+// ── Markdown 渲染（2026-10）─────────────────────────────────────────────────
+// AI 回复是 markdown（**加粗**、小标题、列表、引用、表格…），此前一律走 textContent +
+// white-space:pre-wrap 原样显示，星号、竖线、# 直接暴露给用户。这里做一个自包含的
+// 迷你渲染器：MV3 扩展页 CSP 不允许远程脚本，引 marked/markdown-it 还要多一份打包流程，
+// 所以手写，只覆盖讨论回复里真实会出现的语法。
+//
+// 安全模型（重要）：整段文本先按行 HTML 转义，再在**转义后的结果**上套标记 →
+// 正文里的 < > & 永远是实体，所有标签都只可能由本文件生成，不存在注入面。
+// 链接 href 另走协议白名单（http/https/mailto），javascript: 之类退化成纯文本。
+//
+// 支持：段落 / 软换行（单换行按 <br>）、# 标题、**粗**、*斜*、~~删除~~、`行内码`、
+//      ``` 围栏代码块 ```、> 引用、- / 1. 列表（更深的缩进做视觉下沉）、--- 分隔线、
+//      | 表格 |、[文本](链接) 与裸链接。
+function mdInline(s) {
+  // 行内代码先摘出来占位：里面的 * _ ~~ 不该被当成强调标记
+  const codes = []
+  let t = String(s == null ? '' : s).replace(/`([^`\n]+)`/g, (m, c) => {
+    codes.push(c)
+    return '\u0001' + (codes.length - 1) + '\u0001'
+  })
+  // 链接 [文本](url)：白名单外的协议（javascript: / data: …）不建链，保留原文
+  t = t.replace(/\[([^\]\n]+)\]\(([^()\s]+)\)/g, (m, text, url) => {
+    const raw = url.replace(/&amp;/g, '&')
+    if (!/^(?:https?:|mailto:)/i.test(raw)) return m
+    return '<a href="' + escAttr(raw) + '" target="_blank" rel="noopener noreferrer">' + text + '</a>'
+  })
+  // 裸链接（前面是行首或空白等边界，避免把已生成的 href 再包一层）
+  t = t.replace(/(^|[\s(（【])(https?:\/\/[^\s<>()（）【】"]+)/g, (m, pre, url) =>
+    pre + '<a href="' + escAttr(url) + '" target="_blank" rel="noopener noreferrer">' + url + '</a>')
+  t = t.replace(/\*\*([^\n]+?)\*\*/g, '<strong>$1</strong>')
+  t = t.replace(/__([^\n]+?)__/g, '<strong>$1</strong>')
+  t = t.replace(/(^|[^\w*])\*([^*\n]+?)\*(?!\*)/g, '$1<em>$2</em>')
+  t = t.replace(/(^|[^\w_])_([^_\n]+?)_(?!_)/g, '$1<em>$2</em>')
+  t = t.replace(/~~([^\n]+?)~~/g, '<del>$1</del>')
+  t = t.replace(/\u0001(\d+)\u0001/g, (m, i) => '<code class="md-code">' + codes[Number(i)] + '</code>')
+  return t
+}
+
+// 表格分隔行（|---|:--:|）判定与单元格切分
+function mdIsTableSep(line) {
+  return !!line && line.includes('|') && line.includes('-') && /^\s*\|?[\s:|-]*\|?\s*$/.test(line)
+}
+function mdSplitRow(line) {
+  return String(line).replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim())
+}
+function mdColAlign(sepCell) {
+  const s = String(sepCell).trim()
+  if (/^:-+:$/.test(s)) return 'md-c'
+  if (/^:-+$/.test(s)) return 'md-l'
+  if (/^-+:$/.test(s)) return 'md-r'
+  return ''
+}
+
+function mdToHtml(src) {
+  const lines = String(src == null ? '' : src).replace(/\r\n?/g, '\n').split('\n')
+  const out = []
+  const para = []  // 段落缓冲：软换行渲染成 <br>
+  const flushPara = () => {
+    if (!para.length) return
+    out.push('<p>' + para.join('<br>') + '</p>')
+    para.length = 0
+  }
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    // 围栏代码块：``` / ~~~ 起止，内容只转义不做高亮（AGENT.md 禁止回复带代码块，仅兜底）
+    const fence = /^\s*(`{3,}|~{3,})/.exec(line)
+    if (fence) {
+      flushPara()
+      const closeRe = new RegExp('^\\s*' + fence[1][0] + '{3,}\\s*$')
+      const buf = []
+      i++
+      while (i < lines.length && !closeRe.test(lines[i])) { buf.push(esc(lines[i])); i++ }
+      if (i < lines.length) i++  // 吃掉闭合围栏（未闭合则吃到末尾）
+      out.push('<pre class="md-pre"><code>' + buf.join('\n') + '</code></pre>')
+      continue
+    }
+    // 空行 = 段落边界
+    if (!line.trim()) { flushPara(); i++; continue }
+    // 分隔线
+    if (/^\s*(?:-\s*){3,}$/.test(line) || /^\s*(?:\*\s*){3,}$/.test(line) || /^\s*(?:_\s*){3,}$/.test(line)) {
+      flushPara()
+      out.push('<hr class="md-hr">')
+      i++
+      continue
+    }
+    // 标题：# 后必须有空格；级别往下压（+2），聊天气泡里 h1/h2 太抢眼
+    const head = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line)
+    if (head) {
+      flushPara()
+      const lv = Math.min(head[1].length + 2, 6)
+      out.push('<h' + lv + '>' + mdInline(esc(head[2])) + '</h' + lv + '>')
+      i++
+      continue
+    }
+    // 引用块：连续 > 行合并成一个 blockquote
+    if (/^\s{0,3}>/.test(line)) {
+      flushPara()
+      const buf = []
+      while (i < lines.length && /^\s{0,3}>/.test(lines[i])) {
+        buf.push(mdInline(esc(lines[i].replace(/^\s{0,3}>\s?/, ''))))
+        i++
+      }
+      out.push('<blockquote>' + buf.join('<br>') + '</blockquote>')
+      continue
+    }
+    // 表格：本行含 | 且下一行是分隔行 → 表头 + 表体
+    if (line.includes('|') && i + 1 < lines.length && mdIsTableSep(lines[i + 1])) {
+      flushPara()
+      const headCells = mdSplitRow(line)
+      const aligns = mdSplitRow(lines[i + 1]).map(mdColAlign)
+      i += 2
+      let body = ''
+      while (i < lines.length && lines[i].trim() && lines[i].includes('|')) {
+        const cells = mdSplitRow(lines[i])
+        let tr = ''
+        for (let c = 0; c < headCells.length; c++) {
+          tr += '<td' + (aligns[c] ? ' class="' + aligns[c] + '"' : '') + '>' +
+            mdInline(esc(cells[c] || '')) + '</td>'
+        }
+        body += '<tr>' + tr + '</tr>'
+        i++
+      }
+      let hr = ''
+      for (let c = 0; c < headCells.length; c++) {
+        hr += '<th' + (aligns[c] ? ' class="' + aligns[c] + '"' : '') + '>' +
+          mdInline(esc(headCells[c] || '')) + '</th>'
+      }
+      out.push('<table class="md-table"><thead><tr>' + hr + '</tr></thead><tbody>' + body + '</tbody></table>')
+      continue
+    }
+    // 列表：连续同类项合成一个 ol/ul；缩进更深的项做视觉下沉（不做真正的嵌套层级，
+    // 聊天气泡里够用，也避免层级算法的边界坑）
+    const item = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/.exec(line)
+    if (item) {
+      flushPara()
+      const ordered = /\d/.test(item[2])
+      const baseIndent = item[1].replace(/\t/g, '  ').length
+      let html = ordered ? '<ol class="md-list">' : '<ul class="md-list">'
+      let j = i
+      while (j < lines.length) {
+        const m = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/.exec(lines[j])
+        if (!m) break
+        if (/\d/.test(m[2]) !== ordered) break  // 类型切换 → 结束本列表
+        const indent = m[1].replace(/\t/g, '  ').length
+        html += '<li' + (indent > baseIndent ? ' class="md-sub"' : '') + '>' + mdInline(esc(m[3]))
+        // 续行：缩进的非列表行并入本项（markdown 的 lazy continuation）
+        let k = j + 1
+        const cont = []
+        while (k < lines.length && lines[k].trim() &&
+               !/^\s*(?:[-*+]|\d{1,9}[.)])\s+/.test(lines[k]) && /^\s+/.test(lines[k])) {
+          cont.push(mdInline(esc(lines[k].trim())))
+          k++
+        }
+        if (cont.length) html += '<br>' + cont.join('<br>')
+        html += '</li>'
+        j = k
+      }
+      html += ordered ? '</ol>' : '</ul>'
+      out.push(html)
+      i = j
+      continue
+    }
+    // 普通段落行
+    para.push(mdInline(esc(line)))
+    i++
+  }
+  flushPara()
+  return out.join('')
+}
+
+// 助理气泡正文（markdown）。.md 类在 CSS 里关掉白空格保留，改由块级元素负责排版——
+// 生成 HTML 里没有多余空白，但 pre-wrap 仍会把源码换行当空白显示，直接关掉更稳。
+function mdBubble(content) {
+  return '<div class="bubble md">' + mdToHtml(content) + '</div>'
 }
 
 // 可靠的删除图标（SVG 描边垃圾桶，避免 🗑 emoji 在 Windows 下渲染异常/模糊）
@@ -162,12 +374,16 @@ function saveState() {
       manualBook: _manualBook ? { base: _manualBook.base, bookTitle: _manualBook.bookTitle } : null
     })
   } catch {}
+  saveFreeState()  // 当前自由对话（多对话，2026-11）
   scheduleRefsSave()
 }
 
 async function loadState() {
   try {
-    const data = await chrome.storage.local.get(['refs', 'refNumCounter', 'selectedRef', 'pendingSelectRef', 'fontSize', 'manualBook'])
+    const data = await chrome.storage.local.get(['refs', 'refNumCounter', 'selectedRef', 'pendingSelectRef', 'fontSize', 'manualBook', 'freeConvKey'])
+    // 恢复自由模式上次所在的对话（2026-11 多对话）：清单拉到后 loadFreeConversations
+    // 会校正失效的 key（对话已被归档/删除 → 落到最近活跃的一场）
+    if (isFreeConvKey(data.freeConvKey)) _freeKey = data.freeConvKey
     // 恢复用户设定的消息字号（AI-002）
     if (data.fontSize) { _fontSize = data.fontSize; applyFontSize() }
     if (data.refs?.length) {
@@ -470,12 +686,14 @@ function filterAnns() {
   const base = effectiveBookBase()
   if (!base) return []
   let list = RECENT_ANNS.filter(a => baseBookId(a.bookId) === base)
-  const q = drawerSearchQuery.trim().toLowerCase()
+  // 检索两侧都剥掉不可见双向控制字符（见 esc 注释）：划线文本从书页抄来、搜索词从
+  // 工具栏带过来，同一段文字两边可能一边带 RLM、一边不带，不归一化就会"明明有却搜不到"
+  const q = stripInvisibleBidi(drawerSearchQuery).trim().toLowerCase()
   if (q) {
     list = list.filter(a => {
-      return (a.bookTitle || '').toLowerCase().includes(q) ||
-        (a.chapter || '').toLowerCase().includes(q) ||
-        (a.selectedText || '').toLowerCase().includes(q)
+      return stripInvisibleBidi(a.bookTitle || '').toLowerCase().includes(q) ||
+        stripInvisibleBidi(a.chapter || '').toLowerCase().includes(q) ||
+        stripInvisibleBidi(a.selectedText || '').toLowerCase().includes(q)
     })
   }
   // AI-013：抽屉按书中位置倒序显示（只排序渲染副本，不影响 RECENT_ANNS 内部与选中逻辑）
@@ -484,12 +702,15 @@ function filterAnns() {
 
 // 搜索命中高亮：把文本按查询切分，命中的片段包 <mark>。分段后各自 esc，
 // 避免先整体转义再套标签时把 &lt; 等实体的中间部分误当命中打坏。
+// 两侧都先剥不可见双向控制字符（与 filterAnns 的检索口径一致，否则命中标不上）。
 function hl(text, q) {
-  if (!q) return esc(text)
-  const safeQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const src = stripInvisibleBidi(text)
+  const query = stripInvisibleBidi(q)
+  if (!query) return esc(src)
+  const safeQ = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const re = new RegExp(`(${safeQ})`, 'i')
-  return String(text).split(re).map(p => {
-    if (p && p.toLowerCase() === q.toLowerCase()) return `<mark>${esc(p)}</mark>`
+  return src.split(re).map(p => {
+    if (p && p.toLowerCase() === query.toLowerCase()) return `<mark>${esc(p)}</mark>`
     return esc(p)
   }).join('')
 }
@@ -497,10 +718,11 @@ function hl(text, q) {
 // 查询命中是否落在概览可见区（前30字 / 后20字）。
 // 命中整段都在头 30 字或尾 20 字内 → 概览已可见；横跨省略号或被遮在中间 → 需展开。
 function matchVisibleInPreview(text, q) {
-  const len = text.length
+  const src = stripInvisibleBidi(text)
+  const len = src.length
   if (len <= 50) return true  // 概览即全文，必然可见
-  const low = text.toLowerCase()
-  const qi = q.toLowerCase()
+  const low = src.toLowerCase()
+  const qi = stripInvisibleBidi(q).toLowerCase()
   const headEnd = 30
   const tailStart = len - 20
   let idx = low.indexOf(qi)
@@ -533,7 +755,8 @@ function renderDrawer() {
     return
   }
 
-  const q = drawerSearchQuery.trim().toLowerCase()
+  // 检索口径与 filterAnns 一致：两侧都剥不可见双向控制字符（否则高亮/自动展开会失灵）
+  const q = stripInvisibleBidi(drawerSearchQuery).trim().toLowerCase()
 
   for (const ann of anns) {
     const isSel = sameRef(selectedAnn, ann)
@@ -543,7 +766,7 @@ function renderDrawer() {
     const exceeded = raw.length > 50
     const previewText = exceeded ? raw.slice(0, 30) + '…' + raw.slice(-20) : raw
     // 搜索时命中藏在省略号中间的文本 → 自动展开让命中可见（命中在概览里则保持折叠）
-    const autoExpand = !!(q && exceeded && raw.toLowerCase().includes(q) && !matchVisibleInPreview(raw, q))
+    const autoExpand = !!(q && exceeded && stripInvisibleBidi(raw).toLowerCase().includes(q) && !matchVisibleInPreview(raw, q))
 
     const item = document.createElement('div')
     item.className = 'drawer-item' + (isSel ? ' sel' : '') + (autoExpand ? ' expanded' : '')
@@ -649,7 +872,10 @@ async function openDrawer() {
 // query 为空等价于普通打开。与 openDrawer 一致：打开前重查当前书，防止显示错书的引用。
 async function openDrawerWithSearch(query) {
   drawerSearchQuery = query || ''
-  document.getElementById('drawer-search').value = drawerSearchQuery
+  const searchEl = document.getElementById('drawer-search')
+  searchEl.value = drawerSearchQuery
+  cleanInputBidi(searchEl)  // 书页抄来的搜索词可能夹带不可见双向控制字符，先剥掉再显示
+  drawerSearchQuery = searchEl.value
   document.getElementById('ref-drawer').classList.add('on')
   // AI-001：打开前向活动 tab 重新查询当前书。跨 tab 的最后一次广播可能把
   // _currentBook 带偏（后台 tab 加载晚于前台），不刷新就会显示错书的引用。
@@ -688,8 +914,10 @@ function setFontSize(n) {
 // 有效上下文：自由模式 > 手动选书 > 实时检测到的书。所有"当前书"判定（消息过滤、
 // 引用隔离、命中隔离、发送归属、头部显示）都走这里，保证手动选书时全链路按
 // 选中的书工作（2026-10：无书默认界面 + 已读书籍手动选择）。
+// 自由模式（2026-11 多对话）：base = 当前自由对话 key，title = 对话标题——
+// 每个对话一个 key，消息区/讨论栈/命中按 key 隔离，切换对话 = 切上下文。
 function effectiveBook() {
-  if (_freeMode) return { base: FREE_KEY, bookTitle: '自由模式' }
+  if (_freeMode) return { base: _freeKey || FREE_KEY, bookTitle: freeConvTitle(_freeKey) }
   if (_manualBook) return _manualBook
   return _currentBook
 }
@@ -698,13 +926,13 @@ function effectiveBookBase() {
   return b ? b.base : ''
 }
 
-// 头部队列显示有效上下文，无书时回落到格言；自由模式显示「自由模式」不套书名号
+// 头部队列显示有效上下文，无书时回落到格言；自由模式显示「自由模式 · 对话标题」
 function renderCurrentBook() {
   const el = document.getElementById('current-book')
   if (!el) return
   const book = effectiveBook()
   if (book && book.bookTitle) {
-    el.innerHTML = book.base === FREE_KEY
+    el.innerHTML = isFreeConvKey(book.base)
       ? '<span style="font-weight:600">自由模式</span>'
       : `《${esc(book.bookTitle)}》`
     el.title = book.bookTitle
@@ -714,11 +942,11 @@ function renderCurrentBook() {
   }
 }
 
-// 按当前上下文过滤消息区：自由模式只显示自由消息（FREE_KEY）；读书模式只显示
-// 有效上下文（实时检测 / 手动选书）的书的消息；无有效上下文（书架/首页等且未
+// 按当前上下文过滤消息区：自由模式只显示**当前对话**的消息（该对话 key）；读书模式
+// 只显示有效上下文（实时检测 / 手动选书）的书的消息；无有效上下文（书架/首页等且未
 // 手动选书）时隐藏全部消息，消息区由「无书默认界面」接管——不再像旧逻辑那样
-// 残留显示上一本书/全部书的内容（2026-10 修复）。自由消息（哨兵书 FREE_KEY）
-// 独立，只在自由模式激活时可见。
+// 残留显示上一本书/全部书的内容（2026-10 修复）。自由对话之间同样按 key 隔离
+//（2026-11 多对话）：切对话 = 切 key，天然只显示该场对话。
 function applyBookFilter() {
   const book = effectiveBookBase()
   const msgs = document.getElementById('msgs')
@@ -806,7 +1034,7 @@ function applyBookContext(ctx) {
 async function refreshCurrentBook() {
   // 自由模式期间保持自由上下文：不被面板重开/活动 tab 变化刷新覆盖（退出时手动恢复）
   if (_freeMode) {
-    applyBookContext({ bookId: FREE_KEY, bookTitle: '自由模式' })
+    applyBookContext({ bookId: _freeKey || FREE_KEY, bookTitle: freeConvTitle(_freeKey) })
     return
   }
   try {
@@ -1063,6 +1291,23 @@ function showToast(text, isErr) {
   _toastTimer = setTimeout(() => el.classList.remove('on'), 2600)
 }
 
+// ── 遮罩点击关闭（弹窗/抽屉通用）───────────────────────────────────────────
+// 必须「按在遮罩上、也在遮罩上松开」才算点遮罩。只看 click 的 e.target 是不够的：
+// 在面板内按下、拖到遮罩上松开时，click 的目标是 press/release 两者的**最近公共祖先**
+// ——正是遮罩本身，于是弹窗被误关（在输入框里选中文字往外拖、按下后手滑出面板都会踩到）。
+// 因此记下 mousedown 目标并校验 mouseup 目标，两者都落在遮罩上才关闭。
+// 松开点落在遮罩外（含拖出浏览器窗口）一律不关。
+function bindMaskClose(overlay, close) {
+  if (!overlay) return
+  let downOnMask = false
+  overlay.addEventListener('mousedown', (e) => { downOnMask = e.target === overlay })
+  overlay.addEventListener('mouseup', (e) => {
+    const onMask = downOnMask && e.target === overlay
+    downOnMask = false
+    if (onMask) close()
+  })
+}
+
 // ── 事件绑定 ──────────────────────────────────────────────────────────────
 
 // 打开引用列表（卡片上的切换引用按钮）
@@ -1110,12 +1355,11 @@ document.getElementById('rc-deselect-btn').addEventListener('click', () => {
 
 // 关闭抽屉
 document.getElementById('drawer-close-btn').addEventListener('click', closeDrawer)
-document.getElementById('ref-drawer').addEventListener('click', (e) => {
-  if (e.target.id === 'ref-drawer') closeDrawer()
-})
+bindMaskClose(document.getElementById('ref-drawer'), closeDrawer)
 
-// 搜索引用
+// 搜索引用（输入框同样是"输入框引号镜像"的受害面：净化后再取词，与检索口径一致）
 document.getElementById('drawer-search').addEventListener('input', (e) => {
+  cleanInputBidi(e.target)
   drawerSearchQuery = e.target.value
   renderDrawer()
 })
@@ -1188,12 +1432,16 @@ function hideThinking() {
 // 去重：跟踪已显示的 assistant 消息（前 200 字指纹）
 const _seenFingerprints = new Set()
 
-// 系统提示气泡（2026-09）：/收口 等系统反馈——区别于普通消息的小号灰字样式
-function renderSystemBubble(content) {
+// 系统提示气泡（2026-09）：/收口 等系统反馈——区别于普通消息的小号灰字样式。
+// 2026-11：可传 bookId 显式归属（自由模式的多对话提示要挂在当前那场对话下，
+// 否则按默认归属回落到哨兵 key，切到别的对话时这条提示会串场）。
+function renderSystemBubble(content, bookId) {
   const msgs = document.getElementById('msgs')
   if (!msgs) return
   const el = document.createElement('div')
   el.className = 'msg-system'
+  const book = bookId || effectiveBookBase()
+  if (book) el.dataset.book = baseBookId(book)
   el.innerHTML = `<div class="bubble">${esc(content)}</div>`
   msgs.appendChild(el)
   applyBookFilter()
@@ -1241,7 +1489,7 @@ function addBubble(role, content, extra, note, bookId) {
     }
     hideThinking()
     el.className = 'msg-assistant'
-    el.innerHTML = `<div class="bubble">${esc(content)}</div>`
+    el.innerHTML = mdBubble(content)
   }
 
   msgs.appendChild(el)
@@ -1332,11 +1580,13 @@ function _handleStream(d) {
     // AI-001：继承本次回复归属的书。优先用回复自带的 bookKey（agent 落库即打标，
     // 与提问书一致），面板重开恢复的提问若历史记录缺 bookId，也能正确归属
     _streamEl.dataset.book = baseBookId(d.bookKey) || _thinkingBook
-    _streamEl.innerHTML = `<div class="bubble"></div>`
+    _streamEl.innerHTML = `<div class="bubble md"></div>`
     msgs.appendChild(_streamEl)
     applyBookFilter()
   }
-  _streamEl.querySelector('.bubble').textContent = d.content || ''
+  // 流式分片的 content 是**累计全文**（agent 侧约定），所以每片都整段重渲染 markdown：
+  // 加粗/列表在标记闭合的那一刻成形，用户看到的就是边流边排版的效果
+  _streamEl.querySelector('.bubble').innerHTML = mdToHtml(d.content || '')
   // AI-004：流式时不强制拉滚动条到底部，仅用户接近底部时跟随
   maybeAutoScroll(_streamEl.parentElement)
 }
@@ -1347,17 +1597,17 @@ function refReplyHTML(ref, content) {
   const chapter = esc((ref.chapter || '').slice(0, 12))
   const num = findRefNum(ref.bookTitle, ref.chapter, ref.selectedText)
   const snippet = esc((ref.selectedText || '').slice(0, 80))
-  // 注意：不要用带前导空白的模板字符串，bubble 是 white-space:pre-wrap，
-  // 前导换行/空格会在气泡顶部渲染出一大片空白。
+  // 注意：不要用带前导空白的模板字符串——生成 HTML 里的换行/缩进会进气泡排版；
+  // 正文走 markdown 渲染，引用预览行保持半角引号包住的纯文本（它整行是一句被引用的原文）。
   return (
     `<div class="ref-bar" data-ref-num="${num}">` +
       `<span class="ref-book">${book}</span>` +
       (chapter ? `<span class="ref-chapter">${chapter}</span>` : '') +
       `<span class="ref-num">#${num || '?'}</span>` +
     `</div>` +
-    `<div class="bubble">` +
+    `<div class="bubble md">` +
       `<div class="ref-quote-preview" data-ref-num="${num}">"${snippet}${(ref.selectedText || '').length > 80 ? '…' : ''}"</div>` +
-      `${esc(content)}` +
+      `${mdToHtml(content)}` +
     `</div>`
   )
 }
@@ -1384,7 +1634,7 @@ function _renderEntry(entry, content) {
     bindRefReplyClicks(el, ref)
   } else {
     el.className = 'msg-assistant'
-    el.innerHTML = `<div class="bubble">${esc(content)}</div>`
+    el.innerHTML = mdBubble(content)
   }
   msgs.appendChild(el)
   applyBookFilter()
@@ -1408,7 +1658,9 @@ function upgradeStreamToRefReply(el, ref, content) {
 function patchStreamedComplete(el, content) {
   if (!el) return
   const b = el.querySelector('.bubble')
-  if (b) b.textContent = content
+  if (!b) return
+  b.classList.add('md')  // 上游若建的是纯文本气泡，这里一并升级成 markdown 排版
+  b.innerHTML = mdToHtml(content)
 }
 
 // ── SSE ──────────────────────────────────────────────────────────────────────
@@ -1420,6 +1672,8 @@ function connect() {
   sseConn = new EventSource(`${RECEIVER}/events${q}`)
   sseConn.onopen = () => {
     setDot(true)
+    // 接收端此刻才起来时，把菜单里的「接收端未连接」刷成真实配置状态（只刷新不弹窗）
+    refreshApiStatus()
     // AI-012：重连成功后自愈——补上断连期间漏掉的标注，无需重开面板。
     // 初始连接时 _currentBook 可能尚未就绪（refreshCurrentBook 在其后执行），
     // 此时 syncAnnsFromReceiver 内守卫直接返回，由首次 loadHistory 兜底。
@@ -1434,6 +1688,18 @@ function connect() {
       if (d.type === 'graph-updated') { if (graphView?.isOpen()) graphView.reload(); return }
       // 2026-09：实时栈变化 → 重拉 /stack-hits，恢复/清除"当前讨论命中"高亮
       if (d.type === 'stack-updated') { refreshStackHits(); return }
+      // 2026-11 多对话：对话清单变化（新建/改名/归档/删除）→ 重拉清单刷新对话条与列表；
+      // 归档完成后当前对话若已被清掉，自动落到最近活跃的一场
+      if (d.type === 'free-conversations-updated') {
+        const before = _freeKey
+        loadFreeConversations().then(async () => {
+          if (_freeMode && before && !_freeConvs.some((c) => c.key === before)) {
+            const next = _freeConvs.length ? _freeConvs[0].key : (await createFreeConversation({ silent: true }))
+            if (next) switchFreeConversation(next)
+          }
+        })
+        return
+      }
       // agent 处理步骤（2026-10）：思考气泡按步骤换文案（resolve / answer）。
       // 无气泡（回复已开始渲染/历史回放）时忽略；按书匹配防串上下文（命中按书隔离同款）。
       if (d.type === 'agent-state') {
@@ -1451,7 +1717,10 @@ function connect() {
       if (d.type !== 'message') return
 
       // 会意图命中（AI-020）：agent 引用解析命中旧知识点（L3 图路径上下文）→
-      // 图视图高亮各命中节点的 root→recent 路径并集；图未打开时暂存，打开即应用。
+      // 图视图按两层高亮（2026-10）：① 命中节点 + 沿 user 入边的来路 = L3 真带进
+      // 本轮 context 的部分（绿）；② 实时栈累计命中的其余节点（橙环，它们的讨论已
+      // 在会话历史里）。旧的"混合边全祖先路径并集"已废弃——图和 L3 不一致会误导判断。
+      // 图未打开时暂存，打开即应用。
       // 命中按书隔离（2026-09）：graph-hit 带 bookKey（命中所属书），只显示与当前
       // 上下文匹配的命中——自由模式只收 FREE_KEY 的命中（并入引用窗体），读书模式
       // 只收当前书的命中；其他书的命中忽略，避免串上下文
@@ -1579,8 +1848,10 @@ function connect() {
 }
 
 // ── 当前讨论命中（2026-09 用户定调）────────────────────────────────────────
-// 命中 = 当前实时栈（topic_stack）里 user 条目挂的 cites 对应的节点脉络：
+// 命中 = 当前实时栈（topic_stack）里 user 条目挂的 cites 对应的节点：
 // 打开图 / 收到 stack-updated / 切书时从 receiver 重拉 /stack-hits 恢复高亮；
+// 图视图据此渲染"第二层"（橙环，本场讨论已挂的知识点）+ 与本轮命中一起算 L3 来路层
+// （2026-10 两层口径，见 extension/graph-view.js computeHitLayers）。
 // 栈收口清空后 hits 为空 → 图视图清除 hit 态高亮（栈结束即命中结束）。
 async function refreshStackHits() {
   const ctxBook = effectiveBookBase()
@@ -1604,11 +1875,20 @@ async function refreshStackHits() {
 // ── 发送 ─────────────────────────────────────────────────────────────────────
 async function submit() {
   const input = document.getElementById('input')
-  const content = input.value.trim()
+  const content = stripInvisibleBidi(input.value).trim()  // 双向控制字符不进正文（见 esc 注释）
   const attach = _pendingAttachment
   // 允许仅附件、无正文：附件正文即本次讨论内容（读取进讨论，不落盘保存原文件）
   if (!content && !attach) return
+  // /归档（2026-11）：自由模式下的斜杠命令，直接弹出归档确认窗（要勾选产物去向，
+  // 不能像普通消息那样直接发出）。不发消息、不入队，输入框照常保留原文本。
+  if (_freeMode && content === '/归档') {
+    document.getElementById('cmd-menu').hidden = true
+    openFreeArchive(_freeKey)
+    return
+  }
   input.value = ''
+  _inputPrevValue = ''
+  _quoteParityFlipped = false  // 新消息重新判定输入法引号奇偶（下次第一下就错会立刻再纠正）
   input.style.height = 'auto'
   _pendingAttachment = null
   renderAttachChip()
@@ -1689,6 +1969,70 @@ async function submit() {
   }
 }
 
+// 输入框净化（2026-10）：粘贴进来的不可见双向控制字符会就地改写整段文字的方向，
+// 让全角引号 “ ” 镜像成 ” “ —— 用户看到的就是"双引号顺序反了"，但字符本身看不见、
+// 也说不清哪里不对。这里在输入时直接剥掉，并保持光标位置不跳（见 stripInvisibleBidi）。
+function cleanInputBidi(el) {
+  const before = el.value
+  const after = stripInvisibleBidi(before)
+  if (after === before) return
+  const caret = el.selectionStart
+  el.value = after
+  const pos = Math.max(0, (caret || 0) - (before.length - after.length))
+  try { el.setSelectionRange(pos, pos) } catch {}
+}
+
+// ── 全角双引号方向校正（2026-10）─────────────────────────────────────────────
+// 现象（用户实测 + 落库码点确认）：在侧栏输入框里按引号键，**第一下出 ”、第二下才出 “**，
+// 即"双引号顺序反了"；粘贴一段正确的 “……” 进来显示却完全正常，换到别的输入框也正常。
+//
+// 成因：中文输入法的引号键是「按次数奇偶交替输出 “ / ”」。这个奇偶状态一旦在一个输入框里
+// 停在被错开的一侧（先按过一次、或删掉重打、或发送后 JS 清空 value 而输入法计数没回位），
+// 该框内的引号就会**一直**反着出；焦点换到别的程序/输入框会重置，所以别处看着正常。
+// 输入法内部状态插件改不了，但可以在字符插入的瞬间把方向纠正回来：
+//   · 只有"本框第一次全角双引号打出来是 ”（且它前面没有未配对的 “）"才判定奇偶被错开；
+//   · 判定后，本框内之后每次插入的全角双引号一律取反 → 用户看到的就是正确的 “ ” “ ”；
+//   · 正常输入（第一下就是 “）**完全不干预**——粘贴的正确文本、输入法正常时的嵌套引号
+//     “a“b”c” 都不会被动；
+//   · 框里引号清空（发送后 / 全删）→ 重新判定。
+// 只处理全角双引号：半角 " 与单引号 ‘’ 不动（英文撇号 don’t 会被误伤）。
+let _quoteParityFlipped = false
+
+// s 里未配对的 “ 个数（多出来的 ” 不产生负数）
+function unmatchedOpenQuotes(s) {
+  let depth = 0
+  for (const c of s) {
+    if (c === '\u201c') depth++
+    else if (c === '\u201d') depth = Math.max(0, depth - 1)
+  }
+  return depth
+}
+
+// 打字纠正：只在 value 恰好新增 1 个字符（＝敲进一个字符）时判定；粘贴/不增反减不参与。
+// prevValue 是上一次 input 事件后的值（调用方维护）。
+function fixTypedQuoteDirection(el, prevValue) {
+  if (!el || el.isComposing) return  // 输入法组字中（拼音串）不动
+  const v = el.value
+  const caret = el.selectionStart
+  if (v.length === prevValue.length + 1 && caret != null && caret > 0) {
+    const pos = caret - 1
+    const ch = v[pos]
+    if (ch === '\u201c' || ch === '\u201d') {
+      if (!_quoteParityFlipped && ch === '\u201d' && unmatchedOpenQuotes(v.slice(0, pos)) === 0) {
+        _quoteParityFlipped = true  // 第一次引号就是闭合引号 → 输入法奇偶被错开了
+        postSidebarDebug({ source: 'input', stage: 'quote-parity-flip', at: pos })
+      }
+      if (_quoteParityFlipped) {
+        const want = ch === '\u201c' ? '\u201d' : '\u201c'
+        el.value = v.slice(0, pos) + want + v.slice(pos + 1)
+        try { el.setSelectionRange(caret, caret) } catch {}  // 1:1 换字，光标位置不变
+      }
+    }
+  }
+  if (el.value.indexOf('\u201c') === -1 && el.value.indexOf('\u201d') === -1) _quoteParityFlipped = false
+}
+let _inputPrevValue = ''  // 输入框上一次的 value（打字纠正要判断"新增了哪个字符"）
+
 document.getElementById('send-btn').addEventListener('click', submit)
 document.getElementById('input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -1700,14 +2044,41 @@ document.getElementById('input').addEventListener('keydown', e => {
   }
 })
 document.getElementById('input').addEventListener('input', function () {
+  // 顺序要紧：先按"原始值"判断打字纠正（它靠 +1 字符定位），再做双向控制字符净化，
+  // 最后把净化后的值记成基准，供下一次判断
+  fixTypedQuoteDirection(this, _inputPrevValue)
+  cleanInputBidi(this)
+  _inputPrevValue = this.value
   this.style.height = 'auto'
   this.style.height = Math.min(this.scrollHeight, 120) + 'px'
 })
+// 输入法组字结束（拼音上屏）时补一次判定，并同步基准值
+document.getElementById('input').addEventListener('compositionend', function () {
+  _inputPrevValue = this.value
+})
+// 粘贴走同一套净化：paste 后 value 才更新，所以在下一个事件循环里补一次（输入法上屏同理）
+document.getElementById('input').addEventListener('paste', function () {
+  const el = this
+  setTimeout(() => {
+    cleanInputBidi(el)
+    _inputPrevValue = el.value
+  }, 0)
+})
 
 // ── 斜杠命令菜单（2026-09）：输入 / 弹出可用操作，点击即执行 ──
+// 2026-11 多对话：/归档 只在自由模式出现（归档当前对话并选择产物去向），
+// /收口 只在读书模式出现（自由对话要不要收口由归档时决定，收口用的是同一套程序）。
 const cmdMenu = document.getElementById('cmd-menu')
+function syncCmdMenuItems() {
+  if (!cmdMenu) return
+  for (const item of cmdMenu.querySelectorAll('.cmd-item')) {
+    const when = item.dataset.when || 'reading'
+    item.hidden = (when === 'free') !== !!_freeMode
+  }
+}
 if (cmdMenu) {
   document.getElementById('input').addEventListener('input', () => {
+    if ((document.getElementById('input').value || '').startsWith('/')) syncCmdMenuItems()
     cmdMenu.hidden = !(document.getElementById('input').value || '').startsWith('/')
   })
   cmdMenu.addEventListener('click', (e) => {
@@ -1715,6 +2086,7 @@ if (cmdMenu) {
     if (!item) return
     const el = document.getElementById('input')
     el.value = item.dataset.cmd || ''
+    _inputPrevValue = el.value
     cmdMenu.hidden = true
     submit()
   })
@@ -2247,21 +2619,79 @@ function showConfirm(title, message) {
       overlay.classList.remove('on')
       okBtn.removeEventListener('click', onOk)
       cancelBtn.removeEventListener('click', onCancel)
-      overlay.removeEventListener('click', onBg)
+      overlay.removeEventListener('mousedown', onDown)
+      overlay.removeEventListener('mouseup', onUp)
       document.removeEventListener('keydown', onKey)
     }
     const onOk = () => { cleanup(); resolve(true) }
     const onCancel = () => { cleanup(); resolve(false) }
-    const onBg = (e) => { if (e.target === overlay) onCancel() }
+    // 点遮罩＝取消：与 bindMaskClose 同款判定——按和松都落在遮罩上才算，
+    // 避免在确认框里按下、拖到遮罩上松开时被误当取消（详情见 bindMaskClose 注释）
+    let downOnMask = false
+    const onDown = (e) => { downOnMask = e.target === overlay }
+    const onUp = (e) => {
+      const onMask = downOnMask && e.target === overlay
+      downOnMask = false
+      if (onMask) onCancel()
+    }
     const onKey = (e) => {
       if (e.key === 'Escape') onCancel()
       else if (e.key === 'Enter') onOk()
     }
     okBtn.addEventListener('click', onOk)
     cancelBtn.addEventListener('click', onCancel)
-    overlay.addEventListener('click', onBg)
+    overlay.addEventListener('mousedown', onDown)
+    overlay.addEventListener('mouseup', onUp)
     document.addEventListener('keydown', onKey)
     cancelBtn.focus()  // 默认聚焦「取消」，防止误触回车直接删除
+  })
+}
+
+// 自绘输入弹窗（2026-11：自由对话重命名）。与 showConfirm 同款 overlay，返回
+// Promise<string|null>（取消/关闭返回 null）。不用原生 prompt()——扩展页面里 Chrome 压制它。
+function showPrompt({ title, message = '', value = '', placeholder = '', maxLength = 40 }) {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('prompt-overlay')
+    const input = document.getElementById('prompt-input')
+    if (!overlay || !input) { resolve(null); return }
+    document.getElementById('prompt-title').textContent = title
+    const msgEl = document.getElementById('prompt-msg')
+    msgEl.textContent = message
+    msgEl.hidden = !message
+    input.value = value
+    input.placeholder = placeholder
+    input.maxLength = maxLength
+    overlay.classList.add('on')
+    const okBtn = document.getElementById('prompt-ok-btn')
+    const cancelBtn = document.getElementById('prompt-cancel-btn')
+    const cleanup = () => {
+      overlay.classList.remove('on')
+      okBtn.removeEventListener('click', onOk)
+      cancelBtn.removeEventListener('click', onCancel)
+      input.removeEventListener('keydown', onKey)
+      overlay.removeEventListener('mousedown', onDown)
+      overlay.removeEventListener('mouseup', onUp)
+    }
+    const onOk = () => { const v = input.value; cleanup(); resolve(v) }
+    const onCancel = () => { cleanup(); resolve(null) }
+    const onKey = (e) => {
+      // 输入框里的 Enter 提交、Escape 取消；stopPropagation 防止冒泡触发全局快捷键
+      if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); e.stopPropagation(); onOk() }
+      else if (e.key === 'Escape') { e.stopPropagation(); onCancel() }
+    }
+    let downOnMask = false
+    const onDown = (e) => { downOnMask = e.target === overlay }
+    const onUp = (e) => {
+      const onMask = downOnMask && e.target === overlay
+      downOnMask = false
+      if (onMask) onCancel()
+    }
+    okBtn.addEventListener('click', onOk)
+    cancelBtn.addEventListener('click', onCancel)
+    input.addEventListener('keydown', onKey)
+    overlay.addEventListener('mousedown', onDown)
+    overlay.addEventListener('mouseup', onUp)
+    setTimeout(() => { input.focus(); input.select() }, 30)
   })
 }
 
@@ -2354,7 +2784,7 @@ function renderCompleteAssistant(content, bookId, histRef) {
   const el = document.createElement('div')
   el.className = 'msg-assistant'
   if (bookId) el.dataset.book = baseBookId(bookId)
-  el.innerHTML = `<div class="bubble">${esc(content)}</div>`
+  el.innerHTML = mdBubble(content)
   msgs.appendChild(el)
   applyBookFilter()
   maybeAutoScroll(msgs)
@@ -2417,9 +2847,14 @@ async function loadHistory() {
         const key = msgHistKey('assistant', d._ts, d.content)
         if (_histKeys.has(key)) continue
         _histKeys.add(key)
+        // 归属（2026-10-02）：优先用回复自带的 bookKey（receiver 按库里 conv 打标）——
+        // 旧数据 / 哨兵上下文（_common）才退回"最近前序提问的书"（histBook）。
+        // 不加这条会把跨书回复算到当前书上：2026-09-28 重放的 74 条《静静的顿河》回复
+        // 因此堆在《大国大城》末尾（那段时间没有 user 消息，histBook 停在大国大城）。
+        const replyBook = (d.bookKey && d.bookKey !== '_common') ? baseBookId(d.bookKey) : histBook
         // 走 renderCompleteAssistant：历史渲染不碰实时流气泡与实时队列（见上），
         // 引用条配对只用本趟局部 histPendingRef；指纹与实时流收尾渲染互斥
-        renderCompleteAssistant(d.content, histBook, histPendingRef)
+        renderCompleteAssistant(d.content, replyBook, histPendingRef)
         histPendingRef = null
       }
     }
@@ -2795,15 +3230,20 @@ if (jumpListEl) {
   }, { passive: true })
 }
 
-// ── 自由模式（测试沙盒，2026-09）─────────────────────────────────────────
-// 固定在侧栏的独立上下文（哨兵书 FREE_KEY）：消息区按书过滤天然隔离自由对话；
-// 引用解析照常命中正式会意图（graph-hit 高亮、L3 上下文），收口固化跑在
-// 正式图副本沙盒上（图视图切 ?free=1 查看测试产物），正式图零污染。
+// ── 自由模式 · 多对话（2026-11 用户定调：像网页端一样的新建对话 + 会话隔离 + 归档）──
+// 隔离机制不新造层：每个自由对话 = 一个独立 bookKey（__coread_free_<8hex>__，默认对话
+// 沿用历史哨兵 FREE_KEY）。消息归属（bookId/bookKey）、消息区过滤（dataset.book）、
+// 会意讨论栈（topic_stack[bookKey]）、LLM 会话历史（histories[bookKey]）、引用命中
+// 隔离全部复用"按书隔离"这一条既有链路——切对话 = 切 key。
+// 归档（对话条右侧 ⤓）：归档弹窗勾选「保存记忆 / 收口为节点加入拓扑图」→ POST
+// /free-archive → agent 执行记忆合并与正式图固化，然后清栈清消息（归档即删除），
+// 注册表留一条墓碑记录（产物去向）显示在对话列表的「已归档」区。
+//
 // 引用窗体（2026-09）：本次讨论的引用节点清单——语义命中（graph-hit）自动并入 +
 // 手动从拓扑图选取（双击）；条目悬浮可取消；随消息提交（body.refs），agent 收口
 // 以窗体清单为 cites 建 user 边。
 // 2026-10 用户定调：窗体 = 待提交（可删）+ 锁定（栈命中并入，不可删）——
-// 实时栈命中（/stack-hits，历史消息已提交的 cites）同时进图高亮与窗体锁定条目，
+// 实时栈命中（/stack-hits，历史消息已提交的 cites）同时进图高亮（第二层）与窗体锁定条目，
 // 二者同源保持一致；锁定条目只作显示，不随消息提交（agent 以 body.refs 为 cites，
 // 历史 cites 已由各自消息提交过，重复提交无意义）。
 let _freeRefs = []          // [{ id, point }]：待提交引用清单（手动选取 + 语义命中并入，可删）
@@ -2930,6 +3370,411 @@ function openPickMode() {
   graphView.setPickMode(true)
 }
 
+// 当前自由对话的显示标题（注册表里没登记时按序号兜底："对话 N"）
+function freeConvTitle(key) {
+  const k = key || _freeKey
+  const c = _freeConvs.find((x) => x.key === k)
+  if (c && c.title) return c.title
+  const i = _freeConvs.findIndex((x) => x.key === k)
+  return i >= 0 ? '对话 ' + (i + 1) : '新对话'
+}
+function freeConvMeta(key) {
+  return _freeConvs.find((x) => x.key === (key || _freeKey)) || null
+}
+// 该对话是不是空对话（没有任何消息）——决定归档时给什么提示
+function freeConvIsEmpty(key) {
+  const c = freeConvMeta(key)
+  return !c || !c.messages
+}
+
+// 拉对话清单（活动 + 已归档），并刷新对话条/列表。
+// 会校正当前 key：不在活动清单里（被删/被归档/老数据对不上）就落到最近活跃的一场，
+// 并整链刷新上下文——否则面板重开后头部标题/消息区会停在已失效的那场对话上。
+// autoCreate 只在**最外层**调用时为真：真的空清单时补建第一场对话。递归自己时必须关掉
+// ——若接收端建了对话却读不回（注册表写不进去之类的异常），否则会无限套娃。
+async function loadFreeConversations({ autoCreate = true } = {}) {
+  let keyChanged = false
+  try {
+    const r = await fetch(`${RECEIVER}/free-conversations`)
+    const d = await r.json()
+    _freeConvs = Array.isArray(d.active) ? d.active : []
+    _freeArchived = Array.isArray(d.archived) ? d.archived : []
+    if (!_freeConvs.length && autoCreate) {
+      // 一条都没有：建第一场对话（默认对话由 receiver 侧补登记，这里只是兜底）。
+      // 递归自己时必须关掉 autoCreate（见函数头注释）。
+      const c = await createFreeConversation({ silent: true, reload: false })
+      if (c) return loadFreeConversations({ autoCreate: false })
+    }
+    if (_freeConvs.length && !_freeConvs.some((c) => c.key === _freeKey)) {
+      // 当前 key 不在活动清单里（被删/被归档/老数据对不上）：恢复到最近有说话的对话
+      //（storage 里记的那场若还在用，上面的分支不会进来）
+      const next = d.lastActive && _freeConvs.some((c) => c.key === d.lastActive)
+        ? d.lastActive
+        : (_freeConvs[0] && _freeConvs[0].key)
+      if (next && next !== _freeKey) {
+        _freeKey = next
+        saveFreeState()
+        keyChanged = true
+      }
+    }
+  } catch {
+    // 接收端未启动：清单拉不到，至少保证当前 key 可用（默认对话）
+    if (!_freeConvs.length) _freeConvs = [{ key: _freeKey || FREE_KEY, title: '', messages: 0 }]
+  }
+  if (keyChanged && _freeMode) {
+    applyBookContext({ bookId: _freeKey, bookTitle: freeConvTitle(_freeKey) })
+    onEffectiveContextChange()
+    renderCurrentBook()
+    refreshStackHits()
+  }
+  renderFreeConvBar()
+  renderFreeConvList()
+  return _freeConvs
+}
+
+// 首条指路（2026-11 用户定调）：切到自由模式 / 新建对话 / 切到一场空对话时，在消息区落
+// 一条系统提示，把"这是一场独立对话、怎么再开一场、归档能留什么"讲清楚——光有上方对话条，
+// 用户不一定意识到自由模式是多对话的。幂等：DOM 里已有本对话的提示就不重复落
+//（切走时该对话的气泡被摘掉，切回来会重新补上）；已经说过话的对话不再提示。
+function maybeFreeConvHint() {
+  if (!_freeMode) return
+  const key = _freeKey
+  if (!key) return
+  if (!freeConvIsEmpty(key)) return
+  const msgs = document.getElementById('msgs')
+  if (!msgs) return
+  for (const el of msgs.children) {
+    if (el.className === 'msg-system' && (el.dataset.book || '') === key) return   // 已有一条
+  }
+  const total = _freeConvs.length
+  renderSystemBubble(
+    total > 1
+      ? `这是自由模式里的一场独立对话（共 ${total} 场，互不影响）。直接说点什么开始，或点上方「＋ 新对话」再开一场；归档时可选择保存记忆 / 收口进拓扑图。`
+      : '这是自由模式里的一场独立对话。直接说点什么开始；想另开一个话题就点上方「＋ 新对话」（对话之间互不影响）。归档时可选择保存记忆 / 收口进拓扑图。',
+    key,
+  )
+}
+
+// 新建一场自由对话并切过去。reload=false 时不重拉清单（由调用方负责）——
+// loadFreeConversations 的补建分支要走这条，避免两条异步链互相递归。
+async function createFreeConversation({ silent = false, reload = true } = {}) {
+  try {
+    const r = await fetch(`${RECEIVER}/free-conversations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'create' }),
+    })
+    const d = await r.json()
+    if (!d || !d.key) throw new Error('no key')
+    if (reload) await loadFreeConversations()
+    switchFreeConversation(d.key, { toast: silent ? '' : '已新建对话' })
+    maybeFreeConvHint()
+    return d.key
+  } catch {
+    if (!silent) showToast('新建对话失败：接收端未启动', true)
+    return null
+  }
+}
+
+// 切换自由对话：换上下文（消息区/引用窗体/讨论栈/命中全按新 key 隔离）
+async function switchFreeConversation(key, { toast = '' } = {}) {
+  const next = String(key || '')
+  if (!isFreeConvKey(next)) return
+  const prev = _freeKey
+  if (next === prev) { renderFreeConvBar(); renderFreeConvList(); return }
+  _freeKey = next
+  saveFreeState()
+  // 旧对话的消息从 DOM 里摘掉（其余对话的消息本来就 display:none，留着只为省一次重渲染；
+  // 摘掉后切回来靠 /history 重新渲染——_histKeys 已按对话隔离，不会互相吞消息）
+  if (prev) removeConversationBubbles(prev)
+  // 流式气泡/结束标记属于上一场对话：它可能正指向刚被摘掉的节点（切回来时下一个
+  // 分片会新建气泡；已落库的内容由 loadHistory 补齐），这里一并复位
+  _streamEl = null
+  _streamDone = false
+  clearFreeRefs()   // 引用窗体属于上一场对话：待提交 + 锁定栈命中一并清空
+  hideThinking()    // 上一场对话的"思考中"不该挂在新对话上
+  onEffectiveContextChange()   // 消息过滤 / 引用卡片 / 命中高亮整链刷新
+  renderCurrentBook()
+  renderFreeConvBar()
+  renderFreeConvList()
+  refreshStackHits()   // 新对话的实时栈命中（"讨论命中"锁定条目）
+  loadHistory()        // 把新对话的历史消息渲染出来（幂等：已渲染的按 _histKeys 跳过）
+  maybeFreeConvHint()  // 切到一场还没说过话的对话 → 补回那条指路提示
+  renderNoBookView()
+  scrollMsgsToBottom()
+  if (toast) showToast(toast)
+}
+
+// 摘掉某场对话的消息气泡（切对话用）。只摘该 key 的，别的对话不动。
+function removeConversationBubbles(key) {
+  const msgs = document.getElementById('msgs')
+  if (!msgs) return
+  for (const el of [...msgs.children]) {
+    if ((el.dataset.book || '') === key) el.remove()
+  }
+}
+
+// 渲染自由对话条（切到自由模式的那一刻就出现，见 toggleFreeMode）。
+// 三样东西一眼可见：当前对话（点击开列表）、＋ 新对话（实心绿的主按钮）、⤓ 归档；
+// 另外两处提示多对话存在且可用：徽标显示对话总数、空对话时提示行点出"开新话题"。
+function renderFreeConvBar() {
+  const bar = document.getElementById('free-conv-bar')
+  if (!bar) return
+  bar.hidden = !_freeMode
+  if (!_freeMode) return
+  const titleEl = document.getElementById('fc-title')
+  const countEl = document.getElementById('fc-count')
+  const hintEl = document.getElementById('fc-hint')
+  const cur = document.getElementById('fc-cur')
+  const total = _freeConvs.length
+  const meta = freeConvMeta(_freeKey)
+  const title = freeConvTitle(_freeKey)
+  const msgs = meta ? (meta.messages || 0) : 0
+  if (titleEl) titleEl.textContent = title
+  // 对话总数徽标：只有一场时也显示（"1"本身就在说"这是一场对话，可以再有第二场"）
+  if (countEl) {
+    countEl.hidden = !total
+    countEl.textContent = total ? String(total) : ''
+    countEl.title = total ? `自由模式共有 ${total} 场对话（点左侧标题切换）` : ''
+  }
+  if (cur) {
+    cur.title = `当前自由对话：${title}（${msgs ? msgs + ' 条消息' : '还没有消息'}）` +
+      (total > 1 ? `\n自由模式共 ${total} 场对话，点击切换或新建` : '\n点击切换 / 新建对话')
+  }
+  if (hintEl) {
+    // 空对话（刚进入自由模式 / 刚新建）时给一句指路：说点什么，或另开一场
+    const show = msgs === 0
+    hintEl.hidden = !show
+    hintEl.textContent = show
+      ? (total > 1
+        ? '这是一场新的自由对话，和其它对话互不影响。直接说点什么开始，或点「＋ 新对话」再开一场。'
+        : '自由模式里可以有很多场互不影响的对话。直接说点什么开始吧。')
+      : ''
+  }
+}
+
+function renderFreeConvList() {
+  const overlay = document.getElementById('free-conv-overlay')
+  if (!overlay) return
+  const list = document.getElementById('fcv-list')
+  const empty = document.getElementById('fcv-empty')
+  if (!list) return
+  const fmtTime = (ts) => {
+    if (!ts) return ''
+    const d = new Date(ts)
+    const today = new Date()
+    const sameDay = d.toDateString() === today.toDateString()
+    const hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')
+    return sameDay ? `今天 ${hm}` : `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`
+  }
+  list.innerHTML = ''
+  for (const c of _freeConvs) {
+    const item = document.createElement('div')
+    item.className = 'fcv-item' + (c.key === _freeKey ? ' cur' : '')
+    const bits = [c.messages ? c.messages + ' 条消息' : '还没有消息']
+    if (c.lastAt) bits.push('最近 ' + fmtTime(c.lastAt))
+    item.innerHTML =
+      `<div class="fci-main">` +
+        `<div class="fci-title">${esc(c.title || '新对话')}</div>` +
+        `<div class="fci-meta">${esc(bits.join(' · '))}</div>` +
+      `</div>` +
+      (c.key === _freeKey ? '<span class="fci-badge">当前</span>' : '') +
+      `<button class="fci-act" data-act="rename" title="重命名这场对话">✎</button>` +
+      `<button class="fci-act" data-act="archive" title="归档这场对话（可选保存记忆 / 收口进拓扑图）">⤓</button>` +
+      `<button class="fci-act fci-del" data-act="delete" title="彻底删除这场对话及其消息">🗑</button>`
+    item.addEventListener('click', (e) => {
+      const btn = e.target.closest('.fci-act')
+      if (btn) {
+        e.stopPropagation()
+        if (btn.dataset.act === 'archive') openFreeArchive(c.key)
+        else if (btn.dataset.act === 'rename') renameFreeConversation(c.key, c.title)
+        else deleteFreeConversation(c.key, c.title)
+        return
+      }
+      switchFreeConversation(c.key)
+      closeFreeConvList()
+    })
+    list.appendChild(item)
+  }
+  if (empty) empty.hidden = _freeConvs.length > 0
+  // 已归档区：墓碑记录（产物去向说明），可彻底删除
+  const wrap = document.getElementById('fcv-arch-wrap')
+  const archList = document.getElementById('fcv-arch-list')
+  if (!wrap || !archList) return
+  wrap.hidden = !_freeArchived.length
+  archList.innerHTML = ''
+  for (const c of _freeArchived) {
+    const item = document.createElement('div')
+    item.className = 'fcv-arch-item'
+    const note = (c.archive && c.archive.note) || '已归档（未保存记忆、未收口）'
+    item.innerHTML =
+      `<div class="fca-main">` +
+        `<div class="fca-title">${esc(c.title || '（无标题对话）')}</div>` +
+        `<div class="fca-meta">${esc(fmtTime(c.archivedAt))}${note ? ' · ' + esc(note) : ''}</div>` +
+      `</div>` +
+      `<button class="fci-act fci-del" data-act="drop" title="从归档记录里删掉这条">🗑</button>`
+    item.querySelector('[data-act="drop"]').addEventListener('click', async (e) => {
+      e.stopPropagation()
+      try {
+        await fetch(`${RECEIVER}/free-conversations`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'delete', key: c.key }),
+        })
+      } catch {}
+      await loadFreeConversations()
+    })
+    archList.appendChild(item)
+  }
+}
+
+function openFreeConvList() {
+  const overlay = document.getElementById('free-conv-overlay')
+  if (!overlay) return
+  overlay.classList.add('on')
+  loadFreeConversations()
+  renderFreeConvList()
+}
+function closeFreeConvList() {
+  document.getElementById('free-conv-overlay')?.classList.remove('on')
+}
+
+// 重命名自由对话（对话列表里的 ✎）：标题只用于显示与识别，不影响隔离
+async function renameFreeConversation(key, current) {
+  const label = current || freeConvTitle(key)
+  const next = await showPrompt({
+    title: '重命名对话',
+    value: label,
+    placeholder: '给这场对话起个名字…',
+    maxLength: 40,
+  })
+  if (next === null) return          // 取消
+  const title = next.trim()
+  if (title === (current || '')) return
+  try {
+    const r = await fetch(`${RECEIVER}/free-conversations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'rename', key, title }),
+    })
+    if (!r.ok) throw new Error('HTTP ' + r.status)
+  } catch {
+    showToast('重命名失败：接收端未启动', true)
+    return
+  }
+  await loadFreeConversations()
+  if (key === _freeKey) renderCurrentBook()
+  showToast('已重命名为「' + (title || '新对话') + '」')
+}
+
+async function deleteFreeConversation(key, title) {
+  const label = title || freeConvTitle(key)
+  const ok = await showConfirm('删除自由对话', `彻底删除「${label}」及其消息？归档记录也不会保留。`)
+  if (!ok) return
+  try {
+    await fetch(`${RECEIVER}/free-conversations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', key }),
+    })
+  } catch {
+    showToast('删除失败：接收端未启动', true)
+    return
+  }
+  const wasCurrent = key === _freeKey
+  if (wasCurrent) removeConversationBubbles(key)
+  await loadFreeConversations()
+  if (wasCurrent) {
+    const next = _freeConvs.length ? _freeConvs[0].key : null
+    if (next) switchFreeConversation(next)
+    else await createFreeConversation()
+  }
+  showToast('已删除对话')
+}
+
+// ── 归档（2026-11：归档 = 对话结束并删除）────────────────────────────────────
+// 两个勾选项 = 这场对话的产物去向：保存记忆（profile/soul）、收口进拓扑图（正常收口程序）。
+// 2026-11 用户定调：**默认两项都勾上**（归档默认就把这场对话完整走一遍正常程序），
+// 但可以取消——取消是"这次先不留痕"，不是"以后都不留"。所以这里把用户**最后一次的
+// 选择**记在 storage 里：第一次打开默认双勾，用户取消过哪项，下次就沿用他的选择。
+const ARCHIVE_PREF_KEY = 'freeArchiveOpts'
+
+// 读上次选择；从未选过 → 两项都勾（默认全走正常程序）
+async function loadArchivePref() {
+  const dflt = { memory: true, graph: true }
+  try {
+    const d = await chrome.storage.local.get([ARCHIVE_PREF_KEY])
+    const v = d && d[ARCHIVE_PREF_KEY]
+    if (v && typeof v === 'object') {
+      return { memory: v.memory !== false, graph: v.graph !== false }
+    }
+  } catch {}
+  return dflt
+}
+function saveArchivePref(pref) {
+  try { chrome.storage.local.set({ [ARCHIVE_PREF_KEY]: { memory: !!pref.memory, graph: !!pref.graph } }) } catch {}
+}
+
+let _archiveKey = ''   // 归档弹窗当前针对的对话
+async function openFreeArchive(key) {
+  const k = key || _freeKey
+  if (!isFreeConvKey(k)) return
+  _archiveKey = k
+  const overlay = document.getElementById('free-archive-overlay')
+  const convEl = document.getElementById('fa-conv')
+  const memEl = document.getElementById('fa-memory')
+  const graphEl = document.getElementById('fa-graph')
+  const okBtn = document.getElementById('fa-ok')
+  if (!overlay) return
+  const meta = freeConvMeta(k)
+  const title = freeConvTitle(k)
+  if (convEl) convEl.textContent = title + (meta ? `（${meta.messages || 0} 条消息）` : '')
+  if (okBtn) okBtn.disabled = false
+  closeFreeConvList()
+  overlay.classList.add('on')   // 先开弹窗（不等 storage），勾选状态回读后再校正
+  const pref = await loadArchivePref()
+  if (memEl) memEl.checked = !!pref.memory
+  if (graphEl) graphEl.checked = !!pref.graph
+}
+function closeFreeArchive() {
+  document.getElementById('free-archive-overlay')?.classList.remove('on')
+  _archiveKey = ''
+}
+
+// 执行归档：POST /free-archive → agent 侧做（记忆合并 / 收口固化 / 清栈清消息），
+// 结果以 role=system 落库并经 SSE 回到侧栏（toast + 系统气泡）。
+async function submitFreeArchive() {
+  const key = _archiveKey
+  if (!isFreeConvKey(key)) return
+  const memory = !!document.getElementById('fa-memory')?.checked
+  const graph = !!document.getElementById('fa-graph')?.checked
+  saveArchivePref({ memory, graph })   // 记住这次的选择（下次打开沿用）
+  const okBtn = document.getElementById('fa-ok')
+  if (okBtn) okBtn.disabled = true
+  const wasCurrent = key === _freeKey
+  let queued = false
+  try {
+    const r = await fetch(`${RECEIVER}/free-archive`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, memory, graph }),
+    })
+    queued = r.ok
+  } catch {}
+  if (!queued) {
+    if (okBtn) okBtn.disabled = false
+    showToast('归档失败：接收端未启动', true)
+    return
+  }
+  closeFreeArchive()
+  // 归档要跑记忆合并 / 收口固化（要调模型，可能几十秒）：先给"处理中"反馈，
+  // 完成时 agent 会推 role=system 的系统气泡 + toast。
+  if (memory || graph) showToast('归档中：正在' + [memory ? '保存记忆' : '', graph ? '走正常收口程序进拓扑图' : ''].filter(Boolean).join(' + ') + '…')
+  if (wasCurrent) showThinking(key)
+  // 从活动清单里立刻摘掉（agent 完成后会把消息清掉，这里先刷新列表）
+  setTimeout(() => loadFreeConversations(), 600)
+}
+
 function toggleFreeMode() {
   _freeMode = !_freeMode
   // iPhone 风格滑动开关：滑块状态 / 轨道颜色 / 两侧文案高亮随模式切换
@@ -2946,19 +3791,27 @@ function toggleFreeMode() {
   if (_freeMode) {
     // 暂存读书模式的选中引用：进入自由模式会被当作"切书"取消选中，退出时原样恢复
     _savedReadingAnn = selectedAnn
-    // 快照进入前的实时检测上下文（_currentBook）：applyBookContext(FREE_KEY) 会
-    // 把它覆写成自由哨兵书，退出自由模式时靠这份快照恢复，不依赖可能陈旧/为空的
+    // 快照进入前的实时检测上下文（_currentBook）：applyBookContext(自由对话 key) 会
+    // 把它覆写成自由对话，退出自由模式时靠这份快照恢复，不依赖可能陈旧/为空的
     // _lastWereadContext（手动选书期间它常常不是"进入前正在读的书"）
     _savedExitCtx = _currentBook ? { ..._currentBook } : null
-    applyBookContext({ bookId: FREE_KEY, bookTitle: '自由模式' })
+    // 恢复上次所在的对话（storage）；清单异步拉到后再校正（key 失效则落到最近活跃的一场）
+    _freeKey = restoreFreeKey()
+    applyBookContext({ bookId: _freeKey, bookTitle: freeConvTitle(_freeKey) })
     // _freeMode 已先置位，applyBookContext 里 ctxChanged 判定失效（进出前后
     // effectiveBookBase 都是 FREE_KEY），onEffectiveContextChange 被跳过——读书模式
     // 的「当前引用」卡片残留 .on 不隐藏，与「本次引用」窗体叠成两栏（2026-10 修复）。
     // 这里与切书/手动选书一致，强制整链刷新：隐藏当前引用卡片、消息区/引用抽屉按
-    // 哨兵书隔离、清掉跨上下文命中高亮并取消选中（已暂存，退出时恢复）。
+    // 对话 key 隔离、清掉跨上下文命中高亮并取消选中（已暂存，退出时恢复）。
     onEffectiveContextChange()
     renderFreeRefs()
-    showToast('已进入自由模式：对话为临时测试，不固化进正式会意图')
+    renderFreeConvBar()   // 对话条在进入自由模式的那一刻就出现（含 ＋ 新对话）
+    loadFreeConversations().then(() => {
+      // 清单回来后再刷一次：标题/总数徽标/空对话提示都要等清单才准
+      renderFreeConvBar()
+      maybeFreeConvHint()
+    })
+    showToast('已进入自由模式：对话相互独立，归档时可选择保存记忆 / 收口进拓扑图')
   } else {
     // 退出自由模式：恢复到进入前的上下文。不用 applyBookContext 恢复——它带
     // 「检测到真实阅读即退出手动选书」规则，而 _lastWereadContext 只是历史快照
@@ -2985,8 +3838,9 @@ function toggleFreeMode() {
       _savedReadingAnn = null
     }
     renderRefUI()
-    // 清除本次引用窗体与图视图已选标记（自由模式上下文独立，下次重新开始）
+    // 清除本次引用窗体与图视图已选标记（自由对话上下文独立，下次重新开始）
     clearFreeRefs()
+    renderFreeConvBar()
     showToast('已退出自由模式')
   }
   if (graphView) graphView.setMode(_freeMode ? 'free' : 'formal')
@@ -3028,6 +3882,36 @@ if (freeSwitch) {
   }
 }
 
+// ── 自由对话 UI 接线（2026-11 多对话）─────────────────────────────────────
+// 对话条：点当前对话 → 对话列表（切换/归档/删除）；＋ 新建；⤓ 归档当前对话
+document.getElementById('fc-cur')?.addEventListener('click', openFreeConvList)
+document.getElementById('fc-new')?.addEventListener('click', () => createFreeConversation())
+document.getElementById('fc-archive')?.addEventListener('click', () => openFreeArchive(_freeKey))
+
+// 对话列表弹窗：关闭 / 遮罩点击关闭 / 新建
+document.getElementById('fcv-close-btn')?.addEventListener('click', closeFreeConvList)
+document.getElementById('fcv-new-btn')?.addEventListener('click', async () => { closeFreeConvList(); await createFreeConversation() })
+{
+  const ov = document.getElementById('free-conv-overlay')
+  if (ov) {
+    let downOnMask = false
+    ov.addEventListener('mousedown', (e) => { downOnMask = e.target === ov })
+    ov.addEventListener('mouseup', (e) => { if (downOnMask && e.target === ov) closeFreeConvList(); downOnMask = false })
+  }
+}
+
+// 归档弹窗：取消 / 遮罩关闭 / 确认归档
+document.getElementById('fa-cancel')?.addEventListener('click', closeFreeArchive)
+document.getElementById('fa-ok')?.addEventListener('click', submitFreeArchive)
+{
+  const ov = document.getElementById('free-archive-overlay')
+  if (ov) {
+    let downOnMask = false
+    ov.addEventListener('mousedown', (e) => { downOnMask = e.target === ov })
+    ov.addEventListener('mouseup', (e) => { if (downOnMask && e.target === ov) closeFreeArchive(); downOnMask = false })
+  }
+}
+
 // ── 头部「⋯」更多设置菜单（字号）─────────────────────────────────────
 const moreBtn = document.getElementById('more-btn')
 const moreMenu = document.getElementById('more-menu')
@@ -3044,6 +3928,131 @@ if (moreBtn && moreMenu) {
   })
 }
 
+// ── 模型 API 配置（2026-10）─────────────────────────────────────────────
+// 入口 = 头部「⋯」菜单的「🔑 模型 API 配置」；当前未配置 API 时打开插件自动弹出。
+// 真源是 agent/api-config.json（后端 GET/POST /api-config，.env 为回退）：插件不自己
+// 存一份，避免"界面显示"与"agent 实际取值"两套状态漂移。接收端没起来时**不**自动
+// 弹窗——那时"未配置"是误判，连接状态交给头部指示点。
+const apiOverlay = document.getElementById('api-config')
+
+function openApiConfig() {
+  if (moreMenu) moreMenu.classList.remove('on')
+  if (!apiOverlay) return
+  apiOverlay.classList.add('on')
+  const errEl = document.getElementById('api-err')
+  if (errEl) errEl.textContent = ''
+}
+
+function closeApiConfig() {
+  apiOverlay?.classList.remove('on')
+}
+
+// 拉当前生效配置；接收端未响应返回 null（与"确认未配置"区分开）
+async function fetchApiConfig() {
+  try {
+    const r = await fetch(`${RECEIVER}/api-config`)
+    if (!r.ok) throw new Error('bad status')
+    const cfg = await r.json()
+    return cfg && typeof cfg === 'object' ? cfg : null
+  } catch { return null }
+}
+
+function fillApiForm(cfg) {
+  const base = document.getElementById('api-base')
+  const key = document.getElementById('api-key')
+  const model = document.getElementById('api-model')
+  if (base) base.value = cfg.apiBase || ''
+  if (key) key.value = cfg.apiKey || ''
+  if (model) model.value = cfg.model || ''
+}
+
+// 菜单项状态文案：已配置=绿（带模型名）/ 未配置=灰 / 接收端未连=灰
+function renderApiStatus(cfg) {
+  const desc = document.getElementById('mm-api-desc')
+  if (!desc) return
+  if (!cfg) { desc.textContent = '接收端未连接'; desc.classList.remove('ok'); return }
+  if (cfg.configured) { desc.textContent = '已配置 · ' + (cfg.model || ''); desc.classList.add('ok'); return }
+  desc.textContent = '未配置，点这里填写'
+  desc.classList.remove('ok')
+}
+
+async function refreshApiStatus() {
+  renderApiStatus(await fetchApiConfig())
+}
+
+// 打开配置弹窗：firstRun = 未配置时的引导态（多一行说明）
+function showApiConfigModal(cfg, firstRun) {
+  if (cfg) fillApiForm(cfg)
+  const first = document.getElementById('api-first')
+  if (first) first.hidden = !firstRun
+  const src = document.getElementById('api-src')
+  if (src) src.hidden = !(cfg && cfg.source === 'env')
+  openApiConfig()
+}
+
+// 打开插件时检查一次：确认"未配置"才自动弹窗，并把已填的部分配置预填进输入框
+async function checkApiConfigOnOpen() {
+  const cfg = await fetchApiConfig()
+  renderApiStatus(cfg)
+  if (cfg && !cfg.configured) showApiConfigModal(cfg, true)
+}
+
+async function saveApiConfig() {
+  const btn = document.getElementById('api-save-btn')
+  const errEl = document.getElementById('api-err')
+  const payload = {
+    apiBase: (document.getElementById('api-base')?.value || '').trim(),
+    apiKey: (document.getElementById('api-key')?.value || '').trim(),
+    model: (document.getElementById('api-model')?.value || '').trim(),
+  }
+  const fail = (msg) => { if (errEl) errEl.textContent = msg }
+  fail('')
+  // 前端只拦"空值"，URL 合法性等以后端校验为准（单一真源在 lib/api-config.js）
+  if (!payload.apiBase || !payload.apiKey || !payload.model) {
+    fail('请填写 API 地址、API Key 和模型名')
+    return
+  }
+  if (btn) btn.disabled = true
+  try {
+    const r = await fetch(`${RECEIVER}/api-config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const d = await r.json().catch(() => null)
+    if (!r.ok || !d || !d.ok) throw new Error((d && d.error) || '保存失败')
+    renderApiStatus({ configured: true, model: d.model || payload.model })
+    closeApiConfig()
+    showToast('模型 API 已保存，下次提问即生效')
+  } catch (e) {
+    const msg = (e && e.message) ? e.message : '保存失败'
+    fail(/fetch|network/i.test(msg) ? '接收端未连接，保存失败（请先启动 CoRead 服务）' : msg)
+  } finally {
+    if (btn) btn.disabled = false
+  }
+}
+
+document.getElementById('mm-api-config')?.addEventListener('click', async () => {
+  if (moreMenu) moreMenu.classList.remove('on')
+  const cfg = await fetchApiConfig()
+  showApiConfigModal(cfg, false)
+  if (!cfg) {
+    const errEl = document.getElementById('api-err')
+    if (errEl) errEl.textContent = '接收端未连接，无法读取或保存配置（请先启动 CoRead 服务）'
+  }
+})
+document.getElementById('api-save-btn')?.addEventListener('click', saveApiConfig)
+document.getElementById('api-cancel-btn')?.addEventListener('click', closeApiConfig)
+document.getElementById('api-close-btn')?.addEventListener('click', closeApiConfig)
+bindMaskClose(apiOverlay, closeApiConfig)
+// 三个输入框回车即保存（Esc 关闭）
+for (const id of ['api-base', 'api-key', 'api-model']) {
+  document.getElementById(id)?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); saveApiConfig() }
+    else if (e.key === 'Escape') closeApiConfig()
+  })
+}
+
 // ── 无书默认界面 / 已读书籍选择的事件绑定（2026-10）────────────────────────
 document.getElementById('nb-pick-btn')?.addEventListener('click', openBookPicker)
 document.getElementById('mm-pick-book')?.addEventListener('click', () => {
@@ -3057,14 +4066,13 @@ document.getElementById('mm-exit-manual')?.addEventListener('click', () => {
 document.getElementById('mb-switch-btn')?.addEventListener('click', openBookPicker)
 document.getElementById('mb-exit-btn')?.addEventListener('click', exitManualBook)
 document.getElementById('bp-close-btn')?.addEventListener('click', closeBookPicker)
-document.getElementById('book-picker')?.addEventListener('click', (e) => {
-  if (e.target.id === 'book-picker') closeBookPicker()  // 点击遮罩关闭
-})
+bindMaskClose(document.getElementById('book-picker'), closeBookPicker)  // 点击遮罩关闭（按+松都在遮罩上才算）
 document.getElementById('bp-search')?.addEventListener('input', renderBookList)
 
 // 启动后查询当前阅读书籍（AI-001）：覆盖「切书后重开侧栏」的场景。
 // applyPendingRefSearch 放在 loadHistory 之后：引用列表就绪后再打开抽屉搜索，
 // 否则搜索框填了词但列表还是空的（AI-011）。
+checkApiConfigOnOpen()  // 打开插件即检查模型 API：确认未配置就自动弹出配置弹窗（用户定调）
 loadState()
   .then(loadHistory)
   .then(applyPendingRefSearch)
@@ -3120,3 +4128,349 @@ try {
     if (area === 'local' && changes && changes.miaBindings) refreshWebBindEntry()
   })
 } catch {}
+
+// ── 工具箱（入口：头部「⋯」菜单；当前只有「翻译」一页）────────────────────────
+// 模型配置默认全部用 CoRead 的（agent/api-config.json，经 receiver 读取）。工具箱里另有
+// 三个可选的按字段覆盖：填了就用填的，留空的仍用 CoRead 的。
+// 存储键与 translate-protocol.js 的 STORE_KEYS 保持一致。
+const TR_KEYS = {
+  enabled: 'stEnabled',
+  apiBase: 'stApiBaseOverride',
+  apiKey: 'stApiKeyOverride',
+  model: 'stModelOverride',
+  legacyModel: 'stVisionModel',   // 旧键：早期只能覆盖模型，读到就迁移过来
+}
+const toolbox = document.getElementById('toolbox')
+let trStatus = null   // 最近一次 getTranslateStatus 的结果，按钮处理函数要用里面的 origin
+
+function sendTranslate(message) {
+  return chrome.runtime.sendMessage(message).catch(function (e) {
+    return { ok: false, error: { message: String(e && e.message ? e.message : e) } }
+  })
+}
+
+function trSetErr(msg) {
+  const el = document.getElementById('tr-err')
+  if (el) el.textContent = msg || ''
+}
+
+function trErrorText(resp, fallback) {
+  const err = resp && resp.error
+  if (!err) return fallback
+  return (err.code ? '[' + err.code + '] ' : '') + (err.message || fallback)
+}
+
+async function refreshTranslateStatus() {
+  const resp = await sendTranslate({ action: 'getTranslateStatus' })
+  const st = resp && resp.ok ? resp.status : null
+  trStatus = st
+  const baseEl = document.getElementById('tr-base-model')
+  const warn = document.getElementById('tr-grant-warn')
+  const originEl = document.getElementById('tr-origin')
+  if (baseEl) {
+    if (!st) baseEl.textContent = '读取失败'
+    else if (!st.configured) baseEl.textContent = '未配置'
+    else baseEl.textContent = (st.model || '（未填模型名）') + (st.usingOverride ? '（自定义）' : '（CoRead）')
+  }
+  renderEnableSwitch(!st || st.enabled !== false)
+  if (warn) warn.hidden = !(st && st.configured && st.origin && !st.granted)
+  if (originEl) originEl.textContent = (st && st.origin) || ''
+  refreshRecordCount()
+  return st
+}
+
+/** 本页译文记录条数：贴回 / 清除两个入口据此显示与置灰。 */
+function refreshRecordCount() {
+  const total = trStatus ? (trStatus.recordTotal || 0) : 0
+  const countEl = document.getElementById('tr-record-count')
+  const restoreBtn = document.getElementById('tr-restore-btn')
+  const clearBtn = document.getElementById('tr-clear-btn')
+  if (countEl) countEl.textContent = total ? '（' + total + '）' : ''
+  if (restoreBtn) restoreBtn.disabled = !total
+  if (clearBtn) clearBtn.disabled = !total
+  renderTranslateDiag(trStatus && trStatus.lastDiag)
+}
+
+/**
+ * 最近一次翻译的诊断：锚点拿到没有、文字落在哪个 frame。
+ * 数据来自扩展本地存储，不依赖 receiver —— 排查时不用重启任何进程。
+ */
+function renderTranslateDiag(diag) {
+  const el = document.getElementById('tr-diag')
+  if (!el) return
+  if (!diag) {
+    el.hidden = true
+    el.textContent = ''
+    el.title = ''
+    return
+  }
+  const frames = Array.isArray(diag.frames) ? diag.frames : []
+  const hit = frames.filter((f) => f && f.has).length
+  const when = diag.at ? new Date(diag.at).toLocaleTimeString() : ''
+  const parts = [
+    '最近一次翻译' + (when ? ' ' + when : ''),
+    '锚点' + (diag.anchored ? '已获取' : '未获取（' + (diag.anchorReason || '?') + '）'),
+  ]
+  if (diag.pageW) parts.push('框 ' + diag.pageW + '×' + diag.pageH)
+  if (typeof diag.chain === 'number') parts.push('滚动链内层 ' + diag.chain)
+  if (diag.canvasAnchor) {
+    parts.push('画布锚点已取' + (diag.canvasChanged ? '（画布已重绘→近似）' : '（纯缩放→精确）'))
+  } else if (diag.canvasInfo) {
+    parts.push('画布 ' + diag.canvasInfo.intrinsic)
+  }
+  if (frames.length) parts.push('frame 命中 ' + hit + '/' + frames.length)
+  el.hidden = false
+  el.textContent = parts.join(' · ')
+  el.title = JSON.stringify(diag, null, 1)
+}
+
+// ── 启用开关 ──────────────────────────────────────────────────────────────────
+// 关掉后：两个快捷键与这里的两个按钮都停用（后台还会再挡一次，见 translate-background.js
+// 的 requireEnabled）。「测试连接」不受影响，关着也能验证配置。
+function renderEnableSwitch(on) {
+  const sw = document.getElementById('tr-enable')
+  if (sw) {
+    sw.classList.toggle('on', on)
+    sw.setAttribute('aria-checked', on ? 'true' : 'false')
+  }
+  document.getElementById('tr-enable-on')?.classList.toggle('act', on)
+  document.getElementById('tr-enable-off')?.classList.toggle('act', !on)
+  for (const id of ['tr-region-btn', 'tr-selection-btn']) {
+    const btn = document.getElementById(id)
+    if (btn) btn.disabled = !on
+  }
+}
+
+async function setTranslateEnabled(on) {
+  try { await chrome.storage.local.set({ [TR_KEYS.enabled]: on }) } catch (e) {}
+  renderEnableSwitch(on)
+  showToast(on ? '翻译已启用' : '翻译已禁用，快捷键不再响应')
+}
+
+// ── 自定义模型配置（三项可选覆盖）─────────────────────────────────────────────
+const TR_OVERRIDE_FIELDS = [
+  ['tr-api-base', TR_KEYS.apiBase],
+  ['tr-api-key', TR_KEYS.apiKey],
+  ['tr-model', TR_KEYS.model],
+]
+
+async function loadTranslateSettings() {
+  let store = {}
+  try { store = await chrome.storage.local.get([TR_KEYS.enabled, TR_KEYS.apiBase, TR_KEYS.apiKey, TR_KEYS.model, TR_KEYS.legacyModel]) } catch (e) {}
+  renderEnableSwitch(store[TR_KEYS.enabled] !== false)
+  // 旧键只在没有新键时兜底，让早期填过的「视觉模型」不丢
+  const modelValue = store[TR_KEYS.model] || store[TR_KEYS.legacyModel] || ''
+  const values = { 'tr-api-base': store[TR_KEYS.apiBase] || '', 'tr-api-key': store[TR_KEYS.apiKey] || '', 'tr-model': modelValue }
+  for (const [id] of TR_OVERRIDE_FIELDS) {
+    const el = document.getElementById(id)
+    // 正在输入的框不要被覆盖
+    if (el && document.activeElement !== el) el.value = values[id] || ''
+  }
+}
+
+async function saveTranslateOverride(id, key) {
+  const el = document.getElementById(id)
+  if (!el) return
+  try {
+    await chrome.storage.local.set({ [key]: el.value.trim() })
+    if (key === TR_KEYS.model) await chrome.storage.local.remove(TR_KEYS.legacyModel)
+  } catch (e) {}
+  showToast('模型配置已保存')
+  refreshTranslateStatus()
+}
+
+/** 快捷键按 chrome.commands 的实际绑定显示：改过键、或与别的扩展冲突时这里会露出真相。 */
+async function refreshShortcutLabels() {
+  let cmds = []
+  try { cmds = await chrome.commands.getAll() } catch (e) {}
+  const pick = (name) => {
+    const c = cmds.find((x) => x.name === name)
+    return c && c.shortcut ? c.shortcut : '未设置'
+  }
+  const region = document.getElementById('tr-key-region')
+  const selection = document.getElementById('tr-key-selection')
+  if (region) region.textContent = pick('translate-region')
+  if (selection) selection.textContent = pick('translate-selection')
+}
+
+// 打开工具箱并切到指定 tab。tab 切换是通用的：按钮的 data-tab 与页面的 data-page 同名即可，
+// 以后加工具只要在 sidebar.html 里加一个按钮 + 一个 .tb-page，这里不用改。
+function openToolbox(tab) {
+  if (moreMenu) moreMenu.classList.remove('on')
+  if (!toolbox) return
+  if (tab) selectToolboxTab(tab)
+  toolbox.classList.add('on')
+  trSetErr('')
+  loadTranslateSettings()
+  refreshShortcutLabels()
+  refreshTranslateStatus()
+}
+
+function closeToolbox() {
+  if (toolbox) toolbox.classList.remove('on')
+}
+
+function selectToolboxTab(name) {
+  const tabs = document.querySelectorAll('#tb-tabs .tb-tab')
+  const pages = document.querySelectorAll('#toolbox .tb-page')
+  for (const t of tabs) t.classList.toggle('on', t.dataset.tab === name)
+  for (const p of pages) p.hidden = p.dataset.page !== name
+}
+
+// 面板上的两个动作按钮：先确认已配置且已授权，再发起翻译。
+// chrome.permissions.request 必须在用户手势里调用，所以 origin 提前存在 trStatus 里，
+// 点击时第一个 await 就是它（中间不夹别的异步调用，避免用户手势过期）。
+async function runTranslateAction(action, label) {
+  trSetErr('')
+  if (!trStatus) await refreshTranslateStatus()
+  const st = trStatus
+  if (!st) { trSetErr('无法读取翻译状态，请重试'); return }
+  if (st.enabled === false) { trSetErr('翻译已禁用，请先启用上方开关'); return }
+  if (!st.configured) { trSetErr('尚未配置模型 API，请在「模型 API 配置」中填写地址与 Key'); return }
+  if (st.origin && !st.granted) {
+    let granted = false
+    try { granted = await chrome.permissions.request({ origins: [st.origin] }) } catch (e) {}
+    if (!granted) {
+      trSetErr('未授权访问 ' + st.origin + '，翻译请求将被浏览器拦截')
+      refreshTranslateStatus()
+      return
+    }
+  }
+  const out = await sendTranslate({ action })
+  if (out && out.ok) { closeToolbox(); return }
+  trSetErr(trErrorText(out, label))
+  refreshTranslateStatus()
+}
+
+document.getElementById('mm-toolbox')?.addEventListener('click', function () { openToolbox('translate') })
+document.getElementById('tb-close-btn')?.addEventListener('click', closeToolbox)
+bindMaskClose(toolbox, closeToolbox)
+document.getElementById('tb-tabs')?.addEventListener('click', function (e) {
+  const tab = e.target.closest('.tb-tab')
+  if (tab && tab.dataset.tab) selectToolboxTab(tab.dataset.tab)
+})
+
+// 阅读器：扩展自己的页面，不是注入到网站里的脚本，所以直接开一个标签页即可。
+// 侧栏太窄，长时间阅读还是在标签页里舒服。
+function openReader() {
+  chrome.tabs.create({ url: chrome.runtime.getURL('reader.html'), active: true })
+  closeToolbox()
+}
+document.getElementById('rd-open-btn')?.addEventListener('click', openReader)
+
+// ── 译文对照（阅读器翻过的段落）──────────────────────────────────────────────
+// 面板挂在本侧栏里（reader-notes.js 渲染），阅读器通过后台中继同步条目过来。
+let notesPanel = null
+
+function openNotes() {
+  const box = document.getElementById('reader-notes')
+  if (!box) return
+  if (!notesPanel && window.CoReadNotes) {
+    notesPanel = window.CoReadNotes.mount(document.getElementById('rn-body'), {
+      send: (msg) => chrome.runtime.sendMessage(msg),
+      onClose: closeNotes,
+      toast: (t, err) => showToast(t, err),
+    })
+    // 打开时先拉一次当前快照（阅读器可能已经翻过几段了）
+    chrome.runtime.sendMessage({ action: 'readerGet' })
+      .then((r) => { if (r && r.snapshot) notesPanel.update(r.snapshot) })
+      .catch(() => {})
+  }
+  box.classList.add('on')
+}
+
+function closeNotes() {
+  document.getElementById('reader-notes')?.classList.remove('on')
+}
+
+document.getElementById('mm-notes')?.addEventListener('click', function () {
+  if (moreMenu) moreMenu.classList.remove('on')
+  openNotes()
+})
+
+// 阅读器那边翻译完 / 双击空白处，都会经后台广播过来
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || !msg.action) return
+  if (msg.action === 'readerUpdate') {
+    if (notesPanel && msg.snapshot) notesPanel.update(msg.snapshot)
+    return
+  }
+  if (msg.action === 'notesOpen') { openNotes(); return }
+  if (msg.action === 'notesClose') { closeNotes(); return }
+})
+document.getElementById('tr-region-btn')?.addEventListener('click', function () {
+  runTranslateAction('startSelection', '框选截图失败')
+})
+document.getElementById('tr-selection-btn')?.addEventListener('click', function () {
+  runTranslateAction('translateSelection', '划词翻译失败')
+})
+
+document.getElementById('tr-enable')?.addEventListener('click', function () {
+  setTranslateEnabled(!this.classList.contains('on'))
+})
+
+for (const [id, key] of TR_OVERRIDE_FIELDS) {
+  const el = document.getElementById(id)
+  el?.addEventListener('change', function () { saveTranslateOverride(id, key) })
+  el?.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); this.blur() }   // blur 触发 change
+    else if (e.key === 'Escape') closeToolbox()
+  })
+}
+
+document.getElementById('tr-shortcuts-btn')?.addEventListener('click', function () {
+  try { chrome.tabs.create({ url: 'chrome://extensions/shortcuts' }) }
+  catch (e) { showToast('请手动打开 chrome://extensions/shortcuts 修改快捷键', true) }
+})
+
+document.getElementById('tr-grant-btn')?.addEventListener('click', async function () {
+  trSetErr('')
+  const st = trStatus || await refreshTranslateStatus()
+  if (!st || !st.origin) { trSetErr('无法读取模型地址，请先在「模型 API 配置」中填写'); return }
+  let granted = false
+  try { granted = await chrome.permissions.request({ origins: [st.origin] }) } catch (e) {}
+  if (!granted) { trSetErr('未授权访问 ' + st.origin); return }
+  showToast('已授权访问 ' + st.origin)
+  refreshTranslateStatus()
+})
+
+document.getElementById('tr-test-btn')?.addEventListener('click', async function () {
+  trSetErr('正在测试连接…')
+  const resp = await sendTranslate({ action: 'testConnection' })
+  if (resp && resp.ok) {
+    trSetErr('')
+    showToast('连接正常，模型回复：' + String(resp.text || '').replace(/\s+/g, ' ').slice(0, 20))
+  } else {
+    trSetErr(trErrorText(resp, '连接测试失败'))
+  }
+})
+
+document.getElementById('tr-api-cfg-btn')?.addEventListener('click', async function () {
+  closeToolbox()
+  const cfg = await fetchApiConfig()
+  showApiConfigModal(cfg, false)
+})
+
+// 把本页已记录的译文贴回页面：按记录里的页面坐标还原气泡，滚回原处即可看到
+document.getElementById('tr-restore-btn')?.addEventListener('click', async function () {
+  trSetErr('')
+  const resp = await sendTranslate({ action: 'restoreTranslations' })
+  if (resp && resp.ok) {
+    showToast('已贴回 ' + (resp.shown || 0) + ' 条译文')
+    closeToolbox()
+    return
+  }
+  trSetErr(trErrorText(resp, '贴回失败'))
+})
+
+// 清除本页记录，并顺手关掉页面上还开着的译文气泡
+document.getElementById('tr-clear-btn')?.addEventListener('click', async function () {
+  trSetErr('')
+  const resp = await sendTranslate({ action: 'clearTranslations' })
+  if (resp && resp.ok) {
+    showToast('已清除本页 ' + (resp.removed || 0) + ' 条记录')
+    refreshTranslateStatus()
+    return
+  }
+  trSetErr(trErrorText(resp, '清除失败'))
+})

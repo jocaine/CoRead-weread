@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "CoRead - AI共读",
-  "version": "0.1.0",
-  "description": "微信读书私密标注 + 正文足迹捕获，配合 CoRead 共读 agent 使用",
-  "permissions": ["storage", "sidePanel", "tabs", "unlimitedStorage"],
+  "version": "0.3.0",
+  "description": "微信读书私密标注 + 正文足迹捕获 + 框选/划词翻译 + 自建 PDF 阅读器，配合 CoRead 共读 agent 使用",
+  "minimum_chrome_version": "102",
+  "permissions": ["storage", "sidePanel", "tabs", "unlimitedStorage", "activeTab", "scripting"],
   "side_panel": {
     "default_path": "sidebar.html"
   },
@@ -14,6 +15,7 @@
     "https://www.bilibili.com/*",
     "http://127.0.0.1:7239/*"
   ],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": {
     "service_worker": "service_worker.js",
     "type": "module"
@@ -42,5 +44,21 @@
   "action": {
     "default_popup": "popup.html",
     "default_title": "CoRead"
-  }
+  },
+  "commands": {
+    "translate-region": {
+      "suggested_key": { "default": "Alt+S" },
+      "description": "截图翻译（框选屏幕区域）"
+    },
+    "translate-selection": {
+      "suggested_key": { "default": "Alt+T" },
+      "description": "翻译选中文字"
+    }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["translate-overlay.css"],
+      "matches": ["<all_urls>"]
+    }
+  ]
 }

@@ -23,6 +23,15 @@
     /* 深色面（引用 tooltip）用亮色细滚动条，避免黑底黑条不可见 */
     #jump-tip::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.22); }
     #jump-tip::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.36); }
+    /* 双向文本（bidi）加固（2026-10）：所有文本输入控件的基础方向钉死 LTR（理由见 #input）。
+       textarea / input 未声明方向时，浏览器会按内容自动判定段落方向（UA 的
+       unicode-bidi: plaintext），一旦判成 RTL，全角引号 “ ” 会被镜像成 ” “——
+       用户看到的就是「双引号顺序反了」。这里配合各控件的 dir="ltr" 一起，方向由声明决定。 */
+    input[type="text"], input:not([type]), textarea {
+      direction: ltr;
+      unicode-bidi: isolate;
+      text-align: left;
+    }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue', sans-serif;
       font-size: 14px;
@@ -99,7 +108,9 @@
     .mm-item:hover { background: #f2f7f5; }
     .mm-item[hidden] { display: none; }
     .mm-name { font-weight: 600; color: #07c160; white-space: nowrap; font-size: 12px; }
-    .mm-desc { font-size: 11px; color: #999; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .mm-desc { font-size: 11px; color: #999; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+    /* 模型 API 配置菜单项：状态文案（未配置=灰，已配置=绿），见 sidebar.js renderApiStatus */
+    .mm-desc.ok { color: #07c160; }
     /* 字号调节按钮（AI-002） */
     .fs-btn {
       flex: 0 0 auto;
@@ -268,6 +279,287 @@
     #free-refs .fr-item.fr-locked .fr-idx { font-size: 9px; color: #c9a06a; }
     #free-refs .fr-item.fr-locked .fr-point { color: #8d8d8d; }
     #free-refs .fr-item.fr-locked:hover { background: #f7f7f7; }
+
+    /* ── 自由模式多对话（2026-11）────────────────────────────────
+       对话条：切到自由模式的**那一刻**就固定在消息区上方（与「本次引用」窗体同族样式）
+       ——「＋ 新对话」是进入自由模式后第一眼要看到的动作，所以给它实心绿（其余按钮描边灰）。
+       读书模式下整条隐藏（renderFreeConvBar 置 hidden），靠本段末尾那条 [hidden] 生效。
+       对话列表 / 归档弹窗：z-index 1400（盖住书籍选择 1100、删除确认 1200、
+       API 配置 1300，低于会意图拓扑图 1500）。 */
+    #free-conv-bar {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;   /* 窄侧栏 + 长对话名时按钮换行，不挤成一条缝 */
+      gap: 6px;
+      padding: 6px 10px;
+      background: #fff;
+      border-bottom: 1px solid #ececec;
+      flex-shrink: 0;
+      font-size: 12px;
+    }
+    #free-conv-bar .fc-cur {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid #e4e4e4;
+      background: #fafafa;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 12px;
+      font-family: inherit;
+      color: #333;
+      cursor: pointer;
+      text-align: left;
+    }
+    #free-conv-bar .fc-cur:hover { border-color: #07c160; background: #f6fdf8; }
+    #free-conv-bar .fc-dot {
+      flex: 0 0 auto;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #07c160;
+    }
+    #free-conv-bar .fc-title {
+      flex: 1;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 600;
+    }
+    /* 对话总数徽标：一眼看出"自由模式里可以有很多场对话" */
+    #free-conv-bar .fc-count {
+      flex: 0 0 auto;
+      font-size: 10px;
+      color: #07c160;
+      background: #f0faf3;
+      border: 1px solid #cfeadd;
+      border-radius: 8px;
+      padding: 0 5px;
+      line-height: 15px;
+      font-variant-numeric: tabular-nums;
+    }
+    #free-conv-bar .fc-caret { flex: 0 0 auto; color: #aaa; font-size: 10px; }
+    #free-conv-bar .fc-btn {
+      flex: 0 0 auto;
+      border: 1px solid #ddd;
+      background: #fff;
+      color: #555;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #free-conv-bar .fc-btn:hover { border-color: #07c160; color: #07c160; background: #f6fdf8; }
+    /* 新建对话：进入自由模式后的主要动作，实心绿，与「切换/归档」拉开层级 */
+    #free-conv-bar .fc-btn.fc-new {
+      border-color: #07c160;
+      background: #07c160;
+      color: #fff;
+      font-weight: 600;
+    }
+    #free-conv-bar .fc-btn.fc-new:hover { border-color: #06ad56; background: #06ad56; color: #fff; }
+    #free-conv-bar .fc-btn.fc-archive:hover { border-color: #e6a23c; color: #d98613; background: #fffaf0; }
+    /* 空对话提示行（占满整行，比按钮低一级） */
+    #free-conv-bar .fc-hint {
+      flex: 1 0 100%;
+      font-size: 11px;
+      color: #9a9a9a;
+      line-height: 1.6;
+      padding: 0 1px;
+    }
+    /* 对话条给的是 display:flex —— 按本文件既有约定（见 .gv-* 那段 AI-021 注释），
+       必须再补一条 [hidden] 强制规则，否则 hidden 属性被 display 覆盖，
+       **读书模式下这条自由模式的对话条也会一直挂在消息区上方**（2026-11 用户反馈）。
+       徽标（inline-block）与提示行同理：它们是 span，靠 [hidden] 生效更稳妥。
+       对话列表/归档/重命名弹窗不在此列——它们用 .on 类切换 display，不走 hidden。 */
+    #free-conv-bar[hidden],
+    #free-conv-bar .fc-count[hidden],
+    #free-conv-bar .fc-hint[hidden] { display: none !important; }
+
+    #free-conv-overlay,
+    #free-archive-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.35);
+      z-index: 1400;
+      align-items: center;
+      justify-content: center;
+    }
+    #free-conv-overlay.on,
+    #free-archive-overlay.on { display: flex; }
+    #free-archive-overlay { z-index: 1450; }
+    .fcv-panel {
+      width: min(360px, 90%);
+      max-height: 78%;
+      background: #fff;
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+    }
+    .fcv-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-bottom: 1px solid #ececec;
+      flex-shrink: 0;
+    }
+    .fcv-title { flex: 1; font-size: 14px; font-weight: 600; color: #333; }
+    .fcv-close { border: none; background: none; font-size: 15px; cursor: pointer; color: #aaa; padding: 0 4px; }
+    .fcv-close:hover { color: #333; }
+    .fcv-hint {
+      padding: 8px 14px 2px;
+      font-size: 11px;
+      color: #999;
+      line-height: 1.6;
+      flex-shrink: 0;
+    }
+    .fcv-list { flex: 1; overflow-y: auto; padding: 8px 12px; min-height: 50px; }
+    .fcv-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border: 1px solid #eee;
+      border-radius: 8px;
+      margin-bottom: 6px;
+      cursor: pointer;
+    }
+    .fcv-item:hover { border-color: #07c160; background: #fafffb; }
+    .fcv-item.cur { border-color: #07c160; background: #f2fbf6; }
+    .fcv-item .fci-main { flex: 1; min-width: 0; }
+    .fcv-item .fci-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #222;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .fcv-item .fci-meta { font-size: 11px; color: #999; margin-top: 3px; }
+    .fcv-item .fci-badge {
+      flex: 0 0 auto;
+      font-size: 10px;
+      color: #07c160;
+      border: 1px solid #bfe3cc;
+      background: #f0faf3;
+      border-radius: 4px;
+      padding: 1px 5px;
+    }
+    .fcv-item .fci-act {
+      flex: 0 0 auto;
+      width: 24px;
+      height: 24px;
+      border: none;
+      background: none;
+      cursor: pointer;
+      color: #bbb;
+      border-radius: 5px;
+      padding: 0;
+      font-size: 13px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .fcv-item .fci-act:hover { color: #d98613; background: #fff8ec; }
+    .fcv-item .fci-act.fci-del:hover { color: #e74c3c; background: #fdf0ee; }
+    .fcv-msg { text-align: center; color: #bbb; font-size: 12px; padding: 22px 10px; }
+    .fcv-arch {
+      flex-shrink: 0;
+      border-top: 1px dashed #ececec;
+      padding: 6px 12px 2px;
+      max-height: 34%;
+      overflow-y: auto;
+    }
+    .fcv-arch-title { font-size: 11px; font-weight: 600; color: #b9b9b9; padding: 2px 0 4px; }
+    .fcv-arch-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 8px;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #888;
+    }
+    .fcv-arch-item:hover { background: #f7f7f7; }
+    .fcv-arch-item .fca-main { flex: 1; min-width: 0; }
+    .fcv-arch-item .fca-title {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #666;
+    }
+    .fcv-arch-item .fca-meta { font-size: 10.5px; color: #bbb; margin-top: 2px; }
+    .fcv-new {
+      flex-shrink: 0;
+      margin: 8px 12px 12px;
+      border: 1px dashed #bfe3cc;
+      background: #f6fdf8;
+      color: #07c160;
+      border-radius: 8px;
+      padding: 8px;
+      font-size: 12px;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    .fcv-new:hover { border-color: #07c160; background: #ecfaf1; }
+
+    .fa-box {
+      width: min(350px, 90%);
+      background: #fff;
+      border-radius: 12px;
+      padding: 14px 16px 12px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+    }
+    .fa-title { font-size: 14px; font-weight: 600; color: #333; }
+    .fa-conv {
+      margin-top: 4px;
+      font-size: 12px;
+      color: #07c160;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .fa-desc { margin: 8px 0 10px; font-size: 11.5px; color: #888; line-height: 1.7; }
+    .fa-desc strong { color: #e6a23c; font-weight: 600; }
+    .fa-opt {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 9px 10px;
+      border: 1px solid #eee;
+      border-radius: 8px;
+      margin-bottom: 8px;
+      cursor: pointer;
+    }
+    .fa-opt:hover { border-color: #bfe3cc; background: #fafffb; }
+    .fa-opt input { margin: 2px 0 0; flex: 0 0 auto; accent-color: #07c160; }
+    .fa-opt .fa-opt-main { flex: 1; min-width: 0; }
+    .fa-opt .fa-opt-name { display: block; font-size: 12.5px; font-weight: 600; color: #333; }
+    .fa-opt .fa-opt-desc { display: block; font-size: 11px; color: #999; line-height: 1.6; margin-top: 2px; }
+    .fa-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+    .fa-btn {
+      border: 1px solid #ddd;
+      background: #fff;
+      color: #555;
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-size: 12px;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    .fa-btn:hover { border-color: #bbb; }
+    .fa-btn.fa-ok { border-color: #e6a23c; background: #fff8ec; color: #d98613; font-weight: 600; }
+    .fa-btn.fa-ok:hover { background: #fdf0ee; border-color: #e74c3c; color: #e74c3c; }
+    .fa-btn:disabled { opacity: 0.5; cursor: default; }
     #ref-current .rc-head {
       display: flex;
       align-items: center;
@@ -657,6 +949,13 @@
       font-family: inherit;
       color: #333;
       background: #fafafa;
+      /* 双向文本（bidi）加固（2026-10）：基础方向钉死 LTR。textarea 未声明方向时
+         浏览器会按内容自动判定段落方向（UA 的 unicode-bidi: plaintext），一旦判定成
+         RTL，全角引号 “ ” 会被镜像成 ” “——看起来就是「双引号顺序反了」。配合 HTML 上的
+         dir="ltr"，方向由声明决定，不再随内容漂移。 */
+      direction: ltr;
+      unicode-bidi: isolate;
+      text-align: left;
     }
     #send-btn {
       background: #07c160;
@@ -769,6 +1068,87 @@
       word-break: break-word;
       color: #222;
     }
+    /* ── Markdown 渲染（2026-10）───────────────────────────────────────────
+       AI 回复按 markdown 渲染（sidebar.js mdToHtml），标签全部由本插件生成、内容已转义。
+       气泡默认是 white-space:pre-wrap 的纯文本排版，md 气泡改回 normal，换行交给 <p>/<br>，
+       否则生成 HTML 里的换行会被当成空白多顶出行高。 */
+    .msg-assistant .bubble.md { white-space: normal; }
+    .bubble.md > :first-child { margin-top: 0; }
+    .bubble.md > :last-child { margin-bottom: 0; }
+    .bubble.md p { margin: 0 0 0.55em; }
+    .bubble.md h3, .bubble.md h4, .bubble.md h5, .bubble.md h6 {
+      margin: 0.75em 0 0.35em;
+      font-size: 1em;
+      font-weight: 700;
+      line-height: 1.45;
+      color: #111;
+    }
+    .bubble.md h3 { font-size: 1.06em; }
+    .bubble.md ul, .bubble.md ol { margin: 0 0 0.55em; padding-left: 1.35em; }
+    .bubble.md li { margin: 0.1em 0; }
+    .bubble.md li.md-sub { margin-left: 12px; list-style-type: circle; color: #444; }
+    .bubble.md blockquote {
+      margin: 0 0 0.55em;
+      padding: 2px 0 2px 9px;
+      border-left: 3px solid #cfe9db;
+      background: #fafdfb;
+      border-radius: 0 4px 4px 0;
+      color: #555;
+    }
+    .bubble.md code.md-code {
+      background: #f2f3f5;
+      border-radius: 4px;
+      padding: 0.08em 0.34em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+      color: #c7254e;
+      word-break: break-word;
+    }
+    .bubble.md pre.md-pre {
+      background: #f7f8fa;
+      border: 1px solid #ececec;
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin: 0 0 0.55em;
+      overflow-x: auto;
+      white-space: pre;
+    }
+    .bubble.md pre.md-pre code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+      color: #333;
+      background: none;
+      padding: 0;
+    }
+    .bubble.md hr.md-hr { border: none; border-top: 1px solid #eee; margin: 0.7em 0; }
+    /* 表格：气泡窄，横向可滚，不撑破面板 */
+    .bubble.md table.md-table {
+      border-collapse: collapse;
+      margin: 0 0 0.55em;
+      font-size: 0.95em;
+      display: block;
+      max-width: 100%;
+      overflow-x: auto;
+    }
+    .bubble.md table.md-table th, .bubble.md table.md-table td {
+      border: 1px solid #e6e6e6;
+      padding: 3px 7px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .bubble.md table.md-table th { background: #f6f8f7; font-weight: 600; }
+    .bubble.md .md-c { text-align: center; }
+    .bubble.md .md-r { text-align: right; }
+    .bubble.md a {
+      color: #07c160;
+      text-decoration: none;
+      border-bottom: 1px solid rgba(7, 193, 96, 0.35);
+      word-break: break-all;
+    }
+    .bubble.md a:hover { border-bottom-color: #07c160; }
+    .bubble.md strong { font-weight: 700; color: #111; }
+    .bubble.md del { color: #999; }
+
     .msg-thinking { display: flex; justify-content: flex-start; }
     .msg-thinking .bubble {
       background: #fff;
@@ -991,6 +1371,36 @@
     .confirm-cancel:hover { background: #e5e5e5; }
     .confirm-ok { background: #e74c3c; color: #fff; }
     .confirm-ok:hover { background: #d43c2f; }
+
+    /* ── 输入弹窗（2026-11：自由对话重命名）──────────────────
+       结构复用 .confirm-* 那套盒子；只有输入框与确定按钮是新的
+       （确定按钮走绿色，与「删除」的红色区分开）。 */
+    #prompt-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, .35);
+      z-index: 1460;  /* 高于自由对话列表(1400)/归档弹窗(1450)，低于会意图拓扑图(1500) */
+      align-items: center;
+      justify-content: center;
+    }
+    #prompt-overlay.on { display: flex; }
+    #prompt-input {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 13px;
+      font-family: inherit;
+      outline: none;
+      background: #fafafa;
+      color: #333;
+      margin-bottom: 12px;
+    }
+    #prompt-input:focus { border-color: #07c160; background: #fff; }
+    #prompt-ok-btn { background: #07c160; color: #fff; }
+    #prompt-ok-btn:hover { background: #06ad56; }
 
     /* ── 会意图拓扑视图（AI-020）────────────────────────── */
     /* Obsidian 式话题拓扑图：全面板遮罩，由 graph-view.js 构建 DOM。
@@ -1679,6 +2089,259 @@
     .bp-msg { text-align: center; color: #bbb; font-size: 12px; padding: 22px 10px; }
     .bp-msg.bp-err { color: #e74c3c; }
 
+    /* ── 模型 API 配置弹窗（2026-10）──────────────────────────────
+       入口在头部「⋯」菜单（#mm-api-config）；首次使用 / 当前未配置时打开插件自动弹出
+       （sidebar.js checkApiConfigOnOpen）。三个输入框都是普通 edit，直接改；
+       保存走后端 POST /api-config → agent/api-config.json，保存即生效、无需重启。
+       z-index 1300：盖住书籍选择弹窗(1100) 与删除确认(1200)，但低于会意图拓扑图(1500)。 */
+    #api-config {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.35);
+      z-index: 1300;
+      align-items: center;
+      justify-content: center;
+    }
+    #api-config.on { display: flex; }
+    .api-panel {
+      width: min(360px, 88%);
+      max-height: 88%;
+      overflow-y: auto;
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+    }
+    .api-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-bottom: 1px solid #ececec;
+    }
+    .api-title { flex: 1; font-size: 14px; font-weight: 600; color: #333; }
+    .api-close { border: none; background: none; font-size: 15px; cursor: pointer; color: #aaa; padding: 0 4px; }
+    .api-close:hover { color: #333; }
+    .api-body { padding: 12px 14px 0; }
+    .api-hint { font-size: 11px; color: #999; line-height: 1.65; margin-bottom: 10px; }
+    /* 首次使用提示（未配置自动弹出时显示）：琥珀色，与红色错误行区分 */
+    .api-first {
+      font-size: 11px;
+      color: #b8860b;
+      background: #fffaf0;
+      border: 1px solid #f5e3bd;
+      border-radius: 6px;
+      padding: 6px 8px;
+      line-height: 1.6;
+      margin-bottom: 10px;
+    }
+    .api-first[hidden] { display: none; }
+    /* 当前配置来自 .env 时的说明行：保存后以插件配置为准 */
+    .api-src { font-size: 11px; color: #999; line-height: 1.6; margin: -4px 0 10px; }
+    .api-src[hidden] { display: none; }
+    .api-field { margin-bottom: 10px; }
+    .api-label { display: block; font-size: 12px; color: #555; margin-bottom: 4px; }
+    .api-input {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 12px;
+      outline: none;
+      font-family: inherit;
+      background: #fafafa;
+      color: #333;
+    }
+    .api-input:focus { border-color: #07c160; background: #fff; }
+    .api-err { font-size: 11px; color: #e74c3c; line-height: 1.6; min-height: 15px; margin-bottom: 6px; }
+    .api-actions { display: flex; gap: 8px; padding: 0 14px 14px; }
+    .api-actions button {
+      flex: 1;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 0;
+      font-size: 13px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .api-cancel { background: #f0f0f0; color: #555; }
+    .api-cancel:hover { background: #e5e5e5; }
+    .api-save { background: #07c160; color: #fff; }
+    .api-save:hover { background: #06ad56; }
+    .api-save:disabled { background: #9fd9bb; cursor: default; }
+
+    /* 工具箱（入口：头部「⋯」菜单）：外壳复用 .api-* 的样式，里面按 tab 分页 */
+    #toolbox {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.35);
+      z-index: 1300;
+      align-items: center;
+      justify-content: center;
+    }
+    #toolbox.on { display: flex; }
+    .tb-panel { width: min(380px, 92%); }
+
+    /* 译文对照（入口：「⋯」菜单 / 阅读器里翻译时自动弹出）
+       挂在这里而不是阅读器页面里 —— 一边开着侧栏一边再来一栏就是两栏并排。
+       显示成侧栏里的一整栏（铺满、白底、带返回），不是浮在中间的弹窗。 */
+    #reader-notes {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: #fff;
+      z-index: 1200;
+      flex-direction: column;
+    }
+    #reader-notes.on { display: flex; }
+    #rn-body { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+    .tb-tabs {
+      display: flex;
+      gap: 4px;
+      padding: 0 10px;
+      border-bottom: 1px solid #ececec;
+      flex-shrink: 0;
+    }
+    .tb-tab {
+      border: none;
+      background: none;
+      padding: 8px 10px;
+      margin-bottom: -1px;
+      font-size: 12.5px;
+      font-family: inherit;
+      color: #777;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+    }
+    .tb-tab:hover { color: #333; }
+    .tb-tab.on { color: #07c160; border-bottom-color: #07c160; font-weight: 600; }
+    .tb-body { padding: 12px 14px 14px; }
+    .tb-page[hidden] { display: none; }
+    .tr-act {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #07c160;
+      background: #f2fbf6;
+      color: #07883f;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      font-family: inherit;
+      cursor: pointer;
+      margin-bottom: 8px;
+    }
+    .tr-act:hover { background: #e7f7ee; }
+    .tr-key { font-size: 11px; color: #7aa892; }
+    .tr-sep { height: 1px; background: #ececec; margin: 12px 0 10px; }
+    .tr-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      margin-bottom: 10px;
+    }
+    .tr-label { color: #555; flex-shrink: 0; }
+    .tr-val {
+      color: #333;
+      font-size: 11px;
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 62%;
+    }
+    .tr-warn {
+      font-size: 11px;
+      color: #b8860b;
+      background: #fffaf0;
+      border: 1px solid #f5e3bd;
+      border-radius: 6px;
+      padding: 8px;
+      line-height: 1.6;
+      margin-bottom: 10px;
+      word-break: break-all;
+    }
+    .tr-warn[hidden] { display: none; }
+    .tr-grant {
+      display: block;
+      width: 100%;
+      margin-top: 6px;
+      border: none;
+      border-radius: 6px;
+      background: #b8860b;
+      color: #fff;
+      padding: 6px 0;
+      font-size: 12px;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    .tr-grant:hover { background: #a1750a; }
+    .tr-actions { display: flex; gap: 8px; margin-bottom: 4px; }
+    .tr-actions button {
+      flex: 1;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 0;
+      font-size: 12px;
+      font-family: inherit;
+      background: #f0f0f0;
+      color: #555;
+      cursor: pointer;
+    }
+    .tr-actions button:hover { background: #e5e5e5; }
+    .tr-actions button:disabled { opacity: 0.6; cursor: default; }
+    /* 启用开关那一行 */
+    .tr-enable-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .tr-enable-label { font-size: 12.5px; font-weight: 600; color: #333; }
+    /* 「改快捷键」这类文字入口 */
+    .tr-links { display: flex; justify-content: flex-end; margin-top: -2px; }
+    .tr-link {
+      border: none;
+      background: none;
+      padding: 0;
+      font-size: 11.5px;
+      font-family: inherit;
+      color: #07c160;
+      text-decoration: underline;
+      cursor: pointer;
+    }
+    .tr-link:hover { color: #069a4b; }
+    .tr-link:disabled { color: #c0c0c0; text-decoration: none; cursor: default; }
+    .tr-record { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+    /* 最近一次翻译的诊断：锚点拿到没有、文字落在哪个 frame。鼠标悬停看完整 JSON */
+    .tr-diag {
+      margin-top: 6px;
+      font-size: 11px;
+      line-height: 1.6;
+      color: #8a8f96;
+      word-break: break-all;
+    }
+    .tr-diag[hidden] { display: none; }
+    .tr-act:disabled {
+      border-color: #e2e2e2;
+      background: #f7f7f7;
+      color: #b0b0b0;
+      cursor: default;
+    }
+    .tr-act:disabled .tr-key { color: #c8c8c8; }
+    /* 自定义模型配置（可选覆盖） */
+    .tr-adv { margin: 2px 0 10px; padding-top: 8px; border-top: 1px dashed #ececec; }
+    .tr-adv > summary { font-size: 11.5px; color: #6b7075; cursor: pointer; outline: none; }
+    .tr-adv[open] > summary { margin-bottom: 8px; }
+    .tr-adv-hint { font-size: 11px; color: #999; line-height: 1.6; }
+    .tr-adv .api-field:last-of-type { margin-bottom: 6px; }
+
     /* 无书状态下禁用聊天输入（renderNoBookView） */
     #input:disabled { background: #f2f2f2; color: #bbb; }
     #send-btn:disabled { background: #a9e6c5; cursor: default; }
@@ -1706,6 +2369,18 @@
         <button class="fs-btn" id="fs-down" title="减小字号">Ａ−</button>
         <button class="fs-btn" id="fs-up" title="增大字号">Ａ＋</button>
       </div>
+      <div class="mm-item" id="mm-api-config" title="配置大模型 API（地址 / Key / 模型），保存后立即生效">
+        <span class="mm-name">🔑 模型 API 配置</span>
+        <span class="mm-desc" id="mm-api-desc">读取中…</span>
+      </div>
+      <div class="mm-item" id="mm-toolbox" title="工具箱：翻译等辅助工具">
+        <span class="mm-name">🧰 工具箱</span>
+        <span class="mm-desc">截图翻译 · 划词翻译</span>
+      </div>
+      <div class="mm-item" id="mm-notes" title="阅读器里翻过的译文（PDF 对照阅读）">
+        <span class="mm-name">📖 译文对照</span>
+        <span class="mm-desc">PDF 阅读器翻过的段落</span>
+      </div>
       <div class="mm-item" id="mm-pick-book" title="查看已读完书籍的讨论记录（不需要在微信读书中打开）">
         <span class="mm-name">📚 从已读书籍中选择</span>
         <span class="mm-desc">手动查看某本书的讨论记录</span>
@@ -1723,7 +2398,7 @@
       <div class="drawer-head">
         <span class="drawer-title" id="drawer-title">全部引用</span>
         <button class="drawer-close" id="drawer-close-btn">✕</button>
-        <input type="text" id="drawer-search" placeholder="搜索引用…">
+        <input type="text" id="drawer-search" dir="ltr" placeholder="搜索引用…">
       </div>
       <div class="drawer-list" id="drawer-list"></div>
     </div>
@@ -1762,6 +2437,22 @@
     <span class="mb-hint">未在微信读书中打开</span>
     <button class="mb-btn" id="mb-switch-btn" title="切换另一本书">切换书籍</button>
     <button class="mb-btn mb-exit" id="mb-exit-btn" title="恢复跟随微信读书当前阅读">退出手动</button>
+  </div>
+
+  <!-- 自由对话条（2026-11）：切到「自由」模式的**那一刻**就出现在消息区上方——当前对话
+       （点击开对话列表）、新建对话、归档当前对话全在这里，不用先点进二级入口。
+       多对话隔离：每个对话一个独立上下文（消息/cites/讨论栈/会话历史各自独立），
+       归档时可选择保存记忆与走正常收口程序进拓扑图（两项默认都勾上，可取消）。 -->
+  <div id="free-conv-bar" hidden>
+    <button class="fc-cur" id="fc-cur" title="切换 / 新建自由对话">
+      <span class="fc-dot"></span>
+      <span class="fc-title" id="fc-title">新对话</span>
+      <span class="fc-count" id="fc-count" hidden></span>
+      <span class="fc-caret">▾</span>
+    </button>
+    <button class="fc-btn fc-new" id="fc-new" title="新建对话：开启一个独立的自由讨论上下文（与当前这场互不影响）">＋ 新对话</button>
+    <button class="fc-btn fc-archive" id="fc-archive" title="归档这场对话：选择要不要保存记忆 / 走正常收口程序进拓扑图，归档后对话与消息一并删除">⤓ 归档</button>
+    <div class="fc-hint" id="fc-hint" hidden></div>
   </div>
 
   <div id="msgs"></div>
@@ -1808,15 +2499,83 @@
   <div id="footer">
     <!-- 斜杠命令菜单（2026-09）：输入 / 弹出可用操作，点击即执行 -->
     <div id="cmd-menu" class="cmd-menu" hidden>
-      <div class="cmd-item" data-cmd="/收口" title="收口本书讨论（读完时手动使用）">
+      <div class="cmd-item" data-cmd="/收口" data-when="reading" title="收口本书讨论（读完时手动使用）">
         <span class="cmd-name">/收口</span>
         <span class="cmd-desc">收口本书讨论（读完时手动使用）</span>
+      </div>
+      <div class="cmd-item" data-cmd="/归档" data-when="free" title="归档当前自由对话：可选保存记忆 / 走正常收口程序进拓扑图" hidden>
+        <span class="cmd-name">/归档</span>
+        <span class="cmd-desc">归档当前自由对话（保存记忆 / 收口进拓扑图）</span>
       </div>
     </div>
     <button id="attach-btn" title="上传文本附件（.md / .txt）：读取进本次讨论，不保存原文件">📎</button>
     <input type="file" id="file-input" accept=".md,.markdown,.txt,.text" hidden>
-    <textarea id="input" placeholder="说点什么…" rows="1"></textarea>
+    <textarea id="input" dir="ltr" placeholder="说点什么…" rows="1"></textarea>
     <button id="send-btn">发送</button>
+  </div>
+
+  <!-- 自由对话列表（2026-11）：活动对话（打开 / 归档 / 删除）+ 已归档（产物去向墓碑记录，
+       可彻底删除）。点对话条或「＋ 新对话」时打开 -->
+  <div id="free-conv-overlay">
+    <div class="fcv-panel">
+      <div class="fcv-head">
+        <span class="fcv-title">自由对话</span>
+        <button class="fcv-close" id="fcv-close-btn" title="关闭">✕</button>
+      </div>
+      <div class="fcv-hint">每个对话是独立的讨论上下文（消息、引用、讨论栈互不影响）；归档时选择要不要把这场对话保存进长期记忆 / 走正常收口程序进拓扑图。</div>
+      <div class="fcv-list" id="fcv-list"></div>
+      <div class="fcv-msg" id="fcv-empty" hidden>还没有自由对话</div>
+      <div class="fcv-arch" id="fcv-arch-wrap" hidden>
+        <div class="fcv-arch-title">已归档</div>
+        <div class="fcv-arch-list" id="fcv-arch-list"></div>
+      </div>
+      <button class="fcv-new" id="fcv-new-btn">＋ 新建对话</button>
+    </div>
+  </div>
+
+  <!-- 归档确认弹窗（2026-11）：归档 = 这场对话结束并删除。两个勾选项各自决定"要不要留下
+       这类产物"——**默认都勾上**（归档默认就把这场对话完整走一遍正常程序），可以取消
+       （取消只对这一次生效；下次打开沿用上次的选择，见 sidebar.js loadArchivePref）。
+       勾上 = 按读书模式那套正常程序走完整链路，不是"压成一个节点"。 -->
+  <div id="free-archive-overlay">
+    <div class="fa-box">
+      <div class="fa-title">归档自由对话</div>
+      <div class="fa-conv" id="fa-conv"></div>
+      <div class="fa-desc">
+        归档后这场对话与它的消息会<strong>一并删除</strong>（不可恢复）。下面两项<strong>默认都勾上</strong>——不需要留痕时取消勾选即可：
+      </div>
+      <label class="fa-opt" for="fa-memory">
+        <input type="checkbox" id="fa-memory">
+        <span class="fa-opt-main">
+          <span class="fa-opt-name">保存记忆</span>
+          <span class="fa-opt-desc">把这场对话里属于你的情况、偏好、观念合并进长期记忆（profile / soul），以后每次共读都会带上</span>
+        </span>
+      </label>
+      <label class="fa-opt" for="fa-graph">
+        <input type="checkbox" id="fa-graph">
+        <span class="fa-opt-main">
+          <span class="fa-opt-name">收口进拓扑图</span>
+          <span class="fa-opt-desc">走读书模式的正常收口程序：判专题化 / 判同一性分段 → 逐段归纳问题、派生知识点节点 → 建引用边与段间衍生边，写进正式会意图，之后可被引用解析命中</span>
+        </span>
+      </label>
+      <div class="fa-actions">
+        <button class="fa-btn" id="fa-cancel">取消</button>
+        <button class="fa-btn fa-ok" id="fa-ok">归档并删除</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 输入弹窗（2026-11：自由对话重命名）。与删除确认同款结构，扩展页不能用原生 prompt() -->
+  <div id="prompt-overlay">
+    <div class="confirm-box">
+      <div class="confirm-title" id="prompt-title">重命名</div>
+      <div class="confirm-msg" id="prompt-msg" hidden></div>
+      <input type="text" id="prompt-input" dir="ltr" maxlength="40" placeholder="输入名称…">
+      <div class="confirm-actions">
+        <button class="confirm-btn" id="prompt-cancel-btn">取消</button>
+        <button class="confirm-btn confirm-ok" id="prompt-ok-btn">确定</button>
+      </div>
+    </div>
   </div>
 
   <!-- 已读书籍选择弹窗（2026-10）：列出 receiver /books 返回的已读书籍，点击手动
@@ -1827,10 +2586,144 @@
         <span class="bp-title">已读过的书籍</span>
         <button class="bp-close" id="bp-close-btn" title="关闭">✕</button>
       </div>
-      <input type="text" id="bp-search" placeholder="搜索书名…">
+      <input type="text" id="bp-search" dir="ltr" placeholder="搜索书名…">
       <div class="bp-list" id="bp-list"></div>
       <div class="bp-msg" id="bp-empty" hidden>还没有已读书籍记录</div>
     </div>
+  </div>
+
+  <!-- 模型 API 配置弹窗（2026-10）：入口 = 头部「⋯」菜单的「🔑 模型 API 配置」；
+       当前未配置 API 时打开插件自动弹出（sidebar.js checkApiConfigOnOpen）。
+       三项都是普通输入框（地址 / Key / 模型），保存 → POST /api-config → agent 立即生效 -->
+  <div id="api-config">
+    <div class="api-panel">
+      <div class="api-head">
+        <span class="api-title">模型 API 配置</span>
+        <button class="api-close" id="api-close-btn" title="关闭">✕</button>
+      </div>
+      <div class="api-body">
+        <div class="api-hint">支持任何 OpenAI 兼容协议的服务商（DeepSeek / OpenAI / Kimi / Ollama…）。<br>配置写在本机，保存后立即生效，不需要重启。</div>
+        <div class="api-first" id="api-first" hidden>还没有配置模型 API，填好下面三项才能开始共读讨论。</div>
+        <div class="api-src" id="api-src" hidden>当前配置来自 agent/.env；在这里保存后以插件配置为准。</div>
+        <div class="api-field">
+          <label class="api-label" for="api-base">API 地址</label>
+          <input type="text" class="api-input" id="api-base" dir="ltr" placeholder="https://api.deepseek.com/v1" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="api-field">
+          <label class="api-label" for="api-key">API Key</label>
+          <input type="text" class="api-input" id="api-key" dir="ltr" placeholder="sk-…" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="api-field">
+          <label class="api-label" for="api-model">模型</label>
+          <input type="text" class="api-input" id="api-model" dir="ltr" placeholder="deepseek-chat" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="api-err" id="api-err"></div>
+      </div>
+      <div class="api-actions">
+        <button class="api-cancel" id="api-cancel-btn">取消</button>
+        <button class="api-save" id="api-save-btn">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 工具箱（入口：头部「⋯」菜单）：按 tab 分页，当前只有「翻译」一页。
+       加新工具 = 在 #tb-tabs 里加一个 data-tab 按钮 + 在 .tb-body 里加一个同名的 .tb-page，
+       切换逻辑在 sidebar.js 里是通用的，不用改代码。
+       模型配置默认沿用「⋯ → 🔑 模型 API 配置」，翻译页只提供三个可选的按字段覆盖项。 -->
+  <div id="toolbox">
+    <div class="api-panel tb-panel">
+      <div class="api-head">
+        <span class="api-title">工具箱</span>
+        <button class="api-close" id="tb-close-btn" title="关闭">✕</button>
+      </div>
+      <div class="tb-tabs" id="tb-tabs">
+        <button class="tb-tab on" data-tab="translate">翻译</button>
+        <button class="tb-tab" data-tab="reader">阅读器</button>
+      </div>
+      <div class="tb-body">
+        <div class="tb-page" data-page="reader">
+          <div class="api-hint">
+            在 CoRead 自己的阅读器里读 PDF。正文是真实的文字，所以<b>划选一段按 Alt+T 就能翻译</b>，
+            译文出现在右侧对照栏，同时标回原文。
+          </div>
+          <button class="tr-act" id="rd-open-btn">打开阅读器</button>
+          <div class="tr-sep"></div>
+          <div class="api-hint">
+            改窗口大小、缩放、关掉浏览器再打开，译文都贴在原来那段文字上，不会跑位。
+            书页进度与译文按文件内容自动保存，同一份 PDF 再次打开会回到原处。
+          </div>
+          <div class="api-hint">
+            文字版 PDF 划选就能翻译。<b>扫描件</b>（整页是图片、没有文字层）用工具栏的
+            <b>「框选翻译」</b>：在页面上拖一个框，框里的内容交给模型读图翻译。
+          </div>
+        </div>
+        <div class="tb-page" data-page="translate">
+          <div class="tr-enable-row">
+            <span class="tr-enable-label">启用翻译</span>
+            <button class="mode-switch on" id="tr-enable" role="switch" aria-checked="true"
+                    title="关闭后，Alt+S / Alt+T 与下方按钮均停用">
+              <span class="ms-state" id="tr-enable-off">禁用</span>
+              <span class="ms-track"><span class="ms-thumb"></span></span>
+              <span class="ms-state act" id="tr-enable-on">启用</span>
+            </button>
+          </div>
+          <div class="api-hint">框选屏幕区域，或按快捷键翻译页面上选中的文字。截图内容将发送至模型服务。</div>
+          <button class="tr-act" id="tr-region-btn">框选截图<span class="tr-key" id="tr-key-region">Alt+S</span></button>
+          <button class="tr-act" id="tr-selection-btn">翻译选中文字<span class="tr-key" id="tr-key-selection">Alt+T</span></button>
+          <div class="tr-links">
+            <button class="tr-link" id="tr-shortcuts-btn">快捷键设置</button>
+          </div>
+          <!-- 最近一次翻译的诊断：放在动作按钮正下方，不用滚动就能看到 -->
+          <div class="tr-diag" id="tr-diag" hidden></div>
+          <div class="tr-sep"></div>
+          <div class="tr-row">
+            <span class="tr-label">当前模型</span>
+            <span class="tr-val" id="tr-base-model">读取中…</span>
+          </div>
+          <details class="tr-adv" id="tr-adv">
+            <summary>自定义模型配置（未填写的项沿用模型 API 配置）</summary>
+            <div class="api-field">
+              <label class="api-label" for="tr-api-base">API 地址</label>
+              <input type="text" class="api-input" id="tr-api-base" dir="ltr"
+                     placeholder="沿用模型 API 配置" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="api-field">
+              <label class="api-label" for="tr-api-key">API Key</label>
+              <input type="password" class="api-input" id="tr-api-key" dir="ltr"
+                     placeholder="沿用模型 API 配置" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="api-field">
+              <label class="api-label" for="tr-model">模型</label>
+              <input type="text" class="api-input" id="tr-model" dir="ltr"
+                     placeholder="沿用模型 API 配置；截图翻译需支持图片输入" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="tr-adv-hint">三项独立生效：已填写的项覆盖模型 API 配置中的同名项，未填写的项沿用其值。</div>
+          </details>
+          <div class="tr-row">
+            <span class="tr-label">本页译文记录</span>
+            <span class="tr-record">
+              <button class="tr-link" id="tr-restore-btn">贴回页面<span id="tr-record-count"></span></button>
+              <button class="tr-link" id="tr-clear-btn">清除</button>
+            </span>
+          </div>
+          <div class="tr-warn" id="tr-grant-warn" hidden>
+            尚未授权访问模型域名 <span id="tr-origin"></span>，翻译请求将被浏览器拦截。
+            <button class="tr-grant" id="tr-grant-btn">授权访问模型域名</button>
+          </div>
+          <div class="api-err" id="tr-err"></div>
+          <div class="tr-actions">
+            <button id="tr-test-btn">测试连接</button>
+            <button id="tr-api-cfg-btn">模型 API 配置</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 译文对照（挂在这里而不是阅读器页面里：一边开着侧栏一边再来一栏就是两栏并排）。
+       列表本身由 reader-notes.js 渲染，这边只提供一个整栏容器与入口。 -->
+  <div id="reader-notes">
+    <div id="rn-body"></div>
   </div>
 
   <!-- 会意图拓扑视图（AI-020）：Obsidian 式话题拓扑图，全面板遮罩（DOM 由 graph-view.js 构建） -->
@@ -1850,6 +2743,7 @@
   <!-- 提问 tooltip（AI-031）：脱离 #jump-fab（其 transform 会裁剪 fixed 子弹）→ 左侧弹窗 -->
   <div class="jump-tip" id="jump-tip"></div>
 
+  <script src="reader-notes.js"></script>
   <script src="graph-view.js"></script>
   <script src="sidebar.js"></script>
 </body>

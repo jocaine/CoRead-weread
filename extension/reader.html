@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CoRead 阅读器</title>
+<link rel="stylesheet" href="vendor/pdfjs/text-layer.css">
+<link rel="stylesheet" href="reader.css">
+</head>
+<body>
+
+<header class="rd-bar">
+  <span class="rd-brand">CoRead 阅读器</span>
+  <button id="rd-open" class="rd-btn rd-btn-primary" type="button">打开 PDF</button>
+  <button id="rd-library-btn" class="rd-btn" type="button" title="回到书库（放进来过的 PDF）">书库</button>
+  <input id="rd-file" type="file" accept="application/pdf,.pdf" hidden>
+  <span id="rd-name" class="rd-name">未打开文件</span>
+  <span class="rd-spacer"></span>
+  <span id="rd-status" class="rd-muted" title="渲染状态"></span>
+  <span id="rd-pageinfo" class="rd-muted">—</span>
+  <button id="rd-zoom-out" class="rd-btn" type="button" title="缩小">−</button>
+  <span id="rd-zoom" class="rd-muted">100%</span>
+  <button id="rd-zoom-in" class="rd-btn" type="button" title="放大">＋</button>
+  <button id="rd-box" class="rd-btn" type="button"
+          title="按一次框一次：在页面上拖一个框，交给模型读图翻译（Alt+S）">框选翻译</button>
+  <button id="rd-fit" class="rd-btn" type="button" title="按窗口宽度缩放">适宽</button>
+  <button id="rd-notes" class="rd-btn" type="button" title="在 CoRead 侧栏里打开译文对照">译文</button>
+</header>
+
+<main class="rd-main">
+  <div id="rd-scroll" class="rd-scroll">
+    <div id="rd-pages" class="rd-pages"></div>
+    <div id="rd-empty" class="rd-empty">
+      <h1>读外文，边读边译</h1>
+
+      <div id="rd-library">
+        <div class="rd-lib-head">
+          <span>书库</span>
+          <span id="rd-lib-status" class="rd-muted">读取中…</span>
+        </div>
+        <div id="rd-lib-list" class="rd-lib-list"></div>
+      </div>
+
+      <div class="rd-open-row">
+        <button id="rd-open-main" class="rd-btn rd-btn-primary" type="button">从本地打开 PDF</button>
+        <span class="rd-muted">或把 PDF 拖到这里</span>
+      </div>
+
+      <p class="rd-hint">
+        正文是真实的文字，所以<b>划词就能翻译</b>，译文按段落锚在原文上 ——
+        改窗口大小、缩放、重新打开，位置都不会跑。
+      </p>
+      <p class="rd-hint rd-warn" id="rd-scan-hint" hidden>
+        这份 PDF 没有文字层（是扫描件，页面里只有图片），划词翻译用不了。
+        请点工具栏的<b>「框选翻译」</b>（或按 Alt+S），然后在页面上拖一个框 ——
+        框里的内容交给模型读图翻译，译文同样会贴回这一页。
+      </p>
+    </div>
+  </div>
+
+  <!-- 译文对照不在这里：它挂在 CoRead 侧栏里（一边开着侧栏一边再来一栏就是两栏并排）。
+       阅读器只负责把条目同步过去，并接收侧栏发来的操作。 -->
+</main>
+
+<div id="rd-tip" class="rd-tip" hidden>
+  <button id="rd-tip-translate" type="button">翻译</button>
+  <button id="rd-tip-copy" type="button" title="只复制原文">复制</button>
+</div>
+
+<div id="rd-toast" class="rd-toast" hidden></div>
+
+<script type="module" src="reader.js"></script>
+</body>
+</html>

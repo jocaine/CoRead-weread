@@ -1,0 +1,59 @@
+/* pdf.js 文字层样式（从 pdfjs-dist 6.3.289 的 web/pdf_viewer.css 摘出并精简）
+ *
+ * 来源：pdfjs-dist@6.3.289 · Apache-2.0 · 见同目录 LICENSE
+ * 只保留渲染文字层必需的规则，去掉了原文件里阅读器 UI（工具栏、侧栏、批注编辑器）的部分。
+ *
+ * 定位原理：span 由 TextLayer 写好 left / top / --font-height / --scale-x / --rotate，
+ * 这里的规则负责把它们渲染成"透明文字"——看得见的是下面那张 canvas，能选中、能被 Range
+ * 取到的是这些 span。
+ */
+
+.textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  text-align: initial;
+  line-height: 1;
+  letter-spacing: normal;
+  word-spacing: normal;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 0;
+
+  --min-font-size: 1;
+  /* --total-scale-factor 由外层按 viewport.scale 设置，见 reader.css */
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.textLayer :is(span, br) {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  user-select: text;
+}
+
+.textLayer > :not(.markedContent),
+.textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+
+.textLayer .markedContent {
+  display: contents;
+}
+
+/* 文字层里的图片占位（orig 里有 role="img" 的 span），保持可选中即可 */
+.textLayer span[role="img"] {
+  user-select: none;
+  cursor: default;
+}

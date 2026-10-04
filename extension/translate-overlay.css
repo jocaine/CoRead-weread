@@ -1,0 +1,392 @@
+/* 截图翻译 · 遮罩与气泡样式
+ *
+ * 全部规则都在闭合 Shadow DOM 内，宿主页面的 CSS 影响不到这里。
+ * 宿主元素带 all: initial，所以继承型属性（font / color / line-height）不会穿透进来，
+ * 下面每个可见元素都显式声明字体与颜色。
+ */
+
+:host {
+  all: initial;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.st-root,
+.st-bubble,
+.st-bubble * {
+  box-sizing: border-box;
+}
+
+/* ── 框选遮罩 ──────────────────────────────────────────────────────────────── */
+.st-root {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  pointer-events: none;
+}
+
+.st-shade {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  pointer-events: auto;
+  background: rgba(0, 0, 0, 0.28);
+  cursor: crosshair;
+}
+
+.st-sel {
+  position: fixed;
+  z-index: 2147483647;
+  pointer-events: none;
+  border: 1px solid #4c9ffe;
+  background: rgba(76, 159, 254, 0.16);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.6) inset;
+}
+
+/* ── 气泡容器：一页可以同时存在多个译文气泡 ───────────────────────────────── */
+.st-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  pointer-events: none;
+}
+
+/* 重新定位期间的小角标：截图取景时要藏起 .st-layer，进度只能靠它来报。
+   放在左下角，尽量不挡正文。 */
+.st-toast {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 2147483647;
+  pointer-events: none;
+  max-width: 260px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(28, 30, 34, 0.86);
+  color: #ffffff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* ── 原文高亮：标出"这块已经翻过" ─────────────────────────────────────────── */
+.st-hl {
+  position: fixed;
+  z-index: 1;
+  pointer-events: auto;
+  cursor: pointer;
+  box-sizing: border-box;
+  background: rgba(7, 193, 96, 0.16);
+  border: 1px solid rgba(7, 193, 96, 0.5);
+  border-radius: 3px;
+  transition: background 0.15s;
+}
+
+.st-hl:hover {
+  background: rgba(7, 193, 96, 0.3);
+}
+
+/* 页面重排过、又找不到 DOM 锚点：高亮只能停在原位，未必还对着原文。
+   用虚线 + 降透明度标出来，避免让人以为它仍然准确（画布书 / 跨源 iframe）。 */
+.st-hl.st-hl-approx {
+  border-style: dashed;
+  background: rgba(7, 193, 96, 0.1);
+  opacity: 0.75;
+}
+
+/* 框选期间：高亮与气泡让开鼠标。
+   否则在已经翻译过的区域上按下时，事件被高亮吃掉，遮罩收不到 mousedown，
+   新的框选就起不来。 */
+.st-layer.st-lock .st-hl,
+.st-layer.st-lock .st-bubble {
+  pointer-events: none;
+}
+
+/* ── 气泡 ──────────────────────────────────────────────────────────────────── */
+.st-bubble {
+  position: fixed;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  width: 380px;
+  max-width: calc(100vw - 16px);
+  pointer-events: auto;
+  background: #ffffff;
+  color: #1a1a1a;
+  border: 1px solid #e6e8eb;
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+  font: 13px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  overflow: hidden;
+  /* 不挡正文：离开鼠标时半透明，鼠标移上去恢复不透明好读 */
+  opacity: 0.85;
+  transition: opacity 0.15s;
+}
+
+/* 固定态：钉在屏幕上，给个明显的绿框提示 */
+.st-bubble.st-pinned {
+  border-color: #07c160;
+  box-shadow: 0 8px 28px rgba(7, 193, 96, 0.3);
+}
+
+.st-bubble:hover {
+  opacity: 1;
+}
+
+/* 折叠态：缩成一个小「译」标记贴在原文旁，点 ▸ 展开。
+   它是长驻在正文旁边的，所以比展开态更透：底色改成淡绿、文字改深绿，
+   比原来的实心绿药丸轻得多，压着的正文透得出来。 */
+.st-bubble.st-collapsed {
+  width: auto;
+  border-radius: 8px;
+  border-color: rgba(7, 193, 96, 0.5);
+  background: rgba(255, 255, 255, 0.55);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  opacity: 0.7;
+}
+.st-bubble.st-collapsed:hover { opacity: 1; }
+.st-bubble.st-collapsed .st-head {
+  padding: 3px 6px 3px 8px;
+  border-bottom: none;
+  background: rgba(7, 193, 96, 0.15);
+  border-radius: 7px;
+}
+.st-bubble.st-collapsed .st-title { color: #07883f; font-size: 11px; }
+.st-bubble.st-collapsed .st-close,
+.st-bubble.st-collapsed .st-collapse { color: #07883f; font-size: 13px; }
+.st-bubble.st-collapsed .st-close:hover { color: #c0392b; }
+.st-bubble.st-collapsed .st-collapse:hover { color: #056b32; }
+.st-bubble.st-collapsed .st-body { display: none; }
+.st-bubble.st-collapsed .st-grip { display: none; }
+
+.st-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: #f5f6f8;
+  border-bottom: 1px solid #e6e8eb;
+  cursor: move;
+  user-select: none;
+  flex: 0 0 auto;
+}
+
+.st-grip {
+  flex-shrink: 0;
+  color: #b9bec4;
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: -1px;
+  cursor: move;
+  user-select: none;
+}
+
+.st-title {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  color: #444;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.st-close,
+.st-collapse,
+.st-pin {
+  border: none;
+  background: transparent;
+  color: #8a8f96;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 3px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.st-close:hover { color: #c0392b; }
+.st-collapse:hover { color: #07c160; }
+
+/* 固定按钮用 emoji，颜色改不了，就用透明度表示开/关 */
+.st-pin {
+  font-size: 12px;
+  opacity: 0.4;
+}
+.st-pin:hover { opacity: 0.85; }
+.st-pin.on { opacity: 1; }
+
+/* ── 拖动调整尺寸的右下角把手 ─────────────────────────────────────────────── */
+.st-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 20px;
+  height: 20px;
+  cursor: nwse-resize;
+  opacity: 0.6;
+  background:
+    linear-gradient(135deg, transparent 42%, #8a9099 42%, #8a9099 50%, transparent 50%),
+    linear-gradient(135deg, transparent 62%, #8a9099 62%, #8a9099 70%, transparent 70%),
+    linear-gradient(135deg, transparent 82%, #8a9099 82%, #8a9099 90%, transparent 90%);
+}
+.st-resize:hover { opacity: 1; }
+.st-bubble.st-collapsed .st-resize { display: none; }
+/* 折叠态不显示固定按钮：小标记就那么点大，📌 挤在里面没意义 */
+.st-bubble.st-collapsed .st-pin { display: none; }
+
+/* ── 固定 + 鼠标离开：收成"只显示译文"的小卡 ─────────────────────────────── */
+/* 固定后气泡会一直占着屏幕，所以鼠标不在它上面时收小，只留译文；
+   鼠标移回来立刻恢复完整形态（译文 + 原文 + 按钮）。
+   宽度由 JS（applySize）设置，这里只管隐藏哪些部分。 */
+.st-bubble.st-compact {
+  opacity: 0.7;
+}
+.st-bubble.st-compact .st-head { display: none; }
+.st-bubble.st-compact .st-resize { display: none; }
+.st-bubble.st-compact .st-orig-wrap,
+.st-bubble.st-compact .st-actions { display: none; }
+.st-bubble.st-compact .st-body { padding: 7px 10px; }
+.st-bubble.st-compact .st-text { max-height: 24vh; }
+
+.st-body {
+  padding: 10px 12px 12px;
+  /* 正文区也能拖（文本区除外），抓哪儿都能挪走 */
+  cursor: move;
+  /* 手动调过高度时，内容在这里滚动 */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.st-text,
+.st-orig,
+.st-orig-wrap > summary {
+  cursor: auto;
+}
+
+.st-status {
+  font-size: 12px;
+  color: #6b7075;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.st-status.st-error {
+  color: #c0392b;
+}
+
+.st-text {
+  font-size: 14px;
+  line-height: 1.7;
+  color: #111111;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.st-text.st-stale {
+  color: #9aa0a6;
+}
+
+.st-actions {
+  margin-top: 8px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.st-copy,
+.st-coread,
+.st-relocate,
+.st-retranslate {
+  border: 1px solid #d6dae0;
+  background: #ffffff;
+  color: #3c4148;
+  font-size: 12px;
+  font-family: inherit;
+  padding: 3px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.st-copy:hover,
+.st-coread:hover,
+.st-relocate:hover:not(:disabled),
+.st-retranslate:hover:not(:disabled) {
+  background: #f2f4f7;
+}
+
+/* 送去共读：主按钮的观感，和「复制译文」区分开 */
+.st-coread {
+  border-color: #a8dcc0;
+  color: #07883f;
+  background: #f2fbf6;
+}
+.st-coread:hover { background: #e7f7ee; }
+
+/* 重新定位：只在"位置可能不准"时出现，提示这是一次额外的模型调用 */
+.st-relocate {
+  border-color: #e2c9a0;
+  color: #8a5a00;
+  background: #fffaf0;
+}
+.st-relocate:hover:not(:disabled) { background: #fdf2df; }
+.st-relocate:disabled {
+  color: #b8bcc2;
+  border-color: #e6e8eb;
+  background: #fafbfc;
+  cursor: default;
+}
+
+/* 原文没改动时置灰：一眼看出当前译文是不是已经对应当前原文 */
+.st-retranslate:disabled {
+  color: #b8bcc2;
+  border-color: #e6e8eb;
+  background: #fafbfc;
+  cursor: default;
+}
+
+.st-orig-wrap {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed #e6e8eb;
+}
+
+.st-orig-wrap > summary {
+  font-size: 12px;
+  color: #6b7075;
+  cursor: pointer;
+  outline: none;
+}
+
+.st-orig {
+  display: block;
+  width: 100%;
+  min-height: 58px;
+  max-height: 30vh;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 1px solid #dcdfe3;
+  border-radius: 6px;
+  background: #fafbfc;
+  color: #4a4f55;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  resize: vertical;
+}
+
+.st-orig:focus {
+  outline: none;
+  border-color: #4c9ffe;
+  background: #ffffff;
+}
+
+.st-orig-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}

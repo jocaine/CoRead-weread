@@ -8,6 +8,8 @@
  * - 无 WebSocket
  */
 
+import { installTranslateBackground } from './translate-background.js'
+
 const RECEIVER = 'http://127.0.0.1:7239'
 
 // AI-012：放开 chrome.storage.session 给 content script 用。默认访问级别是
@@ -108,3 +110,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // getReadingContext 已改为侧栏直接定向查询活动 tab（AI-008），不再走 SW 转发，
   // 此前的转发分支已删除。
 })
+
+// ── 翻译能力（框选截图 / 划词）────────────────────────────────────────────────
+// 逻辑都在 translate-background.js 里，只在这里装配，避免和共读的 SW 逻辑混在一起。
+// 它自带一个 chrome.runtime.onMessage 监听，只接管自己认识的那些 action。
+installTranslateBackground()
