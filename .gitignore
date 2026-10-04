@@ -58,6 +58,8 @@ npm-debug.log*
 .selftest/dbg*.out
 # 下载第三方库时的临时目录（pdfjs-dist 的 tgz 与解包结果）
 .vendor-tmp/
+# 安装包构建产物（暂存目录 + 编译输出；node.exe 87 MB，绝不能入库）
+installer/build/
 # 历史截尾游标（运行时个人数据，随会话推进变化）
 agent/hist_cursors.json
 # 评审批次 diff 转储、DOM 转储、采样文本
