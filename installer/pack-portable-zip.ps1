@@ -160,9 +160,24 @@ Copy-Item (Join-Path $repo 'agent\lib')          $agentOut -Recurse
 if (Test-Path (Join-Path $repo 'agent\.env.example')) { Copy-Item (Join-Path $repo 'agent\.env.example') $agentOut }
 $dataOut = Join-Path $agentOut 'scripts\data'
 New-Item -ItemType Directory -Path $dataOut -Force | Out-Null
-foreach ($f in @('knowledge-graph-results.json', 'knowledge-graph-demo.json', 'smoke-stack-sequences.json', 'judge-smoke-cases.json')) {
+
+# 随包分发的"固化图"产物。
+#
+# ⚠️ 这里曾经踩过一个**方向搞反**的坑，记录一下免得重犯：
+#   白名单里原本还写了 knowledge-graph-results.json 和 knowledge-graph-demo.json，
+#   而 agent/scripts/data/ 整个目录是被 .gitignore 排除的（L34）。
+#   后果是：本地打包时文件在，就被拷进包（CI 上不存在，静默跳过），
+#   于是"本地包"比"release 包"多出 2 个文件 —— 而那 2 个文件里装的是
+#   **作者自己的读书会意图谱**（读《静静的顿河》积累的 55 个节点/27 条边）。
+#   也就是说，本地打包会把个人阅读数据一起发出去，而 CI 打包反而躲过了。
+#   现在两个文件都从这里删掉：它们是个人/演示数据，不该随分发包走。
+#   用户自己读书会生成自己的图（agent/data/knowledge-graph.json），
+#   打包时那个目录本就是空的。
+$shipped = @('smoke-stack-sequences.json', 'judge-smoke-cases.json')
+foreach ($f in $shipped) {
   $p = Join-Path $repo "agent\scripts\data\$f"
   if (Test-Path $p) { Copy-Item $p $dataOut }
+  else { Write-Step "（跳过缺失的 $f —— 它没提交进 git，CI 上也不会有）" }
 }
 New-Item -ItemType Directory -Path (Join-Path $agentOut 'data') -Force | Out-Null
 
@@ -347,6 +362,19 @@ foreach ($d in @('data\agent', 'data\receiver\inbox', 'data\receiver\books', 'da
       ForEach-Object { $bad += "$($_.FullName) （数据目录应只有 desktop.ini）" }
   }
 }
+
+# 按**文件名**再挡一道：这些是"真实阅读数据"性质的固化产物。
+# 为什么按名字挡而不是靠扩展名：它们是 .json，跟随包分发的正常产物没法区分。
+# 为什么需要这道锁：它们被 .gitignore 排除，本地存在、CI 不存在——
+# 一旦有人（包括未来的我）手滑把它们加回白名单，本地打包就会把作者的
+# 读书笔记发出去，而 CI 打包看不出来，两边行为不一致、极难察觉。
+foreach ($name in @('knowledge-graph-results.json', 'knowledge-graph-demo.json',
+                    'judge-real-cases.json', 'judge-real-results.json',
+                    'derive-knowledge-graph-inject.json')) {
+  Get-ChildItem $StageDir -Recurse -File -Force -Filter $name -EA SilentlyContinue |
+    ForEach-Object { $bad += "$($_.FullName) （真实阅读数据，不应随包分发）" }
+}
+
 if ($bad.Count) {
   Write-Host '❌ 发现不该打包的内容，已中止：' -ForegroundColor Red
   $bad | Select-Object -First 15 | ForEach-Object { Write-Host "   $_" }

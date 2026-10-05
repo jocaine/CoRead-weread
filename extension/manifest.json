@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CoRead - AI共读",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "微信读书私密标注 + 正文足迹捕获 + 框选/划词翻译 + 自建 PDF 阅读器，配合 CoRead 共读 agent 使用",
   "minimum_chrome_version": "102",
   "permissions": ["storage", "sidePanel", "tabs", "unlimitedStorage", "activeTab", "scripting"],
