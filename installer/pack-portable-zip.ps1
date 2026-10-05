@@ -106,16 +106,48 @@ New-Item -ItemType Directory -Path $internal -Force | Out-Null
 
 # ── 3. Node 运行时（只带 node.exe）──────────────────────────────────
 Write-Host '--- Node 运行时 ---'
+# 三种取 Node 的方式，优先级从高到低：
+#   1) -NodeDir       指定一个已含 node.exe 的目录（CI 里指向 runner 自带的 Node，最快且不联网）
+#   2) 本地缓存         %TEMP%\node-official\node-<版本>-win-x64（上次下载解压留下的）
+#   3) 下载官方 zip    可用环境变量 COREAD_NODE_MIRROR 换镜像前缀
+#                      （官方站在 GitHub 上，国内偶尔慢；换镜像时设成如
+#                       https://registry.npmmirror.com/-/binary/node 即可）
 $nodeSrc = $NodeDir
 if (-not $nodeSrc) {
   $nodeSrc = Join-Path $env:TEMP ("node-official\node-{0}-win-x64" -f $NodeVersion)
   if (-not (Test-Path (Join-Path $nodeSrc 'node.exe'))) {
-    Fail "找不到已解压的官方 Node：$nodeSrc`n  请先跑一次 installer\pack-portable.ps1（它会下载并解压），或用 -NodeDir 指定。"
+    $mirror = $env:COREAD_NODE_MIRROR
+    if ($mirror) {
+      $url = ($mirror.TrimEnd('/')) + "/$NodeVersion/node-$NodeVersion-win-x64.zip"
+    } else {
+      $url = "https://nodejs.org/dist/$NodeVersion/node-$NodeVersion-win-x64.zip"
+    }
+    $zipFile = Join-Path $env:TEMP "node-$NodeVersion-win-x64.zip"
+    Write-Step "下载 Node：$url"
+    if (-not (Test-Path $zipFile)) {
+      node -e "const fs=require('fs');fetch(process.argv[1]).then(async r=>{if(!r.ok)throw new Error('HTTP '+r.status);const f=fs.createWriteStream(process.argv[2]);for await(const c of r.body)f.write(c);await new Promise(x=>f.end(x))}).catch(e=>{console.error(e.message);process.exit(1)})" $url $zipFile
+      if ($LASTEXITCODE -ne 0) {
+        Fail "Node 下载失败。三个办法：`n  1) 用 -NodeDir 指定一个已含 node.exe 的目录（CI 推荐）`n  2) 设环境变量 COREAD_NODE_MIRROR 指向镜像（如 https://registry.npmmirror.com/-/binary/node）`n  3) 手动下载解压到 $nodeSrc"
+      }
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $exDir = Join-Path $env:TEMP 'node-official'
+    New-Item -ItemType Directory -Path $exDir -Force | Out-Null
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile, $exDir)
   }
 }
 Copy-Item (Join-Path $nodeSrc 'node.exe') $internal
+# Node 自己的许可证：随包分发要带上（Apache-2.0 等要求保留声明）。
+# 官方 zip 里有 LICENSE；而 CI 里 runner 自带的 Node 目录通常没有，
+# 所以仓库里存了一份兜底（installer\launcher\LICENSE.node.txt）。
 $lic = Join-Path $nodeSrc 'LICENSE'
-if (Test-Path $lic) { Copy-Item $lic (Join-Path $internal 'LICENSE.node.txt') }
+if (Test-Path $lic) {
+  Copy-Item $lic (Join-Path $internal 'LICENSE.node.txt')
+} else {
+  $repoLic = Join-Path $PSScriptRoot 'launcher\LICENSE.node.txt'
+  if (Test-Path $repoLic) { Copy-Item $repoLic (Join-Path $internal 'LICENSE.node.txt') }
+  else { Write-Host '  [警告] 没有 Node 的 LICENSE 文件，随包分发前请补上' -ForegroundColor Yellow }
+}
 Write-Step ("node.exe  " + [math]::Round((Get-Item (Join-Path $nodeSrc 'node.exe')).Length / 1MB, 1) + ' MB')
 
 # ── 4. 程序文件（白名单，绝不整目录拷）──────────────────────────────

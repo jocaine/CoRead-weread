@@ -1,0 +1,118 @@
+# 推 tag 就自动发版：打包便携包 → 建 Release → 传附件
+#
+# 用法：改完扩展的版本号（extension/manifest.json），然后
+#     git commit -am "release: v0.3.1"
+#     git tag v0.3.1
+#     git push origin main --tags
+# 剩下的这里全自动做掉。
+#
+# 关于 Node 运行时（这个包的特点是要把 node.exe 一起发出去）：
+#   优先用 runner 自带的 Node —— 它本来就装好了，直接 -NodeDir 指过去，
+#   不联网、最快。runner 目录里通常没有 Node 的 LICENSE 文件，
+#   所以仓库里存了一份兜底：installer/launcher/LICENSE.node.txt
+#
+# 如果哪天下不动 nodejs.org（官方站托管在 GitHub 上，国内偶尔慢）：
+#   去仓库 Settings → Secrets and variables → Actions → Variables
+#   加一个名为 COREAD_NODE_MIRROR 的变量，值填镜像前缀，例如
+#     https://registry.npmmirror.com/-/binary/node
+#   脚本会用它替换下载地址。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'          # 只有推 v 开头的 tag 才触发，普通提交不触发
+
+# 建 Release 需要写权限；默认 token 权限越来越紧，这里显式声明
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    # 必须用 Windows runner：包里带的是 node.exe，而且打包脚本用了
+    # attrib.exe 等 Windows 专有命令
+    runs-on: windows-latest
+
+    steps:
+      - name: 取出代码
+        uses: actions/checkout@v4
+
+      - name: 装 Node（只是为了拿到一个 node.exe 一起打包，不跑 npm）
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # setup-node 装好的 node 一定在 PATH 里，直接取其所在目录。
+      # 这样就不必猜 runner 的缓存路径结构，也不会触发下载。
+      - name: 定位 Node 所在目录
+        id: node
+        shell: pwsh
+        run: |
+          $dir = Split-Path (Get-Command node).Source -Parent
+          Write-Host "Node 目录: $dir"
+          Write-Host "Node 版本: $(node --version)"
+          "dir=$dir" >> $env:GITHUB_OUTPUT
+
+      - name: 打包便携包
+        shell: pwsh
+        env:
+          COREAD_NODE_MIRROR: ${{ vars.COREAD_NODE_MIRROR }}
+        run: |
+          ./installer/pack-portable-zip.ps1 -NodeDir "${{ steps.node.outputs.dir }}"
+
+      # 版本号以扩展 manifest 为唯一真源；顺便校验 tag 与 manifest 是否一致，
+      # 不一致就报错——否则会出现"文件名 0.3.1、包内插件 0.3.0"这种错配
+      - name: 校验 tag 与 manifest 版本一致
+        shell: pwsh
+        run: |
+          $ver = (Get-Content extension/manifest.json -Raw | ConvertFrom-Json).version
+          $tag = "${{ github.ref_name }}"
+          Write-Host "manifest 版本 = $ver"
+          Write-Host "tag          = $tag"
+          if ($tag -ne "v$ver") {
+            Write-Error "tag（$tag）与 extension/manifest.json 的版本（$ver）对不上。请把 manifest 改成 $($tag.TrimStart('v')) 后再打 tag。"
+            exit 1
+          }
+
+      - name: 保存构建产物（便于排查）
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-zip
+          path: installer/build/out/*.zip
+          retention-days: 14
+
+      - name: 建 Release 并上传附件
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/build/out/*.zip
+          generate_release_notes: true
+          body: |
+            ## 这是什么
+
+            一个陪你读微信读书的 AI 共读伙伴。它会记住你的阅读画像、追踪你的问题意识，
+            在你划线的地方跟你讨论。
+
+            ## 怎么用
+
+            下载下面的 zip，解压到任意普通文件夹（**别放 C:\Program Files**），
+            双击 `01-START-CoRead.bat`。完整步骤见包里的 `README-FIRST.txt`。
+
+            ## 需要准备
+
+            - Windows 10/11 + Chrome 或 Edge
+            - 一个 OpenAI 兼容的模型 API Key（推荐 DeepSeek）
+
+            ## 特点
+
+            - **不需要安装 Node.js** —— 运行环境已打包在里面
+            - **免安装** —— 解压即用
+            - **数据在本地** —— 阅读记录、画像、聊天都在程序文件夹里，不经过任何服务器
+
+            ## 已知问题
+
+            - **未数字签名**：Windows 可能提示"无法验证发布者"。
+              运行包内 `internal\unblock.bat` 即可消除。
+            - **杀软可能误报**：火绒/360 等可能提示"未知程序修改系统设置"。
+              原因是共读引擎需常驻运行、托盘要写开机自启项。在弹窗里选「允许」即可。
+              介意可核对源码——里面全是可读的纯文本 JavaScript。
