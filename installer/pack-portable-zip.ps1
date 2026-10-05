@@ -372,8 +372,16 @@ $zipSize = (Get-Item $zipPath).Length
 Write-Step ("解压后 " + [math]::Round($rawSize / 1MB, 1) + " MB  →  zip " + [math]::Round($zipSize / 1MB, 1) + " MB")
 
 # 校验 zip 内容
+#
+# ⚠️ 这里有个跨 PowerShell 版本的坑，CI 上踩过一次：
+#   $_.FullName 返回的分隔符方向**随 PS 版本而变**。
+#   同一个 zip，用 PowerShell 5.1（本地）读出来是 'internal/node.exe'，
+#   用 PowerShell 7（GitHub Actions 用的）读出来是 'internal\node.exe'。
+#   而下面 $need 清单里写的是 Windows 反斜杠，于是 5.1 下全对、7 下全 MISS，
+#   报"zip 里缺 13 个关键文件"——实际包是好的，只是字符串没对上。
+#   修法：比较前把两边都归一化成反斜杠，与 PS 版本无关。
 $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
-$names = $zip.Entries | ForEach-Object { $_.FullName }
+$names = $zip.Entries | ForEach-Object { $_.FullName.Replace('/', '\') }
 Write-Host "`n--- zip 校验 ---"
 $need = @(
   # 用户直接面对的
