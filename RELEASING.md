@@ -37,7 +37,62 @@ git push origin main --tags
 推上去之后 `.github/workflows/release.yml` 会自动：
 打包便携包 → 校验 tag 与 manifest 版本一致 → 建 Release → 上传 zip。
 
-**去 https://github.com/lexielin99-code/CoRead-weread/actions 看进度**，
+---
+
+## 仓库与远程（fork 工作流）
+
+这个仓库是 **fork**：上游是 `lexielin99-code/CoRead-weread`，
+自己的 fork 是 `jocaine/CoRead-weread`。
+
+```
+origin    → https://github.com/jocaine/CoRead-weread.git          （自己的 fork，推送目标）
+upstream  → https://github.com/lexielin99-code/CoRead-weread.git  （上游，只读）
+```
+
+| 想做什么 | 命令 |
+|---|---|
+| 推自己的改动 | `git push origin main` |
+| 拉上游的新提交 | `git fetch upstream && git merge upstream/main` |
+| 给上游提改动 | 在 GitHub 上开 Pull Request（fork → upstream） |
+
+CI 与 Release 都跑在**自己的 fork** 上，页面上看：
+https://github.com/jocaine/CoRead-weread/actions
+
+### 本仓库的 git 配置里有两条"解药"，别删
+
+这台机器的全局 gitconfig 里有一条加速规则：
+
+```ini
+[url "https://gitclone.com/"]
+	insteadOf = https://
+```
+
+它把所有 `https://` 地址改写成 `gitclone.com`（只读镜像），后果是**推送必然 502**。
+（顺带说明：这个镜像只支持读取，不支持推送。）
+
+**实测结论：`insteadOf` 是"最长匹配前缀优先"，所以仓库级的规则能盖住全局的。**
+本仓库的 `.git/config` 里因此放了两条针对性配置：
+
+```ini
+; 用一条更长的、指向自己的规则盖住全局改写 → 推送才走 GitHub 真身
+[url "https://github.com/jocaine/CoRead-weread"]
+	insteadOf = https://github.com/jocaine/CoRead-weread
+
+; 这台机器直连 github.com:443 不通（Ping 通但 TLS 被重置），走本地代理
+[http "https://github.com"]
+	proxy = http://127.0.0.1:7897
+```
+
+**换了新机器/新克隆要重新加这两条**，否则会看到 gitclone 的 502 或
+`Failed to connect to github.com port 443`。
+
+> 曾考虑过的两个办法都**实测无效**，别再试：
+> · 命令行写完整地址（`git push https://github.com/...`）——`insteadOf` 对命令行
+>   给的地址**同样生效**，照样被改写到镜像
+> · 在仓库里加"把 github 映射成它自己"的更短前缀——`insteadOf` 是前缀替换，
+>   全局规则先把 `https://` 换掉了，后面再匹配已经没意义
+
+**去 https://github.com/jocaine/CoRead-weread/actions 看进度**，
 失败的话日志里会写清哪一步出错。
 
 > 目前这条链路**尚未实跑验证过**（写好后还没推过 tag）。第一次推 tag 时留意一下
@@ -54,7 +109,7 @@ powershell -ExecutionPolicy Bypass -File installer\pack-portable-zip.ps1
 # 产出：installer\build\out\CoRead-<版本>-portable.zip
 ```
 
-然后去 https://github.com/lexielin99-code/CoRead-weread/releases/new
+然后去 https://github.com/jocaine/CoRead-weread/releases/new
 建 Release：填 tag（`v0.3.1`）、标题、说明，把 zip 拖进附件区，发布。
 
 ### 打包脚本的可选参数
