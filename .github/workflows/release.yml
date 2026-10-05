@@ -59,7 +59,27 @@ jobs:
         env:
           COREAD_NODE_MIRROR: ${{ vars.COREAD_NODE_MIRROR }}
         run: |
-          ./installer/pack-portable-zip.ps1 -NodeDir "${{ steps.node.outputs.dir }}"
+          # 诊断信息必须在调用打包脚本**之前**打印。
+          # 原因：脚本里的 Fail() 用的是 `exit 1`，它会直接终止整个 pwsh 进程，
+          # 调用之后的任何代码（包括捕获退出码、写 job summary）都不会执行。
+          Write-Host "PowerShell 版本 : $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+          Write-Host "工作目录        : $(Get-Location)"
+          Write-Host "node            : $(Get-Command node -EA SilentlyContinue | Select-Object -Expand Source)"
+          Write-Host "COREAD_NODE_MIRROR : '$env:COREAD_NODE_MIRROR'"
+          $nodeDir = "${{ steps.node.outputs.dir }}"
+          Write-Host "-NodeDir        : $nodeDir"
+          if (Test-Path $nodeDir) {
+            Write-Host "含 node.exe     : $(Test-Path (Join-Path $nodeDir 'node.exe'))"
+            Write-Host "含 LICENSE      : $(Test-Path (Join-Path $nodeDir 'LICENSE'))"
+            Write-Host "目录内容        : $((Get-ChildItem $nodeDir | Select-Object -First 12 -ExpandProperty Name) -join ', ')"
+          } else {
+            Write-Host "!! -NodeDir 指向的目录不存在"
+          }
+          Write-Host "证书/代理环境    : HTTPS_PROXY='$env:HTTPS_PROXY'"
+          Write-Host "---- 开始打包 ----"
+
+          # 这里不接管道、不做包装：交回控制台，让脚本的输出原样进日志
+          ./installer/pack-portable-zip.ps1 -NodeDir $nodeDir
 
       # 版本号以扩展 manifest 为唯一真源；顺便校验 tag 与 manifest 是否一致，
       # 不一致就报错——否则会出现"文件名 0.3.1、包内插件 0.3.0"这种错配
