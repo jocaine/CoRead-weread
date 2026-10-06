@@ -27,21 +27,20 @@ import { writeFileAtomic } from '../agent/lib/atomic-write.js'
 import { openChatStore } from '../agent/lib/chat-store.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const AGENT_DIR = path.join(__dirname, '..', 'agent')
-const PORT = parseInt(process.env.COREAD_PORT || '7239')
-const BOOKS_DIR = path.join(__dirname, 'books')
-const INBOX_DIR = path.join(__dirname, 'inbox')
-const CHAT_DB = path.join(INBOX_DIR, 'chat.db')          // 聊天库（方案 B：唯一真源，agent 共用）
-const STREAM_FILE = path.join(INBOX_DIR, 'stream.jsonl') // 瞬态打字机通道（agent 写，不入档）
-const AGENT_STATE_FILE = path.join(INBOX_DIR, 'agent_state.jsonl')  // agent 处理步骤（2026-10：侧栏"正在…"文案）
-const DEBUG_LOG = path.join(INBOX_DIR, 'debug.jsonl')
-const TOPIC_STACK_FILE = path.join(__dirname, '..', 'agent', 'topic_stack.json')  // 实时讨论栈（/stack-hits 与 stack-updated 轮询的数据源，2026-09）
-const TOOLBOX_DIR = path.join(__dirname, 'toolbox')  // 翻译记录（工具箱「贴回本页译文」的数据源）
-const TOOL_HISTORY = path.join(TOOLBOX_DIR, 'history.jsonl')
+// 数据路径：全部来自 agent/lib/paths.js（唯一真源，agent 与 receiver 共用）。
+// 2026-10 目录重构：数据集中在 <包根>\data\，按类型分格；路径规则与分格依据见该文件头部。
+import {
+  CHAT_DB, STREAM_FILE, AGENT_STATE_FILE, TOPIC_STACK_FILE, TOOLBOX_DIR, TOOL_HISTORY_FILE,
+  BOOKS_DIR, ANNOTATIONS_FILE, SESSIONS_DIR, DEBUG_LOG, layoutSummary, ensureDirs,
+} from '../agent/lib/paths.js'
 
-fs.mkdirSync(BOOKS_DIR, { recursive: true })
-fs.mkdirSync(INBOX_DIR, { recursive: true })
-fs.mkdirSync(TOOLBOX_DIR, { recursive: true })
+const PORT = parseInt(process.env.COREAD_PORT || '7239')
+// 兼容旧变量名：Inbox 以前指"标注/聊天文件所在目录"，现在是 data\reading\（标注落点）
+const INBOX_DIR = path.dirname(ANNOTATIONS_FILE)
+const TOOL_HISTORY = TOOL_HISTORY_FILE
+
+// 数据目录先建齐（全新安装时 data\ 整个不存在）。幂等，agent 启动时也会调一次。
+ensureDirs()
 
 // ── SSE ──────────────────────────────────────────────────────────────────────
 const sseClients = new Set()
@@ -199,7 +198,7 @@ setInterval(() => {
 let _freeConvFileMtime = 0
 setInterval(() => {
   let m = 0
-  try { m = fs.statSync(freeConversationFile(AGENT_DIR)).mtimeMs } catch {}
+  try { m = fs.statSync(freeConversationFile(SESSIONS_DIR)).mtimeMs } catch {}
   if (m > 0 && m !== _freeConvFileMtime) {
     _freeConvFileMtime = m
     pushSSE('free-conversations-updated', {})
@@ -336,8 +335,8 @@ function decorateConversation(c, counts) {
 
 /** 读注册表（顺带把历史遗留的默认对话补登记）。返回 { conversations, counts } */
 function conversationsSnapshot() {
-  ensureLegacyConversation(AGENT_DIR)
-  return { registry: readRegistry(AGENT_DIR), counts: conversationCounts() }
+  ensureLegacyConversation(SESSIONS_DIR)
+  return { registry: readRegistry(SESSIONS_DIR), counts: conversationCounts() }
 }
 
 // ── 阅读器书库 ────────────────────────────────────────────────────────────────
@@ -1121,7 +1120,7 @@ const server = http.createServer(async (req, res) => {
       // 标题时用首条用户消息兜底起名（不覆盖用户手动改过的标题，见 touchConversation）
       if (isFreeKey(bookId)) {
         try {
-          const c = touchConversation(AGENT_DIR, bookId, { title: content, now: entry.timestamp })
+          const c = touchConversation(SESSIONS_DIR, bookId, { title: content, now: entry.timestamp })
           if (c) pushSSE('free-conversations-updated', {})
         } catch {}
       }
@@ -1156,7 +1155,7 @@ const server = http.createServer(async (req, res) => {
       // 归档走的是 /free-archive（要交给 agent 做记忆与收口，不能只改注册表）。
       const action = String((data && data.action) || '')
       if (action === 'create') {
-        const { key, conversation } = createConversation(AGENT_DIR, { title: String((data && data.title) || '') })
+        const { key, conversation } = createConversation(SESSIONS_DIR, { title: String((data && data.title) || '') })
         console.log('[free-conversation] create ' + key)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: true, key, conversation: decorateConversation(conversation, new Map()) }))
@@ -1165,7 +1164,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (action === 'rename') {
         const key = String((data && data.key) || '')
-        const c = isFreeKey(key) ? renameConversation(AGENT_DIR, key, (data && data.title) || '') : null
+        const c = isFreeKey(key) ? renameConversation(SESSIONS_DIR, key, (data && data.title) || '') : null
         if (!c) { res.writeHead(404); res.end(JSON.stringify({ error: 'not found' })); return }
         console.log('[free-conversation] rename ' + key + ' → ' + (c.title || '(空)'))
         res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -1177,7 +1176,7 @@ const server = http.createServer(async (req, res) => {
         const key = String((data && data.key) || '')
         if (!isFreeKey(key)) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad key' })); return }
         const removed = (() => { try { return chatStore().deleteConversation(key) } catch { return { messages: 0, events: 0 } } })()
-        const dropped = dropConversation(AGENT_DIR, key)
+        const dropped = dropConversation(SESSIONS_DIR, key)
         console.log(`[free-conversation] delete ${key}（消息 ×${removed.messages} 事件 ×${removed.events}）`)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: dropped, removed: { input: removed.messages, output: removed.events } }))
@@ -1372,8 +1371,10 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`CoRead receiver listening on http://localhost:${PORT}`)
-  console.log(`Inbox: ${INBOX_DIR}`)
-  console.log(`Books: ${BOOKS_DIR}`)
+  console.log(layoutSummary())
+  console.log(`Annotations: ${ANNOTATIONS_FILE}`)
+  console.log(`Books:       ${BOOKS_DIR}`)
+  console.log(`Chat DB:     ${CHAT_DB}`)
 })
 
 // ── 优雅退出 ─────────────────────────────────────────────────────────────────

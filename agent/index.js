@@ -36,20 +36,25 @@ import { canRetryError, isNetworkError, networkErrorMessage, isFatalConfigError,
 // "这条处理过没有"现在是 messages.status 一列，"到哪了"是自增 id——游标文件、指纹台账、
 // decideCursor 判定全部不再需要。lib/inbox-dedupe.js 仍留着（迁移脚本用），运行时不再引用。
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const AGENT_DIR = __dirname
-const RECEIVER_DIR = path.join(__dirname, '..', 'receiver')
-const INBOX_DIR = path.join(RECEIVER_DIR, 'inbox')
-const BOOKS_DIR = path.join(RECEIVER_DIR, 'books')
-const ANNOTATIONS = path.join(INBOX_DIR, 'annotations.jsonl')
-const CURSOR_FILE = path.join(INBOX_DIR, '.agent_cursor')
-// 聊天存储（方案 B）：唯一真源。旧 chat_input.jsonl / chat_output.jsonl 迁移后原样保留，
-// 只作历史备份，不再读写（见 lib/chat-migrate.js）。
-const CHAT_DB = path.join(INBOX_DIR, 'chat.db')
-// 瞬态打字机通道：流式累计文本走这里（侧栏据此渲染），**不入档**——旧结构里它占了
-// chat_output 97.1% 的字节（31919 条快照，全是最终回复的前缀，零信息量）。
-// 启动时清空；接收端按字节偏移 tail，文件被清空时靠"长度回缩"识别并复位。
-const STREAM_FILE = path.join(INBOX_DIR, 'stream.jsonl')
+// ── 数据路径：全部来自 lib/paths.js（唯一真源，agent 与 receiver 共用）────────
+// 2026-10 目录重构：数据不再跟着代码散在各个 __dirname 下，而是集中在 <包根>\data\，
+// 按数据类型分格（config / profile / sessions / reading / runtime / toolbox）。
+// 迁移缘由与分格依据见 lib/paths.js 头部；这里只取常量，不再自己拼路径。
+import {
+  AGENT_DIR, BOOKS_DIR, ANNOTATIONS_FILE, AGENT_CURSOR_FILE, CHAT_DB, STREAM_FILE,
+  AGENT_STATE_FILE, STOP_FILE, JOURNAL_FILE, TOPIC_STACK_FILE, GRAPH_FILE,
+  BUILTIN_GRAPH_RESULTS_FILE, SELF_PORTRAIT_FILE, PROFILE_FILE, SOUL_FILE,
+  HIST_CURSOR_FILE, COLDSTART_MARKER_FILE, SESSIONS_DIR, LAYOUT_KIND, layoutSummary,
+  ensureDirs, detectUnmigrated,
+} from './lib/paths.js'
+
+// 数据目录可能还不存在（全新安装、或用户直接跑 agent）：先建齐。
+// receiver 启动时也会调一次，幂等。
+ensureDirs()
+
+const ANNOTATIONS = ANNOTATIONS_FILE          // 划线标注（reading\）
+const CURSOR_FILE = AGENT_CURSOR_FILE         // 标注处理游标（runtime\；旧名 .agent_cursor，去掉了点——见 paths.js）
+const RESULTS_GRAPH_FILE = BUILTIN_GRAPH_RESULTS_FILE  // 内置回退图（builtin\，随包分发，非用户数据）
 let _store = null
 function chatStore() {
   if (!_store) _store = openChatStore(CHAT_DB)
@@ -71,7 +76,6 @@ function resetStreamFile() {
   try { fs.writeFileSync(STREAM_FILE, '') } catch {}
 }
 // 处理步骤状态（2026-10）：侧栏"正在…"文案数据源。独立文件——不入库，纯瞬态。
-const AGENT_STATE_FILE = path.join(INBOX_DIR, 'agent_state.jsonl')
 // 致命故障（余额/鉴权）暂存：say() 捕获时登记，poller 读到后中止本轮队列并暂停。
 // 用"取走即清空"的语义，避免一次故障被后续消息重复归因。
 let _lastFatalError = null
@@ -80,18 +84,13 @@ function takeFatalError() {
   _lastFatalError = null
   return e
 }
-const STOP_FILE = path.join(AGENT_DIR, '.stop')  // stop.bat 写入哨兵 → poller 检测后优雅保存退出
-const JOURNAL_FILE = path.join(AGENT_DIR, 'session_journal.jsonl')  // 会话流水账：强杀/断电后启动时恢复记忆
-const TOPIC_STACK_FILE = path.join(AGENT_DIR, 'topic_stack.json')  // 会意讨论栈：跨会话持久化（进行中的讨论跨会话恢复），按书隔离 { bookKey: 栈 }
-const GRAPH_FILE = path.join(AGENT_DIR, 'data', 'knowledge-graph.json')  // 会意图持久文件（§5.3：一张图一个文件）
-const RESULTS_GRAPH_FILE = path.join(AGENT_DIR, 'scripts', 'data', 'knowledge-graph-results.json')  // 离线固化产物（loadGraph 回退源，与 receiver /graph 一致）
+// ── 数据路径（承接上方 import；此处只做"给旧名字起别名"，定义都在 lib/paths.js）──
 // 自由模式（2026-09 定调；2026-11 扩为多对话）：侧栏里的独立上下文，每个自由对话
 // 一个 bookKey（__coread_free_<8hex>__，默认对话沿用历史哨兵 __coread_free_mode__，
 // 见 lib/free-conversation.js），对话之间历史/讨论栈/命中全隔离。对话内容默认是
 // 临时的（不写 journal、不收口固化）——归档时由用户勾选：保存记忆（profile/soul）、
 // 收编进正式拓扑图（完整固化）、或都不留（见 archiveFreeConversation）。
 const FREE_KEY = LEGACY_FREE_KEY
-const SELF_PORTRAIT_FILE = path.join(AGENT_DIR, 'self-portrait.md')  // 用户情况与观念画像：总结式维护，不进头部
 
 // 模型 API 配置（2026-10）：真源 = agent/api-config.json（插件侧栏「⋯ → 模型 API 配置」
 // 经 receiver 写入），.env 的 COREAD_* 作为回退（见 lib/api-config.js）。
@@ -142,7 +141,7 @@ function userBookTitles() {
 // （saveSessionMemory 重写 profile/soul）、新书足迹都不再触碰 system；
 // 前缀缓存因此稳定：跨会话恢复历史后，[静态S + 恢复历史] 前缀可跨会话命中。
 function buildSystemInstruction() {
-  const rules = readIfExists(path.join(AGENT_DIR, 'AGENT.md'))
+  const rules = readIfExists(path.join(AGENT_DIR, 'AGENT.md'))   // 人格规则是程序文件，仍随代码走
   return [
     '【重要】所有必要数据已直接包含在对话内容里，不需要也不允许调用任何工具或函数。直接用中文回答。\n\n',
     rules,
@@ -155,8 +154,8 @@ function buildSystemInstruction() {
 // 本轮发言"——此前画像原样拼在提问前，模型把"自述/自陈"式概括当成用户本轮原话，
 // 答非所问并编造"你自己说过…"。档案内容禁止被转述/引用为用户原话（AGENT.md 同款规则）。
 function personaBlock() {
-  const profile = readIfExists(path.join(AGENT_DIR, 'profile.md'))
-  const soul = readIfExists(path.join(AGENT_DIR, 'soul.md'))
+  const profile = readIfExists(PROFILE_FILE)
+  const soul = readIfExists(SOUL_FILE)
   const titles = userBookTitles()
   const bookSection = titles.length
     ? '\n\n【用户书籍足迹】（已添加引用/划线的书，用于跨书联想）\n' + titles.map((t) => `- 《${t}》`).join('\n')
@@ -506,7 +505,7 @@ const TOKEN_PER_CHAR = 0.62                // 实测校准：真实历史 19.9 �
 // 截尾游标（2026-10 用户定调）：{ bookKey: 累计切掉的消息条数 }——histories 截尾点持久化，
 // 重启恢复时从游标处续推（chat 文件里游标之后的轮次 = 在线截尾后的全部内容，纯追加），
 // 不用再"全量重建后重放截尾"。
-const HIST_CURSOR_FILE = path.join(AGENT_DIR, 'hist_cursors.json')
+// 历史截尾游标定义已移到 lib/paths.js（HIST_CURSOR_FILE = sessions\hist-cursors.json）
 let histCutCursors = {}   // 运行时态：{ bookKey: 累计切掉条数 }；main 启动时 loadHistCursors() 加载
 function loadHistCursors() {
   try {
@@ -1468,7 +1467,7 @@ async function archiveFreeConversation(key, opts = {}) {
     }
   })()
   const note = lines.join('；') || '已归档'
-  archiveConversation(AGENT_DIR, key, { archive: { memory: memoryOk, graph: wantGraph && nodeCount > 0 }, note, now: Date.now() })
+  archiveConversation(SESSIONS_DIR, key, { archive: { memory: memoryOk, graph: wantGraph && nodeCount > 0 }, note, now: Date.now() })
 
   const head = `对话已归档并删除${skipped.length ? '（' + skipped.join('、') + '）' : ''}。`
   // 把收口产出的知识点列出来（最多 5 条）：用户要看的是"收成了什么"，
@@ -1594,12 +1593,14 @@ function driveSelfPortrait(unit, ctx = {}) {
 const MEMORY_SPECS = {
   profile: {
     file: 'profile.md',
+    filePath: PROFILE_FILE,          // 实际落点：data\profile\portrait.md（文件名与提示词里的名字分开，见 lib/paths.js）
     maxChars: 400,
     purpose: '用户的长期阅读画像：品味、关注主题、思维习惯、知识背景',
     scope: '只写用户的事实、品味、知识背景与思维习惯；不要写入你自己的立场、观点或相处方式。只能依据用户本人明确表达过的内容——AI 回复中对用户的转述、推断、脑补（含跑题回复）一律不得当作事实写入，具体方法/细节若在对话里查无实据就不要写',
   },
   soul: {
     file: 'soul.md',
+    filePath: SOUL_FILE,             // 实际落点：data\profile\values-portrait.md
     maxChars: 400,  // 250→400：旧规则易被压缩挤掉，放宽后模型更倾向保留原规则
     purpose: '你自己的自画像：讨论中形成的立场、共识与分歧、与用户相处的方式、行为要求',
     scope: '只写你自己的立场与行为规则，并完整保留原内容中已有的行为规则；绝不写入用户的画像类内容',
@@ -1620,8 +1621,7 @@ function stripMemorize(text) {
 // 把一条待记住的内容就地合并进 profile.md / soul.md（一次小 LLM 调用）
 async function runMemoryMerge(target, memory) {
   const spec = MEMORY_SPECS[target] || MEMORY_SPECS.profile
-  const { file, maxChars } = spec
-  const filePath = path.join(AGENT_DIR, file)
+  const { file, maxChars, filePath } = spec
   const oldContent = readIfExists(filePath)
   if (oldContent) {
     try { fs.copyFileSync(filePath, filePath + '.bak') } catch {}
@@ -1713,8 +1713,7 @@ async function saveMemoryFromTranscript(msgs, { label = '本次讨论' } = {}) {
   const specs = MEMORY_SPEC_LIST
   let anyWritten = false
 
-  for (const { type, file, maxChars, purpose, scope } of specs) {
-    const filePath = path.join(AGENT_DIR, file)
+  for (const { type, file, maxChars, purpose, scope, filePath } of specs) {
     const oldContent = readIfExists(filePath)
 
     // 备份旧文件（上一份 .bak 会被覆盖，只留最近一份供人工恢复）
@@ -1856,10 +1855,12 @@ function enrichChatMessage(msg) {
 }
 
 // ── 首次启动：引导冷启动 ─────────────────────────────────────────────────────
-const COLDSTART_SKIP_FLAG = path.join(AGENT_DIR, '.coldstart_skipped')
+// 冷启动标记（2026-10 随目录重构改名）：旧名 .coldstart_skipped（点开头=资源管理器隐藏，
+// 是"用户拷贝数据时看不见、漏拷"的一类文件）。现在叫 profile\coldstart-done，可见。
+const COLDSTART_SKIP_FLAG = COLDSTART_MARKER_FILE
 
 function hasRealProfile() {
-  const profile = readIfExists(path.join(AGENT_DIR, 'profile.md'))
+  const profile = readIfExists(PROFILE_FILE)
   // 有超过 200 字的真实内容（排除空模板和只有日期的情况）
   return profile.replace(/[-\s_*#]/g, '').length > 200
 }
@@ -1955,7 +1956,19 @@ async function processNewAnnotations() {
 // ── REPL ─────────────────────────────────────────────────────────────────────
 async function main() {
   console.log('📖 CoRead 共读 agent 已启动')
+  console.log(`   ${layoutSummary()}`)
   console.log(`   监听标注：${ANNOTATIONS}`)
+  // 升级告警（2026-10 目录重构）：老用户的数据还在旧位置、还没迁移时，新库会**静默地空**——
+  // 用户只会觉得"我的记录没了"。所以这里显式拦住并指路，别让人对着空历史猜。
+  const unmigrated = detectUnmigrated()
+  if (unmigrated.length) {
+    console.log('\n⚠️  检测到旧目录里还有数据，但新数据目录里没有：')
+    for (const line of unmigrated.slice(0, 6)) console.log(`     · ${line}`)
+    if (unmigrated.length > 6) console.log(`     · …另有 ${unmigrated.length - 6} 项`)
+    console.log('   这些数据**不会自动搬过来**。请先退出，然后运行一次迁移：')
+    console.log('     node agent/scripts/migrate-data-layout.mjs --apply')
+    console.log('   （先不加 --apply 跑一遍是演练，只打印计划、不动文件）\n')
+  }
   console.log('   输入 /exit 退出\n')
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '> ' })

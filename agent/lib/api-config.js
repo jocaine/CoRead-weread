@@ -2,12 +2,14 @@
  * 模型 API 配置（2026-10）：插件侧栏「⋯ → 模型 API 配置」写入，agent 与脚本读取。
  *
  * 真源两级，插件优先：
- *   1. agent/api-config.json —— 侧栏经 receiver 写入（本机单用户工具，字段明文）。
+ *   1. data\config\api-config.json —— 侧栏经 receiver 写入（本机单用户工具，字段明文）。
  *      文件里一旦出现某字段，该字段就以文件为准（**即使是空串**）——避免用户在插件里
  *      清空 key 后又被 .env 的旧值「复活」，保证界面显示与实际取值永远一致。
- *   2. COREAD_* 配置 —— 先看进程环境变量（node --env-file 载入的 .env），再看
- *      agent/.env 文件本身。receiver 启动时不带 --env-file，靠这里兜底解析，
- *      让「到底配没配」在插件界面里显示一致。
+ *   2. COREAD_* 配置 —— 先看进程环境变量，再看 data\config\env 文件本身。
+ *      receiver 启动时不带环境变量文件，靠这里兜底解析，让「到底配没配」在插件界面里显示一致。
+ *
+ * 位置由 lib/paths.js 决定（唯一真源）：2026-10 目录重构后落在 <包根>\data\config\，
+ * 与阅读数据分开一格——因为这里面有**密钥明文**，备份分享时要能单独剔除。
  *
  * 调用方在每次 LLM 请求前 resolveApiConfig()：在插件里改完配置无需重启 agent。
  * 本模块只读写本机文件，不发网络请求，也不打印任何 key。
@@ -15,11 +17,9 @@
 
 import fs from 'fs'
 import path from 'path'
-import { fileURLToPath } from 'url'
+import { API_CONFIG_FILE, ENV_FILE } from './paths.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-export const API_CONFIG_FILE = path.join(__dirname, '..', 'api-config.json')
-export const ENV_FILE = path.join(__dirname, '..', '.env')
+export { API_CONFIG_FILE, ENV_FILE }
 export const DEFAULT_MODEL = 'gpt-4o'
 export const CONFIG_KEYS = ['apiBase', 'apiKey', 'model']
 

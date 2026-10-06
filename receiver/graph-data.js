@@ -7,10 +7,10 @@
  * kind = user 用户引用 / derived 对话衍生）。
  *
  * 数据源三级回退（由图视图实时取用）：
- *   1. agent/data/knowledge-graph.json   —— 会意系统固化产物（正式，一张图一个文件）
- *   2. agent/scripts/data/knowledge-graph-results.json（graph 字段）—— 冒烟/派生脚本
+ *   1. data\profile\knowledge-graph.json   —— 会意系统固化产物（正式，一张图一个文件）
+ *   2. builtin\knowledge-graph-results.json（graph 字段）—— 冒烟/派生脚本
  *      产出的有效图，节点带 aliases + discussions，固化未落盘时先展示它
- *   3. ?demo=1 → buildDemoGraph() 从 knowledge-graph-demo.json 的事件序列重建演示拓扑
+ *   3. ?demo=1 → buildDemoGraph() 从 builtin\knowledge-graph-demo.json 的事件序列重建演示拓扑
  *
  * buildDemoGraph：把 demo 文件的「过程事件」（aggregate / edge 事件序列）还原成成品图，
  * 并补入 contextPath 里更规范的 point / aliases——demo 文件记录的是演示输入与产物，
@@ -19,14 +19,20 @@
 
 import fs from 'fs'
 import path from 'path'
-import { fileURLToPath } from 'url'
+import {
+  GRAPH_FILE, BUILTIN_GRAPH_RESULTS_FILE, BUILTIN_GRAPH_DEMO_FILE, PROFILE_DIR,
+} from '../agent/lib/paths.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
+// 路径全部来自 agent/lib/paths.js（唯一真源）。2026-10 目录重构后的落点：
+//   GRAPH_FILE         → data\profile\knowledge-graph.json（用户数据）
+//   GRAPH_RESULTS_FILE → builtin\knowledge-graph-results.json（随包分发的回退图）
+//   GRAPH_DEMO_FILE    → builtin\knowledge-graph-demo.json（随包分发的演示事件序列）
+export const GRAPH_RESULTS_FILE = BUILTIN_GRAPH_RESULTS_FILE
+export const GRAPH_DEMO_FILE = BUILTIN_GRAPH_DEMO_FILE
+/** 自由模式沙盒图（测试产物）：跟正式图谱同一格 */
+export const FREE_GRAPH_FILE = path.join(PROFILE_DIR, 'knowledge-graph.free.json')
 
-export const GRAPH_FILE = path.join(__dirname, '..', 'agent', 'data', 'knowledge-graph.json')
-export const GRAPH_DEMO_FILE = path.join(__dirname, '..', 'agent', 'scripts', 'data', 'knowledge-graph-demo.json')
-export const GRAPH_RESULTS_FILE = path.join(__dirname, '..', 'agent', 'scripts', 'data', 'knowledge-graph-results.json')
-export const FREE_GRAPH_FILE = path.join(__dirname, '..', 'agent', 'data', 'knowledge-graph.free.json')  // 自由模式沙盒图（测试产物）
+export { GRAPH_FILE }
 
 /**
  * 读自由模式沙盒图（测试产物，2026-09）：agent 自由模式的收口固化只落在沙盒

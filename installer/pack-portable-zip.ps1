@@ -1,8 +1,12 @@
-﻿# 生成免安装的便携包（zip）
+﻿# 生成免安装的便携包（zip）——**当前唯一的分发包形态**
 #
-# 与 pack-portable.ps1 的区别：那个产出给 Inno 安装程序用的暂存目录（会写 %TEMP%、
-# 会写注册表，因而会触发火绒 HIPS）；这个产出一个"解压即用"的 zip——
-# 用户自己解压，程序不碰 %TEMP%、不写注册表，被安全软件拦的概率低得多。
+# 曾经还有一个走 Inno Setup 的 .exe 安装包（pack-portable.ps1 + co-read.iss + build-installer.bat），
+# 2026-10-06 连同那几个脚本一起删掉了：未数字签名被火绒 HIPS 拦，且它省下的只是
+# "解压 + 双击"两步（装插件无论如何都得用户手动做）。原因与当年的踩坑记录见
+# distribution-design.md §6.5；需要恢复就从 git 历史取（删前最后提交 498d8f5）。
+#
+# 这个脚本产出一个"解压即用"的 zip：用户自己解压，程序不碰 %TEMP%、不写注册表，
+# 被安全软件拦的概率低得多。
 #
 # 用法（在仓库根目录）：
 #   powershell -ExecutionPolicy Bypass -File installer\pack-portable-zip.ps1
@@ -31,6 +35,52 @@ function Fail($m) { Write-Host "[错误] $m" -ForegroundColor Red; exit 1 }
 Write-Host "`n=== CoRead 便携包 ===" -ForegroundColor Cyan
 Write-Host "仓库: $repo"
 Write-Host "输出: $OutDir`n"
+
+# ── 0. 仓库里的 .ps1 必须带 UTF-8 BOM（先查，别等打包到一半才炸）──────
+# 为什么：Windows PowerShell 5.1 把无 BOM 的 UTF-8 当系统 ANSI（中文 Windows 是 GBK）解析，
+# 脚本里的中文会整体乱码、语法直接崩，而且报错位置完全是错的（实测把中文注释当成了
+# 字符串没闭合）。编辑器"保存"经常把 BOM 吞掉——本项目已经因此踩过三次。
+# 这里只**检查并中止**，不自动补：自动补会掩盖"某个编辑器正在吃掉 BOM"这个事实。
+$noBom = @()
+foreach ($ps1 in Get-ChildItem $repo -Recurse -File -Filter '*.ps1' -EA SilentlyContinue |
+                  Where-Object { $_.FullName -notmatch '\\installer\\build\\|\\node_modules\\|\\\.git\\' }) {
+  $b = [System.IO.File]::ReadAllBytes($ps1.FullName)
+  $hasBom = ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
+  if (-not $hasBom) { $noBom += $ps1.FullName }
+}
+if ($noBom.Count) {
+  Write-Host '❌ 下列 .ps1 缺少 UTF-8 BOM，打包中止：' -ForegroundColor Red
+  $noBom | ForEach-Object { Write-Host "   $($_.Replace($repo + '\', ''))" }
+  Write-Host ''
+  Write-Host '   原因：无 BOM 的 UTF-8 会被 PowerShell 5.1 当 GBK 读，中文注释会让脚本语法崩。'
+  Write-Host '   修法：用支持 UTF-8 BOM 的编辑器另存，或跑：'
+  Write-Host '     $b=[IO.File]::ReadAllBytes($f); [IO.File]::WriteAllBytes($f, ([byte[]](0xEF,0xBB,0xBF)+$b))'
+  exit 1
+}
+Write-Host '✅ 仓库内 .ps1 均带 UTF-8 BOM'
+
+# ── 0b. 仓库里的 .bat / .vbs 必须纯 ASCII（同样先查，别等打包到一半）──────
+# 为什么：cmd.exe 与 Windows Script Host 按系统 ANSI（中文 Windows 是 GBK）读文件，
+# 非 ASCII 会变乱码；cmd 还是边读边执行，乱码行会被当成命令去跑
+# （实测：中文注释被拆成 'is' / 'step' / 'emory' 之类的命令，满屏报错）。
+# 中文说明一律放 .txt / .md。
+$nonAscii = @()
+foreach ($bf in Get-ChildItem $repo -Recurse -File -Include '*.bat', '*.vbs' -EA SilentlyContinue |
+                   Where-Object { $_.FullName -notmatch '\\installer\\build\\|\\node_modules\\|\\\.git\\' }) {
+  $bytes = [System.IO.File]::ReadAllBytes($bf.FullName)
+  $bad = 0
+  foreach ($b in $bytes) { if ($b -gt 127) { $bad++ } }
+  if ($bad -gt 0) { $nonAscii += "$($bf.FullName.Replace($repo + '\', ''))（$bad 个非 ASCII 字节）" }
+}
+if ($nonAscii.Count) {
+  Write-Host '❌ 下列 .bat / .vbs 含非 ASCII 字节，打包中止：' -ForegroundColor Red
+  $nonAscii | ForEach-Object { Write-Host "   $_" }
+  Write-Host ''
+  Write-Host '   原因：cmd / WSH 按系统 ANSI 读取，中文会变乱码并被当作命令执行。'
+  Write-Host '   修法：把这些文件里的中文改成英文，中文说明写到 .txt / .md 里。'
+  exit 1
+}
+Write-Host '✅ 仓库内 .bat / .vbs 均为纯 ASCII'
 
 # ── 版本号：从插件 manifest 读，保证一致 ────────────────────────────
 $manifest = Join-Path $repo 'extension\manifest.json'
@@ -94,15 +144,37 @@ New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
 
 # ── 2. 建立两层结构 ─────────────────────────────────────────────────
 # 为什么这么分：用户打开文件夹时应该一眼看出"我只需要碰哪几个"。
-# 最外层只留三样：
+# 最外层只留四样：
+#     data\            ← 你的全部数据（备份就复制这一个文件夹）
 #     extension\       ← 浏览器插件（装插件时必须选它）
-#     internal\        ← 程序 + 数据，都在这里
+#     internal\        ← 程序本体（Node 运行环境、引擎、接收端、说明书）
 #     几个 .bat / 说明  ← 双击启动、出问题看说明
-# 注意：**没有单独的 data\ 目录**。数据目录是代码里写死的、跟着代码走，
-# 所以它在 internal\agent\data 与 internal\receiver\ 下（详见下方说明）。
-# 不去硬造一个"看起来像数据目录"的空壳——那会让用户以为数据在那、实际不在。
+# 另有 builtin\（随包分发的内置图谱）与 logs\（日志），两者都不是用户数据。
+# 数据能从 internal\ 里拿出来，靠的是 agent/lib/paths.js 这一处路径真源：
+# 它按"agent 是不是装在 internal\ 下"判断包根在哪，进而定位包根下的 data\。
 $internal = Join-Path $StageDir 'internal'
 New-Item -ItemType Directory -Path $internal -Force | Out-Null
+
+# ── 2b. 数据目录与内置数据目录（2026-10 目录重构）────────────────────
+# 新布局（依据 agent/lib/paths.js）：
+#   <包根>\data\      用户数据，按类型分格。**备份 = 复制这一个文件夹。**
+#   <包根>\builtin\   随包分发的内置数据（图谱回退源、演示图）。不属于用户，不参与备份。
+#   <包根>\logs\      日志（托盘输出、侧栏调试上报）。可随时清空。
+# 为什么数据放在包根、不再藏在 internal\ 里：internal\ 的定位是"程序，用户别动"
+# （README-FIRST.txt 原话），数据关在里面就违背这个定位。旧布局的实际代价见
+# distribution-design.md 的记录与 agent/lib/paths.js 头部注释。
+$dataRoot = Join-Path $StageDir 'data'
+$builtinRoot = Join-Path $StageDir 'builtin'
+$logsRoot = Join-Path $StageDir 'logs'
+# 各格都建出来（空目录随包分发）：用户第一次打开就能看懂数据分了几类，
+# 而不是等程序自己按需创建、看起来像"哪一格是空的出问题了"。
+foreach ($d in @('config', 'profile', 'sessions', 'reading', 'runtime', 'toolbox')) {
+  New-Item -ItemType Directory -Path (Join-Path $dataRoot $d) -Force | Out-Null
+}
+New-Item -ItemType Directory -Path $builtinRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $logsRoot -Force | Out-Null
+# data\ 的中文说明书（源文件在 installer\portable\DATA-README.txt，纯 ASCII 文件名 + UTF-8 内容）
+Copy-Item (Join-Path $PSScriptRoot 'portable\DATA-README.txt') (Join-Path $dataRoot 'README.txt')
 
 # ── 3. Node 运行时（只带 node.exe）──────────────────────────────────
 Write-Host '--- Node 运行时 ---'
@@ -158,57 +230,39 @@ Copy-Item (Join-Path $repo 'agent\index.js')     $agentOut
 Copy-Item (Join-Path $repo 'agent\package.json') $agentOut
 Copy-Item (Join-Path $repo 'agent\lib')          $agentOut -Recurse
 if (Test-Path (Join-Path $repo 'agent\.env.example')) { Copy-Item (Join-Path $repo 'agent\.env.example') $agentOut }
-$dataOut = Join-Path $agentOut 'scripts\data'
-New-Item -ItemType Directory -Path $dataOut -Force | Out-Null
 
-# 随包分发的"固化图"产物。
+# 随包分发的"内置数据"产物 → <包根>\builtin\（2026-10 前放在 internal\agent\scripts\data\）
 #
 # ⚠️ 这里曾经踩过一个**方向搞反**的坑，记录一下免得重犯：
 #   白名单里原本还写了 knowledge-graph-results.json 和 knowledge-graph-demo.json，
-#   而 agent/scripts/data/ 整个目录是被 .gitignore 排除的（L34）。
+#   而 agent/scripts/data/ 整个目录是被 .gitignore 排除的。
 #   后果是：本地打包时文件在，就被拷进包（CI 上不存在，静默跳过），
 #   于是"本地包"比"release 包"多出 2 个文件 —— 而那 2 个文件里装的是
 #   **作者自己的读书会意图谱**（读《静静的顿河》积累的 55 个节点/27 条边）。
 #   也就是说，本地打包会把个人阅读数据一起发出去，而 CI 打包反而躲过了。
-#   现在两个文件都从这里删掉：它们是个人/演示数据，不该随分发包走。
-#   用户自己读书会生成自己的图（agent/data/knowledge-graph.json），
-#   打包时那个目录本就是空的。
-$shipped = @('smoke-stack-sequences.json', 'judge-smoke-cases.json')
+#   现在规则说清楚：author 私人的"读数产物"（judge-*、knowledge-graph-results 的真实版）
+#   一律不进包；真正要随包分发的只有下面这两个**通用**文件。
+$shipped = @('knowledge-graph-results.json', 'knowledge-graph-demo.json')
 foreach ($f in $shipped) {
+  $p = Join-Path $repo "agent\scripts\data\$f"
+  if (Test-Path $p) { Copy-Item $p $builtinRoot; Write-Step "builtin\$f" }
+  else { Write-Step "（跳过缺失的 $f —— 它没提交进 git，CI 上也不会有）" }
+}
+# 两个冒烟用例（开发期用，体积小且不含个人数据）：仍随包，放 internal\agent\scripts\data
+$dataOut = Join-Path $agentOut 'scripts\data'
+New-Item -ItemType Directory -Path $dataOut -Force | Out-Null
+foreach ($f in @('smoke-stack-sequences.json', 'judge-smoke-cases.json')) {
   $p = Join-Path $repo "agent\scripts\data\$f"
   if (Test-Path $p) { Copy-Item $p $dataOut }
   else { Write-Step "（跳过缺失的 $f —— 它没提交进 git，CI 上也不会有）" }
 }
-New-Item -ItemType Directory -Path (Join-Path $agentOut 'data') -Force | Out-Null
 
-# receiver 的程序文件放 internal\receiver
+# receiver 的程序文件放 internal\receiver（与 agent 同级：lib/paths.js 靠这个同级关系定位包根）
 $recvOut = Join-Path $internal 'receiver'
 New-Item -ItemType Directory -Path $recvOut -Force | Out-Null
 foreach ($f in @('index.js', 'package.json', 'graph-data.js')) {
   $p = Join-Path $repo "receiver\$f"
   if (Test-Path $p) { Copy-Item $p $recvOut }
-}
-
-# ── 用户数据目录 ────────────────────────────────────────────────────
-# 真相：数据目录是**代码里写死的**，位置跟着代码走：
-#     agent/index.js    → AGENT_DIR 自己，以及 <AGENT_DIR>/data/knowledge-graph.json
-#     receiver/index.js → <自身>/inbox、<自身>/books、<自身>/toolbox
-# 而 agent 与 receiver 必须保持同级（agent 用 ../receiver 找 inbox），
-# 所以两个都放 internal\ 之后，数据就落在：
-#     internal\agent\data\          阅读画像、知识图谱、讨论栈、API 配置
-#     internal\receiver\inbox\      聊天记录、标注
-#     internal\receiver\books\      书库缓存
-#     internal\receiver\toolbox\    翻译记录
-#
-# 曾经试过把数据挪到根目录一个显眼的 data\：需要给代码加环境变量、改 16 处
-# 路径，风险大收益小；用目录联接（junction）试过又会让"备份只拷 data\"落空。
-# 最后选择**如实呈现**：数据就在 internal\ 里，说明书直接写明位置，
-# 备份方式改成"拷整个程序文件夹"。这样不多一层抽象，用户也不会误判。
-$dataRecv = Join-Path $recvOut ''          # internal\receiver
-$dataAgent = Join-Path $agentOut ''        # internal\agent
-New-Item -ItemType Directory -Path (Join-Path $dataAgent 'data') -Force | Out-Null
-foreach ($d in @('inbox', 'books', 'toolbox')) {
-  New-Item -ItemType Directory -Path (Join-Path $dataRecv $d) -Force | Out-Null
 }
 
 # extension 放在最外层显眼位置。
@@ -217,21 +271,35 @@ foreach ($d in @('inbox', 'books', 'toolbox')) {
 Copy-Item (Join-Path $repo 'extension') $StageDir -Recurse
 Remove-Item (Join-Path $StageDir 'extension\test') -Recurse -Force -EA SilentlyContinue
 
-# API 配置模板（空值）
-Copy-Item (Join-Path $PSScriptRoot 'launcher\api-config.template.json') (Join-Path $agentOut 'api-config.json')
+# 图标：托盘用的 coread.ico 放包根 assets\icons\（托盘就按这个相对路径找它）；
+# 浏览器插件图标在 extension\icons\ 里，随 extension 一起走。
+# 生成脚本 tools\make-icons.ps1；缺了它托盘会退回系统默认图标，不会报错。
+$assetsSrc = Join-Path $repo 'assets\icons'
+if (-not (Test-Path (Join-Path $assetsSrc 'coread.ico'))) {
+  Fail '缺少 assets\icons\coread.ico —— 先跑 tools\make-icons.ps1'
+}
+New-Item -ItemType Directory -Path (Join-Path $StageDir 'assets\icons') -Force | Out-Null
+Copy-Item (Join-Path $assetsSrc 'coread.ico') (Join-Path $StageDir 'assets\icons')
+Write-Step 'assets\icons\coread.ico'
+
+# API 配置模板（空值）→ data\config\（2026-10 前在 internal\agent\api-config.json）
+Copy-Item (Join-Path $PSScriptRoot 'launcher\api-config.template.json') (Join-Path $dataRoot 'config\api-config.json')
 
 # ── 5. 启动器与说明文件 ─────────────────────────────────────────────
 Write-Host "`n--- 启动器与说明 ---"
-# 启动器（tray/vbs/stop）放 internal，它们是内部实现
-foreach ($f in @('tray.ps1', 'run-hidden.vbs', 'stop.bat')) {
+# 全部放 internal，它们是内部实现。其中 Start-CoRead.vbs 是**唯一入口**：
+# 用户双击它启动。为什么不是 .bat 见该文件头部注释（.bat 必被 cmd.exe 拉出黑框；
+# .vbs 由 GUI 的 wscript.exe 执行，一点窗口都不出现）。
+foreach ($f in @('tray.ps1', 'stop.bat')) {
   $p = Join-Path $PSScriptRoot "launcher\$f"
   if (-not (Test-Path $p)) { Fail "缺少 launcher\$f" }
   Copy-Item $p $internal
   Write-Step "internal\$f"
 }
-# 用户直接面对的入口放最外层；说明书与解除工具放 internal（说明里会指路）
-Copy-Item (Join-Path $PSScriptRoot 'portable\01-START-CoRead.bat') $StageDir
-Write-Step '01-START-CoRead.bat'
+$starter = Join-Path $PSScriptRoot 'portable\Start-CoRead.vbs'
+if (-not (Test-Path $starter)) { Fail '缺少 portable\Start-CoRead.vbs' }
+Copy-Item $starter $internal
+Write-Step 'internal\Start-CoRead.vbs'
 foreach ($f in @('unblock.bat', 'instructions-zh.txt')) {
   $p = Join-Path $PSScriptRoot "portable\$f"
   if (Test-Path $p) { Copy-Item $p $internal; Write-Step "internal\$f" }
@@ -266,8 +334,13 @@ if (-not $WriteFolderLabels) {
 } else {
 Write-Host "`n--- 文件夹显示名 ---"
 $labels = @(
-  @{ dir = (Join-Path $agentOut 'data');    name = '你的数据（阅读记录、画像、聊天都在这里）'; tip = 'CoRead 的全部个人数据。想备份就复制整个程序文件夹；删掉这个文件夹等于清空所有记录。'; files = $null }
-  @{ dir = (Join-Path $recvOut 'inbox');    name = '聊天与标注';                              tip = '聊天记录、收到的划线标注。'; files = $null }
+  @{ dir = $dataRoot;                       name = '你的数据（备份就复制这个文件夹）';        tip = 'CoRead 的全部个人数据：配置、画像、聊天记录、书与标注、翻译记录。删掉等于清空所有记录。'; files = $null }
+  @{ dir = (Join-Path $dataRoot 'config');  name = '设置（含密钥，别外发）';                  tip = '模型 API 地址与密钥。把数据发给别人排查问题前，先删掉这一格。'; files = $null }
+  @{ dir = (Join-Path $dataRoot 'profile'); name = '画像与知识图谱';                          tip = 'AI 对你的长期理解：阅读画像、价值观侧写、会意图谱。'; files = $null }
+  @{ dir = (Join-Path $dataRoot 'sessions'); name = '聊天记录与讨论';                          tip = '聊天库、会话流水账、正在进行的讨论栈。'; files = $null }
+  @{ dir = (Join-Path $dataRoot 'reading'); name = '书与标注';                                tip = '划线标注、书库缓存（读过的章节原文）。'; files = $null }
+  @{ dir = (Join-Path $dataRoot 'runtime'); name = '运行状态（可删）';                        tip = '处理进度之类的临时状态。删掉只会让程序重新扫一遍，不丢记录。'; files = $null }
+  @{ dir = (Join-Path $dataRoot 'toolbox'); name = '翻译记录';                                tip = '工具箱的翻译历史。'; files = $null }
   @{ dir = $internal;                       name = '程序文件（不要动）';                      tip = '程序自己用的文件：运行环境、代码、说明书。正常使用不需要打开这里。'; files = $null }
   @{ dir = (Join-Path $StageDir 'extension'); name = '浏览器插件（装插件时选这个）';             tip = '在浏览器扩展页点「加载已解压的扩展程序」后，选中这个目录。'; files = $null }
   # 外层：文件夹本身不改名（保持解压出来的样子），但把说明文件显示成中文
@@ -351,27 +424,56 @@ foreach ($pat in @('*.db', '*.db-wal', '*.db-shm', '*.jsonl', 'topic_stack.json'
 }
 Get-ChildItem $StageDir -Recurse -File -Force -Filter '*.env' -EA SilentlyContinue |
   Where-Object { $_.Name -ne '.env.example' } | ForEach-Object { $bad += $_.FullName }
-$cfg = Join-Path $agentOut 'api-config.json'
+$cfg = Join-Path $dataRoot 'config\api-config.json'
 if ((Test-Path $cfg) -and ((Get-Content $cfg -Raw) -match 'sk-[A-Za-z0-9]{10}')) { $bad += $cfg }
-# 数据目录必须是空的（只有我们自己放的 desktop.ini）
-foreach ($d in @('data\agent', 'data\receiver\inbox', 'data\receiver\books', 'data\receiver\toolbox')) {
+# 数据目录必须只有我们自己放的东西——2026-10 重构后数据在 <包根>\data\
+# 允许清单只有一项：config\api-config.json 的空模板（里面每个字段都是空串）。
+# 它必须允许，因为程序起不来就没法让用户填 Key；但它**必须**是空的——
+# 下面同时验内容：出现 sk- 开头的东西就中止。
+foreach ($d in @('data\config', 'data\profile', 'data\sessions', 'data\reading', 'data\runtime', 'data\toolbox')) {
   $full = Join-Path $StageDir $d
   if (Test-Path $full) {
     Get-ChildItem $full -Recurse -File -Force -EA SilentlyContinue |
-      Where-Object { $_.Name -ne 'desktop.ini' } |
-      ForEach-Object { $bad += "$($_.FullName) （数据目录应只有 desktop.ini）" }
+      Where-Object { $_.Name -ne 'desktop.ini' -and $_.Name -ne 'README.txt' -and $_.FullName -ne $cfg } |
+      ForEach-Object { $bad += "$($_.FullName) （数据目录应只有空模板与说明）" }
+  }
+}
+# builtin\ 允许清单：只有这两个**通用**图谱文件（随包分发，agent 与 receiver 运行时读它们）
+# 其余任何文件都不许进——这一格最容易被人手滑塞进"作者自己的图谱产物"。
+$builtinAllow = @('knowledge-graph-results.json', 'knowledge-graph-demo.json')
+$builtinFull = Join-Path $StageDir 'builtin'
+if (Test-Path $builtinFull) {
+  Get-ChildItem $builtinFull -Recurse -File -Force -EA SilentlyContinue |
+    Where-Object { $builtinAllow -notcontains $_.Name } |
+    ForEach-Object { $bad += "$($_.FullName) （builtin 里只允许通用图谱文件）" }
+  # 并且必须与仓库里的源文件逐字节一致——防止"本地打包带出个人变体、CI 打包没有"那种
+  # 两边不一致、极难察觉的情况（这正是当初 knowledge-graph-results.json 踩过的坑）。
+  foreach ($n in $builtinAllow) {
+    $staged = Join-Path $builtinFull $n
+    $source = Join-Path $repo "agent\scripts\data\$n"
+    if (-not (Test-Path $staged)) { continue }
+    if (-not (Test-Path $source)) { $bad += "$staged （仓库里找不到源文件，无法核对）"; continue }
+    $h1 = (Get-FileHash $staged -Algorithm SHA256).Hash
+    $h2 = (Get-FileHash $source -Algorithm SHA256).Hash
+    if ($h1 -ne $h2) { $bad += "$staged （与仓库源文件不一致，可能是个人数据变体）" }
   }
 }
 
-# 按**文件名**再挡一道：这些是"真实阅读数据"性质的固化产物。
+# 按**文件名**再挡一道：这些是"真实阅读数据"性质的产物。
 # 为什么按名字挡而不是靠扩展名：它们是 .json，跟随包分发的正常产物没法区分。
 # 为什么需要这道锁：它们被 .gitignore 排除，本地存在、CI 不存在——
 # 一旦有人（包括未来的我）手滑把它们加回白名单，本地打包就会把作者的
 # 读书笔记发出去，而 CI 打包看不出来，两边行为不一致、极难察觉。
+# 例外：knowledge-graph-{results,demo}.json 在 builtin\ 下是**合法**的（上面已单独校验
+# 它们与仓库源文件一致），所以这两个名字在全盘扫描时放行；它们出现在别处仍然会被抓。
+$nameAllowInBuiltin = @('knowledge-graph-results.json', 'knowledge-graph-demo.json')
 foreach ($name in @('knowledge-graph-results.json', 'knowledge-graph-demo.json',
                     'judge-real-cases.json', 'judge-real-results.json',
                     'derive-knowledge-graph-inject.json')) {
   Get-ChildItem $StageDir -Recurse -File -Force -Filter $name -EA SilentlyContinue |
+    Where-Object {
+      -not ($nameAllowInBuiltin -contains $_.Name -and $_.DirectoryName -eq $builtinFull)
+    } |
     ForEach-Object { $bad += "$($_.FullName) （真实阅读数据，不应随包分发）" }
 }
 
@@ -412,23 +514,35 @@ $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
 $names = $zip.Entries | ForEach-Object { $_.FullName.Replace('/', '\') }
 Write-Host "`n--- zip 校验 ---"
 $need = @(
-  # 用户直接面对的
-  '01-START-CoRead.bat',
+  # 用户直接面对的（入口现在是 .vbs，在 internal 下；包根只有说明文件）
+  'README-FIRST.txt',
   # internal 里的程序与说明
   'internal\node.exe',
+  'internal\Start-CoRead.vbs',
   'internal\tray.ps1',
-  'internal\run-hidden.vbs',
   'internal\stop.bat',
   'internal\unblock.bat',
   'internal\instructions-zh.txt',
   'internal\agent\index.js',
-  'internal\agent\api-config.json',
+  'internal\agent\lib\paths.js',
   'internal\receiver\index.js',
-  # 数据目录（程序运行时往这里写；空壳随包分发）
-  'internal\agent\data\',
-  'internal\receiver\inbox\',
-  'internal\receiver\books\',
-  'internal\receiver\toolbox\'
+  # 数据目录（程序运行时往这里写；空壳随包分发，2026-10 重构后数据在包根 data\）
+  # 注意：**只有空目录才会在 zip 里有条目**。有内容的目录（data\config、builtin）
+  # 不会单独出现，要校验就直接写里面的文件名——写成 'data\config\' 会假报 MISS（实测踩过）。
+  'data\README.txt',
+  'data\config\api-config.json',
+  'data\profile\',
+  'data\sessions\',
+  'data\reading\',
+  'data\runtime\',
+  'data\toolbox\',
+  # 内置数据（随包分发的图谱回退源与演示图）
+  'builtin\knowledge-graph-results.json',
+  'builtin\knowledge-graph-demo.json',
+  # 图标（托盘用）
+  'assets\icons\coread.ico',
+  # 插件图标
+  'extension\icons\icon128.png'
 )
 $missing = 0
 foreach ($n in $need) {

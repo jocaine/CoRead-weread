@@ -13,12 +13,13 @@
  *   · 新对话 key = __coread_free_<8hex>__；默认对话沿用历史 FREE_KEY
  *     （__coread_free_mode__）——不迁移、不重命名，旧栈/旧消息原样可用。
  *   · 本模块只管**注册表**（清单：标题、创建/活跃时间、归档状态）与消息清理；
- *     对话内容本身仍在 receiver/inbox 的 chat_input/chat_output.jsonl 里按 bookId 落库。
+ *     对话内容本身在 data\sessions\chat.db（2026-10 方案 B：SQLite 取代
+ *     chat_input/chat_output.jsonl，见 lib/chat-store.js）。
  *
  * 归属：receiver 与 agent 共用（receiver 提供侧栏用的 HTTP 端点，agent 在归档时
  * 读写状态、清理消息）。纯文件 IO + 纯函数，无进程内状态。
  *
- * 数据：<agentDir>/data/free-conversations.json
+ * 数据：<sessionsDir>/free-conversations.json（2026-10 重构前是 <agentDir>/data/…）
  *   { conversations: [ { id, key, title, createdAt, updatedAt, ticketCount, status,
  *                        archivedAt, archive: { memory, graph } } ] }
  *   status: 'active'（活动列表可见）| 'archived'（已归档——归档即删除，仅留这一条墓碑
@@ -28,6 +29,7 @@
 import fs from 'fs'
 import path from 'path'
 import { writeFileAtomic } from './atomic-write.js'
+import { legacyFreeConversationsFile } from './paths.js'
 
 // 默认自由对话：历史哨兵书 key。旧版本所有自由对话都挂在它下面，保持原样即
 // 向后兼容（旧消息、旧 topic_stack 键、旧 sandbox 产物全部继续可用）。
@@ -48,9 +50,20 @@ export function newFreeKey(rand = Math.random) {
   return FREE_KEY_PREFIX + s + '__'
 }
 
-/** 注册表文件路径（agent/data 下，与 knowledge-graph*.json 同处） */
-export function freeConversationFile(agentDir) {
-  return path.join(agentDir, 'data', 'free-conversations.json')
+/** 注册表文件路径。
+ *  2026-10 目录重构后：data\sessions\free-conversations.json（传进来的是 SESSIONS_DIR）。
+ *  兼容两种老写法，让升级前/未迁移的数据仍可读：
+ *    ① 传的是 agentDir（旧调用点、单测临时目录）→ <dir>/data/free-conversations.json
+ *    ② 旧布局原文件确实还在 → 直接读它（迁移脚本跑之前，用户不该看到"对话列表空了"）
+ *  只有当老文件真实存在时才回退，避免新装用户在 <dir>/data 下凭空多出一个目录。 */
+export function freeConversationFile(dir) {
+  const inData = path.join(dir, 'data', 'free-conversations.json')
+  if (fs.existsSync(inData)) return inData          // ① 传进来的是老式 agentDir，且老文件还在
+  const own = path.join(dir, 'free-conversations.json')
+  if (fs.existsSync(own)) return own                // ② 新布局：data\sessions\free-conversations.json
+  const legacy = legacyFreeConversationsFile()
+  if (fs.existsSync(legacy)) return legacy          // ③ 新位置还没有、老位置有 → 先读老位置（等迁移脚本搬）
+  return own                                        // ④ 全新用户：返回新位置
 }
 
 /** 从首条用户消息取标题：压平空白的单行，长度上限 max 后截断加 … */

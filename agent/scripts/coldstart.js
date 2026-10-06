@@ -13,9 +13,11 @@ import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { resolveApiConfig, isConfigured } from '../lib/api-config.js'
+import { PROFILE_DIR, PROFILE_FILE, ensureDirs } from '../lib/paths.js'  // 数据路径唯一真源
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const AGENT_DIR = path.join(__dirname, '..')
+const AGENT_DIR = path.join(__dirname, '..')   // 程序目录（脚本在这里，随代码走）
+ensureDirs()                                    // 全新安装时 data\ 可能还不存在
 const SKILL_VERSION = '1.0.3'
 const GATEWAY = 'https://i.weread.qq.com/api/agent/gateway'
 
@@ -195,11 +197,12 @@ async function main() {
 
   const profileContent = await distillProfile(shelf, notebooks, allHighlights)
 
-  const profilePath = path.join(AGENT_DIR, 'profile.md')
+  // 画像落点由 lib/paths.js 决定：data\profile\portrait.md（旧版写在 agent\profile.md）
+  const profilePath = PROFILE_FILE
   fs.writeFileSync(profilePath, profileContent + `\n\n---\n_冷启动于 ${new Date().toISOString().slice(0,10)}_\n`)
 
-  console.log('\n✅ profile.md 已生成：', profilePath)
-  console.log('\n冷启动完成！现在可以打开 agent/ 目录开始共读会话了。\n')
+  console.log('\n✅ 阅读画像已生成：', profilePath)
+  console.log('   （同目录还有 values-portrait.md 价值观侧写，由共读过程中自动维护）\n')
 }
 
 main().catch(e => { console.error('❌', e.message); process.exit(1) })
