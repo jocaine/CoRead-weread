@@ -1,14 +1,13 @@
 {
   "name": "coread-agent",
   "type": "module",
-  "description": "CoRead 共读 agent — 自包含交互式会话，调用 Gemini 与用户实时讨论标注",
+  "description": "CoRead 共读 agent — 常驻进程，调用任意 OpenAI 兼容服务商的模型与用户实时讨论标注",
   "main": "index.js",
   "engines": {
     "node": ">=24"
   },
   "scripts": {
     "start": "node --env-file-if-exists=../data/config/env index.js",
-    "coldstart": "node --env-file-if-exists=../data/config/env scripts/coldstart.js",
     "test": "node --test",
     "test:once": "node --test --test-reporter=spec",
     "test:watch": "node --test --watch",

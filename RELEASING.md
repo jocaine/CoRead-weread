@@ -240,7 +240,7 @@ desktop.ini 于是不被读取。
 
 ```
 <包根>\data\config\     设置：API 地址、模型名、密钥（含密钥明文）
-<包根>\data\profile\    阅读画像、价值观侧写、知识图谱、冷启动标记
+<包根>\data\profile\    阅读画像、价值观侧写、知识图谱（+ 会意图谱）
 <包根>\data\sessions\   聊天库 chat.db、会话流水账、游标、讨论栈、停机哨兵
 <包根>\data\reading\    划线标注、书库缓存（读过的章节原文）
 <包根>\data\runtime\    处理状态（可随时删，启动自动重建）

@@ -110,6 +110,9 @@ function legacyResidue() {
         if (/^(profile|soul|session_journal|topic_stack|hist_cursors)\..*\.bak/.test(f)) {
           items.push(path.join(agent, f))
         }
+        // .coldstart_skipped = 旧的"别再问我是否加载微信读书历史"标记。
+        // 那句提问与 coldstart.js 已于 2026-10-06 删除，所以它现在只是**残渣**：
+        // 不再搬进新布局（搬了就是造一个没人读的死文件），列在这里供 --clean-legacy 删掉。
         if (f === '.coldstart_skipped') items.push(path.join(agent, f))
       }
     } catch {}

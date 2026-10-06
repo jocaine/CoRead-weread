@@ -46,7 +46,7 @@ import {
   AGENT_DIR, BOOKS_DIR, ANNOTATIONS_FILE, AGENT_CURSOR_FILE, CHAT_DB, STREAM_FILE,
   AGENT_STATE_FILE, STOP_FILE, JOURNAL_FILE, TOPIC_STACK_FILE, GRAPH_FILE,
   BUILTIN_GRAPH_RESULTS_FILE, SELF_PORTRAIT_FILE, PROFILE_FILE, SOUL_FILE,
-  HIST_CURSOR_FILE, COLDSTART_MARKER_FILE, SESSIONS_DIR, LAYOUT_KIND, layoutSummary,
+  HIST_CURSOR_FILE, SESSIONS_DIR, LAYOUT_KIND, layoutSummary,
   ensureDirs, detectUnmigrated, scriptCommand,
 } from './lib/paths.js'
 
@@ -1856,55 +1856,22 @@ function enrichChatMessage(msg) {
   return msg.content
 }
 
-// ── 首次启动：引导冷启动 ─────────────────────────────────────────────────────
-// 冷启动标记（2026-10 随目录重构改名）：旧名 .coldstart_skipped（点开头=资源管理器隐藏，
-// 是"用户拷贝数据时看不见、漏拷"的一类文件）。现在叫 profile\coldstart-done，可见。
-const COLDSTART_SKIP_FLAG = COLDSTART_MARKER_FILE
-
-function hasRealProfile() {
-  const profile = readIfExists(PROFILE_FILE)
-  // 有超过 200 字的真实内容（排除空模板和只有日期的情况）
-  return profile.replace(/[-\s_*#]/g, '').length > 200
-}
-
-function askQuestion(rl, question) {
-  return new Promise(resolve => rl.question(question, resolve))
-}
-
-async function maybeRunColdstart(rl) {
-  if (hasRealProfile()) return            // 已有画像，跳过
-  if (fs.existsSync(COLDSTART_SKIP_FLAG)) return  // 用户之前选了跳过
-
-  console.log('👋 检测到尚未建立阅读画像。')
-  console.log('   CoRead 可以通过你的微信读书历史（书架、划线、想法）')
-  console.log('   生成一份初始了解，让后续讨论更有针对性。\n')
-
-  const answer = await askQuestion(rl, '是否现在加载？需要 WEREAD_API_KEY（y/n）: ')
-
-  if (answer.trim().toLowerCase() !== 'y') {
-    fs.writeFileSync(COLDSTART_SKIP_FLAG, '')
-    console.log('\n（已跳过，如需加载可手动运行 node scripts/coldstart.js）\n')
-    return
-  }
-
-  if (!process.env.WEREAD_API_KEY) {
-    console.log('\n⚠️  未检测到 WEREAD_API_KEY，请在 .env 里添加后重新启动。\n')
-    return
-  }
-
-  console.log('\n开始加载微信读书历史...\n')
-  const { execSync } = await import('child_process')
-  try {
-    execSync(`node "${path.join(AGENT_DIR, 'scripts', 'coldstart.js')}"`, {
-      stdio: 'inherit',
-      env: process.env,
-    })
-    // 2026-09 画像下沉：system 不含画像，无需重建（personaBlock 每次动态读文件）
-    console.log('\n✓ 阅读画像已加载，开始共读。\n')
-  } catch (e) {
-    console.log(`\n⚠️  加载失败：${e.message}\n`)
-  }
-}
+// ── 首次启动 ─────────────────────────────────────────────────────────────────
+// 2026-10-06 删掉了"引导冷启动"整段：它会在启动时问一句
+//   「是否现在加载？需要 WEREAD_API_KEY（y/n）」
+// 那在"人在终端前"的时代是合理的（当时的入口是 tmux / start.bat 前台跑 agent），
+// 但 2026-10-04 起 agent 由托盘**隐藏启动**，整条链上没有任何控制台 ——
+// rl.question 的回调永不触发，await 永远等下去，**全新用户第一次启动就永久卡住**，
+// 而托盘的健康判据只是"进程在不在"，于是照样显示"运行中 ✅"。
+//
+// 连带删掉的还有它背后的"用微信读书历史生成画像初稿"那条路（scripts/coldstart.js：
+// 走 i.weread.qq.com 的 gateway 全量拉书架/划线/想法）。原因：WEREAD_API_KEY 在便携包里
+// 根本没有来源（全项目只有读、没有写；托盘启动 node 时也不带 --env-file），
+// 所以就算有人能答上那个 y，也只会得到"请在 .env 里添加"。
+//
+// **画像功能本身没有消失**：它还有一条活的写入者 —— 下面 MEMORY_SPECS.profile 的
+// MEMORIZE 协议，会随对话把用户明确表达过的内容合并进 data\profile\portrait.md。
+// 删掉的只是"开局从微信读书拉一份初稿"这一步，新用户从零开始积累。
 
 // ── 处理新标注 ───────────────────────────────────────────────────────────────
 let currentAnn = null
@@ -1976,9 +1943,6 @@ async function main() {
   console.log('   输入 /exit 退出\n')
 
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '> ' })
-
-  // 首次启动引导
-  await maybeRunColdstart(rl)
 
   // 强杀/断电兜底：上次会话未固化的对话在启动时恢复合并
   await recoverUnmergedMemory()

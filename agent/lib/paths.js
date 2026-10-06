@@ -144,10 +144,10 @@ export const SELF_PORTRAIT_FILE = path.join(PROFILE_DIR, 'self-portrait.md')
 export const PROFILE_FILE = path.join(PROFILE_DIR, 'portrait.md')
 export const SOUL_FILE = path.join(PROFILE_DIR, 'values-portrait.md')
 export const UNANSWERED_QUESTIONS_FILE = path.join(PROFILE_DIR, 'unanswered-questions.json')
-/** 冷启动标记：有了它就不再问"是否加载微信读书历史"。
- *  旧名 agent\.coldstart_skipped（点开头 = 资源管理器隐藏，属于"用户拷数据时看不见"的那类文件），
- *  2026-10 随目录重构改名并放进 profile\，让它可见、也知道自己属于哪一格。 */
-export const COLDSTART_MARKER_FILE = path.join(PROFILE_DIR, 'coldstart-done')
+// 2026-10-06 删掉了 COLDSTART_MARKER_FILE（profile\coldstart-done）：
+// 它只是用来记住"别再问是否加载微信读书历史"，而那句提问连同它背后的
+// scripts/coldstart.js 一起删了（原因见 agent/index.js 里那段注释）。
+// 老安装里可能残留一个 0 字节的 profile\coldstart-done，没有任何代码读它，可以直接删。
 /** 内置回退图谱（随包分发；用户数据缺失时图视图显示它） */
 export const BUILTIN_GRAPH_RESULTS_FILE = path.join(BUILTIN_DIR, 'knowledge-graph-results.json')
 /** 演示拓扑的事件序列（随包分发；?demo=1 用） */
@@ -194,7 +194,9 @@ export function legacyLocations() {
   return [
     { from: path.join(legacyAgent, 'api-config.json'), to: API_CONFIG_FILE, kind: 'file', note: '模型 API 配置（含密钥）' },
     { from: path.join(legacyAgent, '.env'), to: ENV_FILE, kind: 'file', note: '环境变量配置（含密钥）' },
-    { from: path.join(legacyAgent, '.coldstart_skipped'), to: COLDSTART_MARKER_FILE, kind: 'file', note: '冷启动已完成标记' },
+    // 注意：旧的 agent\.coldstart_skipped **不再搬进来**。它只是个"别再问我"的标记，
+    // 而那句提问连同 coldstart.js 已于 2026-10-06 删除，搬过来只会造出一个没人读的死文件。
+    // 它仍在 migrate-data-layout.mjs 的残渣清单里，--clean-legacy 会顺手删掉。
     { from: path.join(legacyAgent, 'data', 'knowledge-graph.json'), to: GRAPH_FILE, kind: 'file', note: '会意图谱' },
     { from: path.join(legacyAgent, 'data', 'knowledge-graph.free.json'), to: path.join(PROFILE_DIR, 'knowledge-graph.free.json'), kind: 'file', note: '自由模式沙盒图（测试产物）' },
     { from: path.join(legacyAgent, 'self-portrait.md'), to: SELF_PORTRAIT_FILE, kind: 'file', note: '观念画像' },
@@ -274,7 +276,6 @@ export const DATA_FILES = {  'knowledge-graph': GRAPH_FILE,
   'self-portrait': SELF_PORTRAIT_FILE,
   portrait: PROFILE_FILE,
   'values-portrait': SOUL_FILE,
-  'coldstart-done': COLDSTART_MARKER_FILE,
   'unanswered-questions': UNANSWERED_QUESTIONS_FILE,
   'chat-db': CHAT_DB,
   journal: JOURNAL_FILE,

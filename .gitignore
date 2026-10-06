@@ -41,7 +41,6 @@ receiver/toolbox/
 receiver/backups/
 
 # Agent 标记文件
-agent/.coldstart_skipped
 agent/.stop
 # 会话流水账（强杀恢复用，个人数据）
 agent/session_journal.jsonl
