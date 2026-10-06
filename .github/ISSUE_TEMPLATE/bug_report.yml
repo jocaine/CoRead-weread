@@ -1,0 +1,109 @@
+name: 报一个问题
+description: 启动失败 / 侧栏没反应 / 数据不对 / 翻译或阅读器出错
+title: "[问题] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 提之前请先看两件事
+
+        **1. 先翻一遍排查手册**：包里 `internal\instructions-zh.txt`。
+        启动失败、侧栏一片空白、端口被占用、装插件失败这些常见问题都在里面，
+        通常比等回复快。
+
+        **2. 绝对不要粘贴 `data\config\` 里的内容。**
+        那里存着你的模型 API 密钥，而 issue 是公开的 —— 贴出来等于公开你的钥匙。
+        要发日志的话，先把 `data\config\` 整个文件夹移走或清空再复制。
+
+  - type: input
+    id: version
+    attributes:
+      label: CoRead 版本
+      description: 就是你解压出来的文件夹名（或 zip 名）里的数字
+      placeholder: "0.3.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: 问题出在哪一步
+      options:
+        - 启动：双击 Start-CoRead.vbs 后，托盘图标根本没出现
+        - 启动：托盘出现了，但状态文字不对（部分运行 / 端口被占用）
+        - 装浏览器插件
+        - 侧栏提问：提问后一直没有回复
+        - 侧栏提问：回复内容不对、讨论串了、AI 像失忆
+        - 翻译：Alt+S 框选 / Alt+T 划词
+        - PDF 阅读器
+        - 数据：记录缺失 / 顺序不对 / 知识图谱不对
+        - 其他（在下面的描述里说明）
+    validations:
+      required: true
+
+  - type: input
+    id: tray_status
+    attributes:
+      label: 托盘图标的状态文字
+      description: 右键托盘图标，最上面那行「状态：……」照抄过来
+      placeholder: "状态：运行中 ✅"
+    validations:
+      required: false
+
+  - type: input
+    id: browser
+    attributes:
+      label: 浏览器与版本
+      description: Chrome / Edge / 其他 Chrome 内核浏览器，加版本号（地址栏访问 chrome://version 能看到）
+      placeholder: "Chrome 154.0.8037.97"
+    validations:
+      required: false
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows 版本
+      description: 设置 → 系统 → 关于
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: false
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: 你做了什么、期望发生什么、实际发生了什么
+      description: 尽量按步骤写。涉及某本书或某段划线时，说清是哪一步出的问题。
+      placeholder: |
+        1. 双击了 internal\Start-CoRead.vbs，托盘图标出现，写着「状态：运行中」
+        2. 打开微信读书网页版，侧栏正常出现
+        3. 在侧栏提问「这段话什么意思」
+        4. 期望：几秒后出现回复
+        5. 实际：思考气泡转了一会儿就消失了，一直没有回复
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志内容
+      description: |
+        `logs\` 里有这些文件：tray.log、agent.out.log、agent.err.log、
+        receiver.out.log、receiver.err.log。把**有内容**的那个贴上来即可
+        （一般先看 tray.log 和 agent.out.log），空文件不用贴。
+
+        再提醒一次：贴之前确认里面没有你的 API 密钥。
+      placeholder: 直接把日志内容粘贴在这里
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirms
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我确认上面没有粘贴任何 API 密钥（`data\config\` 里的内容）
+          required: true
+        - label: 我已经看过 `internal\instructions-zh.txt` 的排查手册
+          required: false

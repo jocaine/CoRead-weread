@@ -12,6 +12,13 @@
 | `pack-portable-zip.ps1` | 生成的 zip 名字，如 `CoRead-0.3.1-portable.zip` |
 | GitHub Actions | 校验 tag 与它是否一致，不一致直接报错 |
 
+> **仓库里另外三个 `package.json` 都故意不写 `version`**（2026-10 去掉的）。
+> 它们原来各写着一个 `0.1.0`，从来没跟 manifest 走过 —— 于是"版本号"在仓库里
+> 有三处、其中两处是错的。既然没有任何代码读它们（`agent/package.json` 与
+> `receiver/package.json` 进包只是为了 `"type": "module"`），就删掉，让
+> "唯一真源"这句话**字面上成立**，而不是靠人记得同步。
+> 别再加回来：多一个数字，就多一次对不上的机会。
+
 ### 怎么进位
 
 | 改了什么 | 新版本 |
@@ -19,6 +26,18 @@
 | 修 bug、改文案、微调 | `0.3.0` → `0.3.1` |
 | 加了新功能 | `0.3.1` → `0.4.0`（末位归零） |
 | 大改、不兼容 | → `1.0.0` |
+
+> **⚠️ 0.3.2 的实际情况（2026-10-06 记录）**：这一版**不是**小修 —— 它带了一个
+> **不兼容改动**：用户数据从 `internal\` 下搬到了包根 `data\`，启动入口也从
+> `01-START-CoRead.bat` 换成了 `internal\Start-CoRead.vbs`。按上面那张表，
+> 这类改动本该进次版本号或更高；这一版按发版时的决定出的是 0.3.2（补丁位）。
+> 留这条记录是为了让以后翻历史的人知道：**0.3.2 不是"改了几个字"**。
+>
+> 对老用户的实际影响：升到 0.3.2 后程序按新位置找数据，而他的记录还在
+> `internal\` 下 → 界面上表现为"记录全空了"，必须跑一次数据迁移
+> （见下面「老用户升级：跑一次迁移」一节）。
+>
+> **下次再动数据布局时，先想清楚版本号要不要跟着进位**，并把这条记录一起更新。
 
 ---
 
@@ -126,7 +145,7 @@ powershell -ExecutionPolicy Bypass -File installer\pack-portable-zip.ps1
 ```
 CoRead-<版本>-portable\
 ├── README-FIRST.txt         一分钟上手
-├── data\                    用户数据（空壳 + README.txt + config\api-config.json 空模板）
+├── data\                    用户数据（**只有空目录壳 + README.txt**，不含任何配置文件）
 ├── extension\               浏览器插件
 ├── internal\                程序本体 + 双击入口
 │   ├── Start-CoRead.vbs        ★用户双击这个启动（为什么不是 .bat 见下）
@@ -230,7 +249,12 @@ desktop.ini 于是不被读取。
 <包根>\logs\            日志
 ```
 
-打包时**建空目录即可**，升级时**绝不能覆盖**（升级只覆盖程序文件，`data/` 归用户）。
+打包时**建空目录即可**；而且**不许往 data\ 里放任何文件** —— 这条现在有闸门强制
+（`pack-portable-zip.ps1` 的敏感数据检查：data\ 各格除 `desktop.ini` 与 `README.txt`
+之外出现任何文件，打包直接中止）。为什么这么严：用户升级时最自然的做法就是把新 zip
+**解压到旧文件夹上覆盖**，包里每多一个数据文件，都会在那一下盖掉他自己的东西 ——
+2026-10 就是因为带了 `config\api-config.json` 的空模板，会把用户填好的 API Key 清空。
+所以规矩不是"升级别覆盖"，而是"**让覆盖变安全**"。
 
 `paths.js` 怎么判断包根：看 agent 是不是装在 `internal\` 下——是，则包根 = 上一级
 （便携包布局）；不是，则包根 = 仓库根（开发布局）。两种布局共用同一份代码路径，
@@ -245,12 +269,19 @@ desktop.ini 于是不被读取。
 ### 老用户升级：跑一次迁移
 
 ```powershell
-node internal\agent\scripts\migrate-data-layout.mjs           # 演练，只打印计划
-node internal\agent\scripts\migrate-data-layout.mjs --apply   # 真搬
+internal\node.exe internal\agent\scripts\migrate-data-layout.mjs           # 演练，只打印计划
+internal\node.exe internal\agent\scripts\migrate-data-layout.mjs --apply   # 真搬
 ```
+
+**为什么写 `internal\node.exe` 而不是 `node`**：便携包用户的机器上没装 Node，
+自带的是 `internal\node.exe`，而它从来没被加进 PATH —— 写 `node` 的话用户会看到
+「'node' 不是内部或外部命令」，然后卡在"记录是空的"这一步。
+（2026-10 之前：脚本本身也不在包里，两个原因叠加，说明书写的那条命令 100% 跑不通。
+现在三个面向用户的脚本由 `pack-portable-zip.ps1` 逐个点名进包，并写进了 zip 校验清单。）
 
 规矩：先复制 → 校验字节数 → 通过才删源；关键文件（chat.db、图谱、讨论栈）留
 `.pre-migrate` 备份。跑之前必须完全退出 CoRead，否则文件被占用会失败（脚本会报出来）。
+迁移完旧位置可能还剩几百 MB 残渣，`--clean-legacy` 会先列清单再删。
 agent 启动时会自动体检（`detectUnmigrated()`），发现旧数据没搬会在日志里提示——
 **不能指望用户自己发现"记录变空了"**。
 

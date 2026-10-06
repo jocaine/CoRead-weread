@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 先看排查手册（启动失败 / 侧栏空白 / 端口占用 / 装插件失败）
+    url: https://github.com/jocaine/CoRead-weread/blob/main/installer/portable/instructions-zh.txt
+    about: 常见问题的处理步骤都写在这份手册里，通常比等回复更快
+  - name: 包里的说明书（数据在哪、怎么备份、怎么升级）
+    url: https://github.com/jocaine/CoRead-weread/blob/main/installer/portable/README-FIRST.txt
+    about: 解压后根目录那份「一分钟上手」的原文
