@@ -26,8 +26,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { DATA_FILES, exportedJsonlFile } from '../lib/paths.js'  // 数据路径唯一真源
+import { DATA_FILES, exportedJsonlFile, DEVDATA_DIR } from '../lib/paths.js'  // 数据路径唯一真源
 import { judgeSameProblem, buildSameProblemInstruction } from '../lib/topic-stack.js'
 import { consolidateThreadQuestion, buildQuestionInstruction } from '../lib/thread-question.js'
 import { segmentStack } from '../lib/segment-stack.js'
@@ -44,9 +43,10 @@ function hashStr(s) {
 const INST_HASH = hashStr(buildSameProblemInstruction())
 const Q_INST_HASH = hashStr(buildQuestionInstruction())  // 归纳问题指令版本（threads.question 缓存）
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA = path.resolve(__dirname, './data/judge-real-cases.json')
-const RES = path.resolve(__dirname, './data/judge-real-results.json')
+// judge-real-* 这对中间产物在仓库根的 devdata\（2026-10 从 agent/scripts/data/ 挪出来：
+// 私人语料不该躺在打包源目录隔壁）。详见 lib/paths.js 里 DEVDATA_DIR 的注释。
+const DATA = path.join(DEVDATA_DIR, 'judge-real-cases.json')
+const RES = path.join(DEVDATA_DIR, 'judge-real-results.json')
 // 聊天数据源（2026-10 目录重构后）：
 //   主路 = SQLite，data\sessions\chat.db（reply_to 直连配对）
 //   回退 = 老 JSONL，只在 data\backups\ 里由 export-chat.mjs 导出的只读副本

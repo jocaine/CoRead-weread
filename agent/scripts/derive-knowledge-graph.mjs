@@ -27,7 +27,6 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import {
   createGraph,
   addNode,
@@ -40,11 +39,15 @@ import {
   resolveReferences,
 } from '../lib/knowledge-graph.js'
 import { completionOnce, MAX_JUDGE_TOKENS } from '../lib/llm-api.js'
+import { DEVDATA_DIR } from '../lib/paths.js'   // 开发期数据的唯一真源（不进包）
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA = path.resolve(__dirname, './data/judge-real-results.json')
-const OUT = path.resolve(__dirname, './data/knowledge-graph-results.json')   // 有效数据
-const OUT_DEMO = path.resolve(__dirname, './data/knowledge-graph-demo.json') // 测试辅助
+// 输入与产物都在仓库根的 devdata\（2026-10 从 agent/scripts/data/ 挪出来）：
+// 那些是作者的私人语料（真实讨论单元、评判结果、读书会意图谱），放在打包源目录隔壁
+// 会被"整目录拷"捎带进发行包。详见 lib/paths.js 里 DEVDATA_DIR 的注释。
+const DATA = path.join(DEVDATA_DIR, 'judge-real-results.json')
+const OUT = path.join(DEVDATA_DIR, 'knowledge-graph-results.json')   // 有效数据
+const OUT_DEMO = path.join(DEVDATA_DIR, 'knowledge-graph-demo.json') // 测试辅助
+fs.mkdirSync(DEVDATA_DIR, { recursive: true })
 
 const useReal = process.argv.includes('--real')
 

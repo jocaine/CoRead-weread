@@ -31,7 +31,7 @@ Add-Type -AssemblyName System.Drawing
 #   <包根>\            用户看到的：data\、logs\、extension\、README-FIRST.txt
 #   <包根>\internal\   程序自己用的：node.exe、tray.ps1、Start-CoRead.vbs、agent\、receiver\
 #   <包根>\data\       用户数据（config/profile/sessions/reading/runtime/toolbox/backups）
-#   <包根>\builtin\    随包分发的内置图谱（不是用户数据）
+#   <包根>\builtin\    空目录（2026-10 起不再随包分发图谱文件；不是用户数据）
 #
 # 开发布局（仓库根）：
 #   <仓库根>\          同样的 data\、logs\、extension\

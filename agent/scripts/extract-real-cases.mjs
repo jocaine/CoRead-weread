@@ -18,13 +18,13 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { requireExportedJsonl } from '../lib/paths.js'  // 数据路径唯一真源
+import { requireExportedJsonl, DEVDATA_DIR } from '../lib/paths.js'  // 数据路径唯一真源
 import { parseMessage } from '../lib/chat-input.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const INBOX = requireExportedJsonl('input')
-const DATA = path.resolve(__dirname, './data/judge-real-cases.json')
+// 产物落在仓库根的 devdata\（2026-10 从 agent/scripts/data/ 挪出来：私人语料不该躺在
+// 打包源目录隔壁）。详见 lib/paths.js 里 DEVDATA_DIR 的注释。
+const DATA = path.join(DEVDATA_DIR, 'judge-real-cases.json')
 
 // 默认《静静的顿河》；可用参数覆盖（逗号分隔多个 baseBookId 前缀，如 'ee442b83,6f742a63,54a42df3'）
 const PREFIXES = (process.argv[2] || 'ee442b83643425f356d5638653338624e334c58373064373159317268353955f24')

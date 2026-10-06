@@ -149,7 +149,7 @@ New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
 #     extension\       ← 浏览器插件（装插件时必须选它）
 #     internal\        ← 程序本体（Node 运行环境、引擎、接收端、说明书）
 #     几个 .bat / 说明  ← 双击启动、出问题看说明
-# 另有 builtin\（随包分发的内置图谱）与 logs\（日志），两者都不是用户数据。
+# 另有 builtin\（现在是空目录）与 logs\（日志），两者都不是用户数据。
 # 数据能从 internal\ 里拿出来，靠的是 agent/lib/paths.js 这一处路径真源：
 # 它按"agent 是不是装在 internal\ 下"判断包根在哪，进而定位包根下的 data\。
 $internal = Join-Path $StageDir 'internal'
@@ -158,7 +158,7 @@ New-Item -ItemType Directory -Path $internal -Force | Out-Null
 # ── 2b. 数据目录与内置数据目录（2026-10 目录重构）────────────────────
 # 新布局（依据 agent/lib/paths.js）：
 #   <包根>\data\      用户数据，按类型分格。**备份 = 复制这一个文件夹。**
-#   <包根>\builtin\   随包分发的内置数据（图谱回退源、演示图）。不属于用户，不参与备份。
+#   <包根>\builtin\   空目录（2026-10 起不再随包分发图谱文件，见第 3 步注释）。不属于用户，不参与备份。
 #   <包根>\logs\      日志（托盘输出、侧栏调试上报）。可随时清空。
 # 为什么数据放在包根、不再藏在 internal\ 里：internal\ 的定位是"程序，用户别动"
 # （README-FIRST.txt 原话），数据关在里面就违背这个定位。旧布局的实际代价见
@@ -231,31 +231,43 @@ Copy-Item (Join-Path $repo 'agent\package.json') $agentOut
 Copy-Item (Join-Path $repo 'agent\lib')          $agentOut -Recurse
 if (Test-Path (Join-Path $repo 'agent\.env.example')) { Copy-Item (Join-Path $repo 'agent\.env.example') $agentOut }
 
-# 随包分发的"内置数据"产物 → <包根>\builtin\（2026-10 前放在 internal\agent\scripts\data\）
+# ── builtin\：2026-10 起**不再随包分发任何图谱文件** ────────────────────
 #
-# ⚠️ 这里曾经踩过一个**方向搞反**的坑，记录一下免得重犯：
-#   白名单里原本还写了 knowledge-graph-results.json 和 knowledge-graph-demo.json，
-#   而 agent/scripts/data/ 整个目录是被 .gitignore 排除的。
-#   后果是：本地打包时文件在，就被拷进包（CI 上不存在，静默跳过），
-#   于是"本地包"比"release 包"多出 2 个文件 —— 而那 2 个文件里装的是
-#   **作者自己的读书会意图谱**（读《静静的顿河》积累的 55 个节点/27 条边）。
-#   也就是说，本地打包会把个人阅读数据一起发出去，而 CI 打包反而躲过了。
-#   现在规则说清楚：author 私人的"读数产物"（judge-*、knowledge-graph-results 的真实版）
-#   一律不进包；真正要随包分发的只有下面这两个**通用**文件。
-$shipped = @('knowledge-graph-results.json', 'knowledge-graph-demo.json')
-foreach ($f in $shipped) {
-  $p = Join-Path $repo "agent\scripts\data\$f"
-  if (Test-Path $p) { Copy-Item $p $builtinRoot; Write-Step "builtin\$f" }
-  else { Write-Step "（跳过缺失的 $f —— 它没提交进 git，CI 上也不会有）" }
-}
-# 两个冒烟用例（开发期用，体积小且不含个人数据）：仍随包，放 internal\agent\scripts\data
-$dataOut = Join-Path $agentOut 'scripts\data'
-New-Item -ItemType Directory -Path $dataOut -Force | Out-Null
-foreach ($f in @('smoke-stack-sequences.json', 'judge-smoke-cases.json')) {
-  $p = Join-Path $repo "agent\scripts\data\$f"
-  if (Test-Path $p) { Copy-Item $p $dataOut }
-  else { Write-Step "（跳过缺失的 $f —— 它没提交进 git，CI 上也不会有）" }
-}
+# 这一段以前会把 agent\scripts\data\ 下的两个图谱拷进 builtin\，注释还写着它们是
+# "通用文件"。**但那个位置上的文件其实是作者的私人图谱**（55 节点/27 边，讲
+# 《静静的顿河》《学做工》，4.4 MB 那一堆里的一个，被 .gitignore 排除、只在作者本机）：
+#   · 本地打包 → 文件在 → 拷进包 → **每个用户打开图视图看到的是作者读过的书**
+#   · CI 打包  → 文件不在 git 里 → 静默跳过 → 包里没有内置图
+# 两道本该拦住它的闸门都失效了：
+#   ① "与仓库源文件比 SHA256" —— 副本就是从那个源拷来的，永远相同，**数学上不可能失败**；
+#   ② 按文件名拦"真实阅读数据"时，又用"上面已单独校验过"当理由把它放行了。
+#
+# 现在改成：**一个图谱文件都不发**。私人语料整体搬到了仓库根的 devdata\（打包白名单
+# 永远不碰的目录），所以这里不再有"拷不拷"的判断。
+#
+# 用户那边会怎样（读代码确认过，不是推测）：缺这两个文件时**优雅降级**，不会报错 ——
+#   · agent：index.js 的 readResultsGraph() 整段包在 try/catch 里，返回 null 后
+#     loadGraph() 走 graph = createGraph()，即"空图"。对全新用户这本就是正确状态
+#     （他还没有任何知识点，引用解析本来就该零命中）。
+#   · receiver：graph-data.js 的 readResultsGraph() / buildDemoGraph() 同样 try/catch → null，
+#     图视图回退到空状态。
+# 代价（明确接受，记在这里免得以后当 bug 查）：*升级上来的老用户*如果正式图还没落盘，
+# 就少了"离线固化图"这层回退。要恢复这个能力，得**提交一份真正通用的图谱**再放行，
+# 不能再用作者本机那份。
+Write-Step 'builtin\（空目录：不再随包分发图谱文件）'
+
+# 两个冒烟夹具（judge-smoke-cases.json / smoke-stack-sequences.json）**不进包**（2026-10 改）。
+#
+# 以前它们会进包，理由是"已提交进 git、体积小、是通用夹具"。但两点站不住：
+#   ① 没有任何消费者 —— 它们是 smoke-topicize.mjs / smoke-stack.mjs 的输入，而那两个
+#      脚本本身不在包里（包里只带三个面向用户的维护脚本，见下一段）。等于把测试数据
+#      发给了用户，却没发用它的测试。
+#   ② smoke-stack-sequences.json 里装的是**作者真实的提问与划线原文**（《静静的顿河》的
+#      段落、他自己问的问题、AI 的回复）。它虽早已提交进 git（公开仓库里本来就看得到），
+#      但"随每个用户的安装包一起发出去"是另一回事，也和 README 里"你的标注是私密的"
+#      这个姿态不一致。
+# 现在一律不发：夹具留在 git 里给开发用，用户拿到的包里没有它们。
+# 若哪天真要把冒烟能力随包分发，先把夹具**改写成合成的示例数据**再放行，别用真实语料。
 
 # ── 面向用户的维护脚本（2026-10 加入）────────────────────────────────
 # 为什么必须进包：说明书明确让用户跑数据迁移（从旧版本升上来的记录还在旧位置），
@@ -470,42 +482,36 @@ foreach ($d in @('data\config', 'data\profile', 'data\sessions', 'data\reading',
       ForEach-Object { $bad += "$($_.FullName) （data\ 下只允许空目录与说明文件）" }
   }
 }
-# builtin\ 允许清单：只有这两个**通用**图谱文件（随包分发，agent 与 receiver 运行时读它们）
-# 其余任何文件都不许进——这一格最容易被人手滑塞进"作者自己的图谱产物"。
-$builtinAllow = @('knowledge-graph-results.json', 'knowledge-graph-demo.json')
+# builtin\ 必须**完全为空**（2026-10 改，见上面第 3 步的注释）。
+# 以前这里是一张"允许两个通用图谱文件"的白名单，还配了一道"与仓库源文件比 SHA256"的
+# 校验 —— 但那个源文件就是作者本机的私人图谱，于是校验退化成"副本跟自己比"，
+# 永远通过，白名单反而成了放行证。教训：**校验要跟一个外部基准比**（git 里的内容、
+# 或一个写死的哈希），跟自己的来源比等于没比。
 $builtinFull = Join-Path $StageDir 'builtin'
 if (Test-Path $builtinFull) {
-  Get-ChildItem $builtinFull -Recurse -File -Force -EA SilentlyContinue |
-    Where-Object { $builtinAllow -notcontains $_.Name } |
-    ForEach-Object { $bad += "$($_.FullName) （builtin 里只允许通用图谱文件）" }
-  # 并且必须与仓库里的源文件逐字节一致——防止"本地打包带出个人变体、CI 打包没有"那种
-  # 两边不一致、极难察觉的情况（这正是当初 knowledge-graph-results.json 踩过的坑）。
-  foreach ($n in $builtinAllow) {
-    $staged = Join-Path $builtinFull $n
-    $source = Join-Path $repo "agent\scripts\data\$n"
-    if (-not (Test-Path $staged)) { continue }
-    if (-not (Test-Path $source)) { $bad += "$staged （仓库里找不到源文件，无法核对）"; continue }
-    $h1 = (Get-FileHash $staged -Algorithm SHA256).Hash
-    $h2 = (Get-FileHash $source -Algorithm SHA256).Hash
-    if ($h1 -ne $h2) { $bad += "$staged （与仓库源文件不一致，可能是个人数据变体）" }
+  $stray = @(Get-ChildItem $builtinFull -Recurse -File -Force -EA SilentlyContinue)
+  if ($stray.Count) {
+    $stray | Select-Object -First 5 | ForEach-Object { $bad += "$($_.FullName) （builtin 里不允许有任何文件）" }
   }
 }
 
-# 按**文件名**再挡一道：这些是"真实阅读数据"性质的产物。
+# 按**文件名**再挡一道：这些是"真实阅读数据"性质的产物，任何位置都不许出现。
 # 为什么按名字挡而不是靠扩展名：它们是 .json，跟随包分发的正常产物没法区分。
-# 为什么需要这道锁：它们被 .gitignore 排除，本地存在、CI 不存在——
-# 一旦有人（包括未来的我）手滑把它们加回白名单，本地打包就会把作者的
+# 为什么需要这道锁：它们被 .gitignore 排除，本地存在、CI 不存在 ——
+# 一旦有人（包括未来的我）手滑把 devdata\ 加回某个白名单，本地打包就会把作者的
 # 读书笔记发出去，而 CI 打包看不出来，两边行为不一致、极难察觉。
-# 例外：knowledge-graph-{results,demo}.json 在 builtin\ 下是**合法**的（上面已单独校验
-# 它们与仓库源文件一致），所以这两个名字在全盘扫描时放行；它们出现在别处仍然会被抓。
-$nameAllowInBuiltin = @('knowledge-graph-results.json', 'knowledge-graph-demo.json')
+# 2026-10 起这些文件整体搬到了 devdata\（不在打包路径上），所以这里**取消所有例外**：
+# 出现即中止，不再有"某处合法"的说法。
 foreach ($name in @('knowledge-graph-results.json', 'knowledge-graph-demo.json',
                     'judge-real-cases.json', 'judge-real-results.json',
+                    'judge-real-results.with-xuezuogong.json',
+                    'xuezuogong-rebuilt-discussions.json',
+                    '_l3_sample.txt',
+                    # 这两个虽是 git 里的正式夹具，但内容含作者真实提问与划线，且它们在包里
+                    # 没有消费者 —— 一旦有人把拷贝那段加回来，这里就拦住。
+                    'smoke-stack-sequences.json', 'judge-smoke-cases.json',
                     'derive-knowledge-graph-inject.json')) {
   Get-ChildItem $StageDir -Recurse -File -Force -Filter $name -EA SilentlyContinue |
-    Where-Object {
-      -not ($nameAllowInBuiltin -contains $_.Name -and $_.DirectoryName -eq $builtinFull)
-    } |
     ForEach-Object { $bad += "$($_.FullName) （真实阅读数据，不应随包分发）" }
 }
 
@@ -564,8 +570,9 @@ $need = @(
   'internal\agent\scripts\chat.db.diag-wal.mjs',
   'internal\receiver\index.js',
   # 数据目录（程序运行时往这里写；空壳随包分发，2026-10 重构后数据在包根 data\）
-  # 注意：**只有空目录才会在 zip 里有条目**。有内容的目录（data\config、builtin）
-  # 不会单独出现，要校验就直接写里面的文件名——写成 'data\config\' 会假报 MISS（实测踩过）。
+  # 注意：**只有空目录才会在 zip 里有条目**。有内容的目录不会单独出现，
+  # 要校验就直接写里面的文件名（写成 'data\config\' 会假报 MISS —— 实测踩过）。
+  # 反过来：data\config\ 与 builtin\ 现在都是空的，所以它们**有**目录条目。
   'data\README.txt',
   # data\config\ 现在是**空目录**（包里不再带 api-config.json，见第 3 步的注释）——
   # 只有空目录才会在 zip 里有条目，所以要写成目录名本身。
@@ -575,9 +582,9 @@ $need = @(
   'data\reading\',
   'data\runtime\',
   'data\toolbox\',
-  # 内置数据（随包分发的图谱回退源与演示图）
-  'builtin\knowledge-graph-results.json',
-  'builtin\knowledge-graph-demo.json',
+  # builtin\ 现在是**空目录**（2026-10 起不再随包分发任何图谱文件，见第 3 步注释）。
+  # 只有空目录才会在 zip 里有条目，所以这里写目录名本身。
+  'builtin\',
   # 图标（托盘用）
   'assets\icons\coread.ico',
   # 插件图标

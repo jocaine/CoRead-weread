@@ -17,14 +17,15 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { judgeTopicization } from '../lib/topicize.js'
 import { messageUnit, parseMessage } from '../lib/chat-input.js'
 import { reconstructTopicized } from '../lib/results.js'
+import { DEVDATA_DIR } from '../lib/paths.js'   // 开发期数据的唯一真源（不进包）
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DATA = path.resolve(__dirname, './data/judge-real-cases.json')
-const RES = path.resolve(__dirname, './data/judge-real-results.json')
+// 输入与结果都在仓库根的 devdata\（2026-10 从 agent/scripts/data/ 挪出来：那些是私人语料，
+// 放在打包源目录隔壁会被"整目录拷"捎带进包）。详见 lib/paths.js 里 DEVDATA_DIR 的注释。
+const DATA = path.join(DEVDATA_DIR, 'judge-real-cases.json')
+const RES = path.join(DEVDATA_DIR, 'judge-real-results.json')
 
 const API_KEY = process.env.COREAD_API_KEY
 const API_BASE = (process.env.COREAD_API_BASE || '').replace(/\/$/, '')

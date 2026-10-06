@@ -151,7 +151,7 @@ CoRead-<版本>-portable\
 │   ├── Start-CoRead.vbs        ★用户双击这个启动（为什么不是 .bat 见下）
 │   ├── node.exe  tray.ps1  stop.bat  unblock.bat  instructions-zh.txt
 │   └── agent\  receiver\
-├── builtin\                 内置图谱（knowledge-graph-results/demo.json）
+├── builtin\                 空目录（2026-10 起不再随包分发图谱文件）
 └── logs\                    空目录（托盘与子进程的日志）
 ```
 
@@ -245,7 +245,7 @@ desktop.ini 于是不被读取。
 <包根>\data\reading\    划线标注、书库缓存（读过的章节原文）
 <包根>\data\runtime\    处理状态（可随时删，启动自动重建）
 <包根>\data\toolbox\    翻译记录
-<包根>\builtin\         随包分发的内置图谱（不是用户数据，不参与备份）
+<包根>\builtin\         空目录（2026-10 起不再随包分发图谱文件；不属于用户，不参与备份）
 <包根>\logs\            日志
 ```
 

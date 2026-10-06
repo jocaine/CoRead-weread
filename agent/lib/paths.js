@@ -109,6 +109,20 @@ export const BUILTIN_DIR = path.join(PACKAGE_ROOT, 'builtin')
 /** 日志（托盘输出、侧栏调试上报）：可随时清空 */
 export const LOGS_DIR = path.join(PACKAGE_ROOT, 'logs')
 
+/**
+ * 开发期数据（**不进包、用户机器上不存在**）：judge/图谱那几个离线脚本的输入与产物。
+ *
+ * 为什么单独一格（2026-10 整理）：这些东西以前放在 `agent/scripts/data/`，也就是
+ * **打包源目录的隔壁** —— 而它们是作者的私人语料（真实讨论单元、评判结果、读书会意图谱，
+ * 实测 4.4 MB，且都被 .gitignore 排除、只存在于本机）。风险很实在：打包脚本早先就
+ * 真把作者的知识图谱打进过发行包（本地打包带出去、CI 反而躲过，见 pack-portable-zip.ps1 注释）。
+ * 挪到仓库根的 devdata\ 之后，"agent\scripts\ 整目录拷"这种手滑再也不会捎带私人数据 ——
+ * 从"靠闸门拦"变成"物理上不在那儿"。
+ *
+ * 注意：便携包里这个路径不存在，也不要往里写用户数据。
+ */
+export const DEVDATA_DIR = path.join(PACKAGE_ROOT, 'devdata')
+
 // ── data\ 下的各格 ──────────────────────────────────────────────────────────
 export const CONFIG_DIR = path.join(DATA_DIR, 'config')
 export const PROFILE_DIR = path.join(DATA_DIR, 'profile')
