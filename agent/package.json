@@ -22,6 +22,10 @@
     "extract:real": "node --env-file-if-exists=../data/config/env scripts/extract-real-cases.mjs",
     "group:discussions": "node --env-file-if-exists=../data/config/env scripts/group-discussions.mjs",
     "diag:wal": "node scripts/chat.db.diag-wal.mjs",
-    "backup:chat": "node scripts/backup-chat.mjs"
+    "backup:chat": "node scripts/backup-chat.mjs",
+    "smoke:live": "node scripts/smoke-live-flow.mjs",
+    "selftest:free": "node scripts/selftest-free-conversations.mjs",
+    "check:restore": "node scripts/restore-check.mjs",
+    "clean:chat-errors": "node scripts/clean-chat-errors.mjs"
   }
 }

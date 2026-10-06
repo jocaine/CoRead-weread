@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 /**
- * CoRead 共读 agent — 自包含交互式会话
+ * CoRead 共读 agent —— 常驻进程，由托盘拉起（开发与便携包同一个入口）
  *
- * 在 tmux 里常驻运行，读取标准输入（用户输入 + inject.sh 注入的触发行），
- * 与用户实时讨论标注，调用 LLM API 生成回应。不依赖任何外部 CLI。
+ * 它不自带界面：用户的界面是浏览器侧栏，命令行提示符只用于开发期调试。
+ * 输入来自标准输入（开发时人工敲命令），输出写进日志与聊天库，经 receiver 的 SSE
+ * 推到侧栏。
  *
  * 启动：
- *   npm start            # 模型 API 在插件侧栏「⋯ → 模型 API 配置」里填（推荐）
- *   cp .env.example .env # 或在 .env 里填 COREAD_API_KEY 等配置（CLI / 无插件场景）
+ *   Start-CoRead.vbs     # 推荐：托盘 + receiver + agent，全程后台（用户双击的也是它）
+ *   node --env-file-if-exists=data/config/env agent/index.js   # 开发期要看前台 REPL 时
+ * 模型 API 在插件侧栏「⋯ → 模型 API 配置」里填（推荐）；也可写 data\config\env。
  */
 
 import fs from 'fs'
