@@ -1,0 +1,7 @@
+# 2026-10：.gitconfig 里的 user.name / user.email 曾被误写入中文弯引号
+# （U+201C / U+201D —— 从网页或聊天软件复制文本时容易被自动换上），
+# 于是这之前的提交，署名两边各挂了一对引号，看起来像配置坏了。
+#
+# 下面这行把旧署名映射到正确署名。.mailmap 只影响**显示**
+# （git log / git blame / git shortlog 等），不改写任何历史、不改提交编号。
+jocaine <2508087548@qq.com> “jocaine” <“2508087548@qq.com”>
