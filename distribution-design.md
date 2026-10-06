@@ -137,7 +137,7 @@ Agent agent/index.js                       ← 2226 行
 - ✅ 无 `eval` / `new Function` / 远程脚本注入（CWS 红线）
 - ✅ AI 回复经 `esc()` 转义 + 自研 markdown 转换，不是把远程 HTML 直接塞进 DOM
 - ⚠️ `optional_host_permissions` 申请 `https://*/*` 是审核重点。若固定用一家模型服务，应改成具体域名（如 `https://api.deepseek.com/*`），阻力大降
-- ❌ 缺图标（`manifest.icons` 是 `null`，目录里一个图标文件都没有）
+- ✅ 图标已补齐（2026-10）：`extension/icons/icon{16,32,48,128}.png`，manifest 的 `icons` 与 `action.default_icon` 都已声明；托盘图标另有 `assets/icons/coread.ico`（含 16/32/48/128/256 五档）。生成脚本 `tools/make-icons.ps1`，设计是"蓝底 + 白书页 + 暖橙书签"，取向为**小尺寸优先**（托盘只有 16×16）
 - ❌ 缺隐私政策（处理阅读数据 + 调外部模型，属重点审查对象）
 
 ### 路 A：搬上云端做 SaaS
@@ -272,106 +272,194 @@ HTTP 实测：
 
 ### 6.4 打包时必须注意的路径规则（实测得出）
 
-盲拷整个目录会**把开发机上的个人数据一起打包**——实测中第一次就误带进了 12 本真实书籍、聊天库、API Key。正确的包含/排除清单：
+盲拷整个目录会**把开发机上的个人数据一起打包**——实测中第一次就误带进了 12 本真实书籍、聊天库、API Key。正确的包含/排除清单（**2026-10 目录重构后**）：
 
 | 必须带上 | 必须排除 |
 |---|---|
-| `node.exe` + Node 自己的 LICENSE | `agent/.env`、`agent/api-config.json`（含 API Key 明文） |
-| `agent/index.js`、`agent/package.json`、`agent/lib/`、`agent/.env.example` | `agent/data/`（用户数据：图谱、画像、对话）——**建空目录** |
-| `agent/scripts/data/`（图谱回退源、演示图，**运行时会被读**） | `agent/scripts/` 下其余文件（开发脚本，4.2 MB） |
-| `receiver/index.js`、`package.json`、`graph-data.js` | `receiver/books/`、`receiver/inbox/`、`receiver/toolbox/`——**建空目录** |
+| `node.exe` + Node 自己的 LICENSE | `data/config/env`、`data/config/api-config.json`（含 API Key 明文）——**只放空模板** |
+| `agent/index.js`、`agent/package.json`、`agent/lib/`、`agent/.env.example` | `data/` 下各格（用户数据）——**全部建空目录** |
+| `agent/scripts/data/` 里的冒烟用例（`smoke-*`、`judge-smoke-*`） | `agent/scripts/` 下其余文件（开发脚本，4.2 MB；含作者个人的判例与图谱产物） |
+| `agent/scripts/data/knowledge-graph-{results,demo}.json` → **`builtin/`**（图谱回退源与演示图，运行时会被读） | 作者的 `judge-real-*`、`derive-*` 等真实读数产物 |
+| `receiver/index.js`、`package.json`、`graph-data.js` | 老布局残留：`receiver/books/`、`receiver/inbox/`、`receiver/toolbox/`、`agent/data/` |
 | `extension/`（排除 `test/`） | `agent/test/`、`agent/*.md`、`*.bak*`、`*.out` |
 
-**⚠️ 升级时的红线**：安装包升级只能覆盖程序文件，**绝对不能碰** `agent/data/`、`receiver/books/`、`receiver/inbox/`、`receiver/toolbox/`。否则一次升级就把读者几个月的阅读记录和聊天历史清空。
+**⚠️ 升级时的红线**：升级只能覆盖程序文件，**绝对不能碰** `data/`（用户数据全在这里）。否则一次升级就把读者几个月的阅读记录和聊天历史清空。
 
-### 6.5 安装包已实现（Inno Setup）
+打包脚本里有一道**敏感数据闸门**（`installer/pack-portable-zip.ps1`）：`*.db`、`*.jsonl`、`*.env`、含 `sk-` 的配置、以及 `data/` 下任何非空文件，检出即中止。`builtin/` 另有一条更细的规则——只放行两个通用图谱文件，且逐个与仓库源文件做 SHA256 比对。
 
-安装包已经写好并**编译通过**，产物 `installer/build/out/CoRead-Setup-0.3.0.exe` = **25.5 MB**（94.3 MB 压到 25.5 MB，压缩率 73%，LZMA2/max）。
+### 6.4b 数据目录重构（2026-10-06，已实施）
 
-**文件构成**：
+**改之前**：数据路径散在 5 个文件的 10 处定义里，落点跟着代码走——
 
-| 文件 | 作用 |
+```
+internal\agent\data\        会意图谱、自由对话列表、未答提问清单
+internal\agent\（根目录）   讨论栈、会话流水账、截尾游标、API 配置、三份画像、冷启动标记
+internal\receiver\inbox\    聊天库、标注、标注游标、已删标注存档、调试日志
+internal\receiver\books\    书库缓存
+internal\receiver\toolbox\  翻译记录
+```
+
+**为什么必须改**（不是审美问题，是实测踩出来的）：
+
+1. **用户无法凭目录判断该备份什么**。2026-10-06 实测：用户要把自己的数据搬到新版本，按"看起来像数据目录"的两个文件夹（`agent\data\`、`receiver\books\`）复制，结果 11 个文件没拷过去；`chat.db` 没拷 → 侧栏聊天记录全空。
+2. **只补拷主库会毁数据**。把 `chat.db` 单独拷到已经跑过旧版的目标目录，旁边还留着旧库的 `chat.db-wal`，SQLite 会按那份旧日志把新库**回滚成空库**——实测复现：725 页 → 13 页，941 条消息清零。这个坑对用户完全不可见（"我明明拷了 2.9 MB 的文件"）。
+3. **托盘"优雅停机"从来没生效过**。`tray.ps1` 写哨兵到 `<包根>\data\agent\.stop`，而 agent 查的是 `internal\agent\.stop`——两个路径对不上（同一份代码里两处各自拼路径的直接后果）。日志实证：写哨兵后 3 秒强杀进程，最后一场对话的记忆不固化。**修数据路径这件事顺手把这个 bug 消掉了**：现在两边都从 `agent/lib/paths.js` 取 `STOP_FILE`。
+4. 那行错路径还**凭空造了一个 `<包根>\data\agent\` 空目录**——正是本文件 6.1 节写明"不要去造"的那种误导性空壳（"会让用户以为数据在那、实际不在"）。
+
+**改之后**：
+
+```
+<包根>\
+├── data\            用户数据，按类型分格（备份 = 复制这一个文件夹）
+│   ├── config\        设置（含密钥，单独一格便于剔除）
+│   ├── profile\       画像、价值观侧写、知识图谱
+│   ├── sessions\      聊天库、流水账、游标、讨论栈
+│   ├── reading\       标注、书库缓存
+│   ├── runtime\       处理状态（可随时删）
+│   └── toolbox\       翻译记录
+├── builtin\         随包分发的内置图谱（不是用户数据）
+├── extension\       浏览器插件
+├── internal\        程序本体（不含任何用户数据）
+└── logs\            日志
+```
+
+**实现要点**：
+
+| 项 | 做法 |
 |---|---|
-| `installer/co-read.iss` | Inno Setup 脚本（安装向导 + 装插件教程页 + 升级保数据 + 卸载询问） |
-| `installer/pack-portable.ps1` | 生成干净的暂存目录（含**敏感数据闸门**，检出个人数据就中止） |
+| 路径真源 | `agent/lib/paths.js` 一个文件；agent、receiver、脚本全部 import 它，不再各自 `path.join(__dirname, ...)` |
+| 包根判定 | `PARENT_NAME === 'internal'` → 便携包布局，包根 = 上一级；否则开发布局，包根 = 仓库根。规则只有一条，检查的是**我们自己的安装布局**而不是"仓库长什么样" |
+| 开发 vs 分发 | 两种布局共用同一份代码路径，不需要环境变量、不需要构建期改写 |
+| 老用户升级 | `agent/scripts/migrate-data-layout.mjs`（默认演练，`--apply` 才动文件；先复制→校验字节数→通过才删源→关键文件留 `.pre-migrate` 备份）。agent 启动时用 `detectUnmigrated()` 体检并打印指路提示——**不迁移就是静默的空库，必须显式提醒** |
+| 升级红线 | 升级只覆盖程序文件；`data/` 归用户，见 §6.5 |
+
+**没做的事（如实记录）**：
+
+- **没有"自动迁移"**。老用户升级要手动跑一次迁移脚本（启动时会告警指路）。不做自动的原因：迁移是"复制 → 校验字节数 → 通过才删源"的写操作，必须在程序完全退出时执行、且要能逐项报出失败；塞进启动流程后一旦中途失败，就是"数据搬了一半、程序也起不来"。
+- **开发目录第一次启动时 `data/` 由迁移脚本或 `ensureDirs()` 创建**；全新 clone 的仓库没有 `data/`（`.gitignore` 已排除内容，只留 `README.txt`）。
+
+### 6.4c 启动入口统一：开发与发行共用一套（2026-10-06，已实施）
+
+**改之前**：开发目录有自己的一对 `start.bat` / `stop.bat`（仓库根，前台跑 agent、直接 `taskkill` 收尾），
+便携包有另一套（`01-START-CoRead.bat` + `internal\tray.ps1` + `internal\stop.bat`，托盘驱动、全程隐藏）。
+两套并存的问题不是"重复"，而是**开发期走不到生产的那条路**：
+| 生产路径 | 开发期是否被执行过 |
+|---|---|
+| 写停机哨兵 → 等 agent 保存记忆自己退出 → 关聊天库 | ❌ 从来没有（开发用 `taskkill /F` 直接杀） |
+| 端口 7239 冲突检测 + 明确提示 | ❌ |
+| 崩溃自愈（某一半掉了自动拉起） | ❌ |
+| 哨兵路径本身 | ❌ —— 结果托盘那处路径写歪了**两个月没人发现**（见 §6.5 与 `tray.ps1` 的 Stop-All 注释） |
+
+**改之后**：一个入口、一份托盘代码，两种布局自动适配。
+
+```
+Start-CoRead.vbs （双击它；唯一的入口文件，检查+隐藏启动+失败弹窗都在里面）
+   └─ powershell -File tray.ps1 -AppDir <包根> [-NodeExe <node.exe>]
+```
+
+**为什么入口是 `.vbs` 而不是 `.bat`**：`.bat` 必然被 cmd.exe 执行，而 cmd 是控制台程序 ——
+双击一定闪一个黑窗口（旧版把 echo 与两处 `timeout` 放在 .bat 里，窗口停留约 8 秒）。
+`.vbs` 由 `wscript.exe`（GUI 程序）执行，**零窗口**，托盘也因此能完全隐藏启动。
+2026-10 之前那个 `01-START-CoRead.bat` 只是一行转交（实测仍要占 125 ms），
+用户要求去掉数字前缀并删掉包装，于是入口现在就叫 `Start-CoRead.vbs`。
+
+| | 便携包 | 开发目录 |
+|---|---|---|
+| 入口 | `<包根>\internal\Start-CoRead.vbs` | `<仓库根>\Start-CoRead.vbs`（同名） |
+| tray.ps1 | `internal\tray.ps1` | `installer\launcher\tray.ps1`（同一份文件） |
+| node | 自带 `internal\node.exe` | PATH 里的 `node` |
+| 程序目录 | `internal\` | 仓库根 |
+| 数据 | `<包根>\data\` | `<仓库根>\data\`（同一个相对位置） |
+
+**两条判定规则互为镜像**，都只看一个信号：
+
+- `tray.ps1`：程序目录里**有没有 node.exe** → 有 = 便携包 → 子进程脚本在 `internal\` 下
+- `paths.js`：agent 的父目录**叫不叫 internal** → 是 = 便携包 → 数据在包根 `data\`
+
+⚠️ **VBS 里 `progDir` 与 `appRoot` 必须分开**：前者是 tray.ps1/node.exe 所在处（包里 =
+`internal\`），后者是包根（有 `data\`、`logs\` 的那层），`-AppDir` 只能传后者。
+第一版把 `internal\` 当成了包根，表现是"托盘进程起来了、但日志不写、数据找不到"，
+而且不报任何错 —— 靠桩脚本打印收到的参数才发现（实测记录见下）。
+
+⚠️ **`.vbs` 有退场时间表**：VBScript 已在 2023-10 被微软废弃，三阶段退场
+（Win11 24H2 起是"预装且默认启用"的可选功能 → 约 2027 默认禁用 → 未定日期彻底移除）。
+换掉它的两条路都更贵：`.cmd` + PowerShell 会把黑框带回来；编无控制台的小 exe 会撞上
+未签名的 SmartScreen 与杀软误报（正是删掉 Inno 安装包的原因）。所以现阶段保留 `.vbs`，
+并在说明书里写了排查话术（"双击没反应 → 检查「可选功能」里有没有 VBScript"）。
+
+**代价（明确接受）**：开发时 agent 也跑在后台，没有 `> ` 前台提示符；输出进
+`logs\agent.out.log`。需要前台 REPL 时先从托盘退出、再单独 `node agent\index.js`。
+换来的是"开发期每次起停都在跑生产代码路径"。
+
+**实测验证**（2026-10-06）：
+
+```
+【开发布局】从仓库根双击 Start-CoRead.vbs（.vbs 本身不产生任何控制台窗口）
+  tray.log        : 已启动（dev 布局，node = node）
+  进程            : receiver\index.js + agent\index.js（都用 PATH 里的 node）
+  端口 7239       : LISTENING
+写 data\sessions\stop-request（等价托盘点退出）
+  7 秒后 agent 自己退出，哨兵被它删掉
+  agent.out.log   : 收到停止请求 → 正在固化本次会话记忆 → profile/soul 已合并重写 → 已保存
+  data\profile\portrait.md / values-portrait.md 时间戳更新，并留下 .bak
+
+【便携包布局】解压 zip 后双击包里的 internal\Start-CoRead.vbs（node.exe 与 tray.ps1 换成自证桩）
+  桩收到的参数    : AppDir = <解压包根>（不是 internal\）、NodeExe = internal\node.exe
+  桩自查          : data\ 在、logs\ 在、能写 logs\、builtin\ 在、extension\ 在
+```
+
+**顺带废掉的四个文件**：仓库根 `start.bat`、`stop.bat`（"清残留哨兵"的职责并入
+`tray.ps1` 启动流程与 `paths.js` 统一路径）、`installer\launcher\run-hidden.vbs`
+（职责被 `Start-CoRead.vbs` 取代）、以及两个 `01-START-CoRead.bat` 包装
+（删掉数字前缀，入口直接就是 `Start-CoRead.vbs`）。
+
+### 6.5 安装包（.exe / Inno Setup）路线已删除
+
+**状态：这条路线已放弃，相关代码在 2026-10-06 从仓库里删掉了。**
+
+删掉的文件（需要时从 git 历史恢复，删除前最后一次提交是 `498d8f5`）：
+
+| 文件 | 当初的作用 |
+|---|---|
+| `installer/co-read.iss` | Inno Setup 安装脚本（向导 + 装插件教程页 + 升级保数据 + 卸载询问） |
+| `installer/pack-portable.ps1` | 生成安装包用的暂存目录 |
 | `installer/build-installer.bat` | 一键构建：读 manifest 版本 → 暂存 → 编译 |
-| `installer/launcher/tray.ps1` | 托盘程序（PowerShell + WinForms，零额外依赖）：启动/停止两个进程、状态显示、崩溃自愈、开机自启 |
-| `installer/launcher/run-hidden.vbs` | **无窗口启动器**——这是"读者看不到黑窗口"的实现点 |
-| `installer/launcher/stop.bat` | 停止脚本（先写 `.stop` 哨兵让 agent 优雅保存记忆） |
-| `installer/launcher/api-config.template.json` | API 配置模板（空值，避免把开发机的 Key 带出去） |
-| `installer/verify-installer.ps1` | 自检脚本：安装 → 核对 → **覆盖升级验数据** → 卸载，六步全自动 |
+| `installer/verify-installer.ps1` | 自检脚本：安装 → 核对 → 覆盖升级验数据 → 卸载 |
+| `installer/launcher/.keep` | 占位文件（让安装包建出空的用户数据目录） |
 
-**关键设计（都踩过坑才定下来）**：
+**保留**的是两条分发链路都在用的那部分 `installer/launcher/`：`tray.ps1`、`stop.bat`、`api-config.template.json`、`LICENSE.node.txt`。
 
-1. **装到用户目录、不需要管理员**（`PrivilegesRequired=lowest`）。因为程序要往安装目录写运行时数据（`agent/data`、`receiver/inbox`）。
-2. **升级绝不覆盖用户数据**：`agent/data`、`agent/api-config.json`、`receiver/inbox`、`receiver/books`、`receiver/toolbox` 用 `onlyifdoesntexist` 创建，升级时一律跳过。
-3. **卸载询问是否删数据**，默认保留；另支持 `/KEEPUSERDATA` 静默保留。
-4. **托盘而不是命令行**：读者不会看到 `> ` 提示符；用 VBS 隐藏启动 PowerShell，连窗口闪一下都没有。
-5. **版本号从 `extension/manifest.json` 读**，插件与安装包版本永不脱节。
+**为什么放弃**（两条，任一条都够）：
 
-### 6.6 构建过程中修掉的坑（记录备查）
+1. **被火绒 HIPS 拦截**。编译出来的 `CoRead-Setup-0.3.0.exe`（25.5 MB，编译本身是成功的）在这台机器上跑不起来，报 `Setup was unable to create the directory ...\Temp\is-XXXX.tmp`。根因是**未数字签名**，而代码签名证书约 100–400 美元/年。当前发**便携包 zip**就没有这个问题。
+2. **用户还得手动装插件**。Chrome 的安全边界决定了"静默安装本地后端"做不到，所以安装包省下的只是"解压 + 双击"这两步，却要多养一套构建链路、一套 Inno 脚本、一套自检脚本，并长期承担签名费用与杀软误报。
+
+**历史记录（这些坑是真的踩过，将来若恢复这条路线值得先看）**：
+
+| 现象 | 根因 | 修法 |
+|---|---|---|
+| 安装包编译报 `Column 12` 语法错 | `.iss` 也需要 UTF-8 BOM，否则中文串被截断成非法引号 | 加 BOM |
+| 编译报从 `installer\installer\...` 找不到文件 | `.iss` 的相对路径以**脚本所在目录**为基准，不是当前工作目录 | 把占位文件放进暂存目录再引用 |
+| 安装静默失败（退出码 1、什么都不装） | 在 `InitializeWizard` 里展开 `{app}` 常量 → fatal 异常 | 改用 `CurPageChanged` 里赋值 |
+| 编译报 `String error` | Pascal 用花括号作注释定界符，注释里写 `{app}` 会把注释提前闭合 | 注释里不写花括号常量名 |
+| `SetClipboardText` / `GlobalAlloc` / `SizeOf(Char)` 不可用 | Inno 7 的 Pascal Script 没有这些 | 写临时文件 + PowerShell；用 `Length(S) * 2` |
+| 自启项即使用户没勾也会写入 | `[Tasks]` 里 `autostart` 缺 `unchecked` | 补上 `unchecked` |
+| 构建脚本认不出已安装的 Inno Setup | 只找了 6.x 路径，官方已出 7.1.0 | 6/7 路径都认 |
+| **静默安装在自动化环境里跑不起来** | 二分定位到：极简安装包也失败、GUI 模式却正常 → 是环境干扰 GUI 子系统，**不是安装包的问题**。但因此这条链路始终没能自动验证 | 只能人工双击验证（现已无此必要） |
+| `verify-installer.ps1` 报"用户数据全部保留 ✅"却是假阳性 | 第 1 步安装失败后脚本继续往下跑，那步验的数据其实写在未被覆盖的目录里 | 加门：安装失败立即中止 |
+
+### 6.6 便携包链路的构建坑（记录备查）
 
 | 现象 | 根因 | 修法 |
 |---|---|---|
 | `git add` 被拒 | 早先的 `.gitignore` 规则 `*.diag-*.mjs` 误伤了正式工具 `chat.db.diag-wal.mjs` | 改成只忽略点开头的临时文件 |
 | `.ps1` 中文全乱、语法崩 | Windows PowerShell 5.1 把无 BOM 的 UTF-8 当系统 ANSI(GBK) 读 | 给所有 `.ps1` 加 UTF-8 BOM |
-| 编译报 `Column 12` 语法错 | 同上，`.iss` 也需要 BOM，否则中文串被截断成非法引号 | 加 BOM（构建脚本会保证） |
-| 编译报从 `installer\installer\...` 找不到文件 | `.iss` 的相对路径以**脚本所在目录**为基准，不是当前工作目录 | 把占位文件放进暂存目录再引用 |
-| 安装静默失败（退出码 1、什么都不装） | 在 `InitializeWizard` 里展开 `{app}` 常量 → fatal 异常 | 改用 `CurPageChanged` 里赋值 |
-| 编译报 `String error` | Pascal 用花括号作注释定界符，注释里写了 `{app}` 把注释提前闭合 | 注释里不写花括号常量名 |
-| `SetClipboardText` / `GlobalAlloc` 不可用 | Inno 7 的 Pascal Script 没有这些 | 改为写临时文件 + PowerShell `Set-Clipboard` |
-| `SizeOf(Char)` 报 Type mismatch | Pascal Script 没有 `Char` 类型 | 改用 `Length(S) * 2` |
-| 自启项即使用户没勾也会写入 | `[Tasks]` 里 `autostart` 缺 `unchecked` | 补上 `unchecked` |
-| 构建脚本认不出已安装的 Inno Setup | 只找了 6.x 路径，而官方已出 7.1.0 | 6/7 路径都认 |
-
-### 6.7 还没验证的部分（如实记录）
-
-#### 静默安装在自动化环境里跑不起来（已定位到环境，不是安装包的问题）
-
-实测现象：**Inno 编译出的安装程序，在这个 DSH 会话里无法以静默模式运行**。退出码 1、不生成日志、不创建目录，即"在写下第一行日志之前就被终止"。
-
-做了完整的二分定位：
-
-| 测试 | 结果 |
-|---|---|
-| 编译安装脚本 | ✅ 成功（25.5 MB） |
-| 安装包文件完整性（MZ 头、大小、无 Zone.Identifier 互联网标记） | ✅ 正常 |
-| 编译一个**全新极简安装包**（不装文件、不写注册表、不启动进程） | ✅ 编译成功 |
-| 运行那个极简安装包（静默） | ❌ **同样失败** |
-| **不带参数运行（GUI 模式）** | ✅ **能正常启动并保持运行** |
-| 参数逐项测试 | 不稳定：`/VERYSILENT` → 卡住；`/VERYSILENT /NORESTART` → 退出码 1 |
-
-**判定依据**：连"什么都不做"的极简 Inno 安装包都以同样方式失败，说明与安装脚本的配置无关；而 GUI 模式能正常起来，说明安装包本身是好的。同一 exe 在"卡住"与"退出码 1"之间摇摆，是环境干扰 GUI 子系统的特征。
-
-**结论**：这是自动化环境的限制，**不能据此判定安装包有问题，但也不能算已验证**。
-
-#### 因此下面三条仍未实测
-
-- [ ] 安装向导的"装插件教程页"实际长什么样、按钮能否打开 `chrome://extensions`
-- [ ] 完整安装 → 覆盖升级 → 数据保留 → 卸载 全流程
-- [ ] 托盘程序实际运行效果（图标、菜单、崩溃自愈）
-
-#### 正确的验证方式
-
-**不要依赖静默模式**——直接双击安装包走向导，这是最可靠的验证路径：
-
-```
-installer\build\out\CoRead-Setup-0.3.0.exe
-```
-
-看三件事：① 向导能正常走完；② 最后一页的"装插件四步教程"是否清楚、两个按钮是否可用；③ 装完托盘图标是否出现。
-
-如果双击也没反应，那就是机器上有安全软件在拦（Windows Defender / 其他杀软 / 组策略），那是另一类问题。
-
-#### verify-installer.ps1 的已知缺陷（已修）
-
-第一版有个会误导人的问题：**第 1 步安装失败后它继续往下跑**，导致第 4 步"用户数据全部保留 ✅"成为假阳性——那份数据其实写在未被安装覆盖的目录里，跟"升级保数据"无关。实测被这个假阳性骗过一次。
-
-现已加门：**安装失败立即中止**，并打印排查线索（目录是否创建、日志是否生成、日志尾部），不再产出误导性结论。同时把 `/TASKS=`（空值）改为 `/TASKS=desktopicon`（一个无害的任务名）——空值在某些环境下会让安装程序行为异常。
+| zip 校验假报"缺 data\config\" | **只有空目录才会在 zip 里有条目**，有内容的目录不单独出现 | 校验清单里改写成目录内的具体文件名 |
+| 打包中途被自己的闸门拦下 | 数据目录搬到 `data\` 后，闸门还在按旧路径判断"这一格应该全空" | 闸门跟着更新：放行空模板与说明文件，其余一律中止 |
+| 本地包比 CI 包多文件 | `agent/scripts/data/` 被 `.gitignore` 排除，本地有、CI 没有 | 白名单只留通用文件，并对 `builtin\` 里的图谱逐个做 SHA256 比对 |
 
 ### 6.8 其余待办
 
-- [ ] 装插件教程页补**截图**（现在只有文字步骤；图文并茂是读者能否走完的决定性因素）
 - [ ] **验证非商店扩展能否自动更新**（`update_url` + `--extensions-update-frequency`）——这一步结果决定要不要回头补商店
 - [ ] Windows SmartScreen：未签名会有警告，考虑代码签名证书（约 100–400 美元/年）
 - [ ] 托盘换成正式 exe（现在是 PowerShell 版，架构已留好接口）
