@@ -8,8 +8,12 @@
 
 param(
   [string]$AppDir = (Split-Path -Parent $PSCommandPath),
-  [string]$NodeExe = '',
-  [switch]$AutoStart
+  [string]$NodeExe = ''
+  # 这里原来还有一个 [switch]$AutoStart —— 2026-10 删掉：它声明了但**全项目没有
+  # 一处使用**（也没有任何代码写注册表自启项），而说明书却三处承诺"会写开机自启项"，
+  # 其中一处还拿它当作"杀软为什么报警"的解释。留着死参数比删掉更危险：它会让下一个
+  # 读代码的人以为自启已经实现，于是继续把文档留在错的状态。
+  # 要真做自启功能时再加回来，并且必须同时补一个"关掉自启"的入口。
 )
 
 $ErrorActionPreference = 'SilentlyContinue'

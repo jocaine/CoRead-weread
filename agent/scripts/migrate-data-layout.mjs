@@ -14,6 +14,11 @@
  *   node agent/scripts/migrate-data-layout.mjs --clean-legacy         # 看残渣清单
  *   node agent/scripts/migrate-data-layout.mjs --apply --clean-legacy # 清掉残渣
  *
+ *   上面是**开发目录**的写法（node 在 PATH 里）。便携包用户要换成：
+ *     internal\node.exe internal\agent\scripts\migrate-data-layout.mjs --apply
+ *   —— 包里 node 不在 PATH，自带的是 internal\node.exe。程序里所有面向用户的提示
+ *   都由 paths.js 的 scriptCommand() 按当前布局生成，不要再手写死命令。
+ *
  *   --apply          真正执行（不带就是演练，一个文件都不动）
  *   --keep-source    搬完**保留**旧文件（默认搬完删源，避免下次启动又看到"双份"）
  *   --clean-legacy   清理旧布局残渣（见下）
@@ -38,7 +43,7 @@
 
 import fs from 'fs'
 import path from 'path'
-import { legacyLocations, DATA_DIR, PACKAGE_ROOT, layoutSummary } from '../lib/paths.js'
+import { legacyLocations, DATA_DIR, PACKAGE_ROOT, layoutSummary, scriptCommand } from '../lib/paths.js'
 
 const APPLY = process.argv.includes('--apply')
 const KEEP_SOURCE = process.argv.includes('--keep-source')
@@ -139,7 +144,7 @@ function cleanLegacy() {
 
   if (!APPLY) {
     console.log('\n这是演练。确认后加 --apply 真删：')
-    console.log('  node agent/scripts/migrate-data-layout.mjs --apply --clean-legacy\n')
+    console.log(`  ${scriptCommand('migrate-data-layout.mjs')} --apply --clean-legacy\n`)
     return
   }
   let n = 0
@@ -184,7 +189,7 @@ function migrate() {
 
   if (!APPLY) {
     console.log('\n这是演练。确认无误后加 --apply 真正执行：')
-    console.log('  node agent/scripts/migrate-data-layout.mjs --apply\n')
+    console.log(`  ${scriptCommand('migrate-data-layout.mjs')} --apply\n`)
     return
   }
 
@@ -240,7 +245,7 @@ function migrate() {
       console.log('（旧位置的源文件已删除；关键文件留了 *.pre-migrate 备份，确认无误后可自行清理）')
     }
     console.log('\n旧位置可能还留着代码已不读取的残渣（老格式流水、调试日志、.bak）。')
-    console.log('看一眼：node agent/scripts/migrate-data-layout.mjs --clean-legacy')
+    console.log('看一眼：' + scriptCommand('migrate-data-layout.mjs') + ' --clean-legacy')
   }
   console.log('')
 }

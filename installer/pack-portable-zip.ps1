@@ -257,6 +257,27 @@ foreach ($f in @('smoke-stack-sequences.json', 'judge-smoke-cases.json')) {
   else { Write-Step "（跳过缺失的 $f —— 它没提交进 git，CI 上也不会有）" }
 }
 
+# ── 面向用户的维护脚本（2026-10 加入）────────────────────────────────
+# 为什么必须进包：说明书明确让用户跑数据迁移（从旧版本升上来的记录还在旧位置），
+# 而在此之前整个 agent\scripts\ 目录都不在白名单里 —— 用户照说明抄的命令必然失败：
+#   ① 脚本不在包里（Cannot find module）
+#   ② node 不在 PATH（自带的是 internal\node.exe）
+# 只带这三个，因为它们都直接服务于用户会遇到的事：
+#   migrate-data-layout.mjs  老版本数据搬家（说明书里点名的那条命令）
+#   backup-chat.mjs          把聊天库安全备份一份（chat.db 有 -wal，不能只拷主库）
+#   chat.db.diag-wal.mjs     诊断"主库与暂存本谁新"，备份可疑时先跑它
+# ⚠️ 只能逐个点名，**绝不能整目录拷**：同目录下的 data\ 与 _l3_sample.txt 里是
+#    作者自己的真实语料（2026-10 的教训：本地打包会把它带出去，CI 反而躲过了）。
+$userScripts = @('migrate-data-layout.mjs', 'backup-chat.mjs', 'chat.db.diag-wal.mjs')
+$scriptsOut = Join-Path $agentOut 'scripts'
+New-Item -ItemType Directory -Path $scriptsOut -Force | Out-Null
+foreach ($f in $userScripts) {
+  $p = Join-Path $repo "agent\scripts\$f"
+  if (-not (Test-Path $p)) { Fail "缺少 agent\scripts\$f —— 说明书写着让用户跑它，不能少" }
+  Copy-Item $p $scriptsOut
+  Write-Step "internal\agent\scripts\$f"
+}
+
 # receiver 的程序文件放 internal\receiver（与 agent 同级：lib/paths.js 靠这个同级关系定位包根）
 $recvOut = Join-Path $internal 'receiver'
 New-Item -ItemType Directory -Path $recvOut -Force | Out-Null
@@ -282,8 +303,19 @@ New-Item -ItemType Directory -Path (Join-Path $StageDir 'assets\icons') -Force |
 Copy-Item (Join-Path $assetsSrc 'coread.ico') (Join-Path $StageDir 'assets\icons')
 Write-Step 'assets\icons\coread.ico'
 
-# API 配置模板（空值）→ data\config\（2026-10 前在 internal\agent\api-config.json）
-Copy-Item (Join-Path $PSScriptRoot 'launcher\api-config.template.json') (Join-Path $dataRoot 'config\api-config.json')
+# ⚠️ 这里**故意不放** data\config\api-config.json（2026-10 改）。
+# 以前会拷一份 launcher\api-config.template.json 的空模板进去，理由是"程序起不来就没法
+# 让用户填 Key"。但它是**用户数据**：用户升级时最自然的做法就是把新 zip 解压到旧文件夹上
+# 覆盖，那样一覆盖，他填好的 API 地址/密钥/模型名就被这个空模板**清空**了 ——
+# 而 files（升级只覆盖程序文件、data\ 归用户）本来是打包脚本自己定的规矩。
+# 去掉它的安全性已核实（agent\lib\api-config.js）：
+#   · readApiConfigFile() 打不开文件就返回 {}，不会报错；
+#   · writeApiConfig() 会先 mkdirSync 再写，用户第一次在侧栏保存时自动创建；
+#   · 缺失时 resolveApiConfig() 照常回退到 data\config\env 与默认模型。
+# 于是"解压新包覆盖旧文件夹"变成**安全且正确**的升级方式，不再需要额外说明。
+# 结果是 data\config\ 变成空目录 —— 空目录在 zip 里有条目，所以校验清单里写
+# 'data\config\' 而不是具体文件名（见文件末尾的 $need）。
+Write-Step 'data\config\（空目录，不随包分发任何配置文件）'
 
 # ── 5. 启动器与说明文件 ─────────────────────────────────────────────
 Write-Host "`n--- 启动器与说明 ---"
@@ -424,18 +456,18 @@ foreach ($pat in @('*.db', '*.db-wal', '*.db-shm', '*.jsonl', 'topic_stack.json'
 }
 Get-ChildItem $StageDir -Recurse -File -Force -Filter '*.env' -EA SilentlyContinue |
   Where-Object { $_.Name -ne '.env.example' } | ForEach-Object { $bad += $_.FullName }
-$cfg = Join-Path $dataRoot 'config\api-config.json'
-if ((Test-Path $cfg) -and ((Get-Content $cfg -Raw) -match 'sk-[A-Za-z0-9]{10}')) { $bad += $cfg }
-# 数据目录必须只有我们自己放的东西——2026-10 重构后数据在 <包根>\data\
-# 允许清单只有一项：config\api-config.json 的空模板（里面每个字段都是空串）。
-# 它必须允许，因为程序起不来就没法让用户填 Key；但它**必须**是空的——
-# 下面同时验内容：出现 sk- 开头的东西就中止。
+# 数据目录必须**只有空壳**。data\ 是用户的地盘，而升级时用户最自然的做法就是把新 zip
+# 解压到旧文件夹上覆盖 —— 所以包里多带任何一个数据文件，都会在升级那一刻盖掉他自己的东西。
+# 2026-10 就是这么出事的：包里带了 config\api-config.json 的空模板，一覆盖就把用户填好的
+# API 地址/密钥/模型名清空（而"升级只覆盖程序文件、data\ 归用户"本来是打包脚本自己定的规矩）。
+# 现在这里**没有任何例外**：data\ 各格除 desktop.ini 与 README.txt（我们放的说明）之外，
+# 出现任何文件都直接中止打包。比原来更严 —— 宁可打包失败，也不让用户的数据被覆盖。
 foreach ($d in @('data\config', 'data\profile', 'data\sessions', 'data\reading', 'data\runtime', 'data\toolbox')) {
   $full = Join-Path $StageDir $d
   if (Test-Path $full) {
     Get-ChildItem $full -Recurse -File -Force -EA SilentlyContinue |
-      Where-Object { $_.Name -ne 'desktop.ini' -and $_.Name -ne 'README.txt' -and $_.FullName -ne $cfg } |
-      ForEach-Object { $bad += "$($_.FullName) （数据目录应只有空模板与说明）" }
+      Where-Object { $_.Name -ne 'desktop.ini' -and $_.Name -ne 'README.txt' } |
+      ForEach-Object { $bad += "$($_.FullName) （data\ 下只允许空目录与说明文件）" }
   }
 }
 # builtin\ 允许清单：只有这两个**通用**图谱文件（随包分发，agent 与 receiver 运行时读它们）
@@ -525,12 +557,19 @@ $need = @(
   'internal\instructions-zh.txt',
   'internal\agent\index.js',
   'internal\agent\lib\paths.js',
+  # 面向用户的维护脚本：说明书写着让用户跑迁移，缺一个用户就卡死在那一步。
+  # 写进校验清单是为了让"脚本没进包"这种静默缺失在打包时就炸出来，而不是等用户撞上。
+  'internal\agent\scripts\migrate-data-layout.mjs',
+  'internal\agent\scripts\backup-chat.mjs',
+  'internal\agent\scripts\chat.db.diag-wal.mjs',
   'internal\receiver\index.js',
   # 数据目录（程序运行时往这里写；空壳随包分发，2026-10 重构后数据在包根 data\）
   # 注意：**只有空目录才会在 zip 里有条目**。有内容的目录（data\config、builtin）
   # 不会单独出现，要校验就直接写里面的文件名——写成 'data\config\' 会假报 MISS（实测踩过）。
   'data\README.txt',
-  'data\config\api-config.json',
+  # data\config\ 现在是**空目录**（包里不再带 api-config.json，见第 3 步的注释）——
+  # 只有空目录才会在 zip 里有条目，所以要写成目录名本身。
+  'data\config\',
   'data\profile\',
   'data\sessions\',
   'data\reading\',
@@ -548,9 +587,10 @@ $missing = 0
 foreach ($n in $need) {
   if ($names -contains $n) { Write-Step "OK   $n" } else { Write-Step "MISS $n"; $missing++ }
 }
+$zipCount = $zip.Entries.Count      # 必须**先**取，下面 Dispose 之后 Entries 就空了
 $zip.Dispose()
 if ($missing) { Fail "zip 里缺 $missing 个关键文件" }
 
 Write-Host "`n=== 完成 ===" -ForegroundColor Green
 Write-Host "  $zipPath"
-Write-Host ("  " + $zip.Entries.Count + " 个条目" )
+Write-Host ("  " + $zipCount + " 个条目" )

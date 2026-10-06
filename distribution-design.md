@@ -211,6 +211,13 @@ Agent agent/index.js                       ← 2226 行
 
 **连带结论**：不需要 WebView，所以 Tauri 与 Electron 都不需要，Rust 工具链也不用装。桌面端只需要"托盘图标 + 开机自启"。
 
+> ⚠️ **2026-10 核实：开机自启从未实现**。这里的"需要"是当时列的清单，不是已完成的现状 ——
+> `tray.ps1` 里那个 `[switch]$AutoStart` 声明之后全项目**没有一处使用**，也没有任何代码写
+> 注册表自启项（`$AutoStart` 已删，说明书里三处"会写开机自启项"的承诺也一并撤掉了）。
+> 要不要真做是个待定决策：怕"重启电脑后共读引擎没起来"（那时的症状是全静默的，
+> 见插件侧审计），但又会写系统注册表、需要配一个"关掉自启"的入口。
+> 现在的对外口径是：**CoRead 不开机自启，每次开机自己双击 `Start-CoRead.vbs`**。
+
 ### 6.2 Chrome 应用商店：不作为主要分发渠道
 
 用户提出的问题很关键：**商店扩展装不上本地后端**。核实后确认这是 Chrome 的安全边界，绕不过去：
@@ -544,7 +551,10 @@ Chromium 的 `side_panel` 接口，各内核分支实现不一致，Firefox 用�
 | `installer/verify-installer.ps1` | 自检脚本：安装 → 核对 → 覆盖升级验数据 → 卸载 |
 | `installer/launcher/.keep` | 占位文件（让安装包建出空的用户数据目录） |
 
-**保留**的是两条分发链路都在用的那部分 `installer/launcher/`：`tray.ps1`、`stop.bat`、`api-config.template.json`、`LICENSE.node.txt`。
+**保留**的是分发链路在用的那部分 `installer/launcher/`：`tray.ps1`、`stop.bat`、`LICENSE.node.txt`。
+`api-config.template.json` 仍在仓库里（作为配置格式的参考），但**2026-10 起不再进包** ——
+包里带它会在用户"解压覆盖升级"时清空他自己的 API 配置，详见 `RELEASING.md` 的数据目录一节
+与 `pack-portable-zip.ps1` 第 3 步的注释。
 
 **为什么放弃**（两条，任一条都够）：
 

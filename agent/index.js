@@ -45,7 +45,7 @@ import {
   AGENT_STATE_FILE, STOP_FILE, JOURNAL_FILE, TOPIC_STACK_FILE, GRAPH_FILE,
   BUILTIN_GRAPH_RESULTS_FILE, SELF_PORTRAIT_FILE, PROFILE_FILE, SOUL_FILE,
   HIST_CURSOR_FILE, COLDSTART_MARKER_FILE, SESSIONS_DIR, LAYOUT_KIND, layoutSummary,
-  ensureDirs, detectUnmigrated,
+  ensureDirs, detectUnmigrated, scriptCommand,
 } from './lib/paths.js'
 
 // 数据目录可能还不存在（全新安装、或用户直接跑 agent）：先建齐。
@@ -1966,7 +1966,9 @@ async function main() {
     for (const line of unmigrated.slice(0, 6)) console.log(`     · ${line}`)
     if (unmigrated.length > 6) console.log(`     · …另有 ${unmigrated.length - 6} 项`)
     console.log('   这些数据**不会自动搬过来**。请先退出，然后运行一次迁移：')
-    console.log('     node agent/scripts/migrate-data-layout.mjs --apply')
+    // 命令按当前布局生成：便携包里 node 不在 PATH、脚本也在 internal\ 下，
+    // 硬编码开发目录那套写法会让用户照抄后撞上"node 不是内部或外部命令"。
+    console.log(`     ${scriptCommand('migrate-data-layout.mjs')} --apply`)
     console.log('   （先不加 --apply 跑一遍是演练，只打印计划、不动文件）\n')
   }
   console.log('   输入 /exit 退出\n')

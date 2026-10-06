@@ -84,6 +84,24 @@ export const LAYOUT_KIND = LAYOUT.kind
 export const PACKAGE_ROOT = LAYOUT.packageRoot
 export const LAYOUT_REASON = LAYOUT.reason
 
+/**
+ * 「怎么再跑一次某个脚本」——按当前布局给出**用户真能照着敲**的命令。
+ *
+ * 为什么要有这个函数（2026-10 实测的坑）：程序里几处提示（agent 启动时的升级告警、
+ * 迁移脚本自己打印的下一步）以前硬编码 `node agent/scripts/xxx.mjs`，那是**开发目录**
+ * 的写法。而便携包里：① node 不在 PATH —— 自带的是 `internal\node.exe`；
+ * ② 脚本在 `internal\agent\scripts\` 下。用户照抄的结果是
+ * 「'node' 不是内部或外部命令」或者 Cannot find module，然后就卡住了。
+ *
+ * 判定复用同一份布局信号（PARENT_NAME === 'internal'），不引入第二个真相。
+ * @param {string} scriptFile 脚本文件名，如 'migrate-data-layout.mjs'
+ */
+export function scriptCommand(scriptFile) {
+  return LAYOUT_KIND === 'package'
+    ? `internal\\node.exe internal\\agent\\scripts\\${scriptFile}`
+    : `node agent/scripts/${scriptFile}`
+}
+
 /** data\ 根目录（用户数据的唯一落点） */
 export const DATA_DIR = path.join(PACKAGE_ROOT, 'data')
 /** 程序内置数据（回退图谱、演示图）：不属于用户，不参与备份 */

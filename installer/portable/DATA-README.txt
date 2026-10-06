@@ -40,19 +40,31 @@ toolbox\    翻译记录：工具箱里翻译过的原文与译文。
 --------------------------------------------------------------------
 
 · 换电脑 / 换新版本，怎么把数据搬过去？
-  把整个 data 文件夹复制到新包的根目录（和 internal 同级）即可。
+  换电脑：把整个 data 文件夹复制到新机器上（和 internal 同级）。
+  换新版本（升级）：**不用搬** —— 先从托盘退出 CoRead，把新版本的 zip
+  解压到原来那个文件夹上覆盖，再重新启动即可。包里不含 data\ 下的任何
+  文件，覆盖的只有程序本身，你这一格不会被碰（这条是打包时强制校验的）。
+  想更保险就先复制一份 data 再升级。
 
 · 从很旧的版本升级上来，这里怎么是空的？
-  旧版本的数据还在老位置，需要跑一次迁移：
-      node internal\agent\scripts\migrate-data-layout.mjs --apply
-  （先不加 --apply 跑一遍是演练，只打印计划、不动文件。）
-  程序启动时也会自动体检，发现旧数据没搬会提醒你。
+  旧版本的数据还在老位置，需要跑一次迁移。在包根目录打开命令行，先演练：
+      internal\node.exe internal\agent\scripts\migrate-data-layout.mjs
+  看过它打印的计划、确认没问题，再真搬（加 --apply）：
+      internal\node.exe internal\agent\scripts\migrate-data-layout.mjs --apply
+  （要用包里自带的 node —— 这台机器上没装 Node，直接敲 node 会报"不是内部
+    或外部命令"。）迁移是"先复制、校验字节数、通过才删源"，失败不丢数据。
+  搬完旧位置可能还剩几百 MB 残渣，想清理见 internal\instructions-zh.txt。
+  程序启动时也会自动体检，发现旧数据没搬会在日志里提醒你。
 
 · chat.db 旁边的 chat.db-wal / chat.db-shm 是什么？
   是聊天库的"暂存本"和索引，SQLite 自己管的。**不要单独拷 chat.db**：
   如果目标位置留着旧库的 -wal，SQLite 会按那份旧日志把新库回滚成空库
   （2026-10 实测踩过：941 条消息被清成 0 条）。
   要搬就停掉 CoRead、把 data 整个复制过去，别只挑单个文件。
+  想单独备份一份聊天库，用这个（它会先做一致性检查再写备份）：
+      internal\node.exe internal\agent\scripts\backup-chat.mjs
+  怀疑备份里的记录比界面上少，先跑这个看"主库和暂存本谁新"：
+      internal\node.exe internal\agent\scripts\chat.db.diag-wal.mjs
 
 · 数据会不会上传到服务器？
   不会。这个文件夹只在本机，只有调用模型时才会把对话片段发给你自己配置的
