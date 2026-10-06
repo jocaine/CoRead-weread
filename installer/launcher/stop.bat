@@ -6,22 +6,28 @@ rem
 rem  Normally you should quit via the tray icon instead. This file is the
 rem  fallback for when the tray is gone but the background processes remain.
 rem
-rem  It first drops a ".stop" sentinel so the agent can save its memory and
-rem  exit gracefully, then kills whatever is left.
+rem  It first drops a stop-request sentinel so the agent can save its memory
+rem  and exit gracefully, then kills whatever is left.
+rem
+rem  NOTE (2026-10): the sentinel path must match STOP_FILE in agent/lib/paths.js,
+rem  which is  <package root>\data\sessions\stop-request .
+rem  This script lives in <package root>\internal, hence the leading "..".
+rem  If you change the path, change it in agent/lib/paths.js AND installer\launcher\tray.ps1 too.
 rem ============================================================================
 setlocal
 cd /d "%~dp0"
 
 echo Stopping CoRead...
 
-if not exist "agent" goto killrest
+set "SENTINEL=..\data\sessions\stop-request"
 
 echo   Step 1/2: asking the agent to save memory (up to 90s)...
-type nul > "agent\.stop" 2>nul
+if not exist "..\data\sessions" mkdir "..\data\sessions" 2>nul
+type nul > "%SENTINEL%" 2>nul
 
 set /a waited=0
 :waitloop
-if not exist "agent\.stop" goto saved
+if not exist "%SENTINEL%" goto saved
 if %waited% geq 90 goto force
 timeout /t 3 /nobreak >nul
 set /a waited+=3
@@ -32,7 +38,7 @@ echo   Agent saved and exited.
 goto killrest
 
 :force
-del "agent\.stop" 2>nul
+del "%SENTINEL%" 2>nul
 echo   Agent did not exit in 90s, forcing.
 echo   (Work in progress stays in the topic stack; it is saved as you go.)
 

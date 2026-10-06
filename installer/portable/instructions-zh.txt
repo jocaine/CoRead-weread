@@ -1,4 +1,4 @@
-﻿CoRead 详细说明与故障排查
+CoRead 详细说明与故障排查
 ================================================
 （先看外层那份 README-FIRST.txt，这份是出问题时才用的）
 
@@ -6,28 +6,40 @@
 ■ 完整目录结构
 
     CoRead\
-    ├── 01-START-CoRead.bat        启动（双击这个）
     ├── README-FIRST.txt           一分钟上手
+    ├── data\                      ★你的全部数据（备份就复制这一个文件夹）
+    │   ├── README.txt                这一格是干什么的：备份、哪些能删、密钥在哪
+    │   ├── config\                   ★设置：API 地址、模型名、密钥（含密钥，别外发）
+    │   ├── profile\                  ★画像、价值观侧写、知识图谱
+    │   ├── sessions\                 ★聊天记录、讨论进度、会话流水账
+    │   ├── reading\                  ★划线标注、书库缓存（读过的章节原文）
+    │   ├── runtime\                  运行状态（可以随时删，程序会自己重建）
+    │   └── toolbox\                  ★翻译记录
     ├── extension\                 浏览器插件 ★装插件时选这个目录
-    ├── internal\                  程序 + 你的数据
+    ├── internal\                  程序本体（这里**不放**你的数据）
+    │   ├── Start-CoRead.vbs          ★启动入口（双击这个）
     │   ├── node.exe                  运行环境（不用单独装 Node）
     │   ├── tray.ps1                  托盘程序
-    │   ├── run-hidden.vbs            无窗口启动器
     │   ├── stop.bat                  兜底退出
     │   ├── unblock.bat               解除"来自互联网"标记
     │   ├── instructions-zh.txt       本文件
     │   ├── agent\                    共读引擎
-    │   │   ├── index.js  lib\        代码
-    │   │   └── data\                 ★你的数据：画像、知识图谱、API 配置
-    │   └── receiver\                 接收端
-    │       ├── index.js              代码
-    │       ├── inbox\                ★你的数据：聊天记录、标注
-    │       ├── books\                ★你的数据：书库缓存（读过的章节原文）
-    │       └── toolbox\              ★你的数据：翻译记录
+    │   │   ├── index.js  lib\        代码（lib\paths.js 决定数据落在哪）
+    │   │   └── scripts\              维护脚本（含数据迁移脚本）
+    │   └── receiver\                 接收端（只有代码，没有数据）
+    ├── builtin\                   随程序分发的内置图谱（不是你的数据）
     └── logs\                      运行日志
 
-  带 ★ 的就是你的个人数据。托盘右键有「打开数据文件夹」可直接跳过去。
-  备份 = 把整个 CoRead 文件夹复制一份。
+  启动入口为什么是 .vbs 而不是 .bat：
+    双击 .bat 时 Windows 会用 cmd.exe 去跑它，而 cmd 是控制台程序 —— 必然闪一个
+    黑窗口（旧版本还会停 8 秒）。.vbs 由 wscript.exe 执行，那是图形程序，
+    不会有任何窗口，托盘也因此能完全隐藏启动。文件内容是可读的纯文本，
+    想核对可以右键 →「编辑」。
+
+  带 ★ 的就是你的个人数据，全部在 data\ 下。
+  备份 = 复制 data\ 这一个文件夹；搬家 = 把它拷到新包的同一个位置。
+  为什么这么分：以前数据散在 internal\ 的好几个子目录里，备份得对着说明书一个个找，
+  很容易漏（漏一个游标，程序会把半年前的对话当成新的重跑一遍）。
 
 
 ════════════════════════════════════════════════
@@ -40,7 +52,7 @@
   不是病毒提示，也不是杀软拦截。
 
   处理：双击  internal\unblock.bat  一次，之后不再弹。
-  （或：右键 01-START-CoRead.bat →「属性」→ 勾「解除锁定」→ 确定）
+  （或：右键 internal\Start-CoRead.vbs →「属性」→ 勾「解除锁定」→ 确定）
 
 
 【杀毒软件报警，说"未知程序修改系统设置"】
@@ -59,22 +71,22 @@
   都是可读的纯文本，没有编译过的二进制。
 
 
-【双击启动后，托盘没出现图标】
+【双击 Start-CoRead.vbs 后，托盘没出现图标】
 
   1. 打开  logs\ ，看 tray.log / agent.out.log / receiver.out.log
   2. 最常见原因：端口 7239 被占用（之前启动过一份没关干净）
-     解决：先运行 internal\stop.bat，再重新双击 01-START-CoRead.bat
+     解决：先运行 internal\stop.bat，再重新双击 internal\Start-CoRead.vbs
   3. logs 里写了"启动失败"，把日志内容发到项目 issues
 
 
-【双击启动后闪一下就没反应了】
+【双击 Start-CoRead.vbs 完全没反应（连弹窗都没有）】
 
-  可能是解压不完整。确认这几项都在：
-     internal\node.exe
-     internal\tray.ps1
-     internal\agent\index.js
-     internal\receiver\index.js
-  缺任何一项，请重新解压整个 zip（不要只把某个文件拖出来）。
+  先确认入口文件还在：internal\Start-CoRead.vbs
+  再看 logs\tray.log 有没有新内容（起来了就一定会写）。
+
+  另一种可能：这台机器把 VBScript 组件关掉了（Win11 24H2 起它是"可选功能"，
+  将来默认不启用）。检查办法：设置 → 系统 → 可选功能 → 看列表里有没有
+  VBScript；没有就点「添加功能」装上，然后重新双击。
 
 
 【浏览器侧栏一片空白 / 显示未连接】
@@ -97,5 +109,17 @@
   2. 浏览器扩展页把 CoRead 移除
   3. 删掉整个 CoRead 文件夹
 
-  注意：3 会连你的阅读记录一起删掉（见上面 ★ 标出的位置）。
-  想留着就先备份整个文件夹。
+  注意：3 会连你的阅读记录一起删掉（就是上面 ★ 标的 data\ 文件夹）。
+  想留着就先复制一份 data\。
+
+
+【从旧版本升级上来，聊天记录是空的】
+
+  2026-10 起数据集中到 data\ 了；更早的版本把数据散在 internal\ 里，
+  老数据不会自动搬过来。跑一次迁移即可（先演练、再真搬）：
+
+      node internal\agent\scripts\migrate-data-layout.mjs
+      node internal\agent\scripts\migrate-data-layout.mjs --apply
+
+  迁移是"先复制、校验大小、通过才删源"，失败不会丢数据；跑之前请先退出 CoRead。
+  程序启动时也会自动体检，发现旧数据没搬会在日志里提醒你。

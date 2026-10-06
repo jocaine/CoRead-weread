@@ -8,6 +8,7 @@
 
 param(
   [string]$AppDir = (Split-Path -Parent $PSCommandPath),
+  [string]$NodeExe = '',
   [switch]$AutoStart
 )
 
@@ -15,17 +16,53 @@ $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# ── 目录约定（两层结构）─────────────────────────────────────────────
-#   <包根>\              ← 用户看到的：data\（数据）、logs\、几个 .bat 入口
-#   <包根>\internal\     ← 程序自己用的：node.exe、tray.ps1、agent\、receiver\、extension\
+# ── 目录约定（两种布局都支持，自动判断）─────────────────────────────
+# 便携包布局（读者用的）：
+#   <包根>\            用户看到的：data\、logs\、extension\、README-FIRST.txt
+#   <包根>\internal\   程序自己用的：node.exe、tray.ps1、Start-CoRead.vbs、agent\、receiver\
+#   <包根>\data\       用户数据（config/profile/sessions/reading/runtime/toolbox/backups）
+#   <包根>\builtin\    随包分发的内置图谱（不是用户数据）
 #
-# -AppDir 由 run-hidden.vbs 传入，指向**包根**（不是 internal）。
-# -InternalDir 是本脚本所在目录（internal）。
+# 开发布局（仓库根）：
+#   <仓库根>\          同样的 data\、logs\、extension\
+#   <仓库根>\agent\     程序直接在根下（没有 internal\ 这一层）
+#   <仓库根>\receiver\
+#   <仓库根>\Start-CoRead.vbs              双击入口（与包里同名）
+#   <仓库根>\installer\launcher\tray.ps1   ← 本文件在这儿
+#
+# **同一份脚本、同一个入口，两种布局共用**（2026-10 定调）。为什么值得这么做：
+# 开发期跑的启动/停止路径因此与发行版**完全一致** —— 优雅停机（写哨兵→等 agent
+# 自退→关库）、端口冲突检测、崩溃自愈，这些以前在开发时永远走不到，于是
+# "托盘退出的哨兵写错地方、导致从来没有优雅过"这种 bug 能藏两个月（见 Stop-All）。
+#
+# 判定规则只有一条：**程序目录里有没有 node.exe**。
+#   有（便携包自带 node.exe）→ 便携包布局，程序在 internal\，根 = 上一级
+#   没有（开发机用 PATH 里的 node）→ 开发布局，程序就在根下，node 走 PATH
+# 数据路径不在这里拼：agent\lib\paths.js 用同一个信号（父目录叫不叫 internal）判断，
+# 两边必须一致 —— 改这里就要改那里。
 $PackageRoot = $AppDir
-$InternalDir = Split-Path -Parent $PSCommandPath
-if (-not (Test-Path (Join-Path $InternalDir 'node.exe'))) { $InternalDir = $AppDir }   # 兜底：被单独拿出来跑
+$InternalDir = Split-Path -Parent $PSCommandPath      # internal（便携包）或 installer\launcher（开发）
+$IsPortable = Test-Path (Join-Path $InternalDir 'node.exe')
+if (-not $IsPortable) {
+  if (-not (Test-Path (Join-Path $PackageRoot 'agent\index.js'))) {
+    [System.Windows.Forms.MessageBox]::Show(
+      ("既没有 internal\node.exe，也没有 agent\index.js。" + [Environment]::NewLine +
+       "程序目录不像一个完整的 CoRead：" + [Environment]::NewLine + $PackageRoot),
+      'CoRead 启动失败', 'OK', 'Error') | Out-Null
+    exit 1
+  }
+  $InternalDir = $PackageRoot                          # 开发布局：程序直接就在根下
+}
+$LayoutKind = if ($IsPortable) { 'package' } else { 'dev' }   # 只用于日志/提示文案
+# 子进程脚本路径：便携包在 internal\ 下，开发目录直接在根下
+$AgentScript = if ($IsPortable) { 'internal\agent\index.js' } else { 'agent\index.js' }
+$ReceiverScript = if ($IsPortable) { 'internal\receiver\index.js' } else { 'receiver\index.js' }
 
-$Node = Join-Path $InternalDir 'node.exe'
+# Node 可执行文件：便携包用自带的，开发机用 PATH 里的 node（-NodeExe 可显式覆盖）
+if ($NodeExe) { $Node = $NodeExe }
+elseif ($IsPortable) { $Node = Join-Path $InternalDir 'node.exe' }
+else { $Node = 'node' }
+
 $LogDir = Join-Path $PackageRoot 'logs'
 $PidFile = Join-Path $PackageRoot '.running.pid'
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
@@ -74,8 +111,8 @@ if ($existing.Count -gt 0) {
 
 # ── 拉起一个子进程 ──────────────────────────────────────────────────
 # 用 Start-Process 直接起 node.exe，并把输出重定向到日志文件。
-# 路径相对**包根**给（internal\agent\index.js），因为 node 会按脚本自身位置
-# 推导数据目录，所以数据落在 <包根>\data\ 下。
+# 脚本路径相对**包根**给（internal\agent\index.js）：agent/lib/paths.js 按脚本自身位置
+# 判断"装没装在 internal 下"，进而定位 <包根>\data\ —— 所以这个相对关系不能改。
 function Start-Child($name, $scriptRelPath) {
   $script = Join-Path $PackageRoot $scriptRelPath
   if (-not (Test-Path $script)) { Write-Log 'tray' "找不到 $scriptRelPath，跳过"; return $null }
@@ -114,21 +151,70 @@ function Test-PortConflict {
 }
 
 function Get-CoreadProcesses {
-  # 只认"用我们这个 node.exe 跑的"进程，避免误杀用户其他 node 程序
-  Get-CimInstance Win32_Process -Filter "Name='node.exe'" -EA SilentlyContinue |
-    Where-Object { $_.ExecutablePath -eq $Node }
+  # 只认"我们自己启动的" node 进程，避免误杀用户其他 node 程序。
+  # 便携包：按可执行文件路径精确比对（自带 internal\node.exe）。
+  # 开发布局：用的是 PATH 里的 node，没有独占路径可比，改按命令行匹配我们的入口脚本
+  #          （agent\index.js / receiver\index.js）——比裸的 '*index.js*' 窄得多，
+  #          不会误伤同目录下跑的其他工具脚本。
+  if ($IsPortable) {
+    Get-CimInstance Win32_Process -Filter "Name='node.exe'" -EA SilentlyContinue |
+      Where-Object { $_.ExecutablePath -eq $Node }
+  } else {
+    Get-CimInstance Win32_Process -Filter "Name='node.exe'" -EA SilentlyContinue |
+      Where-Object {
+        $_.CommandLine -like "*$AgentScript*" -or $_.CommandLine -like "*$ReceiverScript*"
+      }
+  }
 }
 
 function Stop-All {
-  # 优雅停机：给 agent 写 .stop 哨兵，它会保存记忆后自己退出
-  $stopFile = Join-Path $PackageRoot 'data\agent\.stop'
+  # 优雅停机：写哨兵文件，agent 轮询到就保存记忆再自己退出。
+  #
+  # ⚠️ 这个路径**必须**与 agent/lib/paths.js 里的 STOP_FILE 一致：
+  #     <包根>\data\sessions\stop-request
+  # 2026-10 修过一个 bug：这里原来写的是 <包根>\data\agent\.stop，而 agent 查的是
+  # internal\agent\.stop（当时数据路径还跟着代码走）——两边对不上，于是"托盘右键退出"
+  # 从来没有触发过优雅停机，日志里永远是写入哨兵后 3 秒强杀，最后一场对话的记忆不固化
+  # （实测日志：18:19:51 写哨兵 → 18:19:54 结束进程）。顺带这行还凭空造了一个
+  # <包根>\data\agent\ 空目录，正是 README 里说"不要去造"的那种误导性空壳。
+  # 数据路径改成 data\ 统一目录后，这里只需跟着 STOP_FILE 走一次；改路径时**同时**改
+  # agent/lib/paths.js 和 installer\launcher\stop.bat。
+  $stopFile = Join-Path $PackageRoot 'data\sessions\stop-request'
   try {
     $dir = Split-Path -Parent $stopFile
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     New-Item -ItemType File -Path $stopFile -Force | Out-Null
   } catch {}
-  Write-Log 'tray' '.stop 哨兵已写入，等待 agent 保存记忆…'
-  Start-Sleep -Seconds 3
+  Write-Log 'tray' '已请求 agent 保存记忆（等待它自己退出）…'
+
+  # 等 agent **进程**结束，而不是等哨兵文件消失。
+  # 为什么：agent 的退出顺序是「先保存记忆 → 删哨兵 → 关聊天库 → 退出」（见 agent/index.js
+  # 的优雅停机分支）。如果盯着哨兵，会在它刚删完哨兵、还没关库的时候就动手强杀——
+  # 那正好破坏了"干净退出"（-wal 不搬回主库）。盯进程才是真的等它收尾。
+  # 一次记忆固化要调一次 LLM，可能几十秒，所以给到 90 秒——与 stop.bat 同口径。
+  # 以前这里是写死 3 秒强杀，等于白写哨兵。
+  $agentProc = Get-CoreadProcesses | Where-Object { $_.CommandLine -like '*agent*' } | Select-Object -First 1
+  $waited = 0
+  $agentExited = $true          # 没有 agent 在跑时也算"已退出"
+  if ($agentProc) {
+    $agentHandle = Get-Process -Id $agentProc.ProcessId -EA SilentlyContinue
+    if ($agentHandle) {
+      $agentExited = $false
+      while (-not $agentExited -and $waited -lt 90) {
+        Start-Sleep -Seconds 3
+        $waited += 3
+        try { $agentExited = $agentHandle.HasExited } catch { $agentExited = $true }
+      }
+    }
+  }
+  if ($agentProc -and -not $agentExited) {
+    Write-Log 'tray' "等待 $waited 秒仍未结束，强制停止（进行中的讨论留在讨论栈里，不会丢）"
+  } elseif ($agentProc) {
+    Write-Log 'tray' "agent 已完成记忆保存并退出（用时约 $waited 秒）"
+  } else {
+    Write-Log 'tray' '没有发现运行中的 agent，直接停止其余进程'
+  }
+
   foreach ($p in (Get-CoreadProcesses)) {
     Write-Log 'tray' "结束 PID $($p.ProcessId) ($($p.Name))"
     Stop-Process -Id $p.ProcessId -Force -EA SilentlyContinue
@@ -149,37 +235,75 @@ function Get-Status {
 }
 
 # ── 启动 ────────────────────────────────────────────────────────────
-if (-not (Test-Path $Node)) {
-  [System.Windows.Forms.MessageBox]::Show(
-    ("找不到 node.exe：" + [Environment]::NewLine + $Node + [Environment]::NewLine + [Environment]::NewLine +
-     "安装似乎不完整，请重新解压整个压缩包。"),
-    'CoRead 启动失败', 'OK', 'Error') | Out-Null
-  exit 1
+# 便携包：检查自带的 node.exe 在不在（不在 = 包不完整）。
+# 开发布局：$Node 是 'node'，得去 PATH 里找；找不到就提示装 Node。
+if ($IsPortable) {
+  if (-not (Test-Path $Node)) {
+    [System.Windows.Forms.MessageBox]::Show(
+      ("找不到 node.exe：" + [Environment]::NewLine + $Node + [Environment]::NewLine + [Environment]::NewLine +
+       "安装似乎不完整，请重新解压整个压缩包。"),
+      'CoRead 启动失败', 'OK', 'Error') | Out-Null
+    exit 1
+  }
+} else {
+  $nodeCmd = Get-Command $Node -EA SilentlyContinue
+  if (-not $nodeCmd) {
+    [System.Windows.Forms.MessageBox]::Show(
+      ("开发布局下需要 PATH 里有 node（找不到 '$Node'）。" + [Environment]::NewLine + [Environment]::NewLine +
+       "装一个 Node 24+，或用 -NodeExe 指定完整路径。" ),
+      'CoRead 启动失败', 'OK', 'Error') | Out-Null
+    exit 1
+  }
 }
 
 Set-Content -Path $PidFile -Value $PID -Encoding ASCII
 
 if (Test-PortConflict) {
-  # 端口被别人的程序占着（常见于"之前用 start.bat 起过一份还在跑"）。
+  # 端口被别人的程序占着（最常见：另一个 CoRead 实例还在跑 —— 便携包与开发目录
+  # 都用 7239，同时只能跑一个）。
   # 这时不要拉起接收端——它起来也会立刻因端口冲突退出，然后被自愈反复重启。
   $owner = Get-PortOwner 7239
   Write-Log 'tray' "端口 7239 已被 PID $owner 占用（不是本程序启动的进程），跳过接收端"
-  Start-Child 'agent' 'internal\agent\index.js' | Out-Null
+  Start-Child 'agent' $AgentScript | Out-Null
   [System.Windows.Forms.MessageBox]::Show(
     ("端口 7239 已被另一个程序占用，CoRead 的接收端无法启动。" + [Environment]::NewLine + [Environment]::NewLine +
-     "最常见的原因：你之前用 start.bat 启动过一份 CoRead，它还在运行。" + [Environment]::NewLine +
-     "请先运行 stop.bat（或右键托盘图标退出），再重新启动 CoRead。"),
+     "最常见的原因：另一个 CoRead 还在运行（便携包与开发目录共用这个端口，" + [Environment]::NewLine +
+     "同时只能跑一个）。请从那个实例的托盘点「退出 CoRead」，再启动这个。"),
     'CoRead：端口被占用', 'OK', 'Warning') | Out-Null
 } else {
-  Start-Child 'receiver' 'internal\receiver\index.js' | Out-Null
+  Start-Child 'receiver' $ReceiverScript | Out-Null
   Start-Sleep -Milliseconds 1200          # 让接收端先占好端口
-  Start-Child 'agent' 'internal\agent\index.js' | Out-Null
+  Start-Child 'agent' $AgentScript | Out-Null
 }
-Write-Log 'tray' '已启动'
+Write-Log 'tray' "已启动（$LayoutKind 布局，node = $Node）"
 
 # ── 托盘图标与菜单 ──────────────────────────────────────────────────
+# 图标文件：assets\icons\coread.ico（含 16/32/48/128/256 五个尺寸，Windows 会挑合适的）。
+# 生成脚本 tools\make-icons.ps1，随包分发时必须一起带上 —— 找不到就退回系统默认图标，
+# 不报错（图标是锦上添花，不该因为它缺失让程序起不来）。
+function Get-TrayIcon {
+  $candidates = @(
+    (Join-Path $PackageRoot 'assets\icons\coread.ico'),
+    (Join-Path $PackageRoot 'installer\build\portable\assets\icons\coread.ico')
+  )
+  foreach ($p in $candidates) {
+    try {
+      if (Test-Path $p) { return (New-Object System.Drawing.Icon($p)) }
+    } catch {}
+  }
+  try {
+    $p = Join-Path $PackageRoot 'assets\icons\icon32.png'
+    if (Test-Path $p) {
+      $bmp = [System.Drawing.Image]::FromFile($p)
+      $h = $bmp.GetHicon()
+      $bmp.Dispose()
+      return [System.Drawing.Icon]::FromHandle($h)
+    }
+  } catch {}
+  return [System.Drawing.SystemIcons]::Application
+}
 $notify = New-Object System.Windows.Forms.NotifyIcon
-$notify.Icon = [System.Drawing.SystemIcons]::Application
+$notify.Icon = Get-TrayIcon
 $notify.Text = 'CoRead 共读'
 $notify.Visible = $true
 
@@ -203,10 +327,9 @@ $menu.Items.Add($itemExt) | Out-Null
 
 $itemData = New-Object System.Windows.Forms.ToolStripMenuItem
 $itemData.Text = '打开数据文件夹（我的记录）'
-# 数据目录是代码里写死的，位置跟着代码走：agent 的数据在 internal\agent\data。
-# 这里直接定位到那个文件夹——对用户来说"打开就能看到我的记录"才是重点，
-# 不需要他知道为什么它在 internal 下面。
-$itemData.add_Click({ Start-Process 'explorer.exe' (Join-Path $PackageRoot 'internal\agent\data') })
+# 2026-10 目录重构后，数据就在包根的 data\（与 internal\ 同级）。
+# 这个路径由 agent\lib\paths.js 决定；改那里就要改这里。
+$itemData.add_Click({ Start-Process 'explorer.exe' (Join-Path $PackageRoot 'data') })
 $menu.Items.Add($itemData) | Out-Null
 
 $itemLogs = New-Object System.Windows.Forms.ToolStripMenuItem
@@ -244,7 +367,7 @@ $timer.add_Tick({
     'running'       { $notify.Text = 'CoRead 运行中';              $itemStatus.Text = '状态：运行中 ✅' }
     'receiver-only' { $notify.Text = 'CoRead 部分运行（引擎未起）';  $itemStatus.Text = '状态：引擎未运行 ⚠️' }
     'partial'       { $notify.Text = 'CoRead 部分运行';             $itemStatus.Text = '状态：部分运行 ⚠️' }
-    'port-conflict' { $notify.Text = 'CoRead：端口 7239 被占用';    $itemStatus.Text = '状态：端口被占用 ❌（先跑 stop.bat）' }
+    'port-conflict' { $notify.Text = 'CoRead：端口 7239 被占用';    $itemStatus.Text = '状态：端口被占用 ❌（另一个实例在跑？）' }
     default         { $notify.Text = 'CoRead 已停止';               $itemStatus.Text = '状态：已停止' }
   }
   # 崩溃自愈：不在退出流程里、且某一半掉了，就补起来（最多每 30 秒一次）
@@ -255,16 +378,16 @@ $timer.add_Tick({
       $last = $script:lastRestart['agent']
       if (-not $last -or ($now - $last).TotalSeconds -gt 30) {
         Write-Log 'tray' '检测到 agent 未运行，尝试重启'
-        Start-Child 'agent' 'internal\agent\index.js' | Out-Null
+        Start-Child 'agent' $AgentScript | Out-Null
         $script:lastRestart['agent'] = $now
       }
     } elseif ($st -eq 'stopped') {
       $last = $script:lastRestart['all']
       if (-not $last -or ($now - $last).TotalSeconds -gt 30) {
         Write-Log 'tray' '检测到两个进程都未运行，尝试重启'
-        Start-Child 'receiver' 'internal\receiver\index.js' | Out-Null
+        Start-Child 'receiver' $ReceiverScript | Out-Null
         Start-Sleep -Milliseconds 1200
-        Start-Child 'agent' 'internal\agent\index.js' | Out-Null
+        Start-Child 'agent' $AgentScript | Out-Null
         $script:lastRestart['all'] = $now
       }
     }

@@ -116,7 +116,8 @@ jobs:
             ## 怎么用
 
             下载下面的 zip，解压到任意普通文件夹（**别放 C:\Program Files**），
-            双击 `01-START-CoRead.bat`。完整步骤见包里的 `README-FIRST.txt`。
+            双击 `internal\Start-CoRead.vbs`（Windows 自带的脚本，用来隐藏启动，
+            不会闪出黑窗口）。完整步骤见包里的 `README-FIRST.txt`。
 
             ## 需要准备
 
