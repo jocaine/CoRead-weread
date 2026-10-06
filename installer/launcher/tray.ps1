@@ -16,6 +16,12 @@ $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# WinForms 视觉样式（按钮/文本框走系统主题，而不是老的灰底 3D 样子）。
+# 必须在**创建任何控件之前**调用，所以放在这儿 —— 后面才会建 NotifyIcon。
+# 托盘右键菜单是 .NET 自绘的（ContextMenuStrip 有自己的渲染器），不受这句影响；
+# 这一句是为「装浏览器插件」那个自建窗体加的：不开它，窗体里的按钮会显得很旧。
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
 # ── 目录约定（两种布局都支持，自动判断）─────────────────────────────
 # 便携包布局（读者用的）：
 #   <包根>\            用户看到的：data\、logs\、extension\、README-FIRST.txt
@@ -320,9 +326,265 @@ $itemOpen.Text = '打开微信读书'
 $itemOpen.add_Click({ Start-Process 'https://weread.qq.com/' })
 $menu.Items.Add($itemOpen) | Out-Null
 
+# ── 装插件指引窗体（自建、**非模态**；2026-10 用户要求可换样式）────────────
+# 为什么不用系统 MessageBox（下面每条都是实测结论）：
+#   · 它是**模态**的 —— 开着的时候托盘那个 5 秒崩溃自愈轮询整个停摆；
+#   · 它的文字**不能选中、也不能复制** —— 用户切到浏览器点几下，剪贴板被别的
+#     东西盖掉，就只能照着屏幕一个字一个字敲这个路径；
+#   · 样式一概改不了（实测枚举只有：按钮组合 / 图标 / 默认按钮；
+#     字体、字号、颜色、布局、连按钮文字都写死）；
+#   · 更现代的 TaskDialog 在 PowerShell 5.1 上**不存在** —— 它是 .NET 5+ 才进
+#     WinForms 的，这里 GetType('System.Windows.Forms.TaskDialog') 返回 null。
+#     要用就得额外带一个 DLL，违背"体积为零、不装额外运行时"这个前提。
+# 自建窗体换来三件事：① 非模态，不挡自愈轮询；② 路径放只读文本框，可选中、
+# 可再次 Ctrl+C；③ 多一个「复制路径」按钮，随时能再复制一次。
+#
+# 两处刻意选择：
+#   · 置顶 + 显示在任务栏 —— 用户接下来要在浏览器里操作，这个窗口是"照着填"
+#     的参考，既不能被浏览器盖住，也不能让他找不到。
+#   · 不放 emoji —— 系统 UI 字体不一定有 emoji 字形，会渲染成方框（豆腐块），
+#     所以文案里用文字描述"拼图块形状的图标"。
+#
+# ⚠️ 按钮的处理器**只能**用 $script: 作用域去拿控件（实测，别改成局部变量）：
+#    嵌在别的处理器内部的脚本块，在事件循环里被调用时**看不到**外层的局部变量
+#    （同步触发会因为动态作用域"看起来能用"，是假阳性）；
+#    而 `.GetNewClosure()` 里的 $script: 指向 closure 自己的模块作用域，写不回来。
+#    所以下面用 $script:extHelpPath / $script:extHelpStatus 这两个中间变量。
+#
+# 版式为什么拆成一堆标签（2026-10 用户反馈"排版乱、不清爽"）：
+#   第一版把整段说明塞进**一个** Label，靠手打空格做缩进 —— 中英文字宽不同，
+#   空格根本对不齐；而且所有文字同字号、同灰度，没有层级，看起来就是一坨。
+#   现在：每一步各自成标签、坐标是真实像素列（不会再歪）；标题 / 正文 / 注解
+#   用三种字重 + 两种灰度分层，层级不靠堆空行。
+# 高度为什么取两种口径的较大值（实测数字，别简化成一个）：
+#   · TextRenderer.MeasureText → 文字**墨迹**高度（长文本还知道换几行）
+#   · Label.PreferredHeight    → Label 按**行高**算的高度
+#   实测（微软雅黑）：13pt 粗体 墨迹 25 / 行高 28；9pt 粗体 17 / 20；8.5pt 17 / 19。
+#   只取前者，粗体上会少 1~3px —— 中文没有下伸部溢出所以**看不出来**，
+#   换个字体或系统就可能把最后一行切掉。只取后者则长文本换行时可能不够。取大的。
+function Add-HelpLabel($Form, [string]$Text, [int]$X, [int]$Y, [int]$W, $Font, $Color) {
+  $l = New-Object System.Windows.Forms.Label
+  $l.AutoSize = $false
+  $l.Text = $Text
+  $l.Font = $Font
+  $l.ForeColor = $Color
+  $l.Location = New-Object System.Drawing.Point($X, $Y)
+  $l.Size = New-Object System.Drawing.Size($W, 10)     # 先定宽；高度下面按量出来的改
+  $hMeas = [System.Windows.Forms.TextRenderer]::MeasureText(
+             $Text, $Font, (New-Object System.Drawing.Size($W, 4000)),
+             [System.Windows.Forms.TextFormatFlags]::WordBreak).Height
+  $l.Size = New-Object System.Drawing.Size($W, [Math]::Max($hMeas, $l.PreferredHeight))
+  $Form.Controls.Add($l)
+  return $l.Size.Height
+}
+
+function Show-ExtensionHelp([string]$ExtDir, [bool]$Copied) {
+  # 已经开着就直接拉到前面，不再开第二个窗口
+  $prev = $script:extHelpForm
+  if ($prev -and -not $prev.IsDisposed) {
+    $prev.Activate()
+    $prev.BringToFront()
+    return
+  }
+
+  $form = New-Object System.Windows.Forms.Form
+  $form.Text = 'CoRead · 安装浏览器插件'
+  $form.StartPosition = 'CenterScreen'
+  $form.FormBorderStyle = 'FixedDialog'
+  $form.MaximizeBox = $false
+  $form.MinimizeBox = $false
+  $form.ShowInTaskbar = $true
+  $form.TopMost = $true
+  # 字体：优先"微软雅黑"，取不到就用系统默认（系统默认靠字体链接也能正常显示
+  # 中文 —— 系统 MessageBox 就是这么显示的）。不硬依赖某个字体名。
+  try { $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9) } catch { }
+  try { $form.Icon = Get-TrayIcon } catch { }
+
+  # ── 版式常量：所有坐标都从这几个数推出来，不散落魔数 ────────────────
+  $margin = 20                       # 左右边距
+  $w      = 540                      # 内容总宽
+  $numW   = 24                       # 步骤序号列宽
+  $bodyX  = $margin + $numW          # 正文左边缘：悬垂缩进，正文对齐在标题下方
+  $bodyW  = $w - $numW
+  $y      = 18                       # 纵向游标：控件自上而下排，末尾按实际高度定窗体
+
+  # 三层字重 + 两种灰度做层级：标题 > 正文 > 注解
+  $fBase  = $form.Font
+  $fTitle = New-Object System.Drawing.Font($fBase.FontFamily, ($fBase.Size + 4), [System.Drawing.FontStyle]::Bold)
+  $fBold  = New-Object System.Drawing.Font($fBase, [System.Drawing.FontStyle]::Bold)
+  $fSmall = New-Object System.Drawing.Font($fBase.FontFamily, ($fBase.Size - 0.5))
+  $cText  = [System.Drawing.SystemColors]::ControlText
+  $cGray  = [System.Drawing.SystemColors]::GrayText
+
+  # ── 文案原则（2026-10 用户要求）────────────────────────────────────
+  # ① 不假设用户用 Chrome："扩展程序管理页"的地址各家不同（chrome:// / edge:// /
+  #    brave:// / …），列不完，所以只教**每家都存在的动作**，不给地址。
+  # ② 按钮名各浏览器不同（Edge 上就不叫「加载已解压的扩展程序」），所以说明它的
+  #    **作用**（选择一个本地文件夹），措辞差异就不会卡住人。
+  # ③ 不放 emoji —— 系统 UI 字体不一定有 emoji 字形，会渲染成方框（豆腐块）。
+  # ④ 书面语，不用聊天口气（第一版是"只需要装一次""找不到它，就点…"）。
+  $steps = @(
+    @{ n = '1'; t = '打开扩展程序管理页'
+       d = @('地址栏右侧的扩展程序图标 →「管理扩展程序」',
+             '或：浏览器菜单 →「扩展程序」') }
+    @{ n = '2'; t = '开启「开发者模式」'
+       d = @() }
+    @{ n = '3'; t = '点击「加载已解压的扩展程序」'
+       d = @('在弹出的目录选择框中粘贴下方路径。',
+             '各浏览器按钮名称略有差异，作用均为选择一个本地文件夹。') }
+  )
+
+  $y += (Add-HelpLabel $form '安装浏览器插件' $margin $y $w $fTitle $cText) + 4
+  $y += (Add-HelpLabel $form '仅需安装一次。适用于 Chrome 内核的浏览器（Chrome、Edge 等）；Firefox 不适用。' $margin $y $w $fSmall $cGray) + 18
+
+  foreach ($s in $steps) {
+    # 序号在固定宽度的列里右对齐；高度取标题那一行的高度 → 自然垂直居中
+    $hT = Add-HelpLabel $form $s.t $bodyX $y $bodyW $fBold $cText
+    $num = New-Object System.Windows.Forms.Label
+    $num.Text = $s.n
+    $num.Font = $fBold
+    $num.ForeColor = $cGray
+    $num.TextAlign = 'MiddleRight'
+    $num.Location = New-Object System.Drawing.Point($margin, $y)
+    $num.Size = New-Object System.Drawing.Size(($numW - 6), $hT)
+    $form.Controls.Add($num)
+    $y += $hT + 3
+    foreach ($line in $s.d) {
+      $y += (Add-HelpLabel $form $line $bodyX $y $bodyW $fSmall $cGray) + 2
+    }
+    $y += 12
+  }
+
+  # ── 路径：标签 + 只读文本框 + 状态行 ────────────────────────────────
+  $y += (Add-HelpLabel $form '插件目录' $margin $y $w $fBold $cText) + 4
+
+  # 只读文本框：能选中、能 Ctrl+C，但改不了。只读时系统会把它画成灰底
+  # （看起来像"禁用"），所以把底色改回窗口色 —— 它是"内容"，不是"不可用"。
+  $txt = New-Object System.Windows.Forms.TextBox
+  $txt.Text = $ExtDir
+  $txt.ReadOnly = $true
+  $txt.Location = New-Object System.Drawing.Point($margin, $y)
+  $txt.Size = New-Object System.Drawing.Size($w, 25)
+  $txt.BackColor = [System.Drawing.SystemColors]::Window
+  $form.Controls.Add($txt)
+  $y += 25 + 10
+
+  $status = New-Object System.Windows.Forms.Label
+  $status.Font = $fSmall
+  $status.ForeColor = $cGray
+  $status.Location = New-Object System.Drawing.Point($margin, $y)
+  $status.Size = New-Object System.Drawing.Size(330, 20)
+  if ($Copied) { $status.Text = '路径已复制到剪贴板。' }
+  else { $status.Text = '剪贴板不可用：请选中上方路径后按 Ctrl+C。' }
+  $form.Controls.Add($status)
+  $y += 20 + 12
+
+  $btnCopy = New-Object System.Windows.Forms.Button
+  $btnCopy.Text = '复制路径'
+  $btnCopy.Location = New-Object System.Drawing.Point(($margin + $w - 212), $y)
+  $btnCopy.Size = New-Object System.Drawing.Size(100, 32)
+  $btnCopy.add_Click({
+    try {
+      [System.Windows.Forms.Clipboard]::SetDataObject($script:extHelpPath.Text, $true)
+      $script:extHelpStatus.Text = '已复制到剪贴板。'
+    } catch {
+      $script:extHelpStatus.Text = '复制失败：请选中上方路径后按 Ctrl+C。'
+    }
+  })
+  $form.Controls.Add($btnCopy)
+
+  $btnClose = New-Object System.Windows.Forms.Button
+  $btnClose.Text = '关闭'
+  $btnClose.Location = New-Object System.Drawing.Point(($margin + $w - 100), $y)
+  $btnClose.Size = New-Object System.Drawing.Size(100, 32)
+  $btnClose.add_Click({ $script:extHelpForm.Close() })
+  $form.Controls.Add($btnClose)
+
+  $y += 32 + 18
+  $form.ClientSize = New-Object System.Drawing.Size(($margin * 2 + $w), $y)
+
+  $form.add_FormClosed({
+    $script:extHelpForm = $null
+    $script:extHelpPath = $null
+    $script:extHelpStatus = $null
+  })
+
+  $script:extHelpForm = $form
+  $script:extHelpPath = $txt
+  $script:extHelpStatus = $status
+  $form.Show()      # Show = 非模态；ShowDialog = 模态（会挡住自愈轮询，别用）
+  $form.Activate()
+}
+
 $itemExt = New-Object System.Windows.Forms.ToolStripMenuItem
-$itemExt.Text = '打开插件文件夹（装插件时用）'
-$itemExt.add_Click({ Start-Process 'explorer.exe' (Join-Path $PackageRoot 'extension') })
+$itemExt.Text = '装浏览器插件（只需一次）'
+# 2026-10 改：这一项以前叫「打开插件文件夹（装插件时用）」，只是把 extension\ 打开。
+# 那是个错的动作 —— 用户要装插件，需要的是"这个目录**在哪**"，不是"里面有什么"：
+#   · Chrome 的「加载已解压的扩展程序」只认磁盘上的目录，不能从 zip 装；
+#   · 也不能把文件夹拖到扩展页上装（拖拽只对 .crx 安装包有效）——
+#     所以用户必须让那个**目录选择框**定位到这个目录；
+#   · 而 extension\ 里 22 个顶层项全是源码（manifest.json、sidebar.js、
+#     vendor\ 里还有 205 个 PDF.js 文件），没有任何一个是"装我"。
+#     打开它，用户反而站在目录**里面**，更不知道自己站在哪一层。
+# 所以这里做三件事：路径进剪贴板（选择框粘贴+回车直接跳过去）、
+# 资源管理器定位（/select 开**父目录**并选中它，旁边就是 README-FIRST.txt）、
+# 三步说明。菜单文案也一并改成按**任务**命名（「装浏览器插件」）而不是按文件夹命名。
+$itemExt.add_Click({
+  $extDir = Join-Path $PackageRoot 'extension'
+  if (-not (Test-Path $extDir)) {
+    [System.Windows.Forms.MessageBox]::Show(
+      ("找不到插件目录：" + [Environment]::NewLine + $extDir),
+      'CoRead', 'OK', 'Warning') | Out-Null
+    return
+  }
+
+  # 先判断指引窗体是不是已经开着 —— 它决定后面做哪几件事。
+  # 实测（2026-10）：同一项点两次时 explorer /select **会再开一个窗口**，
+  # 不会复用已有的那个。所以"已开着"这个判断必须放在 ② 之前，
+  # 否则重复点会越点越多窗口（第一次写成放在 ③，实测就是 2 个窗口）。
+  $prev = $script:extHelpForm
+  $alreadyOpen = [bool]($prev -and -not $prev.IsDisposed)
+
+  # ① 路径进剪贴板。必须用带 $true 的重载：第二个参数 = 进程退出后剪贴板内容仍在，
+  #    否则托盘一关，用户刚复制的东西就没了（SetText 的默认行为就是不持久）。
+  #    重复点这一项时也要重做一遍 —— 那正是用户此刻的意图（剪贴板被别的东西盖了）。
+  $copied = $false
+  try {
+    [System.Windows.Forms.Clipboard]::SetDataObject($extDir, $true)
+    $copied = $true
+  } catch {
+    Write-Log 'tray' "复制插件路径到剪贴板失败: $($_.Exception.Message)"
+  }
+
+  # ② /select 打开父目录并选中 extension（不是打开它本身 —— 见上方注释）。
+  #    只在第一次开：重复点不再堆资源管理器窗口。
+  if (-not $alreadyOpen) {
+    Start-Process 'explorer.exe' "/select,`"$extDir`""
+  }
+
+  # ③ 显示安装指引。文案与窗体都在 Show-ExtensionHelp 里（唯一真源）。
+  if ($alreadyOpen) {
+    $prev.Activate()
+    $prev.BringToFront()
+    Write-Log 'tray' '插件安装指引已在显示：重新复制了路径并拉到前面'
+    return
+  }
+
+  try {
+    Show-ExtensionHelp -ExtDir $extDir -Copied $copied
+    Write-Log 'tray' "已打开插件安装指引（路径已复制: $copied）"
+  } catch {
+    # 兜底：窗体建不出来（极端情况）也不能让用户什么都没看到
+    Write-Log 'tray' "自建指引窗体失败，退回系统弹窗: $($_.Exception.Message)"
+    [System.Windows.Forms.MessageBox]::Show(
+      ('安装浏览器插件，三步：' + [Environment]::NewLine +
+       '  1. 打开扩展程序管理页（扩展程序图标，或浏览器菜单 →「扩展程序」）' + [Environment]::NewLine +
+       '  2. 开启「开发者模式」' + [Environment]::NewLine +
+       '  3. 点击「加载已解压的扩展程序」，选择该目录：' + [Environment]::NewLine +
+       '     ' + $extDir),
+      'CoRead · 安装浏览器插件', 'OK', 'Information') | Out-Null
+  }
+})
 $menu.Items.Add($itemExt) | Out-Null
 
 $itemData = New-Object System.Windows.Forms.ToolStripMenuItem
