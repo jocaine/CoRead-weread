@@ -27,11 +27,13 @@
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'node:url'
+import { CHAT_DB } from '../lib/paths.js'  // 数据路径唯一真源
 import { openChatStore } from '../lib/chat-store.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const REPO = path.resolve(__dirname, '..', '..')
-const dbFile = process.argv[2] || path.join(REPO, 'receiver', 'inbox', 'chat.db')
+// 默认体检当前生效的聊天库（data\sessions\chat.db）；也接受命令行显式给一个路径，
+// 这样即使库还没被创建（或想体检某个备份）也能跑。
+const dbFile = process.argv[2] || CHAT_DB
 
 const kb = (n) => (n / 1024).toFixed(1) + ' KB'
 const stat = (p) => { try { return fs.statSync(p) } catch { return null } }

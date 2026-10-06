@@ -4,6 +4,12 @@
   "version": "0.3.1",
   "description": "微信读书私密标注 + 正文足迹捕获 + 框选/划词翻译 + 自建 PDF 阅读器，配合 CoRead 共读 agent 使用",
   "minimum_chrome_version": "102",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": ["storage", "sidePanel", "tabs", "unlimitedStorage", "activeTab", "scripting"],
   "side_panel": {
     "default_path": "sidebar.html"
@@ -43,7 +49,13 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "CoRead"
+    "default_title": "CoRead",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "commands": {
     "translate-region": {

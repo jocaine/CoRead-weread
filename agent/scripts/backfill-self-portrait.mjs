@@ -1,28 +1,37 @@
 #!/usr/bin/env node
 /**
- * 用户情况与观念画像回填 — 把历史用户消息喂给画像维护，生成 agent/self-portrait.md。
+ * 用户情况与观念画像回填 — 把历史用户消息喂给画像维护，生成 data\profile\self-portrait.md。
  *
- * 数据源：agent/session_journal.jsonl（及 .bak*）+ receiver/inbox/chat_input.jsonl（及 .bak*），
+ * 数据源（2026-10 目录重构后，按可靠性排序自动挑）：
+ *   1. 聊天库 data\sessions\chat.db —— 在线真源（**默认，最完整**）
+ *   2. data\sessions\journal.jsonl（及 .bak*）—— 会话流水账
+ *   3. data\backups\chat_input.export.jsonl（及 .bak*）—— 老格式导出副本，需先跑 export-chat.mjs
  * 按 content 全文去重，按时间排序。每条消息调用 judgeSelfPortrait，
  * 输出 situation（情况）/ belief（观念）的**总结条目**（画像语言，非原文截取）；
  * 每条判定传入已积累的画像条目作去重参照；最后把全部条目渲染成 self-portrait.md。
  *
- * 运行：npm run backfill:portrait（需 agent/.env 配置 COREAD_API_KEY / COREAD_API_BASE）
+ * 运行：npm run backfill:portrait
+ *   （配置读 data\config\env 或 agent\api-config.json，见 lib/api-config.js）
  */
-import { readFileSync, writeFileSync, readdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { DATA_FILES, SESSIONS_DIR, DATA_BACKUPS_DIR } from '../lib/paths.js'  // 数据路径唯一真源
 import { judgeSelfPortrait } from '../lib/self-portrait.js'
+import { openChatStore } from '../lib/chat-store.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const AGENT_DIR = path.join(__dirname, '..')
-const OUT_FILE = path.join(AGENT_DIR, 'self-portrait.md')
+const OUT_FILE = DATA_FILES['self-portrait']
 
-// .env 由 npm run backfill:portrait（--env-file-if-exists=.env）加载
+// .env 由 npm run backfill:portrait 加载（--env-file-if-exists=../data/config/env）
 const API_KEY = process.env.COREAD_API_KEY
 const API_BASE = (process.env.COREAD_API_BASE || '').replace(/\/$/, '')
 const MODEL = process.env.COREAD_MODEL || 'gpt-4o'
-if (!API_KEY || !API_BASE) throw new Error('.env 缺少 COREAD_API_KEY / COREAD_API_BASE')
+if (!API_KEY || !API_BASE) {
+  throw new Error('缺少 COREAD_API_KEY / COREAD_API_BASE。'
+    + '请用 npm run backfill:portrait 运行（它会加载 data/config/env），'
+    + '或在插件侧栏「⋯ → 模型 API 配置」里填好。')
+}
 
 async function callLLMOnce(prompt, maxTokens = 4096) {
   const resp = await fetch(`${API_BASE}/chat/completions`, {
@@ -92,16 +101,33 @@ function mergePortrait(portrait, r) {
 }
 
 // ── 收集数据源 ───────────────────────────────────────────────────────────
+// 2026-10 目录重构：老路径（agent\session_journal.jsonl、receiver\inbox\chat_input.jsonl）已不存在。
+// 现在的取值顺序：聊天库（在线真源）→ 会话流水账 → 老格式导出副本（需先跑 export-chat.mjs）。
+const jsonlInDir = (dir, re) => {
+  try {
+    return readdirSync(dir).filter((f) => re.test(f)).map((f) => path.join(dir, f))
+  } catch { return [] }
+}
 const SOURCE_FILES = [
-  ...readdirSync(AGENT_DIR).filter((f) => /^session_journal\.jsonl(\..*)?$/.test(f)).map((f) => path.join(AGENT_DIR, f)),
-  ...readdirSync(path.join(AGENT_DIR, '..', 'receiver', 'inbox'))
-    .filter((f) => /^chat_input\.jsonl(\..*)?$/.test(f))
-    .map((f) => path.join(AGENT_DIR, '..', 'receiver', 'inbox', f)),
-  ...readdirSync(path.join(AGENT_DIR, '..', 'receiver', 'inbox'))
-    .filter((f) => /^chat_output\.jsonl(\..*)?$/.test(f))
-    .map((f) => path.join(AGENT_DIR, '..', 'receiver', 'inbox', f)),
+  ...jsonlInDir(SESSIONS_DIR, /^journal\.jsonl(\..*)?$/),
+  ...jsonlInDir(DATA_BACKUPS_DIR, /^chat_input\.export\.jsonl(\..*)?$/),
+  ...jsonlInDir(DATA_BACKUPS_DIR, /^chat_output\.export\.jsonl(\..*)?$/),
 ].sort()
-console.log(`数据源：${SOURCE_FILES.length} 个文件`);
+
+// 首选聊天库；库不存在或读不出东西时，回退 jsonl 副本
+const CHAT_DB = DATA_FILES['chat-db']
+const useDb = existsSync(CHAT_DB)
+if (!useDb && !SOURCE_FILES.length) {
+  console.error('\n✗ 找不到可回填的数据源。')
+  console.error(`  聊天库不存在：${CHAT_DB}`)
+  console.error(`  data\\backups\\ 里也没有导出的 jsonl 副本。`)
+  console.error('  若是从旧版本升级上来，先跑一次数据迁移：')
+  console.error('    node agent/scripts/migrate-data-layout.mjs --apply\n')
+  process.exit(1)
+}
+console.log(useDb
+  ? `数据源：聊天库 ${CHAT_DB}${SOURCE_FILES.length ? `（外加 ${SOURCE_FILES.length} 个 jsonl 副本）` : ''}`
+  : `数据源：${SOURCE_FILES.length} 个 jsonl 文件（聊天库不存在）`)
 
 const seen = new Set()
 const messages = [];
@@ -129,8 +155,45 @@ for (const f of SOURCE_FILES) {
   }
 }
 
+// 聊天库（在线真源）里的用户消息与 AI 回复也一起收进来。
+// 为什么不止读 jsonl：重构后在线数据只写库，jsonl 是历史遗留；只读 jsonl 会漏掉近期对话。
+let dbStore = null
+if (useDb) {
+  try {
+    dbStore = openChatStore(CHAT_DB, { readonly: true })
+    for (const u of dbStore.listMessages({ roles: ['user'] })) {
+      const content = String(u.content || '').trim()
+      if (!content || seen.has(content)) continue
+      seen.add(content)
+      messages.push({
+        t: u.timestamp || 0,
+        content,
+        bookTitle: String(u.bookTitle || '').trim(),
+        chapter: String(u.chapter || '').trim(),
+        selectedText: String(u.selectedText || '').trim(),
+      })
+    }
+  } catch (e) {
+    console.log(`  ⚠️ 聊天库读取失败（只用 jsonl 副本继续）：${e.message}`)
+  }
+}
+
 // 收集 AI 回复（chat_output）作对话脉络：流式累积取每条时间戳的最终完整版
 const replyByT = {}
+if (dbStore) {
+  // 库里的回复按 bookKey 隔离，逐本配对（不走时间序猜测，见 lib/chat-store.js 的 pairReplies）
+  const convs = [...new Set(dbStore.listMessages({ roles: ['user'] }).map((u) => u.conv))]
+  for (const conv of convs) {
+    for (const rep of dbStore.pairReplies({ conv }).values()) {
+      const t = rep.timestamp || 0
+      const c = String(rep.content || '').trim()
+      if (!t || c.length < 40) continue
+      const prev = replyByT[t]
+      if (!prev || c.length > prev.length) replyByT[t] = c
+    }
+  }
+  try { dbStore.close() } catch {}
+}
 for (const f of SOURCE_FILES) {
   if (!/chat_output/.test(f)) continue
   const raw = readFileSync(f, 'utf-8')

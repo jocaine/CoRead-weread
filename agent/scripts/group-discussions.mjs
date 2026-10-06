@@ -27,6 +27,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { DATA_FILES, exportedJsonlFile } from '../lib/paths.js'  // 数据路径唯一真源
 import { judgeSameProblem, buildSameProblemInstruction } from '../lib/topic-stack.js'
 import { consolidateThreadQuestion, buildQuestionInstruction } from '../lib/thread-question.js'
 import { segmentStack } from '../lib/segment-stack.js'
@@ -46,10 +47,13 @@ const Q_INST_HASH = hashStr(buildQuestionInstruction())  // 归纳问题指令�
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DATA = path.resolve(__dirname, './data/judge-real-cases.json')
 const RES = path.resolve(__dirname, './data/judge-real-results.json')
-const CHAT_IN = path.resolve(__dirname, '../../receiver/inbox/chat_input.jsonl')
-const CHAT_OUT = path.resolve(__dirname, '../../receiver/inbox/chat_output.jsonl')
-// 聊天库（2026-10-02 方案 B）：有库就优先用它配对（reply_to 直连），否则回退旧 JSONL
-const CHAT_DB = path.resolve(__dirname, '../../receiver/inbox/chat.db')
+// 聊天数据源（2026-10 目录重构后）：
+//   主路 = SQLite，data\sessions\chat.db（reply_to 直连配对）
+//   回退 = 老 JSONL，只在 data\backups\ 里由 export-chat.mjs 导出的只读副本
+// 两者都取不到时 loadReplyByTs 会报错并提示先跑 export-chat.mjs。
+const CHAT_IN = exportedJsonlFile('input')
+const CHAT_OUT = exportedJsonlFile('output')
+const CHAT_DB = DATA_FILES['chat-db']
 
 const API_KEY = process.env.COREAD_API_KEY
 const API_BASE = (process.env.COREAD_API_BASE || '').replace(/\/$/, '')

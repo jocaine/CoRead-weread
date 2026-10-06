@@ -5,23 +5,25 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { AGENT_DIR, BOOKS_DIR, DATA_FILES } from '../lib/paths.js'  // 数据路径唯一真源
 
-const AGENT = 'agent'
-const RECEIVER = 'receiver'
+const AGENT = AGENT_DIR
+const BOOKS = BOOKS_DIR
 const RATIO = 0.62   // 实测校准：真实历史 19.9 万字符 = 12.2 万 token（字符/token ≈ 1.6）
 
 const read = (p) => { try { return fs.readFileSync(p, 'utf8') } catch { return '' } }
 const tok = (s) => Math.ceil(String(s).length * RATIO)
 
 // ── SYSTEM（buildSystemInstruction 的真实组装）──────────────────────────────
+// AGENT.md 是程序文件，跟着代码走；profile/soul 是数据，在 data\profile\ 下
 const rules = read(path.join(AGENT, 'AGENT.md'))
-const profile = read(path.join(AGENT, 'profile.md'))
-const soul = read(path.join(AGENT, 'soul.md'))
+const profile = read(DATA_FILES.portrait)
+const soul = read(DATA_FILES['values-portrait'])
 const booksTitles = []
 try {
-  for (const name of fs.readdirSync(path.join(RECEIVER, 'books'))) {
+  for (const name of fs.readdirSync(BOOKS)) {
     try {
-      const m = JSON.parse(read(path.join(RECEIVER, 'books', name, 'meta.json')))
+      const m = JSON.parse(read(path.join(BOOKS, name, 'meta.json')))
       if (m.wereadBookId && m.bookTitle) booksTitles.push(String(m.bookTitle).replace(/\s+/g, ' ').trim())
     } catch {}
   }
@@ -44,7 +46,7 @@ const userText = '用户本次提问：我想到我们之前说的芬兰的建�
 const userMsg = `[正在共读]《静静的顿河》六\n${bookCtx}\n${userText}`
 
 // L3：真实节点 n_d_28（root，路径=自身）按 l3Block 格式全文
-const graph = JSON.parse(read(path.join(AGENT, 'data', 'knowledge-graph.json')))
+const graph = JSON.parse(read(DATA_FILES['knowledge-graph']))
 const n28 = graph.nodes.find((n) => n.id === 'n_d_28')
 const l3Lines = [
   '[图路径上下文]（你引用/联想到了之前聊过的知识点，root→recent 路径不截断）：',

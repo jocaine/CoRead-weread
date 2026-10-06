@@ -7,9 +7,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { ENV_FILE } from '../lib/paths.js'  // 数据路径唯一真源
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const envPath = path.join(__dirname, '..', '.env')
+// .env 已随 2026-10 目录重构搬到 data\config\env（不再是 agent\.env）
+const envPath = ENV_FILE
 const env = {}
 if (fs.existsSync(envPath)) {
   for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {

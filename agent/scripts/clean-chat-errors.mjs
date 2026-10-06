@@ -18,12 +18,12 @@
  */
 import fs from 'fs'
 import path from 'path'
-import { fileURLToPath } from 'url'
+import { CHAT_DB, READING_DIR } from '../lib/paths.js'  // 数据路径唯一真源
 import { openChatStore } from '../lib/chat-store.js'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const INBOX_DIR = path.resolve(__dirname, '..', '..', 'receiver', 'inbox')
-const DB_FILE = path.join(INBOX_DIR, 'chat.db')
+const DB_FILE = CHAT_DB
+// 删除前的导出存档落在 reading\（与 annotations 同格）；2026-10 前是 receiver\inbox
+const INBOX_DIR = READING_DIR
 const args = process.argv.slice(2)
 const has = (f) => args.includes(f)
 const val = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : '' }

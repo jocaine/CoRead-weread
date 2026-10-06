@@ -34,6 +34,7 @@
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'node:url'
+import { CHAT_DB, DATA_BACKUPS_DIR } from '../lib/paths.js'  // 数据路径唯一真源
 import { openChatStore } from '../lib/chat-store.js'
 // 直接拿底层连接做两件事：把备份转成单文件形态、只读校验副本。
 // 不走 openChatStore，因为它的写模式会执行 `PRAGMA journal_mode = WAL`，
@@ -47,8 +48,10 @@ const args = process.argv.slice(2)
 const has = (f) => args.includes(f)
 const val = (f) => { const i = args.indexOf(f); return i >= 0 ? (args[i + 1] || '') : '' }
 
-const DB_FILE = val('--db') || path.join(REPO, 'receiver', 'inbox', 'chat.db')
-const OUT_DIR = val('--out') || path.join(REPO, 'receiver', 'backups')
+// 路径来自 lib/paths.js（唯一真源）。2026-10 目录重构前它们写死在 receiver\inbox 下。
+const DB_FILE = val('--db') || CHAT_DB
+// 备份放 data\backups\：跟被备份的库同在 data\ 里，用户复制 data\ 时备份一起走
+const OUT_DIR = val('--out') || DATA_BACKUPS_DIR
 const KEEP = Math.max(1, Number(val('--keep') || 20))
 const FORCE_THREE = has('--three-files')
 

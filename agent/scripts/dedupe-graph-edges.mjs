@@ -21,22 +21,24 @@
  * 零改动（幂等）。
  *
  * 用法：node scripts/dedupe-graph-edges.mjs [图文件路径] [--dry]
- *   默认图文件 = agent/data/knowledge-graph.json（正式图）；--dry 只预演不改文件。
+ *   默认图文件 = data\profile\knowledge-graph.json（正式图）；--dry 只预演不改文件。
+ *   升级提示：2026-10 目录重构前它在 agent\data\ 下。旧文件还在、新位置还没有时，
+ *   这里会自动回退到旧路径，免得去重前先要手工搬一次。
  */
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { GRAPH_FILE, legacyLocations } from '../lib/paths.js'  // 数据路径唯一真源
 import { isReachable } from '../lib/knowledge-graph.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const args = process.argv.slice(2)
 const dry = args.includes('--dry')
-const graphFile = path.resolve(
-  __dirname,
-  '..',
-  'data',
-  args.filter((a) => a !== '--dry')[0] || 'knowledge-graph.json',
-)
+const named = args.filter((a) => a !== '--dry')[0]
+const legacyGraph = legacyLocations().find((m) => m.to === GRAPH_FILE)?.from
+const graphFile = named
+  ? path.resolve(named)
+  : (fs.existsSync(GRAPH_FILE) || !legacyGraph || !fs.existsSync(legacyGraph) ? GRAPH_FILE : legacyGraph)
 
 if (!fs.existsSync(graphFile)) {
   console.error('图文件不存在：' + graphFile)
