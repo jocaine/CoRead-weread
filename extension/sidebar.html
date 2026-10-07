@@ -1373,18 +1373,18 @@
     .confirm-ok:hover { background: #d43c2f; }
 
     /* 通知型弹窗（2026-10：本机程序没在运行时按了发送）—— 只告知，不需要用户做选择。
-       四处与确认框不同，都是为了读起来舒服：
+       与确认框的区别，都是为了读起来舒服：
          · 盒子略宽（300px / 92%）：实测最长那行「双击 Start-CoRead.vbs 启动后重试。」
            在 260px 盒子里正好占满 228px 可用宽 —— 零余量，浏览器渲染稍有差异就会折行。
            加宽后可用 268px，余量 40px。
-         · 标题与正文左对齐 + 正文保留换行：中文长句居中会断得很难看，换行位置由调用方给
-           （white-space: pre-line + 消息里的换行符；消息用 textContent 赋值，不碰 innerHTML）
+         · 正文保留换行（white-space: pre-line + 消息里写两行）：居中排版下断行位置本来
+           完全由浏览器定、很容易断得难看；现在由调用方给定两行（用 textContent 赋值，
+           不碰 innerHTML）。
          · 按钮不占满整行：它不是主操作，只是个"知道了"
-         · 确定按钮走绿色 —— 红色是「删除」这类破坏性动作的专用色（同 #prompt-overlay 的约定） */
+         · 确定按钮走绿色 —— 红色是「删除」这类破坏性动作的专用色（同 #prompt-overlay 的约定）
+       文字保持居中（标题沿用 .confirm-title 的居中，正文也不覆盖 text-align）。 */
     #confirm-overlay.notice .confirm-box { width: 300px; max-width: 92%; }
-    #confirm-overlay.notice .confirm-title { text-align: left; }
     #confirm-overlay.notice .confirm-msg {
-      text-align: left;
       white-space: pre-line;
       font-size: 12.5px;
       line-height: 1.75;

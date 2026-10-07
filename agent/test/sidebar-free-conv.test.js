@@ -45,8 +45,12 @@ function makeEl(id = '') {
     scrollTop: 0,
     scrollHeight: 0,
     isComposing: false,
-    addEventListener() {},
-    removeEventListener() {},
+    // 事件：记录处理器，测试可按需 dispatch（默认不自动触发，保持既有测试的同步语义）。
+    // 有了它才能测"同一次 keydown 继续冒泡到 document"这类真实浏览器行为。
+    _h: {},
+    addEventListener(t, fn) { (this._h[t] = this._h[t] || []).push(fn) },
+    removeEventListener(t, fn) { this._h[t] = (this._h[t] || []).filter((f) => f !== fn) },
+    dispatch(t, ev) { for (const f of (this._h[t] || []).slice()) f(ev) },
     appendChild(c) { this.children.push(c); c.parent = this; return c },
     removeChild(c) { this.children = this.children.filter((x) => x !== c); return c },
     remove() { if (this.parent) this.parent.children = this.parent.children.filter((x) => x !== this) },
@@ -101,8 +105,10 @@ function buildDom() {
     createElement: () => makeEl(),
     querySelector: () => makeEl(),
     querySelectorAll: () => [],
-    addEventListener() {},
-    removeEventListener() {},
+    _h: {},
+    addEventListener(t, fn) { (this._h[t] = this._h[t] || []).push(fn) },
+    removeEventListener(t, fn) { this._h[t] = (this._h[t] || []).filter((f) => f !== fn) },
+    dispatch(t, ev) { for (const f of (this._h[t] || []).slice()) f(ev) },
   }
   return { doc, ids, getById }
 }
@@ -476,6 +482,25 @@ test('本机程序没在运行时按发送：不发出、弹出提示、原文�
   assert.equal(getById('confirm-cancel-btn').hidden, true, '只留确定按钮（不需要用户做选择）')
   assert.equal(getById('confirm-overlay').classList.contains('notice'), true, '走通知型排版（标题正文左对齐 + 紧凑绿色按钮）')
   assert.equal(getById('input').value, '这句话应该发不出去', '原文原样留在输入框')
+})
+
+// 回车发送被拦下时，弹窗不能被"同一次回车"关掉（2026-10 实机 bug）：
+// 弹窗是被 keydown 打开的，而这一次 keydown 还会继续冒泡到 document —— 若监听是当场
+// 挂上的，它会立刻命中 onKey → onOk → cleanup，弹窗开了又瞬间关掉，用户什么都看不见。
+// 注：沙箱的 setTimeout 不执行回调，所以"延后注册"的那条监听在这里永远不会挂上；
+//     本测试正是靠这一点工作的 —— 修好之后 document 上没有 keydown 处理器，弹窗留得住。
+//     如果哪天改回当场注册，doc.dispatch 就会把它关掉，这条断言立刻失败。
+test('回车发送被拦下时：弹窗不会被同一次回车立刻关掉', async () => {
+  const { X, getById, doc, calls } = loadSidebar({ convList: [], pingOk: false })
+  await flush()
+  const input = getById('input')
+  input.value = '回车发一句'
+  const ev = { key: 'Enter', shiftKey: false, preventDefault() {} }
+  input.dispatch('keydown', ev)   // 输入框的回车处理 → submit() → 弹窗打开
+  await flush()
+  doc.dispatch('keydown', ev)     // 同一次事件继续冒泡到 document
+  assert.equal(calls.filter((c) => c.url.endsWith('/chat')).length, 0, '没有发出任何消息')
+  assert.equal(getById('confirm-overlay').classList.contains('on'), true, '弹窗仍然开着（没被同一个回车关掉）')
 })
 
 function cssRuleBody(html, selector) {

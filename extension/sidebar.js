@@ -2679,11 +2679,13 @@ function showConfirm(title, message, { okOnly = false, okText = '确认删除' }
     const cancelBtn = document.getElementById('confirm-cancel-btn')
     // okOnly（2026-10）：只留一个确定按钮，用于"只告知、不需要用户做选择"的场景
     // （例：本机程序没在运行时按了发送）。此时遮罩点击与 Esc 都按"知道了"处理；
-    // 另挂 .notice 走一套"通知型"排版（标题正文左对齐、按钮紧凑且绿色，见 sidebar.html）。
+    // 另挂 .notice 走一套"通知型"排版（正文两行、按钮紧凑且绿色，见 sidebar.html）。
     okBtn.textContent = okText
     cancelBtn.hidden = okOnly
     if (okOnly) overlay.classList.add('notice')
+    let keyTimer = null   // 下面"延后注册 Enter 监听"用的句柄（见函数末尾那段注释）
     const cleanup = () => {
+      if (keyTimer) clearTimeout(keyTimer)  // 若弹窗在监听挂上之前就关了（见下方注册那段）
       overlay.classList.remove('on')
       overlay.classList.remove('notice')   // 通知型的排版不能留给下一次普通确认框
       okBtn.removeEventListener('click', onOk)
@@ -2711,7 +2713,12 @@ function showConfirm(title, message, { okOnly = false, okText = '确认删除' }
     cancelBtn.addEventListener('click', onCancel)
     overlay.addEventListener('mousedown', onDown)
     overlay.addEventListener('mouseup', onUp)
-    document.addEventListener('keydown', onKey)
+    // Esc / Enter 的全局监听**延到下一个事件循环**再挂（2026-10 修一个真 bug）：
+    // 弹窗有可能正是被一次"回车"打开的（本机程序没在运行时按回车发送），而**同一次
+    // keydown 还会继续冒泡到 document** —— 监听若当场挂上，这个回车会立刻命中 onKey
+    // → onOk，弹窗开了又瞬间关掉，用户完全看不见（实机现象：按回车毫无反应，
+    // 只有点发送按钮才弹得出来）。
+    keyTimer = setTimeout(() => document.addEventListener('keydown', onKey), 0)
     if (!okOnly) cancelBtn.focus()  // 默认聚焦「取消」，防止误触回车直接删除
   })
 }
