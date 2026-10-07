@@ -84,12 +84,10 @@ npm-debug.log*
 *.out
 *.err
 .playwright-mcp/
-# 阅读器自测（无头 Chrome 驱动 + 浏览器 profile + 截图；驱动脚本本身可以留，产物不留）
-.selftest/chrome-profile*/
-.selftest/*.png
-.selftest/last-report.json
-.selftest/last*.out
-.selftest/dbg*.out
+# 阅读器自测（无头 Chrome 驱动 + 场景脚本 + 测试 PDF + 产物）
+# 2026-10-07 定：这是**作者自己用的**工具，别人 clone 不需要（要测自己搞），所以整格不进 git、只留本地。
+# 之前的做法是"驱动脚本入库、产物不入库"，现在改成整格本地。
+.selftest/
 # 下载第三方库时的临时目录（pdfjs-dist 的 tgz 与解包结果）
 .vendor-tmp/
 # 安装包构建产物（暂存目录 + 编译输出；node.exe 87 MB，绝不能入库）
