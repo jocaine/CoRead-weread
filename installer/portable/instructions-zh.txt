@@ -24,7 +24,6 @@ CoRead 详细说明与故障排查
     │   ├── node.exe                  运行环境（不用单独装 Node）
     │   ├── tray.ps1                  托盘程序
     │   ├── stop.bat                  兜底退出
-    │   ├── unblock.bat               解除"来自互联网"标记
     │   ├── instructions-zh.txt       本文件
     │   ├── agent\                    共读引擎
     │   │   ├── index.js  lib\        代码（lib\paths.js 决定数据落在哪）
@@ -54,8 +53,10 @@ CoRead 详细说明与故障排查
   这是 Windows 的"网络来源标记"（从网上下载的 zip 会带）。
   不是病毒提示，也不是杀软拦截。
 
-  处理：双击  internal\unblock.bat  一次，之后不再弹。
-  （或：右键 Start-CoRead.vbs →「属性」→ 勾「解除锁定」→ 确定）
+  处理：右键 Start-CoRead.vbs →「属性」→ 勾「解除锁定」→ 确定。
+  清这一个文件就够启动了（它才是你真正运行的那个）。
+  想把整个文件夹都清干净：解压之前，先右键 zip 本身 →「属性」→ 勾「解除锁定」。
+  （旧版本附带的 unblock.bat 已删除：它让你双击的 start-portable.bat 从来不存在。）
 
 
 【杀毒软件报警，说"未知程序修改系统设置"】

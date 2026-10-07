@@ -149,7 +149,7 @@ CoRead-<版本>-portable\
 ├── extension\               浏览器插件
 ├── Start-CoRead.vbs         ★用户双击这个启动（为什么不是 .bat 见下）
 ├── internal\                程序本体（入口不在这一格里）
-│   ├── node.exe  tray.ps1  stop.bat  unblock.bat  instructions-zh.txt
+│   ├── node.exe  tray.ps1  stop.bat  instructions-zh.txt
 │   └── agent\  receiver\
 ├── builtin\                 空目录（2026-10 起不再随包分发图谱文件）
 └── logs\                    空目录（托盘与子进程的日志）

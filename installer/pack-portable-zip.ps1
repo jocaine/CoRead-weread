@@ -41,9 +41,15 @@ Write-Host "输出: $OutDir`n"
 # 脚本里的中文会整体乱码、语法直接崩，而且报错位置完全是错的（实测把中文注释当成了
 # 字符串没闭合）。编辑器"保存"经常把 BOM 吞掉——本项目已经因此踩过三次。
 # 这里只**检查并中止**，不自动补：自动补会掩盖"某个编辑器正在吃掉 BOM"这个事实。
+#
+# 2026-10-07 起排除 test\：那一格是非正式/过程性文件的落点（AGENTS.md 第 7 条），
+# 打包白名单根本不碰它，里面的 .ps1 永远不会进包；拿"进包文件"的编码规矩去要求
+# 本机临时实验脚本，只会让打包被一堆与发行无关的文件卡住（实测被 motw-*.ps1 卡过）。
+# 排除它的前提是**打包路径上不会出现 test\** —— 由白名单（逐个文件点名拷贝）保证，
+# 不是推测。真正的 .ps1（tray.ps1）仍由本闸门与后面"扫暂存目录"那步双重把关。
 $noBom = @()
 foreach ($ps1 in Get-ChildItem $repo -Recurse -File -Filter '*.ps1' -EA SilentlyContinue |
-                  Where-Object { $_.FullName -notmatch '\\installer\\build\\|\\node_modules\\|\\\.git\\' }) {
+                  Where-Object { $_.FullName -notmatch '\\installer\\build\\|\\node_modules\\|\\\.git\\|\\test\\' }) {
   $b = [System.IO.File]::ReadAllBytes($ps1.FullName)
   $hasBom = ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
   if (-not $hasBom) { $noBom += $ps1.FullName }
@@ -354,11 +360,21 @@ Write-Host "`n--- 启动器与说明 ---"
 #     为什么不放 internal\ 也不影响程序：本文件自己会找 tray.ps1（先看 internal\，
 #     再看 installer\launcher\，最后看自己这格），两种布局都认。实测过。
 #
-#   tray.ps1 / stop.bat / unblock.bat / instructions-zh.txt → internal\
+#   tray.ps1 / stop.bat / instructions-zh.txt → internal\
 #     tray.ps1 必须与 node.exe 同格：托盘用它判断"便携包还是开发目录"。
-#     另三个是排障用的，跟程序放一起，由说明书指路。
+#     另两个是排障用的，跟程序放一起，由说明书指路。
 #     为什么不是 .bat 做入口见 Start-CoRead.vbs 头部注释（.bat 必被 cmd.exe 拉出黑框；
 #     .vbs 由 GUI 的 wscript.exe 执行，一点窗口都不出现）。
+#
+#   ⚠️ unblock.bat 已于 2026-10-07 删除，不再随包分发。原委由三条事实拼成：
+#     ① 它只在一种情况下有用：用户从网上下载 zip，Windows 给文件打上"网络来源标记"
+#        （Mark of the Web），首次双击时弹「无法验证发布者」；它递归清掉那个标记。
+#     ② 它自己的指引一直是错的——末行写着 "double-click start-portable.bat"，而
+#        start-portable.bat 在 git 全历史里**从未存在过**（真实入口叫过
+#        01-START-CoRead.bat，2026-10 已删）。作者本人也从不点它。
+#     ③ 它并非必需：instructions-zh.txt 一直并列给了 Windows 原生做法
+#        「右键 Start-CoRead.vbs →「属性」→ 勾「解除锁定」」，只清用户实际要运行的那一个
+#        文件就够启动。留着它等于在排查路径上摆一个没人用、还指错路的脚本。
 foreach ($f in @('tray.ps1', 'stop.bat')) {
   $p = Join-Path $PSScriptRoot "launcher\$f"
   if (-not (Test-Path $p)) { Fail "缺少 launcher\$f" }
@@ -369,11 +385,11 @@ $starter = Join-Path $PSScriptRoot 'portable\Start-CoRead.vbs'
 if (-not (Test-Path $starter)) { Fail '缺少 portable\Start-CoRead.vbs' }
 Copy-Item $starter $StageDir
 Write-Step 'Start-CoRead.vbs（包根）'
-foreach ($f in @('unblock.bat', 'instructions-zh.txt')) {
-  $p = Join-Path $PSScriptRoot "portable\$f"
-  if (Test-Path $p) { Copy-Item $p $internal; Write-Step "internal\$f" }
-  else { Fail "缺少 portable\$f" }
-}
+# 详细排查手册（面向用户，说明书多处点名它）
+$diagDoc = Join-Path $PSScriptRoot 'portable\instructions-zh.txt'
+if (-not (Test-Path $diagDoc)) { Fail '缺少 portable\instructions-zh.txt' }
+Copy-Item $diagDoc $internal
+Write-Step 'internal\instructions-zh.txt'
 # 外层一页纸说明（详细手册在 internal\instructions-zh.txt）
 Copy-Item (Join-Path $PSScriptRoot 'portable\README-FIRST.txt') $StageDir
 Write-Step 'README-FIRST.txt'
@@ -584,7 +600,6 @@ $need = @(
   'Start-CoRead.vbs',
   'internal\tray.ps1',
   'internal\stop.bat',
-  'internal\unblock.bat',
   'internal\instructions-zh.txt',
   'internal\agent\index.js',
   'internal\agent\lib\paths.js',
