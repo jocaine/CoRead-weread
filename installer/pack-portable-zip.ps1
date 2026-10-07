@@ -306,10 +306,10 @@ Remove-Item (Join-Path $StageDir 'extension\test') -Recurse -Force -EA SilentlyC
 
 # 图标：托盘用的 coread.ico 放包根 assets\icons\（托盘就按这个相对路径找它）；
 # 浏览器插件图标在 extension\icons\ 里，随 extension 一起走。
-# 生成脚本 tools\make-icons.ps1；缺了它托盘会退回系统默认图标，不会报错。
+# 生成脚本 tools\make-icons.ps1 已于 2026-10-07 删除（要改图标就从 git 历史取回它）；
 $assetsSrc = Join-Path $repo 'assets\icons'
 if (-not (Test-Path (Join-Path $assetsSrc 'coread.ico'))) {
-  Fail '缺少 assets\icons\coread.ico —— 先跑 tools\make-icons.ps1'
+  Fail '缺少 assets\icons\coread.ico —— 它是入库文件，从 git 恢复：git checkout HEAD -- assets/icons'
 }
 New-Item -ItemType Directory -Path (Join-Path $StageDir 'assets\icons') -Force | Out-Null
 Copy-Item (Join-Path $assetsSrc 'coread.ico') (Join-Path $StageDir 'assets\icons')

@@ -289,7 +289,7 @@ Write-Log 'tray' "已启动（$LayoutKind 布局，node = $Node）"
 
 # ── 托盘图标与菜单 ──────────────────────────────────────────────────
 # 图标文件：assets\icons\coread.ico（含 16/32/48/128/256 五个尺寸，Windows 会挑合适的）。
-# 生成脚本 tools\make-icons.ps1，随包分发时必须一起带上 —— 找不到就退回系统默认图标，
+# 生成脚本 tools\make-icons.ps1 已于 2026-10-07 删除（要改图标就从 git 历史取回它）。
 # 不报错（图标是锦上添花，不该因为它缺失让程序起不来）。
 function Get-TrayIcon {
   $candidates = @(
