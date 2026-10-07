@@ -1,7 +1,9 @@
 /**
- * CoRead 翻译能力 · 纯函数层：prompt 组装、请求体组装、模型回复解析、错误分类。
+ * CoRead 翻译能力 · 纯函数层：prompt 组装、请求体组装、模型回复解析、错误分类；
+ * 另外放一个给托盘用的「插件报到」（reportExtensionToHost，见下）。
  *
- * 本文件不含任何 chrome.* 调用，可在 node 里直接单测（见 test/translate-protocol.test.mjs）。
+ * 本文件不含任何 chrome.* 调用（报到那个函数只读 chrome.runtime.id/version，取不到就返回
+ * false），可在 node 里直接单测（见 test/translate-protocol.test.mjs）。
  * translate-background.js 以 ES module 方式 import；translate-overlay.js 是 executeScript
  * 按需注入的经典脚本，不能 import 模块，因此不依赖本文件。
  */
@@ -252,7 +254,7 @@ export function parseTranslation(raw) {
   const start = text.indexOf('{')
   const end = text.lastIndexOf('}')
   if (start === -1 || end <= start) {
-    throw makeError('PARSE_ERROR', '模型输出里没有 JSON 对象')
+    throw makeError('PARSE_ERROR', '模型未返回 JSON 对象')
   }
   let obj
   try {
@@ -261,10 +263,10 @@ export function parseTranslation(raw) {
     throw makeError('PARSE_ERROR', '模型输出的 JSON 无法解析：' + e.message)
   }
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
-    throw makeError('PARSE_ERROR', '模型输出的 JSON 不是对象')
+    throw makeError('PARSE_ERROR', '模型返回的 JSON 不是对象')
   }
   const translation = String(obj.translation ?? '').trim()
-  if (!translation) throw makeError('PARSE_ERROR', '模型输出里没有 translation 字段')
+  if (!translation) throw makeError('PARSE_ERROR', '模型返回的 JSON 缺少 translation 字段')
   return { original: String(obj.original ?? '').trim(), translation }
 }
 
@@ -301,13 +303,13 @@ export function classifyHttpError(status, bodyText) {
     }
   }
   if (status === 401 || status === 403) {
-    return { code: 'BAD_KEY', message: 'API Key 被拒绝（HTTP ' + status + '）。请检查配置中的 API Key', detail }
+    return { code: 'BAD_KEY', message: 'API Key 无效（HTTP ' + status + '），请检查配置中的 API Key', detail }
   }
   if (status === 404) {
     return { code: 'BAD_ENDPOINT', message: '接口或模型不存在（HTTP 404）。请检查 API 地址与模型名', detail }
   }
   if (status === 413) {
-    return { code: 'TOO_LARGE', message: '截图体积超过上游限制，请缩小选区', detail }
+    return { code: 'TOO_LARGE', message: '截图过大，超出模型服务限制，请缩小选区', detail }
   }
   if (status === 429) {
     return { code: 'RATE_LIMIT', message: '请求过于频繁或额度用尽（HTTP 429）', detail }

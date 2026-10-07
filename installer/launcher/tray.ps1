@@ -128,6 +128,14 @@ if (-not $mutexCreatedNew) {
 # 用 Start-Process 直接起 node.exe，并把输出重定向到日志文件。
 # 脚本路径相对**包根**给（internal\agent\index.js）：agent/lib/paths.js 按脚本自身位置
 # 判断"装没装在 internal 下"，进而定位 <包根>\data\ —— 所以这个相对关系不能改。
+# ── 自己起的孩子，自己记住 ──────────────────────────────────────────
+# 2026-10-07：以前 Start-Child 的返回值被六处 `| Out-Null` 丢掉，于是看门狗只能靠
+# `Get-CimInstance` 扫全机进程 + **猜命令行文本**来"认亲"。那条路依赖权限、会被安全
+# 软件拦（实测：受限环境里 CIM 连自己的进程都查不到）。一旦它瞎了，看门狗就以为 agent
+# 掉了，于是**又拉一个** —— 两个 agent 同时回同一条消息，用户看到的就是"被回复两次"。
+# 现在把句柄留着：问 $p.HasExited 就够，可靠、不需要任何权限、不受安全软件影响。
+$script:children = @{ agent = $null; receiver = $null }
+
 function Start-Child($name, $scriptRelPath) {
   $script = Join-Path $PackageRoot $scriptRelPath
   if (-not (Test-Path $script)) { Write-Log 'tray' "找不到 $scriptRelPath，跳过"; return $null }
@@ -139,6 +147,7 @@ function Start-Child($name, $scriptRelPath) {
       -WorkingDirectory $PackageRoot -WindowStyle Hidden -PassThru `
       -RedirectStandardOutput $outLog -RedirectStandardError $errLog
     Write-Log $name "PID $($p.Id)"
+    $script:children[$name] = $p
     return $p
   } catch {
     Write-Log $name "启动失败: $($_.Exception.Message)"
@@ -180,6 +189,19 @@ function Get-CoreadProcesses {
         $_.CommandLine -like "*$AgentScript*" -or $_.CommandLine -like "*$ReceiverScript*"
       }
   }
+}
+
+# 某个孩子还活着吗？（2026-10-07）
+# 优先问我们自己的句柄 —— 可靠、不需要任何权限、不受安全软件影响。
+# 只有拿不到句柄时（脚本缺失、启动失败等）才回退到扫 WMI，并**宁可不动作**：
+# 那条路看不见时会把活着的进程当成死的，而看门狗"以为死了"的后果是多拉一个 agent。
+function Test-ChildAlive([string]$name) {
+  $p = $script:children[$name]
+  if ($p) {
+    try { if (-not $p.HasExited) { return $true } } catch {}
+    return $false      # 句柄有效且已退出 = 确定死了，不必再问 WMI
+  }
+  return (@(Get-CoreadProcesses | Where-Object { $_.CommandLine -like "*$name*" }).Count -gt 0)
 }
 
 function Stop-All {
@@ -239,13 +261,12 @@ function Stop-All {
 
 function Get-Status {
   if (Test-PortConflict) { return 'port-conflict' }
-  $procs = @(Get-CoreadProcesses)
-  if ($procs.Count -eq 0) { return 'stopped' }
-  $hasReceiver = $procs | Where-Object { $_.CommandLine -like '*receiver*' }
-  $hasAgent = $procs | Where-Object { $_.CommandLine -like '*agent*' }
+  $hasReceiver = Test-ChildAlive 'receiver'
+  $hasAgent = Test-ChildAlive 'agent'
   if ($hasReceiver -and $hasAgent) { return 'running' }
   if ($hasReceiver) { return 'receiver-only' }
-  return 'partial'
+  if ($hasAgent) { return 'partial' }
+  return 'stopped'
 }
 
 # ── 启动 ────────────────────────────────────────────────────────────
@@ -673,6 +694,22 @@ $itemStatus.Enabled = $false
 $menu.Items.Add($itemStatus) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
+# ── 两个阅读入口：自己的排第一（2026-10 用户定调）──────────────────────
+# 刻意把「打开 CoRead 阅读器」放在微信读书**上面**：自己那个是本程序的阅读器，
+# 打开它才是"用 CoRead 读书"；微信读书那条是给"我就要在微读的划线里共读"的用户留的。
+# 名字里都带"阅读"二字，但前面那个必须点明是 CoRead 自己的，否则两个条目分不清谁是谁。
+$itemReader = New-Object System.Windows.Forms.ToolStripMenuItem
+$itemReader.Text = '打开 CoRead 阅读器（推荐）'
+$itemReader.add_Click({ Open-Reader })
+$menu.Items.Add($itemReader) | Out-Null
+
+# 阅读器用哪个浏览器（2026-10-07 用户提出"Edge 和 Chrome 都装了怎么办"）
+# 常驻菜单栏而不是"只在多选时才出现"：否则有得选的人反而发现不了入口。
+$readerMenu = New-Object System.Windows.Forms.ToolStripMenuItem
+$readerMenu.Text = '阅读器用哪个浏览器'
+Update-ReaderBrowserMenu      # 开机先填一次；之后选完 或 点「重新检测」都会刷新
+$menu.Items.Add($readerMenu) | Out-Null
+
 $itemOpen = New-Object System.Windows.Forms.ToolStripMenuItem
 $itemOpen.Text = '打开微信读书'
 $itemOpen.add_Click({ Start-Process 'https://weread.qq.com/' })
@@ -989,32 +1026,39 @@ $timer.add_Tick({
   }
   # 崩溃自愈：不在退出流程里、且某一半掉了，就补起来（最多每 30 秒一次）
   # 端口被占用时不自愈——重启多少次都没用，只会在日志里刷屏
+  #
+  # 2026-10-07 两处改动：
+  #   ① 判据从"扫 WMI 认亲"改成问句柄（Test-ChildAlive）——那条路一旦瞎了，
+  #      看门狗会把活着的 agent 当成死的，于是**多拉一个**，两个 agent 同时回话。
+  #   ② 节流键合并：以前 'agent' 与 'all' 各算各的，所以 30 秒拦不住连着拉
+  #      （实测 15:19:30 与 15:19:50 两次，间隔 20 秒）。
   if (-not $script:quitting -and $st -ne 'port-conflict') {
-    $now = Get-Date
-    if ($st -eq 'receiver-only') {
-      $last = $script:lastRestart['agent']
+    if (-not (Test-ChildAlive 'receiver') -or -not (Test-ChildAlive 'agent')) {
+      $now = Get-Date
+      $last = $script:lastRestart['any']
       if (-not $last -or ($now - $last).TotalSeconds -gt 30) {
-        Write-Log 'tray' '检测到 agent 未运行，尝试重启'
-        Start-Child 'agent' $AgentScript | Out-Null
-        $script:lastRestart['agent'] = $now
-      }
-    } elseif ($st -eq 'stopped') {
-      $last = $script:lastRestart['all']
-      if (-not $last -or ($now - $last).TotalSeconds -gt 30) {
-        Write-Log 'tray' '检测到两个进程都未运行，尝试重启'
-        Start-Child 'receiver' $ReceiverScript | Out-Null
-        Start-Sleep -Milliseconds 1200
-        Start-Child 'agent' $AgentScript | Out-Null
-        $script:lastRestart['all'] = $now
+        if (-not (Test-ChildAlive 'receiver')) {
+          Write-Log 'tray' '检测到 receiver 未运行，尝试重启'
+          Start-Child 'receiver' $ReceiverScript | Out-Null
+          Start-Sleep -Milliseconds 1200     # 让接收端先占好端口
+        }
+        if (-not (Test-ChildAlive 'agent')) {
+          Write-Log 'tray' '检测到 agent 未运行，尝试重启'
+          Start-Child 'agent' $AgentScript | Out-Null
+        }
+        $script:lastRestart['any'] = $now
       }
     }
   }
 })
 $timer.Start()
 
-# 首次启动时给个气泡提示
+# 首次启动时给个气泡提示。
+# 气泡是"该去哪儿读书"这句话唯一的落点（菜单要右键才看见），所以两个入口都点名，
+# 并把 CoRead 自己的阅读器放在前面 —— 用户没读说明书时，这里就是他看到的全部指引。
+# NotifyIcon 的气泡正文有长度上限（超过 ~250 字会被截断），这一句要压着写。
 $notify.BalloonTipTitle = 'CoRead 已启动'
-$notify.BalloonTipText = '打开微信读书即可开始共读。右键这个图标可以退出。'
+$notify.BalloonTipText = '双击这个图标打开 CoRead 阅读器（推荐）。想读微信读书就右键图标选它。右键可退出。'
 $notify.ShowBalloonTip(4000)
 
 # ── 主循环 ──────────────────────────────────────────────────────────

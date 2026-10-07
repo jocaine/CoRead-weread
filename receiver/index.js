@@ -68,6 +68,10 @@ function pushSSE(type, data) {
 // 初始化推送水位线：消息用库里的自增 id（只推新行，不重读历史），
 // 流式通道用字节偏移（文件按累计文本追加，可随时被 agent 清空）。
 let _store = null
+
+// 「插件报到」上一次收到的扩展 ID：只用于日志去重（见 POST /hello）。
+let _helloLastId = ''
+
 function chatStore() {
   if (!_store) _store = openChatStore(CHAT_DB)
   return _store
@@ -92,37 +96,19 @@ let agentStateLastLine = (() => {
 })()
 
 // 每 100ms 轮询一次，推给所有 SSE 客户端：
-//   ① 聊天库：id > 水位线的新消息（替代旧"整读 63MB chat_output 再按行数切片"，
+//   ① 瞬态流式通道：按字节偏移 tail（打字机效果），文件被清空时按"长度回缩"复位；
+//   ② 聊天库：id > 水位线的新消息（替代旧"整读 63MB chat_output 再按行数切片"，
 //      旧做法 40 小时烧了约 2700 秒 CPU）；
-//   ② 瞬态流式通道：按字节偏移 tail（打字机效果），文件被清空时按"长度回缩"复位；
 //   ③ 处理步骤 agent_state.jsonl：按行数增量。
+//
+// ⚠️ **① 必须排在 ② 前面**（2026-10-07 修）。原因：
+// 流式结束标记（_stream === -1）与最终完整回复经常落在同一轮轮询里。侧栏靠
+// "-1 先到"才知道该把流式气泡**就地补齐**（extension/sidebar.js 的 _streamDone 分支）；
+// 顺序一旦颠倒，它会先把最终回复当成一条普通新消息**另画一个气泡**，而先前那个流式
+// 气泡没人清 —— 屏幕上就是"同一条回复出现两次"，刷新后才恢复正常（库里始终只有一条）。
+// 症状最容易在**短回复**上命中：回复结束得快，两样东西挤进同一轮。
 setInterval(() => {
-  try {
-    const store = chatStore()
-    const fresh = store.listMessages({ sinceId: chatLastMessageId })
-    if (fresh.length) {
-      chatLastMessageId = fresh[fresh.length - 1].id
-      for (const m of fresh) {
-        pushSSE('message', {
-          role: m.role, content: m.content, timestamp: m.timestamp, bookKey: m.conv,
-          ...(m.status === 'failed' ? { failed: true } : {}),
-        })
-      }
-    }
-    // 图命中事件（events 表）：侧栏图视图据此高亮，不渲染为消息气泡
-    const events = store.listEvents({ sinceId: chatLastEventId, limit: 50 })
-    if (events.length) {
-      chatLastEventId = events[events.length - 1].id
-      for (const e of events) {
-        if (e.kind !== 'graph-hit') continue
-        pushSSE('message', {
-          role: 'graph-hit', hits: (e.payload && e.payload.hits) || [],
-          reason: (e.payload && e.payload.reason) || '', timestamp: e.ts, bookKey: e.conv,
-        })
-      }
-    }
-  } catch {}
-  // 瞬态流式通道（打字机）：只读新增字节，不整读文件
+  // ① 瞬态流式通道（打字机）：只读新增字节，不整读文件。必须最先——见上面那条 ⚠️
   try {
     const size = fs.statSync(STREAM_FILE).size
     if (size < streamOffset) streamOffset = 0        // agent 启动时清空过 → 从头读
@@ -140,6 +126,36 @@ setInterval(() => {
           if (!line.trim()) continue
           try { pushSSE('message', JSON.parse(line)) } catch {}
         }
+      }
+    }
+  } catch {}
+  // ② 聊天库新消息 + 图命中事件
+  try {
+    const store = chatStore()
+    const fresh = store.listMessages({ sinceId: chatLastMessageId })
+    if (fresh.length) {
+      chatLastMessageId = fresh[fresh.length - 1].id
+      for (const m of fresh) {
+        // 只广播"已完成/失败"两种状态（2026-02 用户定调）。
+        // 新提问本来由侧栏自己先渲染（发出去就地画气泡），不需要回推；
+        // 而"排队中"与"已停止"的行推回去只会让屏幕上多出一个重复气泡。
+        if (m.status !== 'ok' && m.status !== 'failed') continue
+        pushSSE('message', {
+          role: m.role, content: m.content, timestamp: m.timestamp, bookKey: m.conv,
+          ...(m.status === 'failed' ? { failed: true } : {}),
+        })
+      }
+    }
+    // 图命中事件（events 表）：侧栏图视图据此高亮，不渲染为消息气泡
+    const events = store.listEvents({ sinceId: chatLastEventId, limit: 50 })
+    if (events.length) {
+      chatLastEventId = events[events.length - 1].id
+      for (const e of events) {
+        if (e.kind !== 'graph-hit') continue
+        pushSSE('message', {
+          role: 'graph-hit', hits: (e.payload && e.payload.hits) || [],
+          reason: (e.payload && e.payload.reason) || '', timestamp: e.ts, bookKey: e.conv,
+        })
       }
     }
   } catch {}
@@ -532,6 +548,10 @@ const server = http.createServer(async (req, res) => {
     let chatRows = []
     try { chatRows = chatStore().listMessages({}) } catch {}
     for (const m of chatRows) {
+      // "排队中"的提问不回放（2026-02）：它是还没被回答的在途消息，侧栏发送时已经画过气泡，
+      // 回放只会让它长出第二个；而且它会被"未回复提问恢复"当成等待回答的提问，
+      // 弹出一个永远转圈的思考气泡。
+      if (m.status === 'pending') continue
       if (m.role === 'user') {
         // 带书上下文的消息保留 bookId，供侧栏按书隔离引用与对话（AI-001）
         const item = { role: 'user', content: m.content, _ts: m.timestamp }
@@ -1195,6 +1215,35 @@ const server = http.createServer(async (req, res) => {
       // 使面板打开期间的增量历史重拉（回复恢复轮询）不会把用户刚发的提问重复渲染一遍
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ ok: true, timestamp: entry.timestamp }))
+      return
+
+    } else if (url === '/session-stop') {
+      // 停止当前回答（2026-02 用户定调）。侧栏点「停止」时调用。
+      //
+      // 为什么只写一个信号文件：agent 在另一个进程里，能让 fetch 中断的 AbortController
+      // 是它进程内的对象，这里够不着 —— 只能留信号让它自己看见（它在流式循环与两处闸门读）。
+      //
+      // 这里**只做入队**，不等 agent 的结果：侧栏的收尾是本地立刻做的（删气泡、清高亮、
+      // 回填原文），不等回执，否则 agent 被强杀时按钮会永远卡在「停止」。
+      const conv = baseBookId(String((data && data.conv) || ''))
+      const targetTs = Number((data && data.targetTs) || 0)
+      // 校验：key 来自请求体，不能直接拼进文件名（路径穿越）。两个入口都只认已知形态。
+      const okShape = conv === '_common' || /^mia_[0-9a-z]+$/i.test(conv) || isFreeKey(conv)
+      if (!conv || !okShape) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'bad conv' })); return
+      }
+      try {
+        fs.mkdirSync(path.dirname(sessionStopFile(conv)), { recursive: true })
+        fs.writeFileSync(sessionStopFile(conv), JSON.stringify({ conv, targetTs, ts: Date.now() }))
+      } catch (e) {
+        console.log('[session-stop] 写信号失败: ' + e.message)
+        res.writeHead(500); res.end(JSON.stringify({ error: e.message })); return
+      }
+      console.log(`[session-stop] ${conv}（提问 ts=${targetTs}）`)
+      // 推给侧栏：侧栏据此做收尾（删提问与半截回答两颗气泡、清命中高亮、回填原文）
+      pushSSE('message-stopped', { bookKey: conv, timestamp: targetTs })
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true }))
       return
 
     } else if (url === '/free-conversations') {

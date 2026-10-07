@@ -359,7 +359,7 @@
     const radioA = makeEl('input'); radioA.type = 'radio'; radioA.name = 'cm-book-src'; radioA.value = 'exist';
     const bodyA = makeEl('span', 'cm-card-body');
     bodyA.appendChild(makeEl('span', 'cm-card-title', '加入已有的书'));
-    bodyA.appendChild(makeEl('span', 'cm-card-desc', miaBooks.length ? '继续划线、讨论' : '还没有书，先建一本吧'));
+    bodyA.appendChild(makeEl('span', 'cm-card-desc', miaBooks.length ? '继续划线、讨论' : '暂无书籍，可新建一本'));
     cardA.appendChild(radioA); cardA.appendChild(bodyA);
     rowBook.appendChild(cardA);
 
@@ -367,7 +367,7 @@
     const radioB = makeEl('input'); radioB.type = 'radio'; radioB.name = 'cm-book-src'; radioB.value = 'new';
     const bodyB = makeEl('span', 'cm-card-body');
     bodyB.appendChild(makeEl('span', 'cm-card-title', '创建一本新书'));
-    bodyB.appendChild(makeEl('span', 'cm-card-desc', '第一次读这本书，给它起个名字'));
+    bodyB.appendChild(makeEl('span', 'cm-card-desc', '首次阅读这本书，为它创建一本新书'));
     cardB.appendChild(radioB); cardB.appendChild(bodyB);
     rowBook.appendChild(cardB);
     box.appendChild(rowBook);
@@ -390,7 +390,7 @@
     const wrapInp = makeEl('div', 'cm-field');
     const inp = makeEl('input');
     inp.type = 'text';
-    inp.placeholder = '书名，例如：怎么办？';
+    inp.placeholder = '书名（例如：怎么办？）';
     wrapInp.appendChild(inp);
     box.appendChild(wrapInp);
 
@@ -402,7 +402,7 @@
     const radioDir = makeEl('input'); radioDir.type = 'radio'; radioDir.name = 'cm-scope'; radioDir.value = 'dir';
     const bodyDir = makeEl('span', 'cm-card-body');
     bodyDir.appendChild(makeEl('span', 'cm-card-title', '整个目录'));
-    bodyDir.appendChild(makeEl('span', 'cm-card-desc', '本目录全部页面算这本书，翻章不用重复绑'));
+    bodyDir.appendChild(makeEl('span', 'cm-card-desc', '本目录下所有页面均属于这本书，翻章时无需重复绑定'));
     cardDir.appendChild(radioDir); cardDir.appendChild(bodyDir);
     rowScope.appendChild(cardDir);
 
@@ -410,7 +410,7 @@
     const radioPage = makeEl('input'); radioPage.type = 'radio'; radioPage.name = 'cm-scope'; radioPage.value = 'page';
     const bodyPage = makeEl('span', 'cm-card-body');
     bodyPage.appendChild(makeEl('span', 'cm-card-title', '仅本页'));
-    bodyPage.appendChild(makeEl('span', 'cm-card-desc', '只有当前这一页算这本书'));
+    bodyPage.appendChild(makeEl('span', 'cm-card-desc', '仅当前页面属于这本书'));
     cardPage.appendChild(radioPage); cardPage.appendChild(bodyPage);
     rowScope.appendChild(cardPage);
     box.appendChild(rowScope);
@@ -425,14 +425,14 @@
       cardDir.className = dir ? 'cm-card on' : 'cm-card';
       cardPage.className = dir ? 'cm-card' : 'cm-card on';
       chip.textContent = dir
-        ? ('将覆盖：' + dirKey + '（含子页面）')
-        : ('仅此页：…/' + pageKey.split('/').slice(-2).join('/'));
+        ? ('覆盖范围：' + dirKey + '（含子页面）')
+        : ('仅覆盖：…/' + pageKey.split('/').slice(-2).join('/'));
       if (dir && !isIndexPage) {
-        tip.textContent = '💡 同一来源的多个页面（如一部著作的分章）想一次加入？选「整个目录」会覆盖该路径下所有页面。';
+        tip.textContent = '同一来源的多个页面（如一部著作的分章）可一次加入：选「整个目录」即覆盖该路径下所有页面。';
       } else if (dir && isIndexPage) {
-        tip.textContent = '✅ 目录页：选「整个目录」会把本目录下的全部章节页一次加入。';
+        tip.textContent = '目录页：选「整个目录」将一次加入本目录下的全部章节页。';
       } else {
-        tip.textContent = '💡 只绑这一页；相关的其它页面之后可再绑，或改用「整个目录」。';
+        tip.textContent = '仅绑定本页；相关页面之后可再绑定，或改用「整个目录」。';
       }
     }
     radioDir.addEventListener('change', renderScope);
@@ -488,7 +488,7 @@
         bindingNow = null;
         closeDialog();
         refreshPill();
-        toast('已解除，这一页恢复未绑定状态');
+        toast('已解除绑定');
       });
       btns.appendChild(unbind);
     }
@@ -501,14 +501,14 @@
       let bookTitle = '';
       if (radioA.checked) {
         bookId = sel.value || '';
-        if (!bookId) { toast('请先选择一本书，或切到「创建一本新书」'); return; }
+        if (!bookId) { toast('请先选择一本书，或切换为「创建一本新书」'); return; }
         const hit = miaBooks.find(function (b) { return b.base === bookId });
         bookTitle = hit ? hit.bookTitle || '' : '';
       } else {
         const title = inp.value.trim();
-        if (!title) { toast('给这本书起个名字吧'); return; }
+        if (!title) { toast('请填写书名'); return; }
         const created = await createBook(title.slice(0, 200));
-        if (!created) { toast('建书失败：接收端未启动？'); return; }
+        if (!created) { toast('创建书籍失败：CoRead 本机服务未启动'); return; }
         bookId = created.bookId;
         bookTitle = created.bookTitle;
       }
@@ -558,7 +558,7 @@
       }
     }
     pill.textContent = bindingNow ? '📚 ' + (bindingNow.bookTitle || bindingNow.bookId) : '📚 绑定到书';
-    pill.title = bindingNow ? ('本页在《' + (bindingNow.bookTitle || bindingNow.bookId) + '》(' + bindingScopeOf(bindingNow) + ')，点击调整') : '把这一页加入一本书（划线共读前需要先加入）';
+    pill.title = bindingNow ? ('本页属于《' + (bindingNow.bookTitle || bindingNow.bookId) + '》（' + bindingScopeOf(bindingNow) + '），点击调整') : '将本页加入一本书（划线共读前需先加入）';
     pill.style.display = bindingNow ? '' : 'none';
   }
 
@@ -579,18 +579,18 @@
     floatBtn = makeEl('div', 'coread-mia-ui coread-mia-float');
     if (mode === 'bind') {
       // 未绑定：只给加入书的入口
-      const btn = makeEl('button', 'cm-btn', '📚 加入一本书…');
-      btn.title = '本页还没加入任何书：先选择一本书，之后划线就能共读';
+      const btn = makeEl('button', 'cm-btn', '📚 加入一本书');
+      btn.title = '本页尚未加入任何书：先选择一本书，之后划线即可共读';
       btn.addEventListener('click', function (e) { floatAction(e, openBindDialog) });
       floatBtn.appendChild(btn);
     } else {
       // 已绑定：共读 + 在已有引用里搜索这段文字
       const btnRead = makeEl('button', 'cm-btn', '📌 共读');
-      btnRead.title = '设为当前引用，到侧栏与 AI 共读这一段';
+      btnRead.title = '设为当前引用，在侧栏与 AI 共读这一段';
       btnRead.addEventListener('click', function (e) { floatAction(e, onShareClick) });
       floatBtn.appendChild(btnRead);
-      const btnSearch = makeEl('button', 'cm-btn', '🔍 搜索引用');
-      btnSearch.title = '在本书已有引用/划线里搜索这段文字（侧栏引用抽屉）';
+      const btnSearch = makeEl('button', 'cm-btn', '🔍 查引用');
+      btnSearch.title = '在本书已有引用与划线中搜索这段文字（侧栏引用列表）';
       btnSearch.addEventListener('click', function (e) { floatAction(e, onSearchRefClick) });
       floatBtn.appendChild(btnSearch);
     }
@@ -626,7 +626,7 @@
     try { chrome.storage.local.set({ pendingRefSearch: { query: text, ts: Date.now() } }) } catch (e) {}
     try { chrome.runtime.sendMessage({ action: 'coreadOpenRefSearch', query: text }) } catch (e) {}
     try { window.getSelection().removeAllRanges() } catch (e) {}
-    toast('已在侧栏引用抽屉搜索这段文字');
+    toast('已在侧栏引用列表中搜索这段文字');
   }
   async function onShareClick() {
     const text = lastSelText || '';
@@ -656,10 +656,10 @@
     });
     try { window.getSelection().removeAllRanges() } catch (e) {}
     if (j) {
-      toast('已设为当前引用，去侧栏讨论');
+      toast('已设为当前引用，可在侧栏提问');
       renderMarks();
     } else {
-      toast('CoRead 接收端未启动？(127.0.0.1:7239)');
+      toast('CoRead 本机服务未启动（127.0.0.1:7239）');
     }
   }
 
@@ -732,7 +732,7 @@
     if (!m) return;
     try {
       const text = decodeURIComponent(m[1]);
-      setTimeout(function () { if (!scrollToText(text)) toast('未在本页找到该引用原文'); }, 350);
+      setTimeout(function () { if (!scrollToText(text)) toast('本页未找到该引用原文'); }, 350);
     } catch (e) {}
   }
   chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {

@@ -349,6 +349,23 @@ export class ChatStore {
     return n
   }
 
+  /**
+   * 删除事件（2026-02：用户停止一轮时，那一轮的图命中事件要一并删掉）。
+   * 为什么不留：命中事件是"给侧栏点亮节点"的一次性信号，不参与任何持久结构；
+   * 留着它只会在断线重连补发时把已清掉的高亮又推回来。
+   * @param {{conv?: string, kind?: string}} f 按对话与类型过滤（都不给则删全部）
+   * @returns {number} 删掉的行数
+   */
+  deleteEvents({ conv, kind } = {}) {
+    const where = []
+    const vals = []
+    if (conv != null) { where.push('conv = ?'); vals.push(String(conv)) }
+    if (kind != null) { where.push('kind = ?'); vals.push(String(kind)) }
+    if (!where.length) return 0
+    const r = this.db.prepare(`DELETE FROM events WHERE ${where.join(' AND ')}`).run(...vals)
+    return Number(r.changes || 0)
+  }
+
   // ── 统计/维护 ───────────────────────────────────────────────────────────
   stats() {
     const one = (sql) => Number(this.db.prepare(sql).get().n || 0)

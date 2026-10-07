@@ -128,7 +128,7 @@ async function startSelection() {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: () => {
-        if (!window.__coreadStOverlay) throw new Error('overlay 未就绪')
+        if (!window.__coreadStOverlay) throw new Error('翻译浮层未就绪')
         window.__coreadStOverlay.startSelection()
       },
     })
@@ -213,7 +213,7 @@ async function translateSelection() {
   try {
     data = { translation: parseTranslation(r.text).translation }
   } catch {
-    return fail('PARSE_ERROR', '翻译结果不符合约定格式，请重试')
+    return fail('PARSE_ERROR', '模型返回的内容格式不正确，请重试')
   }
 
   try {
@@ -221,7 +221,7 @@ async function translateSelection() {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: (payload, rect, sourceText) => {
-        if (!window.__coreadStOverlay) throw new Error('overlay 未就绪')
+        if (!window.__coreadStOverlay) throw new Error('翻译浮层未就绪')
         // sourceText 用来核对选区是否还是原来那段：一致才按逐行矩形画高亮
         window.__coreadStOverlay.showText(payload, rect, sourceText)
       },
@@ -310,10 +310,10 @@ async function readConfig() {
       }
       await chrome.storage.local.set({ [STORE_KEYS.config]: live })
     } else {
-      syncError = 'CoRead 里还没有配置模型 API'
+      syncError = '尚未配置模型 API'
     }
   } catch {
-    syncError = '接收端未连接'
+    syncError = 'CoRead 本机服务未连接'
   }
 
   const base = live || {
@@ -359,7 +359,7 @@ async function getTranslateStatus() {
     pageUrl = tab && tab.url ? tab.url : ''
     if (pageUrl) recordTotal = (await fetchToolRecords(pageUrl, 1)).total || 0
   } catch {
-    recordError = '接收端未连接，读不到译文记录'
+    recordError = 'CoRead 本机服务未连接，无法读取译文记录'
   }
 
   // 最近一次翻译的诊断（存在扩展本地，不依赖 receiver）
@@ -463,7 +463,7 @@ async function translateImage(msg) {
         return { ok: true, data: parseTranslation(retry.text), retried: true }
       } catch {}
     }
-    return fail('PARSE_ERROR', '模型返回的内容不符合约定格式，重试后仍失败。请重新截图')
+    return fail('PARSE_ERROR', '模型返回的内容格式不正确，重试后仍失败。请重新框选')
   }
 }
 
@@ -482,7 +482,7 @@ async function translateText(msg) {
   try {
     data = parseTranslation(r.text)
   } catch {
-    return fail('PARSE_ERROR', '重译结果不符合约定格式')
+    return fail('PARSE_ERROR', '重译结果格式不正确')
   }
   return { ok: true, data: { original: text, translation: data.translation } }
 }
@@ -526,7 +526,7 @@ async function relocateAnchor(msg) {
       parsed.raw)
   }
   if (!parsed.box) {
-    return fail('PARSE_ERROR', '模型没有按约定返回位置信息', parsed.raw)
+    return fail('PARSE_ERROR', '模型未按格式返回位置信息', parsed.raw)
   }
   return { ok: true, box: parsed.box, snippet: relocateSnippet(text, 80) }
 }
@@ -563,9 +563,9 @@ async function readerCommand(msg) {
   // （发送方收不到自己发的消息，所以这里不会自环。）
   try {
     const res = await chrome.runtime.sendMessage(payload)
-    return res || { ok: false, error: { message: '阅读器没有返回结果' } }
+    return res || { ok: false, error: { message: '阅读器未返回结果' } }
   } catch (e) {
-    return { ok: false, error: { message: '阅读器页面没有响应（可能没打开）' } }
+    return { ok: false, error: { message: '阅读器无响应（可能未打开）' } }
   }
 }
 
@@ -768,10 +768,10 @@ async function recordTranslation(msg, sender) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     })
-    if (!resp.ok) return fail('RECEIVER_ERROR', '接收端返回 HTTP ' + resp.status)
+    if (!resp.ok) return fail('RECEIVER_ERROR', 'CoRead 本机服务返回 HTTP ' + resp.status)
     return { ok: true }
   } catch (e) {
-    return fail('RECEIVER_DOWN', '接收端未连接，本次译文未记录', String(e?.message || e))
+    return fail('RECEIVER_DOWN', 'CoRead 本机服务未连接，本次译文未记录', String(e?.message || e))
   }
 }
 
@@ -779,23 +779,23 @@ async function recordTranslation(msg, sender) {
 async function restoreTranslations() {
   const tab = await activeTab()
   if (!tab) return fail('NO_TAB', '没有可用的标签页')
-  if (!tab.url) return fail('NO_TAB', '读不到当前页面地址')
+  if (!tab.url) return fail('NO_TAB', '无法读取当前页面地址')
 
   let data
   try {
     data = await fetchToolRecords(tab.url, 50)
   } catch (e) {
     // 老版本 receiver 没有这三个端点，会返回 404——提示重启，别让人以为是没连上
-    return fail('RECEIVER_READ_FAIL', '读不到译文记录（' + String(e?.message || e) + '）。若刚更新过 CoRead，请重启 receiver', String(e?.message || e))
+    return fail('RECEIVER_READ_FAIL', '无法读取译文记录（' + String(e?.message || e) + '）。若刚更新过 CoRead，请重启本机服务', String(e?.message || e))
   }
-  if (!data.records.length) return fail('NO_RECORDS', '本页还没有译文记录')
+  if (!data.records.length) return fail('NO_RECORDS', '本页暂无译文记录')
 
   try {
     await ensureOverlay(tab.id)
     const out = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: (records) => {
-        if (!window.__coreadStOverlay) throw new Error('overlay 未就绪')
+        if (!window.__coreadStOverlay) throw new Error('翻译浮层未就绪')
         return window.__coreadStOverlay.restore(records)
       },
       args: [data.records],
@@ -812,7 +812,7 @@ async function restoreTranslations() {
 async function clearTranslations() {
   const tab = await activeTab()
   if (!tab) return fail('NO_TAB', '没有可用的标签页')
-  if (!tab.url) return fail('NO_TAB', '读不到当前页面地址')
+  if (!tab.url) return fail('NO_TAB', '无法读取当前页面地址')
 
   let removed = 0
   try {
@@ -821,11 +821,11 @@ async function clearTranslations() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: tab.url }),
     })
-    if (!resp.ok) return fail('RECEIVER_ERROR', '接收端返回 HTTP ' + resp.status)
+    if (!resp.ok) return fail('RECEIVER_ERROR', 'CoRead 本机服务返回 HTTP ' + resp.status)
     const data = await resp.json().catch(() => null)
     removed = Number(data && data.removed) || 0
   } catch (e) {
-    return fail('RECEIVER_READ_FAIL', '无法清除记录（' + String(e?.message || e) + '）。若刚更新过 CoRead，请重启 receiver', String(e?.message || e))
+    return fail('RECEIVER_READ_FAIL', '无法清除记录（' + String(e?.message || e) + '）。若刚更新过 CoRead，请重启本机服务', String(e?.message || e))
   }
 
   // 记录清了，页面上开着的气泡也一并收掉（关不掉不影响结果）
@@ -894,7 +894,7 @@ async function setTranslationRef(msg) {
   if (!ctx) {
     return fail(
       'NO_BOOK',
-      '当前页面没有关联任何书，没法设为引用。微信读书阅读页、或在页面上「加入一本书」过的文库页面才行。',
+      '当前页面未关联任何书籍，无法设为引用。仅支持微信读书阅读页，或已「加入一本书」的页面。',
     )
   }
 
@@ -911,9 +911,9 @@ async function setTranslationRef(msg) {
         sourceUrl: String(msg?.url || ''),
       }),
     })
-    if (!resp.ok) return fail('RECEIVER_ERROR', '接收端返回 HTTP ' + resp.status)
+    if (!resp.ok) return fail('RECEIVER_ERROR', 'CoRead 本机服务返回 HTTP ' + resp.status)
   } catch (e) {
-    return fail('RECEIVER_DOWN', '接不上本地接收端，没设成引用', String(e?.message || e))
+    return fail('RECEIVER_DOWN', '未连接 CoRead 本机服务，未设为引用', String(e?.message || e))
   }
 
   // 顺手把侧栏打开。拿不到用户手势时会失败，失败也无所谓：引用已入列表，打开侧栏就能看到。
@@ -927,6 +927,6 @@ async function requireEnabled() {
   const ov = await readOverrides()
   if (ov.enabled) return null
   // 快捷键路径没有面板可点，用角标给个反馈，否则按键像没反应
-  flashBadge('关', '翻译已在工具箱里关闭')
+  flashBadge('关', '翻译已在工具箱中关闭')
   return fail('DISABLED', '翻译已在工具箱中禁用。请在侧栏「⋯ → 🧰 工具箱 → 翻译」中启用')
 }

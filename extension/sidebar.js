@@ -281,8 +281,8 @@ function refreshDot() {
   if (!dot) return
   dot.style.background = (_backendAlive && _sseOpen) ? '#07c160' : '#ddd'
   dot.title = !_backendAlive
-    ? '本机程序未运行'
-    : (!_sseOpen ? '推送通道已断开，正在重连' : '本机程序运行中')
+    ? 'CoRead 本机服务未运行'
+    : (!_sseOpen ? '推送通道已断开，正在重连' : 'CoRead 本机服务运行中')
 }
 
 function setBackendAlive(alive) {
@@ -810,13 +810,13 @@ function renderDrawer() {
   const effBook = effectiveBook()
   if (titleEl) titleEl.textContent = effBook && effBook.bookTitle
     ? `引用 · 《${effBook.bookTitle}》`
-    : '当前未在读'
+    : '暂未关联书籍'
 
   const anns = filterAnns()
 
   if (anns.length === 0) {
     const hint = !effBook
-      ? '未在读书籍页，打开一本书或从已读书籍中选择'
+      ? '未在读书籍页：请打开一本书，或从已读书籍中选择'
       : '无匹配引用'
     list.innerHTML = `<div style="text-align:center;color:#bbb;padding:20px;font-size:0.92em;">${hint}</div>`
     return
@@ -844,7 +844,7 @@ function renderDrawer() {
     item.innerHTML = `
       <div class="di-head">
         <span class="di-num">#${ann.refNum || '?'}</span>
-        <span class="di-book">${hl(ann.bookTitle || '未知书', q)}</span>
+        <span class="di-book">${hl(ann.bookTitle || '未知书籍', q)}</span>
       </div>
       <div class="di-chapter">${hl((ann.chapter || '').slice(0, 40), q)}</div>
       <div class="di-text">${hl(previewText, q)}</div>
@@ -1143,8 +1143,8 @@ function renderNoBookView() {
   if (input) {
     input.disabled = noBook
     input.placeholder = noBook
-      ? '未检测到书籍：打开微信读书中的书，或从已读书籍中选择'
-      : '说点什么…'
+      ? '未检测到书籍：请打开微信读书中的书，或从已读书籍中选择'
+      : '输入你的问题…'
   }
   if (sendBtn) sendBtn.disabled = noBook
   if (attachBtn) attachBtn.disabled = noBook
@@ -1216,7 +1216,7 @@ async function openBookPicker() {
     _bookPickerList = Array.isArray(d.books) ? d.books : []
   } catch {
     _bookPickerList = []
-    if (listEl) listEl.innerHTML = '<div class="bp-msg bp-err">接收端未启动，无法读取已读书籍</div>'
+    if (listEl) listEl.innerHTML = '<div class="bp-msg bp-err">CoRead 本机服务未启动，无法读取已读书籍</div>'
     return
   }
   renderBookList()
@@ -1235,7 +1235,7 @@ function renderBookList() {
   if (!list.length) {
     if (emptyEl) {
       emptyEl.hidden = false
-      emptyEl.textContent = q ? '没有匹配的书籍' : '还没有已读书籍记录'
+      emptyEl.textContent = q ? '无匹配的书籍' : '暂无已读书籍记录'
     }
     return
   }
@@ -1246,7 +1246,7 @@ function renderBookList() {
     const time = b.updatedAt ? new Date(b.updatedAt).toLocaleDateString() : ''
     item.innerHTML =
       `<div class="bi-main">` +
-        `<div class="bi-title">${esc(b.bookTitle || '（未知名书籍）')}</div>` +
+        `<div class="bi-title">${esc(b.bookTitle || '（书名未知）')}</div>` +
         (time ? `<div class="bi-meta">最近更新 ${time}</div>` : '') +
       `</div>` +
       `<button class="bi-del" title="删除这本书的记录">${ICON_TRASH}</button>`
@@ -1266,7 +1266,7 @@ async function deleteBook(b) {
   if (!b || !b.base) return
   const title = b.bookTitle || '这本书'
   const ok = await showConfirm(`删除《${title}》？`,
-    '将删除该书的所有划线、章节缓存与聊天记录（含「已读过的书籍」列表），此操作不可恢复。')
+    '将删除该书的所有划线、章节缓存与聊天记录（含「已读书籍」列表），此操作不可恢复。')
   if (!ok) return
   try {
     const resp = await fetch(`${RECEIVER}/book-delete`, {
@@ -1276,7 +1276,7 @@ async function deleteBook(b) {
     })
     if (!resp.ok) throw new Error('bad status')
   } catch {
-    showToast('删除失败：接收端未响应', true)
+    showToast('删除失败：CoRead 本机服务无响应', true)
     return
   }
   // 删除的是当前有效上下文（正在阅读/手动查看的书）→ 重置为无书状态，
@@ -1445,10 +1445,10 @@ let thinkingEl = null
 // 状态迟迟未到（agent 正在处理上一条/排队）则按等待时长走兜底文案。
 const THINKING_COPY = {
   init: '正在理解你的提问',
-  resolve: '正在检索我们聊过的旧知识点',
+  resolve: '正在检索此前讨论过的知识点',
   answer: '正在组织回答',
   fallback1: '正在结合上下文思考',
-  fallback2: '内容较多，还在思考中',
+  fallback2: '内容较多，仍在思考',
 }
 const _thinkingFallbacks = []  // 兜底文案定时器（hideThinking / 步骤到达时清除）
 let _thinkingStepArrived = false  // 是否已收到 agent 步骤（收到后兜底不再覆盖）
@@ -1478,7 +1478,7 @@ function showThinking(bookId) {
   thinkingEl = document.createElement('div')
   thinkingEl.className = 'msg-thinking'
   thinkingEl.dataset.book = _thinkingBook  // AI-001：跟随本次回复的书
-  thinkingEl.innerHTML = `<div class="bubble"><span>正在理解你的提问</span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`
+  thinkingEl.innerHTML = `<div class="bubble"><span>${THINKING_COPY.init}</span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`
   msgs.appendChild(thinkingEl)
   applyBookFilter()
   maybeAutoScroll(msgs)
@@ -1494,6 +1494,9 @@ function hideThinking() {
   _recoverAnswerSeen = true
   clearThinkingFallbacks()
   if (thinkingEl) { thinkingEl.remove(); thinkingEl = null }
+  // 思考气泡一撤，就说明本地不再"卡在等回答"了（回答到了 / 用户点了停止）→ 按钮回「发送」。
+  // 放在这里而不是各处调用点：思考气泡与「停止」态是同一个状态的两种表现，必须同生同灭。
+  finishWaiting()
 }
 
 // 去重：跟踪已显示的 assistant 消息（前 200 字指纹）
@@ -1515,11 +1518,16 @@ function renderSystemBubble(content, bookId) {
   maybeAutoScroll(msgs)
 }
 
+/**
+ * 追加一个气泡。
+ * @returns {HTMLElement|null} 新建的气泡（被去重/就地升级吸收时返回 null）——
+ *   调用方（submit）要靠它记住"本轮提问的气泡"，停止时才能精确删掉那一颗。
+ */
 function addBubble(role, content, extra, note, bookId) {
   // assistant 消息去重
   if (role === 'assistant') {
     const fp = (content || '').slice(0, 200)
-    if (_seenFingerprints.has(fp)) return
+    if (_seenFingerprints.has(fp)) return null
     _seenFingerprints.add(fp)
     if (_seenFingerprints.size > 200) _seenFingerprints.clear()  // 防止无限增长
   }
@@ -1548,11 +1556,11 @@ function addBubble(role, content, extra, note, bookId) {
         if (entry && entry.ref) upgradeStreamToRefReply(_streamEl, entry.ref, content)
         else patchStreamedComplete(_streamEl, content)
         _streamEl = null
-        return
+        return null
       }
       // 非流式的完整渲染（历史回放 / 兜底）：直接渲染
       _renderRefReply(content)
-      return
+      return null
     }
     hideThinking()
     el.className = 'msg-assistant'
@@ -1562,6 +1570,7 @@ function addBubble(role, content, extra, note, bookId) {
   msgs.appendChild(el)
   applyBookFilter()
   maybeAutoScroll(msgs)
+  return el
 }
 
 // ── 消息去重 ──────────────────────────────────────────────────────────────
@@ -1755,6 +1764,16 @@ function connect() {
       if (d.type === 'graph-updated') { if (graphView?.isOpen()) graphView.reload(); return }
       // 2026-09：实时栈变化 → 重拉 /stack-hits，恢复/清除"当前讨论命中"高亮
       if (d.type === 'stack-updated') { refreshStackHits(); return }
+      // 停止当前回答（2026-02）：接收端已受理停止请求 → 本地收尾。
+      // 幂等：点按钮时本地已经收过一次尾，这里再走一次不会出错（气泡已无、高亮已清）。
+      // 为什么还要这一条：agent 被强杀 / 接收端自己判定停止（如答案已到）时，
+      // 屏幕要靠这条事件才收得干净。
+      if (d.type === 'message-stopped') {
+        // 只认事件自带的 timestamp（它就是"哪一轮"的身份证）。**不要**回退到 _awaitTs——
+        // 那会让一条过期事件被误当成当前轮。对不上就是重放的旧事件，不动屏幕（见 isCurrentTurn）。
+        finishStoppedTurn({ content: _awaitContent, bookKey: d.bookKey || _awaitBook, timestamp: d.timestamp })
+        return
+      }
       // 2026-11 多对话：对话清单变化（新建/改名/归档/删除）→ 重拉清单刷新对话条与列表；
       // 归档完成后当前对话若已被清掉，自动落到最近活跃的一场
       if (d.type === 'free-conversations-updated') {
@@ -1939,6 +1958,145 @@ async function refreshStackHits() {
   graphView.applyStackHits(hits)
 }
 
+// ── 停止当前回答（2026-02 用户定调）─────────────────────────────────────────
+// 回答生成期间，发送按钮**就地**变「停止」（不并排加第二个按钮）。
+// 点停止 → 通知接收端写一个信号文件（agent 在另一个进程里，只能这样告诉它）→
+// 本地立刻收尾：删掉提问与半截回答两颗气泡、清命中高亮、原文回填输入框。
+//
+// 为什么按钮态以"本地是否在等回答"为准、不等 agent 回执：agent 被强杀时回执永不到达，
+// 按钮会永远卡在「停止」，用户既停不了也发不出。
+let _awaitingStop = false    // 本地是否正在等这一条的回答（= 按钮是否处于「停止」态）
+let _awaitUserEl = null      // 本轮提问的气泡（停止时要连它一起删）
+let _awaitBook = ''          // 本轮提问归属的对话（命中按对话隔离，防串场）
+let _awaitTs = 0             // 本轮提问的落库 timestamp（停止请求要带上它做目标标识）
+const STOP_LABEL = '停止'
+const SEND_LABEL = '发送'
+
+function setSendBtnMode(stopping) {
+  const btn = document.getElementById('send-btn')
+  if (!btn) return
+  btn.textContent = stopping ? STOP_LABEL : SEND_LABEL
+  btn.classList.toggle('stopping', !!stopping)
+}
+
+/** 开始等这一条的回答：按钮变「停止」。userEl = 这条提问的气泡 */
+function startWaiting(userEl, book, content) {
+  _awaitingStop = true
+  _awaitUserEl = userEl || null
+  _awaitBook = book || ''
+  _awaitTs = 0
+  _awaitContent = content || ''
+  setSendBtnMode(true)
+}
+/** 回答到达 / 已停止：按钮回「发送」。不清 _awaitTs 与 _awaitUserEl——
+ *  停止收尾（SSE 可能比 POST 响应先到）还要用它们。 */
+function finishWaiting() {
+  _awaitingStop = false
+  setSendBtnMode(false)
+}
+let _awaitContent = ''   // 本轮提问原文（停止后回填输入框）
+
+/** 点「停止」：告知接收端 + 本地收尾（不等回执）。 */
+async function requestStop() {
+  if (!_awaitingStop) return          // 没在等（回答已到、按钮已复位）→ 忽略
+  const content = _awaitContent
+  const ts = _awaitTs
+  const book = _awaitBook
+  // 本地先收尾：用户点下去就该看到反应，不等 agent。SSE message-stopped 到达时会再走一次
+  // 同一个收尾函数（幂等），那时 _awaitTs 已填好，可登记历史 key。
+  // force：本地这一次是"确认要停"，此刻 ts 可能还没从 POST 响应回来，不能拿它当门槛。
+  finishWaiting()
+  finishStoppedTurn({ content, bookKey: book, timestamp: ts, force: true })
+  try {
+    await fetch(`${RECEIVER}/session-stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conv: book, targetTs: ts }),
+    })
+  } catch (e) {
+    console.warn('[CoRead] session-stop POST failed:', e.message)
+  }
+}
+
+/**
+ * 这条停止事件是不是"当前这一轮"的（2026-02）。
+ *
+ * 为什么必须判：message-stopped 是按**对话**隔离的，而删除是**不认轮次**的——
+ * 只要同一场对话里收到这个事件就会删掉"当前那颗提问气泡"。而 SSE 断线重连会
+ * **补发最近 100 条事件**（接收端 recentEvents 缓冲），于是一次停止的旧事件
+ * 完全可能在下一轮提问时被重放，把新气泡连带删掉（现象：正常提问的气泡也没了）。
+ *
+ * 所以：能对 timestamp 就一定对（提问落库时间戳是这一轮的身份证）；
+ * 对不上就是过期的重放事件，一律不动屏幕。force = 本地刚点的停止（此刻 ts 可能还没回来）。
+ */
+function isCurrentTurn({ bookKey, timestamp, force } = {}) {
+  const evBook = baseBookId(bookKey) || ''
+  const ctxBook = effectiveBookBase()
+  if (evBook && ctxBook && evBook !== ctxBook) return false
+  if (force) return true
+  if (!_awaitUserEl && !_streamEl) return false     // 屏幕上没有"本轮"可删
+  const ts = Number(timestamp || 0)
+  return !!ts && ts === Number(_awaitTs || 0)
+}
+
+/**
+ * 停止收尾（幂等）：撤思考气泡、删提问与半截回答两颗气泡、清命中高亮与自动弹出的图窗口、
+ * 原文回填输入框（**覆盖**框内内容，2026-02 用户定调）。
+ */
+function finishStoppedTurn({ content, bookKey, timestamp, force = false } = {}) {
+  // 排查留痕（2026-02）：这条路径只在"停止"时该被走到。若正常提问也被走到，
+  // debug.jsonl 里会留下 source=sidebar / kind=stop-turn 的记录，可直接定位是谁触发的。
+  postSidebarDebug({
+    kind: 'stop-turn', bookKey, timestamp: timestamp || 0, force,
+    awaitTs: _awaitTs, hasUserEl: !!_awaitUserEl, hasStreamEl: !!_streamEl,
+  })
+  if (!isCurrentTurn({ bookKey, timestamp, force })) return    // 过期事件 / 别的对话：不动屏幕
+
+  hideThinking()
+  // 半截回答气泡（流式那条）
+  if (_streamEl) {
+    try { _streamEl.remove() } catch {}
+    _streamEl = null
+    _streamDone = false
+  }
+  // 提问气泡
+  if (_awaitUserEl) {
+    try { _awaitUserEl.remove() } catch {}
+    _awaitUserEl = null
+  }
+  // 命中高亮 + 自动弹出的拓扑图窗口。图不是这一轮自动弹的就不关（用户自己开着的窗口不关）。
+  try {
+    const gv = graphView
+    if (gv) {
+      gv._cancelAutoDismiss()          // 先取消挂起的渐隐/轮播定时器
+      gv.clearHighlight()              // 高亮与"本轮命中"一起清（内置 _turnHits = null）
+      if (gv._autoOpened) gv.close()
+      gv._autoOpened = false
+    }
+  } catch {}
+  // 引用配对队列：本次请求那个占位条目出队，否则下一条真实回复的配对会挤偏一格
+  try { if (_pendingRefs.length) _pendingRefs.pop() } catch {}
+  // 登记历史 key：面板重开时的增量历史不会把这条提问再渲染一遍
+  try { if (timestamp) _histKeys.add(msgHistKey('user', timestamp, content || '')) } catch {}
+  // 原文回填（覆盖框内内容），光标置末尾并保持聚焦——改题目重发是本功能的主要用途。
+  // 没有原文可回填时（接收端自己判定停止、本地没参与）不清空用户正在打的字。
+  try {
+    const inp = document.getElementById('input')
+    if (inp) {
+      if (content) inp.value = content
+      _inputPrevValue = inp.value
+      inp.style.height = 'auto'
+      inp.style.height = Math.min(inp.scrollHeight, 120) + 'px'
+      inp.focus()
+      inp.setSelectionRange(inp.value.length, inp.value.length)
+    }
+  } catch {}
+  // 收尾是一次性的：清掉"本轮"引用，之后任何重放的旧事件都不会再命中这一轮（见 isCurrentTurn）
+  _awaitUserEl = null
+  _awaitTs = 0
+  _awaitContent = ''
+}
+
 // ── 发送 ─────────────────────────────────────────────────────────────────────
 async function submit() {
   const input = document.getElementById('input')
@@ -1956,7 +2114,7 @@ async function submit() {
   // 本机程序没在运行 → 不发，弹窗告知（2026-10）。
   // 拦在清空输入框之前：原文字样留着，用户启动 CoRead 后直接再按一次发送即可。
   if (!_backendAlive) {
-    showSendFailedNotice('本机程序未运行，消息未发送。\n双击 Start-CoRead.vbs 启动后重试。')
+    showSendFailedNotice('CoRead 本机服务未运行，消息未发送。\n双击 Start-CoRead.vbs 启动后重试。')
     pingOnce()   // 立刻复探一次，把灯刷成真实状态
     return
   }
@@ -1973,8 +2131,10 @@ async function submit() {
   const bubbleText = attach
     ? ('📎 ' + attach.fileName + (content ? '\n\n' + content : ''))
     : content
-  addBubble('user', bubbleText, null, null, msgBook)
+  const userEl = addBubble('user', bubbleText, null, null, msgBook)
   showThinking(msgBook)
+  // 发送成功即进入"等回答"态：按钮变「停止」，并记住这颗提问气泡（停止时连它一起删）
+  startWaiting(userEl, msgBook, content)
 
   // 附件块：作为本次讨论上下文喂给 AI；用后即弃，不落盘、不生成文档书、不建已上传列表
   const attachBlock = attach ? ('[附件]《' + attach.fileName + '》\n' + attach.text) : ''
@@ -2030,7 +2190,11 @@ async function submit() {
       // 提问再渲染一遍
       try {
         const j = await resp.json()
-        if (j && j.timestamp) _histKeys.add(msgHistKey('user', j.timestamp, body.content))
+        if (j && j.timestamp) {
+          _histKeys.add(msgHistKey('user', j.timestamp, body.content))
+          // 停止请求需要它做"目标是哪一条"的标识（agent 侧据此配对提问行）
+          if (_awaitingStop) _awaitTs = j.timestamp
+        }
       } catch {}
     }
   } catch (e) {
@@ -2042,13 +2206,14 @@ async function submit() {
       const inp = document.getElementById('input')
       if (inp && !inp.value) { inp.value = content; inp.style.height = 'auto' }
     } catch {}
-    showSendFailedNotice('本机程序未响应，消息未发送。\n原文已保留在输入框，可再次发送。')
+    showSendFailedNotice('CoRead 本机服务未响应，消息未发送。\n原文已保留在输入框，可再次发送。')
     pingOnce()
     // 发送失败：这条消息没到 receiver、agent 不会回复。弹掉刚入队的自己的条目，
     // 避免它的最终记录永远不来、把后续真实回复的配对挤偏。不整队清空——前一条
     // 仍在流式的回复还需要自己的队项配对。
     _pendingRefs.pop()
-    hideThinking()
+    _awaitUserEl = null   // 这条没发出去，没有"本轮提问气泡"可留
+    hideThinking()        // 内含 finishWaiting：按钮回「发送」
   }
 }
 
@@ -2116,7 +2281,11 @@ function fixTypedQuoteDirection(el, prevValue) {
 }
 let _inputPrevValue = ''  // 输入框上一次的 value（打字纠正要判断"新增了哪个字符"）
 
-document.getElementById('send-btn').addEventListener('click', submit)
+document.getElementById('send-btn').addEventListener('click', () => {
+  // 回答生成中 → 同一个按钮是「停止」（2026-02 用户定调：就地变，不并排加第二个）
+  if (_awaitingStop) { requestStop(); return }
+  submit()
+})
 document.getElementById('input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
@@ -2199,11 +2368,11 @@ async function pickAttachment(file) {
   if (!file) return
   const ext = (file.name.split('.').pop() || '').toLowerCase()
   if (!['md', 'markdown', 'txt', 'text'].includes(ext)) {
-    showToast('只支持 .md / .txt 文本附件', true)
+    showToast('仅支持 .md / .txt 文本附件', true)
     return
   }
   if (file.size > 2 * 1024 * 1024) {
-    showToast('附件超过 2MB，暂不支持', true)
+    showToast('附件超过 2MB，无法添加', true)
     return
   }
   let text
@@ -2409,7 +2578,7 @@ async function jumpToAnnotation(ann) {
     if (base.indexOf('mia_') === 0) {
       const srcUrl = String(ann.sourceUrl || '')
       if (!srcUrl || !ann.selectedText) {
-        showToast('该网页源引用缺少页面地址，无法跳转', true)
+        showToast('该引用缺少页面地址，无法跳转', true)
         return
       }
       const baseUrl = srcUrl.split('#')[0]
@@ -2802,7 +2971,7 @@ function showPrompt({ title, message = '', value = '', placeholder = '', maxLeng
 
 async function deleteRef(ann) {
   if (!ann?.bookId || !ann?.selectedText) return
-  const ok = await showConfirm('删除这条引用？', '删除后书页里的共读标记也会移除。')
+  const ok = await showConfirm('删除这条引用？', '删除后书页中的共读标记也会移除。')
   if (!ok) return
 
   // 先从本地移除匹配项（AI-007：按 bookmarkId/章节位置精确匹配，避免同文本连坐删除）。
@@ -3237,7 +3406,7 @@ function renderJumpList() {
   _jumpTargets = qs
   jumpListEl.innerHTML = ''
   if (qs.length === 0) {
-    jumpListEl.innerHTML = '<div class="jump-empty">还没有提问</div>'
+    jumpListEl.innerHTML = '<div class="jump-empty">暂无提问</div>'
     updateJumpActive()
     return
   }
@@ -3245,7 +3414,7 @@ function renderJumpList() {
     const item = document.createElement('div')
     item.className = 'jump-item'
     item.dataset.idx = i
-    const text = questionSnippet(el) || '（消息）'
+    const text = questionSnippet(el) || '（无内容）'
     const span = document.createElement('span')
     span.className = 'jump-text'
     span.textContent = text
@@ -3554,8 +3723,8 @@ function maybeFreeConvHint() {
   const total = _freeConvs.length
   renderSystemBubble(
     total > 1
-      ? `这是自由模式里的一场独立对话（共 ${total} 场，互不影响）。直接说点什么开始，或点上方「＋ 新对话」再开一场；归档时可选择保存记忆 / 收口进拓扑图。`
-      : '这是自由模式里的一场独立对话。直接说点什么开始；想另开一个话题就点上方「＋ 新对话」（对话之间互不影响）。归档时可选择保存记忆 / 收口进拓扑图。',
+      ? `自由模式下每场对话有独立上下文（共 ${total} 场）。直接提问即可，或点击上方「＋ 新对话」另开一场；归档时可选择保存记忆、收口进会意图。`
+      : '自由模式下每场对话有独立上下文。直接提问即可；需要另开话题时点击上方「＋ 新对话」。归档时可选择保存记忆、收口进会意图。',
     key,
   )
 }
@@ -3576,7 +3745,7 @@ async function createFreeConversation({ silent = false, reload = true } = {}) {
     maybeFreeConvHint()
     return d.key
   } catch {
-    if (!silent) showToast('新建对话失败：接收端未启动', true)
+    if (!silent) showToast('新建对话失败：CoRead 本机服务未启动', true)
     return null
   }
 }
@@ -3643,7 +3812,7 @@ function renderFreeConvBar() {
     countEl.title = total ? `自由模式共有 ${total} 场对话（点左侧标题切换）` : ''
   }
   if (cur) {
-    cur.title = `当前自由对话：${title}（${msgs ? msgs + ' 条消息' : '还没有消息'}）` +
+    cur.title = `当前自由对话：${title}（${msgs ? msgs + ' 条消息' : '暂无消息'}）` +
       (total > 1 ? `\n自由模式共 ${total} 场对话，点击切换或新建` : '\n点击切换 / 新建对话')
   }
   if (hintEl) {
@@ -3652,8 +3821,8 @@ function renderFreeConvBar() {
     hintEl.hidden = !show
     hintEl.textContent = show
       ? (total > 1
-        ? '这是一场新的自由对话，和其它对话互不影响。直接说点什么开始，或点「＋ 新对话」再开一场。'
-        : '自由模式里可以有很多场互不影响的对话。直接说点什么开始吧。')
+        ? '这是本场对话的独立上下文，与其他对话互不影响。直接提问即可，或点击「＋ 新对话」另开一场。'
+        : '自由模式下可创建多场互不影响的对话。直接提问即可。')
       : ''
   }
 }
@@ -3676,7 +3845,7 @@ function renderFreeConvList() {
   for (const c of _freeConvs) {
     const item = document.createElement('div')
     item.className = 'fcv-item' + (c.key === _freeKey ? ' cur' : '')
-    const bits = [c.messages ? c.messages + ' 条消息' : '还没有消息']
+    const bits = [c.messages ? c.messages + ' 条消息' : '暂无消息']
     if (c.lastAt) bits.push('最近 ' + fmtTime(c.lastAt))
     item.innerHTML =
       `<div class="fci-main">` +
@@ -3684,9 +3853,9 @@ function renderFreeConvList() {
         `<div class="fci-meta">${esc(bits.join(' · '))}</div>` +
       `</div>` +
       (c.key === _freeKey ? '<span class="fci-badge">当前</span>' : '') +
-      `<button class="fci-act" data-act="rename" title="重命名这场对话">✎</button>` +
-      `<button class="fci-act" data-act="archive" title="归档这场对话（可选保存记忆 / 收口进拓扑图）">⤓</button>` +
-      `<button class="fci-act fci-del" data-act="delete" title="彻底删除这场对话及其消息">🗑</button>`
+      `<button class="fci-act" data-act="rename" title="重命名本对话">✎</button>` +
+      `<button class="fci-act" data-act="archive" title="归档本对话（可保存记忆、收口进会意图）">⤓</button>` +
+      `<button class="fci-act fci-del" data-act="delete" title="彻底删除本对话及其消息">🗑</button>`
     item.addEventListener('click', (e) => {
       const btn = e.target.closest('.fci-act')
       if (btn) {
@@ -3717,7 +3886,7 @@ function renderFreeConvList() {
         `<div class="fca-title">${esc(c.title || '（无标题对话）')}</div>` +
         `<div class="fca-meta">${esc(fmtTime(c.archivedAt))}${note ? ' · ' + esc(note) : ''}</div>` +
       `</div>` +
-      `<button class="fci-act fci-del" data-act="drop" title="从归档记录里删掉这条">🗑</button>`
+      `<button class="fci-act fci-del" data-act="drop" title="从归档记录中删除这条">🗑</button>`
     item.querySelector('[data-act="drop"]').addEventListener('click', async (e) => {
       e.stopPropagation()
       try {
@@ -3750,7 +3919,7 @@ async function renameFreeConversation(key, current) {
   const next = await showPrompt({
     title: '重命名对话',
     value: label,
-    placeholder: '给这场对话起个名字…',
+    placeholder: '输入对话名称…',
     maxLength: 40,
   })
   if (next === null) return          // 取消
@@ -3764,7 +3933,7 @@ async function renameFreeConversation(key, current) {
     })
     if (!r.ok) throw new Error('HTTP ' + r.status)
   } catch {
-    showToast('重命名失败：接收端未启动', true)
+    showToast('重命名失败：CoRead 本机服务未启动', true)
     return
   }
   await loadFreeConversations()
@@ -3783,7 +3952,7 @@ async function deleteFreeConversation(key, title) {
       body: JSON.stringify({ action: 'delete', key }),
     })
   } catch {
-    showToast('删除失败：接收端未启动', true)
+    showToast('删除失败：CoRead 本机服务未启动', true)
     return
   }
   const wasCurrent = key === _freeKey
@@ -3868,13 +4037,13 @@ async function submitFreeArchive() {
   } catch {}
   if (!queued) {
     if (okBtn) okBtn.disabled = false
-    showToast('归档失败：接收端未启动', true)
+    showToast('归档失败：CoRead 本机服务未启动', true)
     return
   }
   closeFreeArchive()
   // 归档要跑记忆合并 / 收口固化（要调模型，可能几十秒）：先给"处理中"反馈，
   // 完成时 agent 会推 role=system 的系统气泡 + toast。
-  if (memory || graph) showToast('归档中：正在' + [memory ? '保存记忆' : '', graph ? '走正常收口程序进拓扑图' : ''].filter(Boolean).join(' + ') + '…')
+  if (memory || graph) showToast('归档中：正在' + [memory ? '保存记忆' : '', graph ? '收口进会意图' : ''].filter(Boolean).join(' + ') + '…')
   if (wasCurrent) showThinking(key)
   // 从活动清单里立刻摘掉（agent 完成后会把消息清掉，这里先刷新列表）
   setTimeout(() => loadFreeConversations(), 600)
@@ -3916,7 +4085,7 @@ function toggleFreeMode() {
       renderFreeConvBar()
       maybeFreeConvHint()
     })
-    showToast('已进入自由模式：对话相互独立，归档时可选择保存记忆 / 收口进拓扑图')
+    showToast('已进入自由模式：各对话相互独立，归档时可选择保存记忆、收口进会意图')
   } else {
     // 退出自由模式：恢复到进入前的上下文。不用 applyBookContext 恢复——它带
     // 「检测到真实阅读即退出手动选书」规则，而 _lastWereadContext 只是历史快照
@@ -4075,7 +4244,7 @@ function fillApiForm(cfg) {
 function renderApiStatus(cfg) {
   const desc = document.getElementById('mm-api-desc')
   if (!desc) return
-  if (!cfg) { desc.textContent = '接收端未连接'; desc.classList.remove('ok'); return }
+  if (!cfg) { desc.textContent = '本机服务未连接'; desc.classList.remove('ok'); return }
   if (cfg.configured) { desc.textContent = '已配置 · ' + (cfg.model || ''); desc.classList.add('ok'); return }
   desc.textContent = '未配置，点这里填写'
   desc.classList.remove('ok')
@@ -4131,7 +4300,7 @@ async function saveApiConfig() {
     showToast('模型 API 已保存，下次提问即生效')
   } catch (e) {
     const msg = (e && e.message) ? e.message : '保存失败'
-    fail(/fetch|network/i.test(msg) ? '接收端未连接，保存失败（请先启动 CoRead 服务）' : msg)
+    fail(/fetch|network/i.test(msg) ? 'CoRead 本机服务未连接，保存失败。请先启动 CoRead。' : msg)
   } finally {
     if (btn) btn.disabled = false
   }
@@ -4143,7 +4312,7 @@ document.getElementById('mm-api-config')?.addEventListener('click', async () => 
   showApiConfigModal(cfg, false)
   if (!cfg) {
     const errEl = document.getElementById('api-err')
-    if (errEl) errEl.textContent = '接收端未连接，无法读取或保存配置（请先启动 CoRead 服务）'
+    if (errEl) errEl.textContent = 'CoRead 本机服务未连接，无法读取或保存配置。请先启动 CoRead。'
   }
 })
 document.getElementById('api-save-btn')?.addEventListener('click', saveApiConfig)
@@ -4225,7 +4394,7 @@ document.getElementById('nb-bind-btn')?.addEventListener('click', async () => {
       ok = arr.some(function (x) { return x && x.ok })
     } catch (e) {}
   }
-  if (!ok) showToast('无法唤起绑定框：请刷新文库页面后重试', true)
+  if (!ok) showToast('无法打开绑定窗口，请刷新页面后重试', true)
 })
 
 // AI-021：绑定/解除后（页面或其它上下文写入 miaBindings）刷新入口
@@ -4276,7 +4445,7 @@ async function refreshTranslateStatus() {
   if (baseEl) {
     if (!st) baseEl.textContent = '读取失败'
     else if (!st.configured) baseEl.textContent = '未配置'
-    else baseEl.textContent = (st.model || '（未填模型名）') + (st.usingOverride ? '（自定义）' : '（CoRead）')
+    else baseEl.textContent = (st.model || '（未填模型）') + (st.usingOverride ? '（自定义）' : '')
   }
   renderEnableSwitch(!st || st.enabled !== false)
   if (warn) warn.hidden = !(st && st.configured && st.origin && !st.granted)
@@ -4315,16 +4484,16 @@ function renderTranslateDiag(diag) {
   const when = diag.at ? new Date(diag.at).toLocaleTimeString() : ''
   const parts = [
     '最近一次翻译' + (when ? ' ' + when : ''),
-    '锚点' + (diag.anchored ? '已获取' : '未获取（' + (diag.anchorReason || '?') + '）'),
+    '定位锚点' + (diag.anchored ? '已获取' : '未获取（' + (diag.anchorReason || '原因未知') + '）'),
   ]
-  if (diag.pageW) parts.push('框 ' + diag.pageW + '×' + diag.pageH)
-  if (typeof diag.chain === 'number') parts.push('滚动链内层 ' + diag.chain)
+  if (diag.pageW) parts.push('选区 ' + diag.pageW + '×' + diag.pageH)
+  if (typeof diag.chain === 'number') parts.push('滚动容器层级 ' + diag.chain)
   if (diag.canvasAnchor) {
-    parts.push('画布锚点已取' + (diag.canvasChanged ? '（画布已重绘→近似）' : '（纯缩放→精确）'))
+    parts.push('画布锚点已获取' + (diag.canvasChanged ? '（画布重绘，位置为近似值）' : '（仅缩放，位置精确）'))
   } else if (diag.canvasInfo) {
-    parts.push('画布 ' + diag.canvasInfo.intrinsic)
+    parts.push('画布尺寸 ' + diag.canvasInfo.intrinsic)
   }
-  if (frames.length) parts.push('frame 命中 ' + hit + '/' + frames.length)
+  if (frames.length) parts.push('内嵌框架命中 ' + hit + '/' + frames.length)
   el.hidden = false
   el.textContent = parts.join(' · ')
   el.title = JSON.stringify(diag, null, 1)
@@ -4437,7 +4606,7 @@ async function runTranslateAction(action, label) {
     let granted = false
     try { granted = await chrome.permissions.request({ origins: [st.origin] }) } catch (e) {}
     if (!granted) {
-      trSetErr('未授权访问 ' + st.origin + '，翻译请求将被浏览器拦截')
+      trSetErr('尚未授权访问 ' + st.origin + '，翻译请求将被浏览器拦截')
       refreshTranslateStatus()
       return
     }
@@ -4505,7 +4674,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action === 'notesClose') { closeNotes(); return }
 })
 document.getElementById('tr-region-btn')?.addEventListener('click', function () {
-  runTranslateAction('startSelection', '框选截图失败')
+  runTranslateAction('startSelection', '框选翻译失败')
 })
 document.getElementById('tr-selection-btn')?.addEventListener('click', function () {
   runTranslateAction('translateSelection', '划词翻译失败')
@@ -4526,7 +4695,7 @@ for (const [id, key] of TR_OVERRIDE_FIELDS) {
 
 document.getElementById('tr-shortcuts-btn')?.addEventListener('click', function () {
   try { chrome.tabs.create({ url: 'chrome://extensions/shortcuts' }) }
-  catch (e) { showToast('请手动打开 chrome://extensions/shortcuts 修改快捷键', true) }
+  catch (e) { showToast('请在 chrome://extensions/shortcuts 中修改快捷键', true) }
 })
 
 document.getElementById('tr-grant-btn')?.addEventListener('click', async function () {
@@ -4535,7 +4704,7 @@ document.getElementById('tr-grant-btn')?.addEventListener('click', async functio
   if (!st || !st.origin) { trSetErr('无法读取模型地址，请先在「模型 API 配置」中填写'); return }
   let granted = false
   try { granted = await chrome.permissions.request({ origins: [st.origin] }) } catch (e) {}
-  if (!granted) { trSetErr('未授权访问 ' + st.origin); return }
+  if (!granted) { trSetErr('尚未授权访问 ' + st.origin); return }
   showToast('已授权访问 ' + st.origin)
   refreshTranslateStatus()
 })

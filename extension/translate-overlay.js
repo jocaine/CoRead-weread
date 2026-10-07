@@ -60,7 +60,7 @@
       '  <div class="st-bubble" hidden>',
       '    <div class="st-head">',
       '      <span class="st-grip" title="按住可拖动">⋮⋮</span>',
-      '      <span class="st-title">截图翻译</span>',
+      '      <span class="st-title">框选翻译</span>',
       '      <button class="st-pin" type="button" title="固定：不随页面滚动、点别处也不收起">📌</button>',
       '      <button class="st-collapse" type="button" title="折叠为小标记">▾</button>',
       '      <button class="st-close" type="button" title="关闭">×</button>',
@@ -71,10 +71,10 @@
       '        <div class="st-dest">',
       '          <div class="st-text"></div>',
       '          <div class="st-actions">',
-      '            <button class="st-coread" type="button" title="设为侧栏的当前引用，之后在输入框里向 AI 提问">设为引用</button>',
+      '            <button class="st-coread" type="button" title="设为侧栏当前引用，之后可在侧栏输入框中提问">设为引用</button>',
       '            <button class="st-copy" type="button">复制译文</button>',
       '            <button class="st-relocate" type="button" hidden',
-      '                    title="页面重排后高亮只能就近保留。点这里让模型看着当前画面把这段文字重新找出来">重新定位</button>',
+      '                    title="页面重排后高亮只能就近保留。点击让模型在当前画面中重新定位这段文字">重新定位</button>',
       '          </div>',
       '        </div>',
       '        <details class="st-orig-wrap" open>',
@@ -228,7 +228,7 @@
 
     const capture = await send({ action: 'captureScreen' })
     if (!capture || !capture.ok) {
-      const b = createBubble(rect, { kind: 'image', title: '截图翻译' })
+      const b = createBubble(rect, { kind: 'image', title: '框选翻译' })
       showError(b, capture && capture.error, '截图失败')
       return
     }
@@ -237,12 +237,12 @@
     try {
       dataUrl = await cropToDataUrl(capture.dataUrl, rect, viewport.width, MAX_SIDE)
     } catch (e) {
-      const b = createBubble(rect, { kind: 'image', title: '截图翻译' })
+      const b = createBubble(rect, { kind: 'image', title: '框选翻译' })
       showError(b, { message: '裁剪失败：' + e.message }, '裁剪失败')
       return
     }
 
-    const b = createBubble(rect, { kind: 'image', title: '截图翻译', loading: true })
+    const b = createBubble(rect, { kind: 'image', title: '框选翻译', loading: true })
     const res = await send({ action: 'translateImage', dataUrl })
     if (!b.alive) return
     if (!res || !res.ok) {
@@ -984,7 +984,7 @@
     btn.textContent = '定位中…'
     b.refs.status.hidden = false
     b.refs.status.classList.remove('st-error')
-    b.refs.status.textContent = '正在让模型在当前画面里找这段文字…'
+    b.refs.status.textContent = '正在让模型在当前画面中定位这段文字…'
     let res
     try {
       const vw = Math.max(1, window.innerWidth)
@@ -1311,7 +1311,7 @@
    */
   function titleFrom(text, kind) {
     const first = String(text || '').split('\n').map((s) => s.trim()).find(Boolean) || ''
-    if (!first) return kind === 'image' ? '截图翻译' : '划词翻译'
+    if (!first) return kind === 'image' ? '框选翻译' : '划词翻译'
     return first.length > 14 ? first.slice(0, 14) + '…' : first
   }
 

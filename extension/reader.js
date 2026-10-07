@@ -145,10 +145,10 @@ async function archiveToLibrary(bytes, name) {
     )
     state.archived = true
     await touchLibraryMeta()
-    toast('已存入书库，下次不用再选文件')
+    toast('已存入书库，下次无需再选文件')
     return true
   } catch (e) {
-    toast('这份 PDF 没能存入书库（CoRead 后台没起来？）：' + ((e && e.message) || e), true)
+    toast('未能存入书库：CoRead 本机服务未启动（' + ((e && e.message) || e) + '）', true)
     return false
   }
 }
@@ -191,7 +191,7 @@ function renderLibrary(books) {
   if (!box) return
   box.replaceChildren()
   if (!books.length) {
-    els.libraryStatus.textContent = '还没有'
+    els.libraryStatus.textContent = '暂无'
     return
   }
   els.libraryStatus.textContent = books.length + ' 本'
@@ -204,7 +204,7 @@ function renderLibrary(books) {
 
     const name = document.createElement('span')
     name.className = 'rd-lib-name'
-    name.textContent = b.name || '(未命名).pdf'
+    name.textContent = b.name || '未命名.pdf'
 
     const meta = document.createElement('span')
     meta.className = 'rd-lib-meta'
@@ -229,7 +229,7 @@ async function loadLibrary() {
     state.library = data.books || []
     renderLibrary(state.library)
   } catch (e) {
-    els.libraryStatus.textContent = '读不到（CoRead 后台没起来）'
+    els.libraryStatus.textContent = '读取失败：CoRead 本机服务未启动'
     els.libraryList.replaceChildren()
   }
 }
@@ -250,7 +250,7 @@ async function openFromLibrary(book) {
     const bytes = new Uint8Array(await res.arrayBuffer())
     await openBytes(bytes, book.name || '未命名.pdf', { archived: true })
   } catch (e) {
-    toast('从书库打开失败：' + ((e && e.message) || e) + '（可以改用「从本地打开」）', true)
+    toast('从书库打开失败：' + ((e && e.message) || e) + '（可改用「从本地打开」）', true)
   }
 }
 
@@ -258,7 +258,7 @@ async function openFromLibrary(book) {
 function showLibrary() {
   closeDoc()
   els.empty.hidden = false
-  els.name.textContent = '未打开文件'
+  els.name.textContent = '未打开 PDF'
   loadLibrary()
 }
 
@@ -275,7 +275,7 @@ async function openFile(file) {
     await openBytes(bytes, file.name)          // 本地打开的会顺手存进书库
   } catch (e) {
     // 读文件本身失败（权限、被占用、太大）也要说出来，不能一声不响留一片白
-    failOpen('读不到这个文件：' + ((e && e.message) || e))
+    failOpen('无法读取文件：' + ((e && e.message) || e))
   }
 }
 
@@ -284,7 +284,7 @@ function failOpen(message) {
   console.warn('[阅读器] 打开失败', message)
   closeDoc()
   els.empty.hidden = false
-  els.name.textContent = '未打开文件'
+  els.name.textContent = '未打开 PDF'
   els.status.textContent = message
   els.status.style.color = '#9a3b3b'
   toast(message, true)
@@ -308,7 +308,7 @@ async function openBytes(bytes, name, opts = {}) {
     if (keepForUpload) archiveToLibrary(keepForUpload, state.name)
     else touchLibraryMeta()
   } catch (e) {
-    failOpen('这份 PDF 打不开：' + ((e && e.message) || e))
+    failOpen('无法打开该 PDF：' + ((e && e.message) || e))
   }
 }
 
@@ -821,7 +821,7 @@ function hideTip() { els.tip.hidden = true }
 async function translateSelection() {
   const hit = state.lastSelection || selectionAnchors()
   if (!hit) {
-    toast('先划选一段原文，再按 Alt+T', true)
+    toast('请先划选原文，再按 Alt+T', true)
     return
   }
   // 同一段再翻一次不该多出一条
@@ -829,7 +829,7 @@ async function translateSelection() {
   if (dup && reuseDuplicate(dup)) { hideTip(); return }
 
   const source = anchorsText(hit.anchors)
-  if (!source.trim()) { toast('没取到可翻译的文字', true); return }
+  if (!source.trim()) { toast('未获取到可翻译的文字', true); return }
   hideTip()
   requestNotesOpen()
   // 划完就把选区撤掉：留着蓝色选区既碍眼，也会挡住"点已翻过区域"这个动作
@@ -876,12 +876,12 @@ async function translateSelection() {
  * 现在按钮与 Alt+S 都是"进入一次框选"，拖完即结束，Esc 取消（与页面上的截图翻译同一套习惯）。
  */
 function startBoxSelect() {
-  if (!state.doc) { toast('先打开一份 PDF', true); return }
+  if (!state.doc) { toast('请先打开 PDF', true); return }
   if (state.boxMode) return
   state.boxMode = true
   els.box.classList.add('is-on')
   els.pages.classList.add('is-boxing')
-  toast('在页面上拖一个框（框完自动退出，Esc 取消）')
+  toast('在页面上拖出选区（完成后自动退出，Esc 取消）')
 }
 
 function endBoxSelect(reason) {
@@ -963,8 +963,8 @@ function cropCanvas(canvas, frac) {
 async function translateRegion(pageEl, frac) {
   const num = Number(pageEl.dataset.page)
   const p = state.pages[num - 1]
-  if (!p || !p.canvas) { toast('这一页还没画出来，稍等一下再框', true); return }
-  if (frac.w < 0.01 || frac.h < 0.005) { toast('框太小了，重新框一块', true); return }
+  if (!p || !p.canvas) { toast('本页尚未渲染完成，请稍后重试', true); return }
+  if (frac.w < 0.01 || frac.h < 0.005) { toast('选区过小，请重新框选', true); return }
 
   // 同一块再框一次不该多出一条
   const dup = findDuplicate({ kind: 'image', page: num, rect: frac })
@@ -1103,7 +1103,7 @@ function reuseDuplicate(dup) {
   requestNotesOpen()
   if (dup.translation) {
     revealEntry(dup.id)
-    toast('这一段已经翻过了，已跳到对照栏')
+    toast('本段已翻译，已跳转到对照栏')
     return true
   }
   return false
@@ -1227,7 +1227,7 @@ async function copyText(text) {
 
 /** 设为引用：沿用翻译那套（receiver 侧只设为当前引用，不触发 agent） */
 async function setAsReference(entry) {
-  if (!entry || !entry.translation) return { ok: false, error: { message: '这条还没有译文' } }
+  if (!entry || !entry.translation) return { ok: false, error: { message: '该条目暂无译文' } }
   const res = await callBackground({
     action: 'setTranslationRef',
     original: entry.source,
@@ -1245,7 +1245,7 @@ async function setAsReference(entry) {
  */
 async function retranslateEntry(id, text) {
   const e = state.entries.find((x) => x.id === id)
-  if (!e) return { ok: false, error: { message: '找不到这一条' } }
+  if (!e) return { ok: false, error: { message: '未找到该条目' } }
   const next = String(text || '').trim()
   if (!next) return { ok: false, error: { message: '原文不能为空' } }
   e.source = next

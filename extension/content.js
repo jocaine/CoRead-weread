@@ -553,7 +553,7 @@ function injectToolbarButton() {
   const btn = document.createElement('div')
   btn.className = 'toolbarItem coread-toolbar-btn'
   btn.style.cssText = 'cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;width:56px;flex-shrink:0;'
-  btn.title = '在侧栏引用栏中搜索划线内容（如角色名）'
+  btn.title = '在侧栏引用列表中搜索划线内容（如角色名）'
   btn.innerHTML = `
     <div class="toolbarItem_icon" style="font-size:18px;line-height:1;color:#fff;">🔍</div>
     <div class="toolbarItem_text" style="font-size:11px;color:#fff;margin-top:2px;">查引用</div>

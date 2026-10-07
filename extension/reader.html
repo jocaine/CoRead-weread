@@ -12,19 +12,19 @@
 <header class="rd-bar">
   <span class="rd-brand">CoRead 阅读器</span>
   <button id="rd-open" class="rd-btn rd-btn-primary" type="button">打开 PDF</button>
-  <button id="rd-library-btn" class="rd-btn" type="button" title="回到书库（放进来过的 PDF）">书库</button>
+  <button id="rd-library-btn" class="rd-btn" type="button" title="回到书库（打开过的 PDF）">书库</button>
   <input id="rd-file" type="file" accept="application/pdf,.pdf" hidden>
-  <span id="rd-name" class="rd-name">未打开文件</span>
+  <span id="rd-name" class="rd-name">未打开 PDF</span>
   <span class="rd-spacer"></span>
-  <span id="rd-status" class="rd-muted" title="渲染状态"></span>
+  <span id="rd-status" class="rd-muted" title="页面渲染状态"></span>
   <span id="rd-pageinfo" class="rd-muted">—</span>
   <button id="rd-zoom-out" class="rd-btn" type="button" title="缩小">−</button>
   <span id="rd-zoom" class="rd-muted">100%</span>
   <button id="rd-zoom-in" class="rd-btn" type="button" title="放大">＋</button>
   <button id="rd-box" class="rd-btn" type="button"
-          title="按一次框一次：在页面上拖一个框，交给模型读图翻译（Alt+S）">框选翻译</button>
+          title="进入一次框选：在页面拖出选区，由模型读图翻译（Alt+S）">框选翻译</button>
   <button id="rd-fit" class="rd-btn" type="button" title="按窗口宽度缩放">适宽</button>
-  <button id="rd-notes" class="rd-btn" type="button" title="在 CoRead 侧栏里打开译文对照">译文</button>
+  <button id="rd-notes" class="rd-btn" type="button" title="在侧栏打开译文对照">译文</button>
 </header>
 
 <main class="rd-main">
@@ -43,18 +43,11 @@
 
       <div class="rd-open-row">
         <button id="rd-open-main" class="rd-btn rd-btn-primary" type="button">从本地打开 PDF</button>
-        <span class="rd-muted">或把 PDF 拖到这里</span>
+        <span class="rd-muted">或将 PDF 拖到此处</span>
       </div>
 
-      <p class="rd-hint">
-        正文是真实的文字，所以<b>划词就能翻译</b>，译文按段落锚在原文上 ——
-        改窗口大小、缩放、重新打开，位置都不会跑。
-      </p>
-      <p class="rd-hint rd-warn" id="rd-scan-hint" hidden>
-        这份 PDF 没有文字层（是扫描件，页面里只有图片），划词翻译用不了。
-        请点工具栏的<b>「框选翻译」</b>（或按 Alt+S），然后在页面上拖一个框 ——
-        框里的内容交给模型读图翻译，译文同样会贴回这一页。
-      </p>
+      <p class="rd-hint">正文是真实文字，<b>划词即可翻译</b>；译文按段落锚定在原文上，改变窗口大小、缩放或重新打开，位置都不会偏移。</p>
+      <p class="rd-hint rd-warn" id="rd-scan-hint" hidden>本 PDF 没有文字层（扫描件，页面内容为图片），无法使用划词翻译。请点击工具栏的<b>「框选翻译」</b>（或按 Alt+S），在页面上拖出选区，由模型读图翻译，译文同样会贴回本页。</p>
     </div>
   </div>
 
@@ -64,7 +57,7 @@
 
 <div id="rd-tip" class="rd-tip" hidden>
   <button id="rd-tip-translate" type="button">翻译</button>
-  <button id="rd-tip-copy" type="button" title="只复制原文">复制</button>
+  <button id="rd-tip-copy" type="button" title="仅复制原文">复制</button>
 </div>
 
 <div id="rd-toast" class="rd-toast" hidden></div>

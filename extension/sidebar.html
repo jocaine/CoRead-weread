@@ -970,6 +970,10 @@
       font-family: inherit;
     }
     #send-btn:hover { background: #06ad56; }
+    /* 停止态（2026-02）：回答生成中，发送按钮就地变「停止」——同一个按钮，不并排加第二个。
+       灰色以示"这不是发送"，避免用户以为自己按的是发送。 */
+    #send-btn.stopping { background: #8a8f99; }
+    #send-btn.stopping:hover { background: #757a83; }
 
     .msg-annotation {
       background: #fff;
@@ -1870,6 +1874,9 @@
       color: #9aa0a8;
       line-height: 1.7;
       max-width: 260px;
+      /* 空态文案里用 \n 分段（graph-view.js _setEmpty）：默认 white-space 会把它压成空格，
+         所以这里必须放行换行，否则两句话会挤成一段 */
+      white-space: pre-line;
     }
     .gv-empty-actions { display: flex; gap: 8px; }
 
@@ -2381,14 +2388,14 @@
 <body>
   <div id="header">
     <span class="title" id="current-book"><em>We read to know we are not alone.</em></span>
-    <span id="dot" title="本机程序连接状态"></span>
+    <span id="dot" title="CoRead 本机服务连接状态"></span>
     <button class="mode-switch" id="free-switch" role="switch" aria-checked="false"
-            title="读书模式 / 自由模式（iPhone 滑动开关）：自由模式为临时测试对话，不固化进正式会意图">
+            title="读书模式 / 自由模式：自由模式为临时讨论，不写入会意图">
       <span class="ms-state">读书</span>
       <span class="ms-track"><span class="ms-thumb"></span></span>
       <span class="ms-state">自由</span>
     </button>
-    <button class="hdr-icon" id="graph-btn" title="会意图（话题拓扑图）">◎</button>
+    <button class="hdr-icon" id="graph-btn" title="会意图（知识点拓扑图）">◎</button>
     <button class="hdr-icon" id="more-btn" title="更多设置">⋯</button>
     <!-- 更多设置菜单（字号等）：作为 #header（position:relative）子元素锚定到右上 -->
     <div id="more-menu">
@@ -2397,23 +2404,23 @@
         <button class="fs-btn" id="fs-down" title="减小字号">Ａ−</button>
         <button class="fs-btn" id="fs-up" title="增大字号">Ａ＋</button>
       </div>
-      <div class="mm-item" id="mm-api-config" title="配置大模型 API（地址 / Key / 模型），保存后立即生效">
+      <div class="mm-item" id="mm-api-config" title="配置模型 API（地址 / Key / 模型），保存后立即生效">
         <span class="mm-name">🔑 模型 API 配置</span>
         <span class="mm-desc" id="mm-api-desc">读取中…</span>
       </div>
-      <div class="mm-item" id="mm-toolbox" title="工具箱：翻译等辅助工具">
+      <div class="mm-item" id="mm-toolbox" title="工具箱：翻译与 PDF 阅读器">
         <span class="mm-name">🧰 工具箱</span>
-        <span class="mm-desc">截图翻译 · 划词翻译</span>
+        <span class="mm-desc">框选翻译 · 划词翻译</span>
       </div>
-      <div class="mm-item" id="mm-notes" title="阅读器里翻过的译文（PDF 对照阅读）">
+      <div class="mm-item" id="mm-notes" title="PDF 阅读器中的译文对照">
         <span class="mm-name">📖 译文对照</span>
-        <span class="mm-desc">PDF 阅读器翻过的段落</span>
+        <span class="mm-desc">PDF 阅读器翻译过的段落</span>
       </div>
-      <div class="mm-item" id="mm-pick-book" title="查看已读完书籍的讨论记录（不需要在微信读书中打开）">
+      <div class="mm-item" id="mm-pick-book" title="查看已读书籍的讨论记录（无需在微信读书中打开）">
         <span class="mm-name">📚 从已读书籍中选择</span>
         <span class="mm-desc">手动查看某本书的讨论记录</span>
       </div>
-      <div class="mm-item" id="mm-exit-manual" title="停止手动选书，恢复跟随微信读书当前阅读" hidden>
+      <div class="mm-item" id="mm-exit-manual" title="退出手动选书，恢复跟随微信读书当前阅读" hidden>
         <span class="mm-name">↩ 停止手动选书</span>
         <span class="mm-desc">恢复自动跟随</span>
       </div>
@@ -2449,13 +2456,13 @@
   <div id="no-book-view" hidden>
     <div class="nb-icon">📖</div>
     <div class="nb-title">未检测到正在阅读的书籍</div>
-    <div class="nb-desc">打开微信读书中的书籍后自动同步该书讨论；<br>已读完的书可手动选择查看历史记录</div>
-    <button class="nb-pick-btn" id="nb-pick-btn">📚 从已读过的书籍中选择</button>
+    <div class="nb-desc">打开微信读书中的书籍后自动同步该书讨论；<br>已读书籍可手动查看历史记录</div>
+    <button class="nb-pick-btn" id="nb-pick-btn">📚 从已读书籍中选择</button>
     <div class="nb-web-card" id="nb-web-card" hidden>
       <div class="nb-web-eyebrow">网页阅读源</div>
       <div class="nb-web-url" id="nb-web-url"></div>
-      <div class="nb-web-desc">把当前页面加入一本书后，在这页选中文字即可划线共读。</div>
-      <button class="nb-web-act" id="nb-bind-btn" title="把当前文库页面加入一本书">加入一本书</button>
+      <div class="nb-web-desc">将当前页面加入一本书后，在本页选中文字即可划线共读。</div>
+      <button class="nb-web-act" id="nb-bind-btn" title="将当前页面加入一本书">加入一本书</button>
     </div>
   </div>
 
@@ -2478,8 +2485,8 @@
       <span class="fc-count" id="fc-count" hidden></span>
       <span class="fc-caret">▾</span>
     </button>
-    <button class="fc-btn fc-new" id="fc-new" title="新建对话：开启一个独立的自由讨论上下文（与当前这场互不影响）">＋ 新对话</button>
-    <button class="fc-btn fc-archive" id="fc-archive" title="归档这场对话：选择要不要保存记忆 / 走正常收口程序进拓扑图，归档后对话与消息一并删除">⤓ 归档</button>
+    <button class="fc-btn fc-new" id="fc-new" title="新建对话：开启独立的讨论上下文，与当前对话互不影响">＋ 新对话</button>
+    <button class="fc-btn fc-archive" id="fc-archive" title="归档本对话：可选择保存记忆、收口进会意图；归档后对话与消息一并删除">⤓ 归档</button>
     <div class="fc-hint" id="fc-hint" hidden></div>
   </div>
 
@@ -2492,7 +2499,7 @@
       <button id="rc-jump-btn" title="在微信读书打开原文位置">📍</button>
       <button id="rc-jump-back-btn" title="返回跳转前的阅读位置" style="display:none">↩</button>
       <button id="rc-switch-btn">切换引用 ▸</button>
-      <button id="rc-collapse-btn" title="折叠/展开">▾</button>
+      <button id="rc-collapse-btn" title="折叠 / 展开">▾</button>
       <button class="rc-del" id="rc-del-btn" title="删除引用">🗑</button>
       <button class="rc-deselect" id="rc-deselect-btn" title="取消引用">✕</button>
     </div>
@@ -2503,7 +2510,7 @@
       <div class="rc-text" id="rc-text"></div>
       <div class="rc-meta" id="rc-meta"></div>
     </div>
-    <div class="rc-empty" id="rc-empty">暂无选中引用，点「切换引用」选择一条划线</div>
+    <div class="rc-empty" id="rc-empty">暂无选中引用，点击「切换引用」选择划线</div>
   </div>
 
   <!-- 自由模式引用窗体（2026-09）：当前讨论的引用节点（语义命中自动并入 + 手动选取），
@@ -2512,10 +2519,10 @@
   <div id="free-refs" hidden>
     <div class="fr-head">
       <span class="fr-label" id="fr-label">🔗 本次引用</span>
-      <button class="fr-pick-btn" id="fr-pick-btn" title="打开拓扑图：单击查看详情，双击选取为引用">＋ 拓扑图选取</button>
+      <button class="fr-pick-btn" id="fr-pick-btn" title="打开会意图：单击查看详情，双击设为引用">＋ 会意图选取</button>
     </div>
     <div class="fr-list" id="fr-list"></div>
-    <div class="fr-empty" id="fr-empty">还没有引用：自动命中并入，或「＋ 拓扑图选取」手动选</div>
+    <div class="fr-empty" id="fr-empty">暂无引用：可自动并入，或从会意图选取</div>
   </div>
 
   <!-- 待发送附件提示片（上传文本附件后显示；读取进讨论，不保存原文件） -->
@@ -2527,18 +2534,18 @@
   <div id="footer">
     <!-- 斜杠命令菜单（2026-09）：输入 / 弹出可用操作，点击即执行 -->
     <div id="cmd-menu" class="cmd-menu" hidden>
-      <div class="cmd-item" data-cmd="/收口" data-when="reading" title="收口本书讨论（读完时手动使用）">
+      <div class="cmd-item" data-cmd="/收口" data-when="reading" title="收口本书讨论（读完时手动执行）">
         <span class="cmd-name">/收口</span>
-        <span class="cmd-desc">收口本书讨论（读完时手动使用）</span>
+        <span class="cmd-desc">收口本书讨论（读完时手动执行）</span>
       </div>
-      <div class="cmd-item" data-cmd="/归档" data-when="free" title="归档当前自由对话：可选保存记忆 / 走正常收口程序进拓扑图" hidden>
+      <div class="cmd-item" data-cmd="/归档" data-when="free" title="归档当前自由对话：可选择保存记忆、收口进会意图" hidden>
         <span class="cmd-name">/归档</span>
-        <span class="cmd-desc">归档当前自由对话（保存记忆 / 收口进拓扑图）</span>
+        <span class="cmd-desc">归档当前自由对话（保存记忆 / 收口进会意图）</span>
       </div>
     </div>
-    <button id="attach-btn" title="上传文本附件（.md / .txt）：读取进本次讨论，不保存原文件">📎</button>
+    <button id="attach-btn" title="上传文本附件（.md / .txt）：内容读入本次讨论，不留存原文件">📎</button>
     <input type="file" id="file-input" accept=".md,.markdown,.txt,.text" hidden>
-    <textarea id="input" dir="ltr" placeholder="说点什么…" rows="1"></textarea>
+    <textarea id="input" dir="ltr" placeholder="输入你的问题…" rows="1"></textarea>
     <button id="send-btn">发送</button>
   </div>
 
@@ -2550,9 +2557,9 @@
         <span class="fcv-title">自由对话</span>
         <button class="fcv-close" id="fcv-close-btn" title="关闭">✕</button>
       </div>
-      <div class="fcv-hint">每个对话是独立的讨论上下文（消息、引用、讨论栈互不影响）；归档时选择要不要把这场对话保存进长期记忆 / 走正常收口程序进拓扑图。</div>
+      <div class="fcv-hint">每个对话有独立的消息、引用与讨论栈；归档时可选择是否保存记忆、是否收口进会意图。</div>
       <div class="fcv-list" id="fcv-list"></div>
-      <div class="fcv-msg" id="fcv-empty" hidden>还没有自由对话</div>
+      <div class="fcv-msg" id="fcv-empty" hidden>暂无自由对话</div>
       <div class="fcv-arch" id="fcv-arch-wrap" hidden>
         <div class="fcv-arch-title">已归档</div>
         <div class="fcv-arch-list" id="fcv-arch-list"></div>
@@ -2569,21 +2576,19 @@
     <div class="fa-box">
       <div class="fa-title">归档自由对话</div>
       <div class="fa-conv" id="fa-conv"></div>
-      <div class="fa-desc">
-        归档后这场对话与它的消息会<strong>一并删除</strong>（不可恢复）。下面两项<strong>默认都勾上</strong>——不需要留痕时取消勾选即可：
-      </div>
+      <div class="fa-desc">归档后对话与消息将<strong>一并删除</strong>，不可恢复。以下两项<strong>默认勾选</strong>，不需要留痕时取消即可：</div>
       <label class="fa-opt" for="fa-memory">
         <input type="checkbox" id="fa-memory">
         <span class="fa-opt-main">
           <span class="fa-opt-name">保存记忆</span>
-          <span class="fa-opt-desc">把这场对话里属于你的情况、偏好、观念合并进长期记忆（profile / soul），以后每次共读都会带上</span>
+          <span class="fa-opt-desc">将这场对话中你的情况、偏好与观点合并进长期记忆（你的阅读画像与它的自画像），此后每次共读都会带上</span>
         </span>
       </label>
       <label class="fa-opt" for="fa-graph">
         <input type="checkbox" id="fa-graph">
         <span class="fa-opt-main">
-          <span class="fa-opt-name">收口进拓扑图</span>
-          <span class="fa-opt-desc">走读书模式的正常收口程序：判专题化 / 判同一性分段 → 逐段归纳问题、派生知识点节点 → 建引用边与段间衍生边，写进正式会意图，之后可被引用解析命中</span>
+          <span class="fa-opt-name">收口进会意图</span>
+          <span class="fa-opt-desc">按读书模式的收口流程：切分并归纳讨论、派生知识点节点、建立引用边与衍生边，写入会意图后可被引用解析命中</span>
         </span>
       </label>
       <div class="fa-actions">
@@ -2611,12 +2616,12 @@
   <div id="book-picker">
     <div class="bp-panel">
       <div class="bp-head">
-        <span class="bp-title">已读过的书籍</span>
+        <span class="bp-title">已读书籍</span>
         <button class="bp-close" id="bp-close-btn" title="关闭">✕</button>
       </div>
       <input type="text" id="bp-search" dir="ltr" placeholder="搜索书名…">
       <div class="bp-list" id="bp-list"></div>
-      <div class="bp-msg" id="bp-empty" hidden>还没有已读书籍记录</div>
+      <div class="bp-msg" id="bp-empty" hidden>暂无已读书籍记录</div>
     </div>
   </div>
 
@@ -2630,9 +2635,9 @@
         <button class="api-close" id="api-close-btn" title="关闭">✕</button>
       </div>
       <div class="api-body">
-        <div class="api-hint">支持任何 OpenAI 兼容协议的服务商（DeepSeek / OpenAI / Kimi / Ollama…）。<br>配置写在本机，保存后立即生效，不需要重启。</div>
-        <div class="api-first" id="api-first" hidden>还没有配置模型 API，填好下面三项才能开始共读讨论。</div>
-        <div class="api-src" id="api-src" hidden>当前配置来自 agent/.env；在这里保存后以插件配置为准。</div>
+        <div class="api-hint">支持任何兼容 OpenAI 协议的服务商（DeepSeek / OpenAI / Kimi / Ollama…）。<br>配置保存在本机，保存后立即生效，无需重启。</div>
+        <div class="api-first" id="api-first" hidden>尚未配置模型 API，填写以下三项后才能开始共读讨论。</div>
+        <div class="api-src" id="api-src" hidden>当前配置来自 agent/.env，在此保存后以插件配置为准。</div>
         <div class="api-field">
           <label class="api-label" for="api-base">API 地址</label>
           <input type="text" class="api-input" id="api-base" dir="ltr" placeholder="https://api.deepseek.com/v1" autocomplete="off" spellcheck="false">
@@ -2670,20 +2675,11 @@
       </div>
       <div class="tb-body">
         <div class="tb-page" data-page="reader">
-          <div class="api-hint">
-            在 CoRead 自己的阅读器里读 PDF。正文是真实的文字，所以<b>划选一段按 Alt+T 就能翻译</b>，
-            译文出现在右侧对照栏，同时标回原文。
-          </div>
+          <div class="api-hint">在 CoRead 阅读器中阅读 PDF。正文是真实文字，<b>划选一段按 Alt+T 即可翻译</b>，译文显示在右侧对照栏，并标回原文。</div>
           <button class="tr-act" id="rd-open-btn">打开阅读器</button>
           <div class="tr-sep"></div>
-          <div class="api-hint">
-            改窗口大小、缩放、关掉浏览器再打开，译文都贴在原来那段文字上，不会跑位。
-            书页进度与译文按文件内容自动保存，同一份 PDF 再次打开会回到原处。
-          </div>
-          <div class="api-hint">
-            文字版 PDF 划选就能翻译。<b>扫描件</b>（整页是图片、没有文字层）用工具栏的
-            <b>「框选翻译」</b>：在页面上拖一个框，框里的内容交给模型读图翻译。
-          </div>
+          <div class="api-hint">改变窗口大小、缩放或重新打开浏览器，译文仍锚定原文段落，不会移位。书页进度与译文按文件内容自动保存，再次打开同一份 PDF 会回到原处。</div>
+          <div class="api-hint">文字版 PDF 划选即可翻译。<b>扫描件</b>（整页为图片、没有文字层）请用工具栏的<b>「框选翻译」</b>：在页面拖出选区，由模型读图翻译。</div>
         </div>
         <div class="tb-page" data-page="translate">
           <div class="tr-enable-row">
@@ -2695,9 +2691,9 @@
               <span class="ms-state act" id="tr-enable-on">启用</span>
             </button>
           </div>
-          <div class="api-hint">框选屏幕区域，或按快捷键翻译页面上选中的文字。截图内容将发送至模型服务。</div>
-          <button class="tr-act" id="tr-region-btn">框选截图<span class="tr-key" id="tr-key-region">Alt+S</span></button>
-          <button class="tr-act" id="tr-selection-btn">翻译选中文字<span class="tr-key" id="tr-key-selection">Alt+T</span></button>
+          <div class="api-hint">框选屏幕区域，或按快捷键翻译选中的文字。截图内容将发送至模型服务。</div>
+          <button class="tr-act" id="tr-region-btn">框选翻译<span class="tr-key" id="tr-key-region">Alt+S</span></button>
+          <button class="tr-act" id="tr-selection-btn">划词翻译<span class="tr-key" id="tr-key-selection">Alt+T</span></button>
           <div class="tr-links">
             <button class="tr-link" id="tr-shortcuts-btn">快捷键设置</button>
           </div>
@@ -2723,7 +2719,7 @@
             <div class="api-field">
               <label class="api-label" for="tr-model">模型</label>
               <input type="text" class="api-input" id="tr-model" dir="ltr"
-                     placeholder="沿用模型 API 配置；截图翻译需支持图片输入" autocomplete="off" spellcheck="false">
+                     placeholder="沿用模型 API 配置；框选翻译需支持图片输入" autocomplete="off" spellcheck="false">
             </div>
             <div class="tr-adv-hint">三项独立生效：已填写的项覆盖模型 API 配置中的同名项，未填写的项沿用其值。</div>
           </details>
@@ -2734,10 +2730,7 @@
               <button class="tr-link" id="tr-clear-btn">清除</button>
             </span>
           </div>
-          <div class="tr-warn" id="tr-grant-warn" hidden>
-            尚未授权访问模型域名 <span id="tr-origin"></span>，翻译请求将被浏览器拦截。
-            <button class="tr-grant" id="tr-grant-btn">授权访问模型域名</button>
-          </div>
+          <div class="tr-warn" id="tr-grant-warn" hidden>尚未授权访问模型域名 <span id="tr-origin"></span>，翻译请求将被浏览器拦截。<button class="tr-grant" id="tr-grant-btn">授权访问模型域名</button></div>
           <div class="api-err" id="tr-err"></div>
           <div class="tr-actions">
             <button id="tr-test-btn">测试连接</button>

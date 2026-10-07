@@ -112,6 +112,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 此前的转发分支已删除。
 })
 
+// ── 向本机服务报到（托盘「打开 CoRead 阅读器」要用）──────────────────────────
+// 扩展 ID 只有浏览器知道，托盘那个独立进程问不到；这里每次启动报一次，接收端落成
+// data\runtime\extension-id。三个入口各报一次，覆盖全部"浏览器重新认识这个插件"的时机：
+//   · 浏览器刚启动 → onStartup（SW 被拉起）
+//   · 插件刚装上 / 刚更新 / 被重新加载 → onInstalled
+//   · SW 因空闲被回收后又被唤醒 → 顶层这一行
+// 重复报到无害：接收端覆盖写同一个文件，ID 没变就不打日志。
+reportExtensionToHost()
+chrome.runtime.onStartup.addListener(() => reportExtensionToHost())
+chrome.runtime.onInstalled.addListener(() => reportExtensionToHost())
+
 // ── 翻译能力（框选截图 / 划词）────────────────────────────────────────────────
 // 逻辑都在 translate-background.js 里，只在这里装配，避免和共读的 SW 逻辑混在一起。
 // 它自带一个 chrome.runtime.onMessage 监听，只接管自己认识的那些 action。

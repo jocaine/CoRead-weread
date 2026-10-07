@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "CoRead - AI共读",
+  "name": "CoRead — AI 共读",
   "version": "0.3.2",
-  "description": "微信读书私密标注 + 正文足迹捕获 + 框选/划词翻译 + 自建 PDF 阅读器，配合 CoRead 共读 agent 使用",
+  "description": "微信读书划线共读、框选与划词翻译、PDF 阅读器；需配合 CoRead 本机服务使用",
   "minimum_chrome_version": "102",
   "icons": {
     "16": "icons/icon16.png",
@@ -49,7 +49,7 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "CoRead",
+    "default_title": "CoRead 共读",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
@@ -60,11 +60,11 @@
   "commands": {
     "translate-region": {
       "suggested_key": { "default": "Alt+S" },
-      "description": "截图翻译（框选屏幕区域）"
+      "description": "框选翻译（框选屏幕区域后翻译）"
     },
     "translate-selection": {
       "suggested_key": { "default": "Alt+T" },
-      "description": "翻译选中文字"
+      "description": "划词翻译（翻译选中的文字）"
     }
   },
   "web_accessible_resources": [

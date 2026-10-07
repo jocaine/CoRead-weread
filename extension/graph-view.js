@@ -406,6 +406,7 @@
       this._bound = false
       this._loadPromise = null   // 加载中的 promise（防重入：open 与 applyHit 并发加载时复用）
       this._open = false
+      this._autoOpened = false   // 窗口是"命中自动弹出"的（2026-02）：停止一轮时侧栏据此连窗口一起收
       this._demo = false
       this._free = false   // 自由模式沙盒图（/graph?free=1，测试固化产物）
       this._source = 'file'   // 图数据来源：file（固化图）| results（冒烟有效图）| demo（演示拓扑）| free（自由模式沙盒图）
@@ -474,7 +475,11 @@
     // 命中自动弹出 + 渐隐关闭：打开遮罩 → 等图加载并应用命中（root→recent 路径
     // 高亮 + 横幅通知 + 相机适配）→ 按链展示：单链停留后渐隐关闭；多链轮播
     // （每条链横幅 + 聚焦，全部播完再渐隐关闭）。
+    //
+    // _autoOpened（2026-02）：标记"这个窗口是命中自动弹出来的"。用户停止一轮时，
+    // 侧栏据此决定要不要连窗口一起收 —— 用户自己开着图在看的话不能关。
     async _autoShowHit(hits, reason) {
+      this._autoOpened = true
       this._openOverlay()
       await this.applyHit(hits, reason, 'hit')
       if (!this.graph) { this.close(); return }   // 图加载失败：不演动画，直接收起
@@ -560,7 +565,7 @@
         this._renderBookLegend()
         this._setLoading('')
         if (this.run.nodes.length === 0) {
-          this._setEmpty(true, '会意图还没有节点：固化流程还没写出图文件。\n可先「载入演示拓扑」预览交互与命中高亮。')
+          this._setEmpty(true, '会意图中暂无节点：尚无讨论收口固化。\n可先「载入演示拓扑」预览交互与命中高亮。')
           this.closeDetail()   // 空态时收起可能残留的详情面板
         }
         else this._setEmpty(false)
@@ -577,7 +582,7 @@
         return this.graph
       } catch (e) {
         this._setLoading('')
-        this._setEmpty(true, '加载拓扑失败（receiver 未启动？），可重试。', true)
+        this._setEmpty(true, '会意图加载失败：CoRead 本机服务未启动。可重试。', true)
         console.warn('[CoRead] graph load failed:', e)
         return null
       }
@@ -732,8 +737,8 @@
       const hint = this.container && this.container.querySelector('.gv-hint')
       if (hint) {
         hint.textContent = this._pickMode
-          ? '单击查看详情 · 双击选取为引用'
-          : '滚轮缩放 · 拖空白平移 · 悬停节点看名称 · 点选看详情'
+          ? '单击查看详情 · 双击设为引用'
+          : '滚轮缩放 · 拖拽空白平移 · 悬停查看名称 · 单击查看详情'
       }
     }
 
@@ -1585,22 +1590,22 @@
         '</div>' +
         '<div class="gv-banner" id="gv-banner" hidden>' +
           '<span class="gv-banner-text" id="gv-banner-text"></span>' +
-          '<button class="gv-btn gv-banner-clear" id="gv-banner-clear">隐藏当前讨论命中高亮</button>' +
+          '<button class="gv-btn gv-banner-clear" id="gv-banner-clear">隐藏本次命中高亮</button>' +
         '</div>' +
         '<div class="gv-canvas-wrap" id="gv-wrap">' +
           '<canvas id="gv-canvas"></canvas>' +
-          '<div class="gv-hint">滚轮缩放 · 拖空白平移 · 悬停节点看名称 · 点选看详情</div>' +
+          '<div class="gv-hint">滚轮缩放 · 拖拽空白平移 · 悬停查看名称 · 单击查看详情</div>' +
           '<div class="gv-chain-switch" id="gv-chain-switch" hidden></div>' +
           '<div class="gv-legend" id="gv-legend" hidden>' +
-            '<div><span class="sw" style="background:#6d72e8"></span>user 边 · 用户引用</div>' +
-            '<div><span class="sw" style="background:#8a92a6"></span>derived 边 · 对话衍生</div>' +
+            '<div><span class="sw" style="background:#6d72e8"></span>引用边 · 你引用过的</div>' +
+            '<div><span class="sw" style="background:#8a92a6"></span>衍生边 · 讨论派生</div>' +
             // 图例只列两条（2026-10 用户定调：那两层的术语没必要占图例位置）。
             // 图例色**从 COLORS 取**，不写死十六进制 —— 用户报过"recent 标识和图例对不上"，
             // 一半是渲染漏读 COLORS（隐藏态用了 pathAccent），一半是图例里硬编码的色值会和
             // 渲染漂移。写死色值这条路直接堵掉：改 COLORS 图例自动跟着变。
             // 粗细与渲染一致：路径起点 2px 虚线 / 引用节点 3px（thick）。
             '<div class="gv-lg-title">命中高亮</div>' +
-            '<div><span class="ring dashed" style="border-color:' + COLORS.rootMark + '"></span>路径起点（无入边）</div>' +
+            '<div><span class="ring dashed" style="border-color:' + COLORS.rootMark + '"></span>脉络起点（无入边）</div>' +
             '<div><span class="ring thick" style="border-color:' + COLORS.recentMark + '"></span>引用到的知识点</div>' +
             '<div class="gv-lg-title">节点颜色 · 所属书籍</div>' +
             '<div id="gv-legend-books"></div>' +
@@ -1616,7 +1621,7 @@
                 '<div class="gd-label">专题化讨论</div>' +
                 '<div id="gv-d-discs"></div>' +
               '</div>' +
-              '<div class="gd-note" id="gv-d-note" hidden>演示数据：节点只有知识点表述（point）。相关说法与专题化讨论由会意系统在真实讨论收口固化时生成，真实图写入后此处会显示。</div>' +
+              '<div class="gd-note" id="gv-d-note" hidden>演示数据：节点仅有知识点表述。相关说法与专题化讨论由收口固化生成，真实图写入后此处会显示。</div>' +
             '</div>' +
             '<div class="gd-pip-tip" id="gv-d-pip-tip"></div>' +   // 轮次 pip 详情 tooltip（AI-035）
           '</div>' +
@@ -1941,7 +1946,7 @@
           ? '这条脉络 ' + cur.nodes.length + ' 个节点'
             + (cur.nodes.length > 1 ? '' : '（没有上游）')
             + ' · 其余 ' + Math.max(0, chains.length - 1) + ' 条已压暗'
-          : '本场讨论引用到 ' + hl.recent.length + ' 个旧知识点 · 连它们的上游共亮 ' + hl.ids.size + ' 个'
+          : '本场讨论引用到 ' + hl.recent.length + ' 个旧知识点，连同其上游共高亮 ' + hl.ids.size + ' 个'
         // 隐藏态只保留指示行（2026-09 修复：隐藏时没有聚焦任何脉络，
         // 标题行和（X/N）都没有着落，一并去掉）；显示态 = 指示行 + 配色行 + 标题分行
         this._setBannerLines(
@@ -1962,10 +1967,10 @@
       this._bannerBtnKind = kind
       if (kind === 'clear') {
         this.bannerClearBtn.textContent = '清除搜索'
-        this.bannerClearBtn.title = '清空搜索框，退出搜索命中'
+        this.bannerClearBtn.title = '清空搜索框并退出搜索命中'
       } else {
         const hidden = this._hlHidden
-        this.bannerClearBtn.textContent = hidden ? '显示当前讨论命中高亮' : '隐藏当前讨论命中高亮'
+        this.bannerClearBtn.textContent = hidden ? '显示本次命中高亮' : '隐藏本次命中高亮'
         this.bannerClearBtn.title = hidden ? '恢复显示本次命中的路径高亮' : '暂时隐藏本次命中的路径高亮（数据保留，可随时恢复）'
       }
     }
@@ -2012,7 +2017,7 @@
       if (!chains || chains.length <= 1 || this._hlHidden) { el.hidden = true; return }
       el.hidden = false
       const allBtn = '<button class="gv-chain-btn' + (this._focusChain < 0 ? ' sel' : '') + '" data-chain="-1"'
-        + ' title="显示全部 ' + chains.length + ' 条脉络（含本场讨论已挂的知识点）">全部</button>'
+        + ' title="显示全部 ' + chains.length + ' 条脉络（含本场已挂知识点）">全部</button>'
       el.innerHTML = allBtn + chains.map((c, i) =>
         '<button class="gv-chain-btn' + (i === this._focusChain ? ' sel' : '') + '" data-chain="' + i +
         '" title="只看第 ' + (i + 1) + ' 条脉络（' + c.hits.length + ' 个命中节点，' + c.nodes.length + ' 个节点），其它脉络压暗">脉络 ' + (i + 1) + '</button>'
@@ -2057,9 +2062,9 @@
       const badge = this.container && this.container.querySelector('#gv-demo-badge')
       if (!badge) return
       const s = this._source
-      if (s === 'demo') { badge.hidden = false; badge.textContent = '演示数据'; badge.title = '演示拓扑：由 knowledge-graph-demo.json 重建' }
-      else if (s === 'results') { badge.hidden = false; badge.textContent = '冒烟结果'; badge.title = '有效图：由冒烟/派生脚本产出（knowledge-graph-results.json）' }
-      else if (s === 'free') { badge.hidden = false; badge.textContent = '自由模式'; badge.title = '自由模式沙盒图：测试对话的固化产物，不进入正式图' }
+      if (s === 'demo') { badge.hidden = false; badge.textContent = '演示数据'; badge.title = '演示图：由 knowledge-graph-demo.json 重建' }
+      else if (s === 'results') { badge.hidden = false; badge.textContent = '测试数据'; badge.title = '测试图：由冒烟 / 派生脚本产出（knowledge-graph-results.json）' }
+      else if (s === 'free') { badge.hidden = false; badge.textContent = '自由模式'; badge.title = '自由模式沙盒图：测试对话的固化产物，不写入正式会意图' }
       else { badge.hidden = true }
     }
     _setLoading(text) {
@@ -2125,7 +2130,7 @@
           const book = d.book ? '《' + escHtml(bookName(d.book)) + '》' : ''
           const chapter = d.chapter ? escHtml(d.chapter) : ''
           const excerpts = Array.isArray(d.excerpts) ? d.excerpts : []
-          const meta = [book, chapter, excerpts.length ? excerpts.length + ' 轮交锋' : ''].filter(Boolean).join(' · ')
+          const meta = [book, chapter, excerpts.length ? excerpts.length + ' 轮讨论' : ''].filter(Boolean).join(' · ')
           // AI-038：每张讨论卡片都显示轮次排号（即使只有 1 轮也显示「1」），保证导航必然可见
           const pipHtml = excerpts.length
             ? '<div class="gd-round-nav">' + excerpts.map((e, i) => '<span class="gd-pip" data-r="' + i + '">' + (i + 1) + '</span>').join('') + '</div>'

@@ -13,6 +13,7 @@
  */
 
 import fs from 'fs'
+import net from 'net'
 import path from 'path'
 import readline from 'readline'
 import { fileURLToPath } from 'url'
@@ -46,13 +47,53 @@ import {
   AGENT_DIR, BOOKS_DIR, ANNOTATIONS_FILE, AGENT_CURSOR_FILE, CHAT_DB, STREAM_FILE,
   AGENT_STATE_FILE, STOP_FILE, JOURNAL_FILE, TOPIC_STACK_FILE, GRAPH_FILE,
   BUILTIN_GRAPH_RESULTS_FILE, SELF_PORTRAIT_FILE, PROFILE_FILE, SOUL_FILE,
-  HIST_CURSOR_FILE, SESSIONS_DIR, LAYOUT_KIND, layoutSummary,
+  HIST_CURSOR_FILE, SESSIONS_DIR, LOGS_DIR, LAYOUT_KIND, layoutSummary,
   ensureDirs, detectUnmigrated, scriptCommand,
+  sessionStopFile, listSessionStopFiles,
 } from './lib/paths.js'
 
 // 数据目录可能还不存在（全新安装、或用户直接跑 agent）：先建齐。
 // receiver 启动时也会调一次，幂等。
 ensureDirs()
+
+// ── 单实例保护（2026-10-07）──────────────────────────────────────────────
+// 为什么需要：托盘的自愈逻辑在"以为 agent 掉了"时会再拉一个（它的判据曾被 WMI 挡住，
+// 见 installer/launcher/tray.ps1 的注释）。agent 自己不设防时，两个进程会同时读同一个
+// 聊天库、各回一条 —— 用户看到的就是**同一条消息被回复两次**。
+// 2026-10-07 实测：25 秒内被拉起 3 个（logs/agent.log 里记着三次「启动」）。
+//
+// 用什么：**命名管道** `\\.\pipe\CoReadAgent`。它就是 Windows 内核命名对象那一族，
+// 和托盘用的具名互斥体同一个原理：
+//   · 抢的时候是原子的 —— 内核保证，第二次绑定必定失败（本机实测 EADDRINUSE）
+//   · 进程无论怎么死，内核都会释放它 —— **不留文件，也没有 PID 复用问题**
+// 为什么不用端口当锁：端口会被无关程序占坑，那时我们会误判成"已有实例"而**拒绝启动**；
+// 管道名只可能被我们自己占用。
+// 为什么用全局作用域（不带会话前缀）：data\ 是整机一份，跨用户跑两个 agent 会写同一个库。
+//
+// 拿不到锁就直接退出：宁可这个进程不启动，也不能两个一起回话。
+const AGENT_LOCK_PIPE = '\\\\.\\pipe\\CoReadAgent'
+const lockResult = await new Promise((resolve) => {
+  const srv = net.createServer((sock) => sock.destroy())
+  srv.once('error', (err) => resolve({ srv: null, err }))
+  srv.listen(AGENT_LOCK_PIPE, () => resolve({ srv, err: null }))
+})
+if (lockResult.err) {
+  if (lockResult.err.code === 'EADDRINUSE') {
+    // 落一条**不会被覆盖**的痕迹：多个 agent 共用 logs\agent.out.log，新实例的
+    // Start-Process 重定向会把它清空 —— 今天就是因为这个，事后什么都查不到。
+    try {
+      fs.appendFileSync(
+        path.join(LOGS_DIR, 'agent-instances.log'),
+        `[${new Date().toISOString()}] 拒绝启动：${AGENT_LOCK_PIPE} 已被占用（本进程 PID ${process.pid}）\n`
+      )
+    } catch {}
+    console.error(`⚠️ 已经有 CoRead agent 在运行（${AGENT_LOCK_PIPE} 被占用），本进程退出。`)
+    console.error('   要另开一个（调试用）请先从托盘退出 CoRead。')
+    process.exit(0)
+  }
+  // 锁本身出错不该让程序起不来：宁可漏挡，也不要误拒（与托盘那条同样的取舍）
+  console.error(`⚠️ 单实例锁创建失败（${lockResult.err.code || lockResult.err.message}）：跳过这道检查继续启动。`)
+}
 
 const ANNOTATIONS = ANNOTATIONS_FILE          // 划线标注（reading\）
 const CURSOR_FILE = AGENT_CURSOR_FILE         // 标注处理游标（runtime\；旧名 .agent_cursor，去掉了点——见 paths.js）
@@ -250,6 +291,80 @@ function readPendingMessages(limit = 10) {
 }
 function markMessage(id, fields) {
   try { chatStore().updateMessage(id, fields) } catch (e) { console.log(`  ⚠️ 更新消息状态失败：${e.message}`) }
+}
+
+// ── 停止当前回答（2026-02 用户定调）─────────────────────────────────────────
+// 侧栏点「停止」→ receiver 写一个按对话区分的信号文件 → agent 在处理中读到就**弃掉这一轮**：
+// 屏幕上提问与半截回答都删、库里也不留行、记忆标作废、讨论栈与图谱完全不碰，
+// 只有原文由侧栏回填进输入框。
+//
+// 为什么做成"信号文件"而不是掐断请求：receiver 与 agent 是两个进程，
+// 能让 fetch 中断的 AbortController 是 agent 进程内的对象，另一个进程够不着。
+const ABORTED_CODE = 'COREAD_USER_STOPPED'   // 专用标记：与 HTTP 状态码区分（err.status 已被 401/402/403 判定占用）
+// say() 在"用户停止"时返回这个标记（而不是 ⚠️ 串）：调用方据此跳过入栈、走弃轮清理。
+// 用标记而不是抛异常：say() 是"永远返回字符串"的既有契约，改契约会牵动所有调用点。
+const ABORTED_REPLY = '\u0000COREAD_ABORTED'
+function isAbortedReply(reply) { return String(reply) === ABORTED_REPLY }
+function isAborted(e) { return !!e && e.code === ABORTED_CODE }
+function abortedError() {
+  const e = new Error('用户停止了本轮回答')
+  e.code = ABORTED_CODE
+  return e
+}
+/**
+ * 读走本对话的停止信号（读到即删）。agent 在三个位置调用它：
+ * 流式循环内（让停止立刻生效）、回答生成完后入栈前（正确性闸）、队列每条开始前（正确性闸）。
+ * 信号是"一次性的"：谁先读到谁删，删掉之后后续检查点自然放行，不会误伤下一轮。
+ */
+function consumeSessionStop(conv) {
+  const f = sessionStopFile(conv)
+  try {
+    if (!fs.existsSync(f)) return false
+    fs.unlinkSync(f)
+    return true
+  } catch { return false }
+}
+/** 启动清场：runtime 里的停止信号是瞬态文件，跨进程残留一律丢弃（同 stream.jsonl 的处理） */
+function clearSessionStops(reason = '') {
+  const files = listSessionStopFiles()
+  for (const f of files) { try { fs.unlinkSync(f) } catch {} }
+  if (files.length && reason) console.log(`  🧹 清理残留停止信号 ×${files.length}（${reason}）`)
+}
+/** 该提问是否已有完整回答（用于"停止来晚了"的判定：答完了就不再回头删） */
+function hasReplyTo(id) {
+  try {
+    for (const rep of chatStore().pairReplies({}).values()) {
+      if (Number(rep.replyTo) === Number(id)) return true
+    }
+  } catch {}
+  return false
+}
+/**
+ * 弃掉被用户停止的那一轮：屏幕上与库里都不留痕。
+ *   · 提问行：整条删（留着的话面板重开时气泡会从历史里长回来）
+ *   · 图谱命中事件：删（用户看不见的暗账，留着还会在断线重连时把高亮推回来）
+ *   · 历史与 journal：由调用方与 say() 负责（它们在自己的作用域里）
+ * 若发现该提问其实已经有完整回答（停止来晚了），就什么都不删——只把信号消费掉。
+ * @returns {boolean} 是否真的弃掉了（false = 停止来晚了/找不到这条）
+ */
+function discardStoppedTurn({ conv, questionId }) {
+  try {
+    const id = Number(questionId || 0)
+    if (!id) return false
+    const row = chatStore().getMessage(id)
+    if (!row) return false
+    if (hasReplyTo(id)) {
+      console.log(`  ⏹ 停止信号到达时这一轮已有完成回答（id ${id}）：不改动，仅消费信号`)
+      return false
+    }
+    const del = chatStore().deleteMessages([id])
+    const ev = chatStore().deleteEvents({ conv: String(conv || ''), kind: 'graph-hit' })
+    console.log(`  ⏹ 本轮已停止：提问行与命中事件已删（messages ×${del} / events ×${ev}）`)
+    return true
+  } catch (e) {
+    console.log(`  ⚠️ 停止清理失败（不影响后续）: ${e.message}`)
+    return false
+  }
 }
 
 // ── 标注队列 ────────────────────────────────────────────────────────────────
@@ -887,6 +1002,9 @@ async function say(userText, options = {}) {
     let lastWrite = 0
     let result
     while (true) {
+      // 停止信号（2026-02）：每收一段就瞄一眼——这一眼不影响正确性（真正的闸在 say() 返回后），
+      // 只为让停止**立刻**生效：否则模型会把整段答案写完再整体丢弃，白花钱、清理晚、拖住后面排队的事。
+      if (consumeSessionStop(key)) throw abortedError()
       result = await stream.next()
       if (result.done) {
         fullContent = result.value || fullContent
@@ -941,6 +1059,17 @@ async function say(userText, options = {}) {
       appendChatOutput('assistant', displayContent, key, { replyTo: options.replyTo })
     }
   } catch (e) {
+    // 用户停止（2026-02 用户定调"当没问过"）：不写失败气泡、不加 ⚠️、不标作废入库，
+    // 只把这一轮留下的痕迹收干净，然后返回中止标记让调用方跳过入栈那一步。
+    // 与下面普通失败的区别：失败是"还欠用户一个答案"（入库 + 下轮重试），
+    // 停止是"这一轮不存在"（什么都不留）。
+    if (isAborted(e)) {
+      if (key !== '_meta' && started) appendChatOutputStreamEnd(key)   // 侧栏那半截气泡要收尾
+      hist.pop()                                                        // 半句话不进上下文
+      if (key !== '_meta' && !isFreeKey(key)) voidJournalUserMsg(key, storeText)  // 用户原话不进画像
+      console.log('  ⏹ 本轮已停止（回答丢弃、记忆作废、不入栈）')
+      return ABORTED_REPLY
+    }
     // 出错也要收尾：流已吐过一部分时补 -1 + 错误记录，避免侧栏气泡卡在思考动画。
     // 元任务（_meta）不写库，避免在侧栏产生记忆合并过程的伪气泡。
     // 失败回答以 status='failed' 入库：它不参与配对（pairReplies 跳过 ⚠️/failed），
@@ -1659,12 +1788,51 @@ function readJournalLines() {
     .filter(Boolean)
 }
 
-// 上一次 checkpoint 之后的全部对话消息（尚未固化进 profile/soul 的部分）
+/**
+ * 把某场对话里"用户说了什么"的流水行标成作废（2026-02 用户停止一轮时调用）。
+ *
+ * 为什么需要：journal 那行是**用户按下发送的瞬间就同步落盘**的（防强杀丢话），
+ * 中止时必须把它作废，否则用户的原话照样会被会话结束时的记忆固化写进 profile/soul。
+ *
+ * 为什么就地改写而不删行：流水账保持"只追加、可整文件重写（checkpoint 就是这么干的）"
+ * 这个性质更好核对；作废行留着也便于事后排查"这轮为什么没进记忆"。
+ * 只改**最新**那条匹配行：中止的那轮总是最近一轮。
+ *
+ * @returns {boolean} 是否标上了
+ */
+function voidJournalUserMsg(bookKey, content) {
+  try {
+    const raw = readIfExists(JOURNAL_FILE)
+    if (!raw) return false
+    const lines = raw.split('\n')
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]
+      if (!line.trim()) continue
+      let o
+      try { o = JSON.parse(line) } catch { continue }
+      if (!o || o.kind !== 'msg' || o.role !== 'user') continue
+      if (String(o.bookKey || '') !== String(bookKey || '')) continue
+      if (String(o.content || '') !== String(content || '')) continue
+      if (o.voided) return true          // 已经是作废态
+      o.voided = true
+      o.voidedAt = Date.now()
+      lines[i] = JSON.stringify(o)
+      fs.writeFileSync(JOURNAL_FILE, lines.join('\n'))
+      return true
+    }
+  } catch (e) {
+    console.log(`  ⚠️ 流水账作废标记失败（不影响主流程）: ${e.message}`)
+  }
+  return false
+}
+
+// 上一次 checkpoint 之后的全部对话消息（尚未固化进 profile/soul 的部分）。
+// **跳过作废行**：被用户停止的那一轮不该进画像（2026-02 用户定调）。
 function unmergedJournalMsgs() {
   const lines = readJournalLines()
   let lastCp = -1
   for (let i = 0; i < lines.length; i++) if (lines[i].kind === 'checkpoint') lastCp = i
-  return lines.slice(lastCp + 1).filter(l => l.kind === 'msg')
+  return lines.slice(lastCp + 1).filter(l => l.kind === 'msg' && !l.voided)
 }
 
 // 把对话记录压成可喂给 LLM 的文本：区分说话人（用户/AI），不截断——
@@ -1950,6 +2118,10 @@ async function main() {
   // 聊天存储：打开（必要时建表）并把上次崩溃残留的"处理中"状态清干净。
   // 瞬态打字机通道每次启动清空——它不入档，留着只会让侧栏看到上次的半截气泡。
   resetStreamFile()
+  // 停止信号也是瞬态文件：上次运行（尤其崩溃）残留的一律丢弃。
+  // 进程内正常流程是"读到即删"，跨进程崩溃才会残留；留着只会在下一轮启动时
+  // 误弃一条无关的提问，所以这里无条件清场。
+  clearSessionStops('启动清场')
   try {
     const st = chatStore().stats()
     console.log(`   聊天库：${CHAT_DB}（${st.messages} 条消息 / ${st.conversations} 个对话 / 待处理 ${st.pending} / 失败待重试 ${st.failed}）`)
@@ -2035,6 +2207,13 @@ async function main() {
         // AI-001：消息归属当前书——有 bookId 用其书（自由消息也带书签，见 sidebar submit），
         // 无 bookId 则沿用"正在读的书"（currentBookKey），否则进 _common。
         const key = msg.bookId ? baseBookId(msg.bookId) : (msg.conv || currentBookKey || '_common')
+        // 停止信号·正确性闸②（2026-02 用户定调）：本条开始处理前先看一眼。
+        // 它兜住的是"信号到达时这条已经被捡进队列"的情形——命中就整轮弃掉，不解析、不生成、不入栈。
+        // 这里**不用动历史**：say() 还没被调用，这条消息从未进过 histories。
+        if (consumeSessionStop(key)) {
+          discardStoppedTurn({ conv: msg.conv, questionId: msg.id })
+          continue
+        }
         // /收口：手动收口本书讨论（2026-09 用户定调——读完一本书时使用）。
         // 指令消息不进栈/不进会话历史/不触发 LLM，只执行收口并回复确认。
         if (String(msg.content || '').trim() === '/收口') {
@@ -2101,6 +2280,13 @@ async function main() {
         // replyTo = 这条提问的 id：回答入库时直接挂上引用（配对从"时间序推断"变成"外键"）
         const reply = await say(userMsg, { bookKey: key, storeText, assistantSelected: selectionFromMsg(msg), l3: citesR.l3, replyTo: msg.id })
         _lastReplyCtx = stripCodeBlocks(reply)
+        // 用户停止（2026-02 用户定调"当没问过"）：say() 已经把历史与流水账收干净了，
+        // 这里再弃掉库里的提问行与命中事件，然后**直接进入下一条**——
+        // 不标 ok、不标 failed、不入栈判同一、不记账。判同一根本轮不到被踩。
+        if (isAbortedReply(reply)) {
+          discardStoppedTurn({ conv: msg.conv, questionId: msg.id })
+          continue   // 瞬态流的收尾由 say() 独占写（那里已补 -1），此处不再重复写
+        }
         // 致命配置/额度错误（401/402/403）：中止本轮 + 暂停队列 + 只留一条 system 提示。
         // 该消息保持 pending（不标 ok）→ 充值/改配置后会重新回答；也不再逐条试
         // （旧行为会刷出几百个 ⚠️ 气泡，2026-09-28 一次刷了 213 个）。

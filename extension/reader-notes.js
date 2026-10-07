@@ -100,7 +100,7 @@
     clearBtn.addEventListener('click', () => send({ action: 'readerCommand', type: 'clear' }))
     const closeBtn = el('button', 'rn-muted', '← 返回')
     closeBtn.type = 'button'
-    closeBtn.title = '回到共读标注'
+    closeBtn.title = '返回共读标注'
     closeBtn.style.cssText = 'border:0;background:transparent;cursor:pointer;font:inherit;padding:2px 6px'
     closeBtn.addEventListener('click', () => opts.onClose && opts.onClose())
     head.append(title, spacer, count, clearBtn, closeBtn)
@@ -110,7 +110,7 @@
     const empty = el('div', 'rn-empty')
     empty.append(
       el('div', null, '划选一段原文按 Alt+T 翻译；扫描件用阅读器工具栏的「框选翻译」。'),
-      el('div', null, '译文会出现在这里，并贴回原文位置。'),
+      el('div', null, '译文会显示在这里，并贴回原文位置。'),
     )
     root.append(head, bookLine, list, empty)
 
@@ -173,14 +173,14 @@
           }
           acts.append(
             mk('跳到原文', () => send({ action: 'readerCommand', type: 'reveal', id: e.id })),
-            mk('改原文重译', () => { editingId = e.id; render() }),
+            mk('修改原文重译', () => { editingId = e.id; render() }),
             mk('复制译文', async () => {
               const ok = await copyText(e.translation || '')
               toast(ok ? '已复制' : '复制失败', !ok)
             }),
             mk('设为引用', async () => {
               const r = await send({ action: 'readerCommand', type: 'reference', id: e.id })
-              toast(r && r.ok ? '已设为引用' : '设为引用失败：' + ((r && r.error && r.error.message) || '未知错误'),
+              toast(r && r.ok ? '已设为引用' : '设为引用失败：' + ((r && r.error && r.error.message) || '原因未知'),
                 !(r && r.ok))
             }, 'rn-ref'),
             mk('删除', () => send({ action: 'readerCommand', type: 'remove', id: e.id })),
