@@ -1935,7 +1935,7 @@ async function submit() {
   // 本机程序没在运行 → 不发，弹窗告知（2026-10）。
   // 拦在清空输入框之前：原文字样留着，用户启动 CoRead 后直接再按一次发送即可。
   if (!_backendAlive) {
-    showSendFailedNotice('本机程序未运行，消息未发送。请双击 Start-CoRead.vbs 启动后重试。')
+    showSendFailedNotice('本机程序未运行，消息未发送。\n双击 Start-CoRead.vbs 启动后重试。')
     pingOnce()   // 立刻复探一次，把灯刷成真实状态
     return
   }
@@ -2021,7 +2021,7 @@ async function submit() {
       const inp = document.getElementById('input')
       if (inp && !inp.value) { inp.value = content; inp.style.height = 'auto' }
     } catch {}
-    showSendFailedNotice('本机程序未响应，消息未发送。原文已保留在输入框，可再次发送。')
+    showSendFailedNotice('本机程序未响应，消息未发送。\n原文已保留在输入框，可再次发送。')
     pingOnce()
     // 发送失败：这条消息没到 receiver、agent 不会回复。弹掉刚入队的自己的条目，
     // 避免它的最终记录永远不来、把后续真实回复的配对挤偏。不整队清空——前一条
@@ -2678,11 +2678,14 @@ function showConfirm(title, message, { okOnly = false, okText = '确认删除' }
     const okBtn = document.getElementById('confirm-ok-btn')
     const cancelBtn = document.getElementById('confirm-cancel-btn')
     // okOnly（2026-10）：只留一个确定按钮，用于"只告知、不需要用户做选择"的场景
-    // （例：本机程序没在运行时按了发送）。此时遮罩点击与 Esc 都按"知道了"处理。
+    // （例：本机程序没在运行时按了发送）。此时遮罩点击与 Esc 都按"知道了"处理；
+    // 另挂 .notice 走一套"通知型"排版（标题正文左对齐、按钮紧凑且绿色，见 sidebar.html）。
     okBtn.textContent = okText
     cancelBtn.hidden = okOnly
+    if (okOnly) overlay.classList.add('notice')
     const cleanup = () => {
       overlay.classList.remove('on')
+      overlay.classList.remove('notice')   // 通知型的排版不能留给下一次普通确认框
       okBtn.removeEventListener('click', onOk)
       cancelBtn.removeEventListener('click', onCancel)
       overlay.removeEventListener('mousedown', onDown)

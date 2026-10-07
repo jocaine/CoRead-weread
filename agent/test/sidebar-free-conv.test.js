@@ -474,6 +474,7 @@ test('本机程序没在运行时按发送：不发出、弹出提示、原文�
   assert.equal(getById('confirm-title').textContent, '无法发送', '弹窗标题')
   assert.match(getById('confirm-msg').textContent, /未运行/, '弹窗说明了原因')
   assert.equal(getById('confirm-cancel-btn').hidden, true, '只留确定按钮（不需要用户做选择）')
+  assert.equal(getById('confirm-overlay').classList.contains('notice'), true, '走通知型排版（标题正文左对齐 + 紧凑绿色按钮）')
   assert.equal(getById('input').value, '这句话应该发不出去', '原文原样留在输入框')
 })
 
