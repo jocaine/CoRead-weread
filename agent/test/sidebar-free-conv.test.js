@@ -108,7 +108,7 @@ function buildDom() {
 }
 
 // 一次装载：跑完 sidebar.js 的顶层代码 + 把要断言的对象暴露出来
-function loadSidebar({ convList = [], archiveOk = true } = {}) {
+function loadSidebar({ convList = [], archiveOk = true, pingOk = true } = {}) {
   const { doc, ids, getById } = buildDom()
   const calls = []   // 记录 fetch 调用 [{url, method, body}]
   const storage = {}
@@ -120,6 +120,10 @@ function loadSidebar({ convList = [], archiveOk = true } = {}) {
     const body = opts.body ? JSON.parse(opts.body) : null
     calls.push({ url: u, method, body })
     const json = (obj, ok = true) => ({ ok, status: ok ? 200 : 400, json: async () => obj })
+
+    // 存活探测（2026-10）：默认成功。传 pingOk:false 模拟"本机程序没在运行"
+    // —— 连接灯、离线横幅、发送按钮置灰都挂在它上面。
+    if (u.endsWith('/ping')) return json({ ok: true }, pingOk)
 
     if (u.endsWith('/free-conversations') && method === 'GET') {
       const active = convs.filter((c) => c.status !== 'archived')
@@ -442,6 +446,28 @@ function htmlSource() {
   return fs.readFileSync(HTML, 'utf8')
 }
 // 取某条选择器规则体（第一个匹配到的），用于断言它是否设了 display
+// ── 本机程序没在运行：灯变灰 + 横幅出现 + 发送按钮按不动 ──────────────────────
+// 为什么这三条要一起断言：它们是同一次轮询结果的三个表现，任何一条漏了都会让用户
+// 看到自相矛盾的界面（比如按钮能按、却没有横幅解释为什么发不出去）。
+// 注：灯的"绿"需要 SSE 也连上，而测试里的 EventSourceStub 不会触发 onopen，
+//     所以这里只断言"离线时变灰"，不断言在线时变绿。
+test('本机程序没在运行时：灯变灰、横幅出现、发送按钮置灰并说明原因', async () => {
+  const { getById } = loadSidebar({ convList: [], pingOk: false })
+  await flush()
+  assert.equal(getById('dot').style.background, '#ddd', '连接灯变灰')
+  assert.equal(getById('offline-banner').hidden, false, '离线横幅出现（开机即离线也要出现）')
+  assert.equal(getById('send-btn').disabled, true, '发送按钮按不动')
+  assert.match(getById('send-btn').title, /没在运行/, '按钮的悬停提示说明了原因')
+  assert.match(getById('dot').title, /没在运行/, '灯的悬停提示说明了原因')
+})
+
+test('本机程序在运行时：不出现离线横幅', async () => {
+  const { getById } = loadSidebar({ convList: [] })   // 默认 /ping 成功
+  await flush()
+  assert.equal(getById('offline-banner').hidden, true, '在线时不显示横幅')
+  assert.doesNotMatch(getById('send-btn').title, /没在运行/, '按钮不再因离线而说明')
+})
+
 function cssRuleBody(html, selector) {
   const esc2 = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const m = new RegExp('(?:^|[},])\\s*' + esc2 + '\\s*(?:,[^{}]*)?\\{([^}]*)\\}', 'm').exec(html)

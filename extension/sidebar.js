@@ -265,10 +265,12 @@ function refreshDot() {
 }
 
 function setBackendAlive(alive) {
-  const changed = alive !== _backendAlive
+  // 注意：**不要**做"值没变就提前返回"的优化。开机时 _backendAlive 本来就是 false，
+  // 若第一次轮询也是"离线"，提前返回会让横幅永远不显示（HTML 里它是 hidden 的）——
+  // 而这恰恰是横幅最该出现的情况。写 DOM 是幂等的，每次都同步一遍最稳。
   _backendAlive = alive
   refreshDot()
-  if (!changed) return
+  applySendEnabled()
   const b = document.getElementById('offline-banner')
   if (b) b.hidden = alive
 }
@@ -277,6 +279,20 @@ function setSseOpen(open) {
   if (open === _sseOpen) return
   _sseOpen = open
   refreshDot()
+}
+
+let _noBook = false   // 有没有正在读/选中的书（由 renderNoBookView 维护）
+// 发送按钮的可用性 = "有书" **且** "本机程序在跑"。两个条件在这里合成一处，
+// 否则 renderNoBookView 与轮询各写一次 disabled，后写的会把前一个覆盖掉
+// （实测隐患：轮询说"在跑"就会把"无书"的禁用解开）。
+function applySendEnabled() {
+  const btn = document.getElementById('send-btn')
+  if (!btn) return
+  const offline = !_backendAlive
+  btn.disabled = _noBook || offline
+  btn.title = offline
+    ? '本机程序没在运行，发不出去 —— 请先双击 Start-CoRead.vbs 启动 CoRead'
+    : (_noBook ? '未检测到书籍' : '')
 }
 
 async function pingOnce() {
@@ -293,6 +309,8 @@ async function pingOnce() {
 }
 
 function startPingLoop() {
+  applySendEnabled()                             // 先按"离线"把发送按钮锁上：宁可晚几毫秒解开，
+                                                 // 也不要在第一次探测返回前放行一次注定失败的发送
   pingOnce()                                     // 立刻探一次，别让灯先灰 5 秒
   if (_pingTimer) clearInterval(_pingTimer)
   _pingTimer = setInterval(pingOnce, 5000)
@@ -1121,7 +1139,6 @@ function renderNoBookView() {
   // 提问浮窗（jump-fab）随之收起，不残留上一本书的跳转条
   if (noBook) applyBookFilter()
   const input = document.getElementById('input')
-  const sendBtn = document.getElementById('send-btn')
   const attachBtn = document.getElementById('attach-btn')
   if (input) {
     input.disabled = noBook
@@ -1129,7 +1146,8 @@ function renderNoBookView() {
       ? '未检测到书籍：打开微信读书中的书，或从已读书籍中选择'
       : '说点什么…'
   }
-  if (sendBtn) sendBtn.disabled = noBook
+  _noBook = noBook
+  applySendEnabled()   // 发送按钮 = 有书 && 本机程序在（见 applySendEnabled 的注释）
   if (attachBtn) attachBtn.disabled = noBook
   refreshWebBindEntry()  // AI-021：无书状态时按活动 tab 显示/隐藏网页绑定入口
 }
@@ -1936,8 +1954,9 @@ async function submit() {
     openFreeArchive(_freeKey)
     return
   }
-  // 本机程序没在运行 → 拦在这里，不发（2026-10）：发出去只会失败，而且原文会被清掉。
-  // 字原样留在输入框里，用户启动 CoRead 后直接再按一次发送即可。
+  // 兜底（2026-10）：正常情况下发送按钮已置灰、回车也按不动，走不到这里。
+  // 只有"轮询刚说在、说完就挂"这种 5 秒以内的竞态才会到 —— 此时绝不发，
+  // 原文原样留在输入框里，用户启动 CoRead 后直接再按一次发送即可。
   if (!_backendAlive) {
     const gateBook = selectedAnn ? selectedAnn.bookId : effectiveBookBase()
     renderSystemBubble('⚠️ 本机程序没在运行，这条消息没有发出去。请双击 Start-CoRead.vbs 启动 CoRead（等托盘图标出现），再按一次发送。', gateBook)
@@ -2104,6 +2123,7 @@ document.getElementById('send-btn').addEventListener('click', submit)
 document.getElementById('input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
+    if (!_backendAlive) return   // 离线：回车不发送（按钮已置灰、横幅已在说明原因）
     const im = document.getElementById('cmd-menu')
     if (im) im.hidden = true
     if (document.getElementById('input').value.trim() === '/') return  // 纯 "/" 不发送（斜杠菜单占位）
