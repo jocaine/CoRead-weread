@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CoRead — AI 共读",
-  "version": "0.3.2",
+  "version": "1.0.0",
   "description": "微信读书划线共读、框选与划词翻译、PDF 阅读器；需配合 CoRead 本机服务使用",
   "minimum_chrome_version": "102",
   "icons": {
