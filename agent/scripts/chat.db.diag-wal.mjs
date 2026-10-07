@@ -65,32 +65,61 @@ const shmSt = stat(dbFile + '-shm')
 const dbSt = stat(dbFile)
 
 // ── 2. 问 SQLite 要权威状态 ─────────────────────────────────────
-const store = openChatStore(dbFile, { readonly: true })
-const q = (sql) => store.db.prepare(sql).get()
-const pageSize = q('PRAGMA page_size').page_size
-const pageCount = q('PRAGMA page_count').page_count
-const journalMode = q('PRAGMA journal_mode').journal_mode
-const ck = q('PRAGMA wal_checkpoint(PASSIVE)')
-const stats = store.stats()
-store.close()
+//
+// ⚠️ 这里必须**可写**打开，不能用 { readonly: true }（2026-10-07 实测踩坑）。
+// 原因：下面那句 `PRAGMA wal_checkpoint(PASSIVE)` 是**写操作**——它要把暂存本里的帧搬回
+// 主库。只读连接上跑它，SQLite 直接抛 `attempt to write a readonly database`，脚本当场崩，
+// 而"暂存本里有没有没搬回去的数据"这个**最要紧的判读恰恰打印不出来**。
+// 反讽的是，用户最需要这个诊断的时刻（库可疑、被杀软锁住、盘只读）正是只读打开会失败的时刻。
+//
+// 关于"只读"这个词：本脚本**不改你的数据**（不增不删任何消息），但它会触发一次
+// PASSIVE checkpoint —— 那是把已经在库里的数据从暂存本搬回主库的正常收尾动作，SQLite
+// 自己做，做完数据一条不变。头部第 13 行原来的"只读"字样已按此修正。
+//
+// 打不开时的退路：只报文件层判读（体积 + 时间戳），并说清哪部分没测到 —— 绝不假装正常。
+let store = null
+try {
+  store = openChatStore(dbFile)
+} catch (e) {
+  console.log(`\n⚠️ 打不开聊天库，SQLite 部分跳过：${e.message}`)
+  console.log('   常见原因：主程序正在运行（库被占用），或所在磁盘/目录只读。')
+  console.log('   下面只能给出文件层判读 —— 它不足以判断"有没有数据悬在暂存本里"。')
+}
 
-console.log(`\n  journal_mode = ${journalMode}   页大小 ${pageSize}   主库 ${pageCount} 页`)
-console.log(`  消息 ${stats.messages} 条 / 对话 ${stats.conversations} 个 / 待处理 ${stats.pending} / 失败 ${stats.failed}`)
-console.log(`  暂存本 ${ck.log} 帧，其中已搬回主库 ${ck.checkpointed} 帧`)
+if (store) {
+  const q = (sql) => store.db.prepare(sql).get()
+  const pageSize = q('PRAGMA page_size').page_size
+  const pageCount = q('PRAGMA page_count').page_count
+  const journalMode = q('PRAGMA journal_mode').journal_mode
+  let ck = null
+  try {
+    ck = q('PRAGMA wal_checkpoint(PASSIVE)')
+  } catch (e) {
+    console.log(`\n⚠️ wal_checkpoint 失败（${e.message}）——暂存本帧数无法判定`)
+  }
+  const stats = store.stats()
+  store.close()
 
-// ── 3. 结论 ─────────────────────────────────────────────────────
-console.log('\n──── 判读 ────')
-const lagMin = dbSt && walSt ? Math.round((walSt.mtime - dbSt.mtime) / 60000) : 0
-console.log(`  主库比暂存本旧 ${lagMin} 分钟`)
+  console.log(`\n  journal_mode = ${journalMode}   页大小 ${pageSize}   主库 ${pageCount} 页`)
+  console.log(`  消息 ${stats.messages} 条 / 对话 ${stats.conversations} 个 / 待处理 ${stats.pending} / 失败 ${stats.failed}`)
+  if (ck) console.log(`  暂存本 ${ck.log} 帧，其中已搬回主库 ${ck.checkpointed} 帧`)
 
-if (ck.log === 0) {
-  console.log('  ✅ 暂存本为空：所有数据都在主库，此刻只拷 chat.db 是完整的')
-} else if (ck.checkpointed >= ck.log) {
-  console.log(`  ⚠️ 暂存本里 ${ck.log} 帧虽然都已搬回主库（数据不丢），但文件本身没清空。`)
-  console.log('     → 这是"搬完了没清扫"的中间状态。只拷 chat.db 目前安全，但下次写入就会变。')
-} else {
-  console.log(`  ❌ 有 ${ck.log - ck.checkpointed} 帧还没搬回主库 —— 此刻只拷 chat.db 会丢这部分数据！`)
-  console.log('     → 先跑 agent/scripts/backup-chat.mjs（会先做 checkpoint），或停掉主程序再拷。')
+  // ── 3. 结论 ─────────────────────────────────────────────────────
+  console.log('\n──── 判读 ────')
+  const lagMin = dbSt && walSt ? Math.round((walSt.mtime - dbSt.mtime) / 60000) : 0
+  console.log(`  主库比暂存本旧 ${lagMin} 分钟`)
+
+  if (ck) {
+    if (ck.log === 0) {
+      console.log('  ✅ 暂存本为空：所有数据都在主库，此刻只拷 chat.db 是完整的')
+    } else if (ck.checkpointed >= ck.log) {
+      console.log(`  ⚠️ 暂存本里 ${ck.log} 帧虽然都已搬回主库（数据不丢），但文件本身没清空。`)
+      console.log('     → 这是"搬完了没清扫"的中间状态。只拷 chat.db 目前安全，但下次写入就会变。')
+    } else {
+      console.log(`  ❌ 有 ${ck.log - ck.checkpointed} 帧还没搬回主库 —— 此刻只拷 chat.db 会丢这部分数据！`)
+      console.log('     → 先跑 agent/scripts/backup-chat.mjs（会先做 checkpoint），或停掉主程序再拷。')
+    }
+  }
 }
 
 if (shmSt) {

@@ -545,8 +545,20 @@ const server = http.createServer(async (req, res) => {
     const chatItems = []
     // 聊天消息来自聊天库（一个查询，替代"读两个 jsonl 再各自排序拼接"）：
     // id 序 = 到达顺序；回答带 reply_to，与提问天然相邻。
+    //
+    // ⚠️ 这个 catch 以前是空的 `catch {}`（2026-10-07 改）。后果实测过：
+    // 某次启动时 SQLite 没能正常建立 WAL 的 -shm（多进程共用索引），之后每次
+    // listMessages 都抛错、被这里无声吞掉 —— 侧栏于是**安静地一条对话都不显示**，
+    // 用户看到的是"我的聊天记录全没了"，而库里 957 条一条不少。前端只有一串
+    // annotation、没有任何报错线索，排查花了两小时。
+    // 所以：出错必须留痕。日志里这一行就是"侧栏空了"与"数据丢了"的分界线。
     let chatRows = []
-    try { chatRows = chatStore().listMessages({}) } catch {}
+    try {
+      chatRows = chatStore().listMessages({})
+    } catch (e) {
+      console.error(`[history] 读聊天库失败，本次不返回任何对话：${e.message}`)
+      console.error(`[history] 库=${CHAT_DB}` + (fs.existsSync(CHAT_DB + '-shm') ? '（-shm 存在：可能是 -shm/-wal 状态异常，先退出主程序再重启）' : ''))
+    }
     for (const m of chatRows) {
       // "排队中"的提问不回放（2026-02）：它是还没被回答的在途消息，侧栏发送时已经画过气泡，
       // 回放只会让它长出第二个；而且它会被"未回复提问恢复"当成等待回答的提问，
