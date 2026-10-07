@@ -74,7 +74,6 @@ elseif ($IsPortable) { $Node = Join-Path $InternalDir 'node.exe' }
 else { $Node = 'node' }
 
 $LogDir = Join-Path $PackageRoot 'logs'
-$PidFile = Join-Path $PackageRoot '.running.pid'
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
 # ── 日志写入 ────────────────────────────────────────────────────────
@@ -90,29 +89,35 @@ function Write-Log($name, $msg) {
 # ── 单实例保护 ──────────────────────────────────────────────────────
 # 没有这道检查时，用户连点两次「启动」会起两个托盘，而两个托盘各自管一套
 # 子进程：一个抢到 7239 端口，另一个的接收端起不来就会触发自愈反复重启，
-# 日志刷屏、行为难以解释。所以启动前先看有没有已经跑着的。
-# 两条检测取并集（只看 PID 文件不够：强杀后文件会残留成假阳性）。
-function Find-ExistingTray {
-  $found = @()
-  Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -EA SilentlyContinue |
-    Where-Object { $_.CommandLine -like '*tray.ps1*' } |
-    Where-Object { $_.ProcessId -ne $PID } |
-    ForEach-Object { $found += [int]$_.ProcessId }
-  if (Test-Path $PidFile) {
-    $old = 0
-    [void][int]::TryParse((Get-Content $PidFile -Raw -EA SilentlyContinue).Trim(), [ref]$old)
-    if ($old -gt 0 -and $old -ne $PID) {
-      if (Get-Process -Id $old -EA SilentlyContinue) { $found += $old }
-    }
-  }
-  return ($found | Sort-Object -Unique)
+# 日志刷屏、行为难以解释。
+#
+# 2026-10-07 换成**具名互斥体**（named mutex）。旧做法是"扫进程命令行 + 读
+# .running.pid，两条取并集"，三条都不成立：
+#   1. **不是原子的**：两个进程几乎同时启动时，双方都在对方登记之前查完 → 双双放行。
+#      单实例必须由内核的原子操作裁决，不能"先看看有没有人，再起"。
+#   2. **PID 文件不是锁**：进程被强杀后文件残留，等 Windows 把那个编号复用给别的
+#      进程，下次启动就会看到"这个 PID 活着"而**拒绝启动**。误拒比误放更糟：
+#      误放有端口冲突检测兜底；误拒只会让用户以为程序坏了（而且弹窗把原因指向端口）。
+#   3. **判据写死了 powershell.exe**：哪天改用 pwsh 启动，检测会静默失效 —— 不报错，
+#      只是再也挡不住第二个实例。
+# 互斥体由内核保证原子：同时创建只有一个进程拿到 createdNew=$true。进程无论怎么退出
+# （正常、强杀、崩溃），内核都会在最后一个句柄关闭时销毁它 —— 不留文件、没有残留、
+# 没有编号复用问题。命名空间用 Local\ 而不是 Global\：Global\ 需要
+# SeCreateGlobalPrivilege，普通用户没有（会直接抛权限错），而"同一会话里连点两次"
+# 正是要挡的场景。
+$mutexCreatedNew = $false
+try {
+  # 句柄一直持有到进程结束（故意不 ReleaseMutex：对象存在本身就是"已有实例在跑"）
+  $script:trayMutex = [System.Threading.Mutex]::new($false, 'Local\CoReadTray', [ref]$mutexCreatedNew)
+} catch {
+  # 宁可漏挡，也不要因为这道检查本身出错而起不来
+  Write-Log 'tray' ("单实例互斥体创建失败，跳过这道检查继续启动：" + $_.Exception.Message)
+  $mutexCreatedNew = $true
 }
-
-$existing = @(Find-ExistingTray)
-if ($existing.Count -gt 0) {
-  Write-Log 'tray' ("已有实例在运行（PID {0}），本次启动退出" -f ($existing -join ', '))
+if (-not $mutexCreatedNew) {
+  Write-Log 'tray' '已有实例在运行（具名互斥体 Local\CoReadTray 已存在），本次启动退出'
   [System.Windows.Forms.MessageBox]::Show(
-    ("CoRead 已经在运行了（进程号 " + ($existing -join ', ') + "）。" + [Environment]::NewLine + [Environment]::NewLine +
+    ("CoRead 已经在运行了。" + [Environment]::NewLine + [Environment]::NewLine +
      "请看屏幕右下角托盘里的图标。" + [Environment]::NewLine +
      "右键那个图标可以退出 CoRead，退出后再重新启动即可。"),
     'CoRead', 'OK', 'Information') | Out-Null
@@ -230,7 +235,6 @@ function Stop-All {
     Stop-Process -Id $p.ProcessId -Force -EA SilentlyContinue
   }
   Remove-Item $stopFile -Force -EA SilentlyContinue
-  Remove-Item $PidFile -Force -EA SilentlyContinue
 }
 
 function Get-Status {
@@ -265,8 +269,6 @@ if ($IsPortable) {
     exit 1
   }
 }
-
-Set-Content -Path $PidFile -Value $PID -Encoding ASCII
 
 if (Test-PortConflict) {
   # 端口被别人的程序占着（最常见：另一个 CoRead 实例还在跑 —— 便携包与开发目录

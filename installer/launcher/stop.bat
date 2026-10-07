@@ -51,7 +51,6 @@ for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":7239.*LISTENING"') d
 rem Kill the tray script only, never other PowerShell windows
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" -EA SilentlyContinue | Where-Object { $_.CommandLine -like '*tray.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }" >nul 2>&1
 
-del ".running.pid" 2>nul
 if exist "logs" echo   Done. Logs are in the logs folder.
 
 echo Done.
