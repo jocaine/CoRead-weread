@@ -70,15 +70,32 @@ console.log(`聊天库：${DB_FILE}`)
 console.log(`备份到：${OUT_DIR}\n`)
 
 // ── 备份前先看状态，并把结论告诉用户 ────────────────────────────────
-const src = openChatStore(DB_FILE, { readonly: true })
+// ⚠️ 这里必须**可写**打开（2026-10-08 实测踩坑；与 chat.db.diag-wal.mjs 是同一个坑，
+//    那边 2026-10-07 修过、这里漏了）：下面那句 `PRAGMA wal_checkpoint(PASSIVE)` 是
+//    **写操作** —— 它要把暂存本里的帧搬回主库。只读连接上跑它，SQLite 直接抛错
+//    （实测 `disk I/O error`，errstr=disk I/O error / 也可能报 attempt to write a
+//    readonly database），脚本会在**产出备份之前**就崩掉。
+//    后果是最坏的那种组合：暂存本非空（有数据悬着）时才崩，暂存本为空时才跑得通 ——
+//    也就是"没事时能备份、真有事时备份不了"，而用户看到旧备份还在，容易以为已经备过。
+//    打开方式与正式备份那步（route A 的 openChatStore(DB_FILE)）保持一致。
+const src = openChatStore(DB_FILE)
 const before = src.stats()
-const ckBefore = src.db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get()
+// 预检只是为了打印帧数，不该有权力让整个备份失败：读不到就直说，备份照做
+// （route A 走 SQLite 官方备份接口，本身就能带上暂存本里的数据）。
+let ckBefore = null
+try {
+  ckBefore = src.db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get()
+} catch (e) {
+  console.log(`  ⚠️ 暂存本状态读不到（${e.message}）——继续备份，不影响备份内容`)
+}
 src.close()
 
 console.log(`  消息 ${before.messages} 条 / 对话 ${before.conversations} 个`)
-console.log(`  暂存本 ${ckBefore.log} 帧，其中已搬回主库 ${ckBefore.checkpointed} 帧`)
-if (ckBefore.log > ckBefore.checkpointed) {
-  console.log(`  ⚠️ 有 ${ckBefore.log - ckBefore.checkpointed} 帧还只在暂存本里 —— 幸好本脚本会带上它们`)
+if (ckBefore) {
+  console.log(`  暂存本 ${ckBefore.log} 帧，其中已搬回主库 ${ckBefore.checkpointed} 帧`)
+  if (ckBefore.log > ckBefore.checkpointed) {
+    console.log(`  ⚠️ 有 ${ckBefore.log - ckBefore.checkpointed} 帧还只在暂存本里 —— 幸好本脚本会带上它们`)
+  }
 }
 
 // ── 选路线 ────────────────────────────────────────────────────────────

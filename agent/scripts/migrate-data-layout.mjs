@@ -49,7 +49,16 @@ const APPLY = process.argv.includes('--apply')
 const KEEP_SOURCE = process.argv.includes('--keep-source')
 const CLEAN_LEGACY = process.argv.includes('--clean-legacy')
 
-/** 迁移前先给这些关键文件留一份 .pre-migrate 备份（basename 匹配）——丢了就找不回来的那些 */
+/**
+ * 迁移前先给这些关键文件留一份 .pre-migrate 备份 —— 丢了就找不回来的那些。
+ * 名字按**新布局的目标名**写；判定时源名与目标名都认，因为老布局里这个文件叫
+ * `topic_stack.json`（下划线），搬过去才叫 `topic-stack.json`（连字符）。
+ *
+ * ⚠️ 2026-10-08 修过这里：原来只拿**源 basename** 去比上面这份连字符名单，于是讨论栈
+ * 永远匹配不上 —— 而迁移默认是**删源**，结果它在旧位置被删掉、新位置又没留第二份备份。
+ * 讽刺的是文件头第 1 条与用户手册（instructions-zh）都写着"关键文件（聊天库、图谱、
+ * 讨论栈）在删源之前再补一份 .pre-migrate 备份"：承诺了三份，实际只给两份。
+ */
 const BACKUP_BEFORE_DELETE = new Set(['chat.db', 'knowledge-graph.json', 'topic-stack.json'])
 
 function fmt(n) {
@@ -218,7 +227,7 @@ function migrate() {
         const s = fs.statSync(p.from).size
         const d = fs.statSync(p.to).size
         if (s !== d) throw new Error(`校验不一致：源 ${s} 字节，目标 ${d} 字节`)
-        if (BACKUP_BEFORE_DELETE.has(path.basename(p.from))) {
+        if (BACKUP_BEFORE_DELETE.has(path.basename(p.from)) || BACKUP_BEFORE_DELETE.has(path.basename(p.to))) {
           fs.copyFileSync(p.to, p.to + '.pre-migrate')
         }
         console.log(`  ✓ ${p.note}（${fmt(d)}）`)

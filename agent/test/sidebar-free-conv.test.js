@@ -459,7 +459,7 @@ test('本机程序没在运行时：灯变灰，提示文字直说"未运行"', 
   const { getById } = loadSidebar({ convList: [], pingOk: false })
   await flush()
   assert.equal(getById('dot').style.background, '#ddd', '连接灯变灰')
-  assert.equal(getById('dot').title, '本机程序未运行', '提示文字直接说明是哪种断连')
+  assert.equal(getById('dot').title, 'CoRead 本机服务未运行', '提示文字直接说明是哪种断连')
   assert.doesNotMatch(getById('dot').title, /重连/, '不能把"程序没运行"说成"正在重连"')
 })
 
