@@ -1,4 +1,25 @@
+// ── 托盘要用的一件事：把扩展 ID 报给本机服务（POST /hello）────────────────────
+// 侧栏是经典脚本（sidebar.html 用 <script src> 引入），不能 import translate-protocol.js，
+// 所以这里按同样的报文自己发一份 —— 字段名（id/version）与那个模块里的
+// reportExtensionToHost 必须一致，改一处就要改另一处。
+//
+// 为什么侧栏也要报：service worker 可能因空闲被浏览器回收，而"浏览器启动"与"服务端启动"
+// 的先后顺序也不固定（先开浏览器、后开托盘是常见顺序）。侧栏是用户最常打开的地方，
+// 让它每次打开都补报一次，托盘就不必等 SW 被唤醒。
+//
+// 静默失败：接收端没起时这不是错误，吞掉即可，绝不能影响侧栏加载。
+function reportExtensionToHost() {
+  try {
+    fetch(RECEIVER + '/hello', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: chrome.runtime.id, version: chrome.runtime.getManifest().version }),
+    }).catch(() => {})
+  } catch (e) {}
+}
+
 const RECEIVER = 'http://127.0.0.1:7239'
+reportExtensionToHost()   // 必须在这行之后：函数体里用到 RECEIVER
 // 自由模式（2026-09 定调；2026-11 扩为多对话）：侧栏里的独立上下文，引用解析照常
 // 命中正式会意图，对话内容默认不留痕（不进长期记忆、不进正式图）。
 // 多对话（2026-11 用户定调）：每个自由对话 = 一个独立 bookKey（__coread_free_<8hex>__；

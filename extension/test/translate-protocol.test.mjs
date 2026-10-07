@@ -25,6 +25,8 @@ import {
   normalizeApiBase,
   originPattern,
   parseRelocateReply,
+  RECEIVER_URL,
+  reportExtensionToHost,
   parseTranslation,
   relocateSnippet,
   stripCodeFence,
@@ -278,4 +280,70 @@ test('buildRelocatePrompt 用的是短片段而不是整段原文', () => {
   assert.ok(!p.includes('word '.repeat(60).trim()))
   assert.ok(p.includes(relocateSnippet('word '.repeat(60))))
   assert.match(p, /开头一部分/)
+})
+// ── 向本机服务报到（托盘「打开 CoRead 阅读器」依赖它）─────────────────────────
+// 这几条钉的是"报到这件事绝不能反过来影响浏览器"：失败一律吞掉、返回 false，
+// 只有真正发出请求那一步才允许碰 fetch。chrome.* 与 fetch 在这里换成替身。
+function withStubs({ chrome, fetch }, fn) {
+  const savedChrome = globalThis.chrome
+  const savedFetch = globalThis.fetch
+  if (chrome === undefined) delete globalThis.chrome; else globalThis.chrome = chrome
+  if (fetch === undefined) delete globalThis.fetch; else globalThis.fetch = fetch
+  try { return fn() } finally {
+    if (savedChrome === undefined) delete globalThis.chrome; else globalThis.chrome = savedChrome
+    if (savedFetch === undefined) delete globalThis.fetch; else globalThis.fetch = savedFetch
+  }
+}
+
+const fakeChrome = {
+  runtime: {
+    id: 'abcdefghijklmnopabcdefghijklmnop',
+    getManifest: () => ({ version: '9.9.9' }),
+  },
+}
+
+test('报到：POST /hello，报文带 id 与 version', async () => {
+  const calls = []
+  const ok = await withStubs({
+    chrome: fakeChrome,
+    fetch: (url, opts) => { calls.push({ url, opts }); return Promise.resolve({ ok: true }) },
+  }, () => reportExtensionToHost())
+  assert.equal(ok, true)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url, `${RECEIVER_URL}/hello`)
+  assert.equal(calls[0].opts.method, 'POST')
+  assert.deepEqual(JSON.parse(calls[0].opts.body), {
+    id: 'abcdefghijklmnopabcdefghijklmnop', version: '9.9.9',
+  })
+})
+
+test('报到：本机服务没起（fetch 抛错）时不抛出，只返回 false', async () => {
+  const ok = await withStubs({
+    chrome: fakeChrome,
+    fetch: () => { throw new TypeError('Failed to fetch') },
+  }, () => reportExtensionToHost())
+  assert.equal(ok, false)
+})
+
+test('报到：HTTP 非 2xx 时返回 false', async () => {
+  const ok = await withStubs({
+    chrome: fakeChrome,
+    fetch: () => Promise.resolve({ ok: false, status: 403 }),
+  }, () => reportExtensionToHost())
+  assert.equal(ok, false)
+})
+
+test('报到：拿不到 chrome.runtime.id 时直接返回 false，且不发请求', async () => {
+  let called = false
+  const noId = await withStubs({
+    chrome: { runtime: {} },
+    fetch: () => { called = true; return Promise.resolve({ ok: true }) },
+  }, () => reportExtensionToHost())
+  assert.equal(noId, false)
+  assert.equal(called, false, '没有 ID 就不该发请求')
+})
+
+test('报到：chrome 整个不存在（在 node 里跑）也不抛', async () => {
+  const ok = await withStubs({ chrome: undefined, fetch: undefined }, () => reportExtensionToHost())
+  assert.equal(ok, false)
 })

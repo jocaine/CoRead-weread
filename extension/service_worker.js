@@ -9,6 +9,7 @@
  */
 
 import { installTranslateBackground } from './translate-background.js'
+import { reportExtensionToHost } from './translate-protocol.js'
 
 const RECEIVER = 'http://127.0.0.1:7239'
 

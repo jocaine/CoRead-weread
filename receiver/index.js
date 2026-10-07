@@ -32,6 +32,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 import {
   CHAT_DB, STREAM_FILE, AGENT_STATE_FILE, TOPIC_STACK_FILE, TOOLBOX_DIR, TOOL_HISTORY_FILE,
   BOOKS_DIR, ANNOTATIONS_FILE, SESSIONS_DIR, DEBUG_LOG, layoutSummary, ensureDirs,
+  sessionStopFile, EXTENSION_ID_FILE, isExtensionId,
 } from '../agent/lib/paths.js'
 
 const PORT = parseInt(process.env.COREAD_PORT || '7239')
@@ -919,7 +920,46 @@ const server = http.createServer(async (req, res) => {
   const url = req.url
 
   try {
-    if (url === '/api-config') {
+    if (url === '/hello') {
+      // 插件报到（2026-10）：把**扩展 ID** 落到 data\runtime\extension-id。
+      //
+      // ⚠️ 2026-10-07 修正定位：托盘打开阅读器的**主路是自己算**这个 ID（扩展目录绝对
+      // 路径的 SHA256 前 16 字节，算法固定可复现），不读这个文件。所以这个接口是**回退**：
+      //   ① 浏览器哪天改了 ID 派生算法 → 浏览器亲口报的这个值仍然对；
+      //   ② 出问题时，这份文件是"浏览器当时到底用的哪个 ID"的现场记录。
+      // 曾经把它当主路，结果很脆：插件只在浏览器启动/重载/装上时报一次，文件一旦缺失
+      // 而浏览器又一直开着，就再也没有第二次机会补上（实测把这个功能整断了）。
+      //
+      // 来源限制用 isExtensionOnly（比 originAllowed 更严）：它写的是托盘可能拿去用的
+      // 编号，不能让网页脚本改 —— 只认回环地址 + 无 Origin/显式扩展来源。
+      if (!isExtensionOnly(origin, req)) {
+        res.writeHead(403); res.end(JSON.stringify({ ok: false, error: 'forbidden' })); return
+      }
+      const id = String((data && data.id) || '').trim()
+      if (!isExtensionId(id)) {
+        // 形状不对一律拒收，绝不把没校验过的字符串落到盘上：托盘会拿它拼 URL
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: 'bad extension id' }))
+        return
+      }
+      try {
+        writeFileAtomic(EXTENSION_ID_FILE, id + '\n')
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: '写入失败：' + e.message }))
+        return
+      }
+      // 只在 ID 变了时打日志：插件每次开浏览器都会报到，逐次刷屏会把日志淹掉，
+      // 而"ID 变了"正是最该留痕的事（换了浏览器 / 插件被重新加载 / 文件夹挪了位置）。
+      if (id !== _helloLastId) {
+        console.log(`[hello] 插件扩展 ID ${_helloLastId ? '已更新' : '已登记'}：${id}`)
+        _helloLastId = id
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, id, version: String((data && data.version) || '') }))
+      return
+
+    } else if (url === '/api-config') {
       // 保存模型 API 配置（侧栏「⋯ → 模型 API 配置」保存按钮）。写入 agent/api-config.json，
       // agent 每次调用 LLM 前重读该文件 —— 保存后立即生效，不需要重启 agent。
       // 与 GET 同样只认扩展页：不能让页面脚本改写用户的密钥/把请求导向别处。

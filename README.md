@@ -84,8 +84,9 @@ Chrome 扩展（extension/）—— 界面也在这里：侧栏、翻译浮层�
 2. 解压到任意普通文件夹 —— **不要放 `C:\Program Files`**，那里程序写不进自己的数据
 3. 双击 `internal\Start-CoRead.vbs`，右下角出现托盘图标就是启动了
 4. 装浏览器插件：**右键托盘图标 →「装浏览器插件」**，照它弹出的三步做
-5. 填模型 API Key：打开[微信读书网页版](https://weread.qq.com)，右侧会出现 CoRead 侧栏，
-   点右上角「⋯」→「模型 API 配置」，填入 API 地址、Key、模型名
+5. 填模型 API Key：**双击托盘图标**会打开 CoRead 自己的阅读器（能在里面读 PDF、划词翻译），
+   点侧栏右上角「⋯」→「模型 API 配置」，填入 API 地址、Key、模型名。
+   想在微信读书里共读也行：右键托盘图标 →「打开微信读书」，右侧是同一个侧栏，配置共用。
 
 包内的三份说明：`README-FIRST.txt`（一分钟上手）、`data\README.txt`（数据在哪、哪一格能删、
 怎么备份）、`internal\instructions-zh.txt`（出问题时的排查手册）。
@@ -153,6 +154,9 @@ COREAD_MODEL=qwen2.5:14b
 2. 开启「开发者模式」
 3. 点「加载已解压的扩展程序」，选择 `extension/` 目录
 4. 打开 [weread.qq.com](https://weread.qq.com) 进入任意书籍的阅读页
+
+想在 CoRead 自己的阅读器里读 PDF：双击托盘图标，或从侧栏工具箱的「打开阅读器」进入
+（阅读器是扩展自己的页面，入口在 `extension/reader.html`）。
 
 ### 测试
 

@@ -314,8 +314,354 @@ function Get-TrayIcon {
   } catch {}
   return [System.Drawing.SystemIcons]::Application
 }
+# ── CoRead 自己的阅读器（2026-10：托盘里也要能直接进）──────────────────
+# 阅读器是**浏览器插件自己的页面**，地址形如 chrome-extension://<扩展ID>/reader.html。
+#
+# ── 那个 ID 从哪来 ──────────────────────────────────────────────────────
+# 它是扩展目录**绝对路径**的 SHA256 前 16 字节（十六进制再把 0-9a-f 映射成 a-p）。
+# 算法固定、可复现，本机自己就算得出来 —— 不需要问任何人。实测对账过两次：
+#   C:\Users\lengdrug\CoRead-weread\extension → bjoeiphhecggpckaiekpigobpffdgjmo（与 Chrome 记的一致）
+#   E:\coRead\extension                       → ocfjjjjhhiikpabdadcppobakffidgfb（与 Edge 记的一致）
+# 所以：**换个目录装，ID 就变**。这意味着拿"某个固定文件里的 ID"当唯一依据是错的
+# （第一版就这么设计，结果那份文件一旦缺失、浏览器又一直开着，就再也没机会补上，
+# 功能整个断掉）。现在一律**按各自路径现算**，算不出来才回退读 data\runtime\extension-id。
+function Get-ExtensionIdFromPath([string]$Dir) {
+  if (-not $Dir -or -not (Test-Path $Dir)) { return '' }
+  try {
+    # ⚠️ Chrome 是对路径的 **UTF-16LE** 字节做 SHA256（.NET 的 Unicode 编码就是这个），
+    #    不是 UTF-8。用错编码算出来的是一串同样像模像样的 32 位 ID，但打不开任何东西 ——
+    #    这个坑没有报错、只有"页面不存在"，所以别改这一行。
+    $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+             [Text.Encoding]::Unicode.GetBytes($Dir))
+    $hex = -join ($sha[0..15] | ForEach-Object { $_.ToString('x2') })
+    $alphabet = 'abcdefghijklmnop'
+    $id = -join ($hex.ToCharArray() | ForEach-Object { $alphabet[[Convert]::ToInt32($_, 16)] })
+    if ($id -cnotmatch '^[a-p]{32}$') { return '' }   # 形状自检（大小写敏感）
+    return $id
+  } catch { return '' }
+}
+
+# 按 exe 文件名找浏览器：先查 App Paths（Chrome 与 Edge 安装时都会登记，值是完整路径，
+# **装到 D 盘也照样准确**），再扫卸载项里登记的安装目录，最后试常见安装路径。
+function Find-BrowserByExeName([string]$exeName) {
+  foreach ($root in 'HKCU:', 'HKLM:') {
+    $k = "$root\Software\Microsoft\Windows\CurrentVersion\App Paths\$exeName"
+    try {
+      if (Test-Path $k) {
+        $v = (Get-ItemProperty $k -Name '(default)' -EA SilentlyContinue).'(default)'
+        if ($v -and (Test-Path $v)) { return $v }
+      }
+    } catch {}
+  }
+  try {
+    $roots = @(
+      'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+      'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+      'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($item in (Get-ItemProperty $roots -EA SilentlyContinue)) {
+      if (-not $item.InstallLocation) { continue }
+      $hit = Get-ChildItem -LiteralPath $item.InstallLocation -Filter $exeName -Recurse -File -Depth 2 -EA SilentlyContinue |
+             Select-Object -First 1
+      if ($hit) { return $hit.FullName }
+    }
+  } catch {}
+  foreach ($c in @(
+    (Join-Path $env:ProgramFiles "Google\Chrome\Application\$exeName"),
+    (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\$exeName"),
+    (Join-Path $env:LOCALAPPDATA "Google\Chrome\Application\$exeName"),
+    (Join-Path ${env:ProgramFiles(x86)} "Microsoft\Edge\Application\$exeName"),
+    (Join-Path $env:ProgramFiles "Microsoft\Edge\Application\$exeName")
+  )) { if ($c -and (Test-Path $c)) { return $c } }
+  return ''
+}
+
+
+# 列出某个浏览器 profile 里**所有未打包扩展**的 (ID, 安装路径)。
+#
+# 为什么要有这个"笨"函数（2026-10-07 用户提出"我 Edge 和 Chrome 都装了"）：
+# 早先的做法是"拿本包算出的 ID 去这个 profile 里找"——那只认**从本包目录加载**的那一份。
+# 实测本机：Chrome 加载的是本仓库那份，Edge 加载的是 E:\coRead 那份便携包，
+# 两者的 ID 根本不是同一个 —— 于是 Edge 被彻底漏掉，用户想用 Edge 都用不了。
+# 现在改成"把这个浏览器装了哪些本地扩展**全列出来**，再按路径判断谁是我们"，
+# 这样无论 CoRead 是从哪个目录加载的、装了几份，都能认出来。
+#
+# ⚠️ 下面这几条是实测踩出来的，改之前先读：
+#   · 文件是**单行巨型 JSON**（实测 245 KB 一行），所以一律全文匹配，不能按行找；
+#   · `"path"` 用非贪婪匹配会撞上条目内部**嵌套的** path 字段（preferences /
+#     content_settings 里就有），必须先把每个 `"<ID>":{…}` 的花括号配对圈出来再取。
+function Get-InstalledUnpackedExtensions([string]$ProfDir) {
+  $pref = Join-Path $ProfDir 'Secure Preferences'
+  if (-not (Test-Path $pref)) { return @() }
+  $raw = ''
+  try {
+    $fs = [IO.File]::Open($pref, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try { $sr = New-Object IO.StreamReader($fs); $raw = $sr.ReadToEnd() } finally { $fs.Dispose() }
+  } catch { return @() }
+  if (-not $raw) { return @() }
+  $out = @()
+  foreach ($m in [regex]::Matches($raw, '"([a-p]{32})"\s*:\s*\{')) {
+    $id = $m.Groups[1].Value
+    $brace = $raw.IndexOf('{', $m.Index)
+    if ($brace -lt 0) { continue }
+    $depth = 0; $end = -1
+    for ($k = $brace; $k -lt $raw.Length; $k++) {
+      $c = $raw[$k]
+      if ($c -eq '{') { $depth++ }
+      elseif ($c -eq '}') { $depth--; if ($depth -eq 0) { $end = $k; break } }
+    }
+    if ($end -le $brace) { continue }
+    $body = $raw.Substring($brace, $end - $brace + 1)
+    # 只认"未打包扩展"（location:4）—— 商店装的扩展没有可读的 path，也不是我们这份
+    if (-not $body.Contains('"location":4')) { continue }
+    $pm = [regex]::Match($body, '"path"\s*:\s*"((?:[^"\\]|\\.)*)"')
+    if (-not $pm.Success) { continue }
+    $p = ($pm.Groups[1].Value -replace '\\\\', '\')
+    if ($p) { $out += @{ Id = $id; Path = $p } }
+  }
+  return $out
+}
+
+# 找出这台机器上"哪些浏览器装了 CoRead"。返回数组，每项：
+#   @{ Key; Name; Exe; ExtId; Profile; Updated; Path }
+#
+# 判定依据是**扩展的安装路径**，不是"某个固定 ID"：
+#   · 路径里带 CoRead（`\coread\`、`\CoRead-0.3.1-portable\` …）→ 就是我；
+#   · 或路径等于我们自己的两个可能安装目录（本包根、本包的 internal\）。
+# 为什么必须这样（2026-10-07 实测踩到）：同一份插件可以从**不同目录**加载到不同浏览器，
+# 而 ID 是按目录路径算的 —— 本机 Chrome 装的是本仓库那份（bjoeiph…），
+# Edge 装的是 E:\coRead 那份便携包（ocfjjj…），**两个 ID 根本不一样**。
+# 早先拿"本包算出的 ID"去找，结果 Edge 被彻底漏掉（用户想用 Edge 都用不了）。
+function Get-ReaderBrowsers {
+  $map = @(
+    @{ key = 'chrome';   name = 'Chrome';   local = 'Google\Chrome\User Data';               exe = 'chrome.exe' }
+    @{ key = 'edge';     name = 'Edge';     local = 'Microsoft\Edge\User Data';              exe = 'msedge.exe' }
+    @{ key = 'brave';    name = 'Brave';    local = 'BraveSoftware\Brave-Browser\User Data'; exe = 'brave.exe' }
+    @{ key = 'vivaldi';  name = 'Vivaldi';  local = 'Vivaldi\User Data';                     exe = 'vivaldi.exe' }
+    @{ key = 'chromium'; name = 'Chromium'; local = 'Chromium\User Data';                    exe = 'chrome.exe' }
+    @{ key = 'liebao';   name = '猎豹';     local = 'liebao\User Data';                      exe = 'liebao.exe' }
+    @{ key = '360';      name = '360极速';  local = '360Chrome\Chrome\User Data';            exe = '360chrome.exe' }
+    @{ key = 'qq';       name = 'QQ浏览器'; local = 'Tencent\QQBrowser\User Data';           exe = 'QQBrowser.exe' }
+    @{ key = 'sogou';    name = '搜狗';     local = 'SogouExplorer\User Data';               exe = 'SogouExplorer.exe' }
+  )
+  # 我们自己可能的安装目录（便携包是 <包根>\extension，仓库是同一层）
+  $ours = @()
+  foreach ($d in @((Join-Path $PackageRoot 'extension'), (Join-Path $PackageRoot 'internal\extension'))) {
+    if (Test-Path $d) { $ours += $d.TrimEnd('\').ToLower() }
+  }
+  $out = @()
+  foreach ($b in $map) {
+    $ud = Join-Path $env:LOCALAPPDATA $b.local
+    if (-not (Test-Path $ud)) { continue }
+    $exe = Find-BrowserByExeName $b.exe
+    if (-not $exe) { continue }                    # exe 找不到就没法打开，别浪费时间翻清单
+    $profs = @()
+    if (Test-Path (Join-Path $ud 'Default')) { $profs += (Join-Path $ud 'Default') }
+    $profs += @(Get-ChildItem (Join-Path $ud 'Profile *') -Directory -EA SilentlyContinue |
+                 Select-Object -ExpandProperty FullName)
+    foreach ($pd in $profs) {
+      foreach ($ext in (Get-InstalledUnpackedExtensions $pd)) {
+        $p = $ext.Path.TrimEnd('\')
+        $pl = $p.ToLower()
+        $isOurs = ($ours -contains $pl) -or $pl.Contains('\coread') -or $pl.Contains('\co-read')
+        if (-not $isOurs) { continue }
+        $updated = ''
+        try { $updated = (Get-Item $p -EA SilentlyContinue).LastWriteTime.ToString('yyyy-MM-dd') } catch {}
+        $out += @{
+          Key = $b.key; Name = $b.name; Exe = $exe; ExtId = $ext.Id
+          Profile = [IO.Path]::GetFileName($pd); Updated = $updated; Path = $p
+        }
+        break                                       # 一个 profile 里认一个就够
+      }
+    }
+  }
+  return $out
+}
+
+# ── 用哪个浏览器打开：记在 data\config\reader-browser.txt ────────────────
+# 为什么要有这个设置（2026-10-07 用户提出"两个都装了怎么办"）：
+#   Chrome 与 Edge 都装了插件时没有唯一正确答案 —— 只能用户说了算。
+#   而**多份安装的阅读进度是各存各的**（译文与读到第几页存在那个浏览器的
+#   chrome.storage.local 里），所以这个选择有实际后果，不能随机挑。
+# 放 data\config\ 的理由：那正是"设置"这一格，与模型 API 配置同级；
+# 而且文件是纯文本带注释，用户想手改也知道写什么。
+function Get-ReaderBrowserPref {
+  $f = Join-Path $PackageRoot 'data\config\reader-browser.txt'
+  if (-not (Test-Path $f)) { return '' }
+  $lines = @()
+  try { $lines = [IO.File]::ReadAllLines($f) } catch { return '' }
+  foreach ($ln in $lines) {
+    $t = $ln.Trim()
+    if (-not $t -or $t.StartsWith('#')) { continue }
+    return $t.Trim('"').Trim("'").ToLower()
+  }
+  return ''
+}
+function Set-ReaderBrowserPref([string]$Key) {
+  $f = Join-Path $PackageRoot 'data\config\reader-browser.txt'
+  try {
+    $dir = Split-Path -Parent $f
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $txt = @(
+      '# CoRead 用哪个浏览器打开自己的阅读器（写出名字即可，程序只读非注释行）',
+      '# 可选值：chrome / edge / brave / vivaldi / chromium / liebao / 360 / qq / sogou',
+      '# 删掉这个文件（或删掉下面那行）→ 恢复"每次列出来让你选"（只有一个可用时自动用它）。',
+      '# 为什么需要它：Chrome 与 Edge 都装了插件时没有唯一答案；而且两边的阅读进度',
+      '# （译文、读到第几页）是各存各的，所以选哪个是有后果的。',
+      $Key
+    )
+    [IO.File]::WriteAllLines($f, $txt, (New-Object System.Text.UTF8Encoding($false)))
+    return $true
+  } catch {
+    Write-Log 'tray' "写 reader-browser.txt 失败: $($_.Exception.Message)"
+    return $false
+  }
+}
+
+# 当前该用哪个浏览器（结果放 $script:readerPick，同时把 $script:browserSource 写好）
+function Resolve-ReaderBrowser {
+  $list = Get-ReaderBrowsers
+  $script:readerBrowsers = $list
+  $script:readerPick = $null
+  if (-not $list -or $list.Count -eq 0) {
+    $script:browserSource = '清单里没有任何浏览器装着本插件'
+    return $null
+  }
+  # ① 用户指定过的
+  $pref = Get-ReaderBrowserPref
+  if ($pref) {
+    $hit = $list | Where-Object { $_.Key -eq $pref -or $_.Name.ToLower() -eq $pref } | Select-Object -First 1
+    if ($hit) { $script:browserSource = "你指定过用 $($hit.Name)"; $script:readerPick = $hit; return $hit }
+    Write-Log 'tray' "设置里写的 $pref 没装着本插件，改回让你选"
+  }
+  # ② 只有一个可用 → 直接用它（大多数用户是这种，不该被打扰）
+  if ($list.Count -eq 1) {
+    $script:browserSource = "只有 $($list[0].Name) 装着本插件"
+    $script:readerPick = $list[0]
+    return $list[0]
+  }
+  # ③ 多个可用 → 让用户选，并把选择记下来
+  $msg = "CoRead 插件在下面这些浏览器里都装着，用哪一个打开阅读器？"
+  $msg += [Environment]::NewLine + "选定后会记住，下次直接用它（想换：右键托盘图标 →「阅读器用哪个浏览器」）。"
+  $msg += [Environment]::NewLine
+  foreach ($it in $list) {
+    $msg += [Environment]::NewLine + "  · $($it.Name)（$($it.Profile)）"
+    if ($it.Updated) { $msg += "  插件更新于 $($it.Updated)" }
+  }
+  $msg += [Environment]::NewLine + [Environment]::NewLine + "注意：两边的阅读进度（译文、读到第几页）各存各的，选哪个会影响你看到的进度。"
+  $msg += [Environment]::NewLine + "按「是」用第一个，按「否」用最后一个。"
+  $r = [System.Windows.Forms.MessageBox]::Show($msg, 'CoRead 阅读器：用哪个浏览器？', 'YesNo', 'Question')
+  if ($r -eq 'Yes') { $script:readerPick = $list[0] } else { $script:readerPick = $list[$list.Count - 1] }
+  $script:browserSource = "你刚选的（共 $($list.Count) 个可用）"
+  Set-ReaderBrowserPref $script:readerPick.Key | Out-Null
+  return $script:readerPick
+}
+
+# 阅读器打不开时的说明。
+# 为什么不悄悄改成打开微信读书：用户点的就是"我自己的阅读器"，目标被偷偷换掉，
+# 行为不可预测 —— 而真正该说的解决办法本来就得说出来。
+function Show-ReaderHint([string]$Why) {
+  $msg = @(
+    '托盘没能打开 CoRead 阅读器。可能的原因：'
+    ''
+    '· 插件还没在任何浏览器里加载过 → 在浏览器工具栏点一下 CoRead 图标（拼图块形状），'
+    '  或者打开一次微信读书网页版；'
+    '· extension 目录被挪了位置或改了名 → 插件编号是按目录路径算的，路径变了编号就变，'
+    '  浏览器里那份要重新「加载已解压的扩展程序」选一次（托盘会重新认出来）。'
+  ) -join [Environment]::NewLine
+  if ($Why) { $msg += ([Environment]::NewLine + [Environment]::NewLine + $Why) }
+  [System.Windows.Forms.MessageBox]::Show($msg, 'CoRead 阅读器', 'OK', 'Information') | Out-Null
+}
+
+# 打开阅读器：**交给浏览器 exe**（不走协议关联，理由见下面那一段注释），地址按该浏览器的 ID 现拼。
+function Open-Reader {
+  $pick = Resolve-ReaderBrowser
+  if (-not $pick) {
+    Write-Log 'tray' "打不开 CoRead 阅读器：没有任何浏览器装着本插件（$($script:browserSource)）"
+    Show-ReaderHint ''
+    return
+  }
+  $url = "chrome-extension://$($pick.ExtId)/reader.html"
+  try {
+    Start-Process -FilePath $pick.Exe -ArgumentList @($url)
+    Write-Log 'tray' "已打开 CoRead 阅读器（$($pick.Name) / $($pick.Exe)；选择依据：$($script:browserSource)）"
+  } catch {
+    Write-Log 'tray' "打开 CoRead 阅读器失败: $($_.Exception.Message)"
+    Show-ReaderHint ("系统没能用这个浏览器打开地址：" + $pick.Exe)
+  }
+}
+
+# ── 找浏览器：不要交给 Windows 去猜（2026-10-07 实测踩到）────────────────
+# 踩的坑：早先直接 Start-Process 'chrome-extension://…'。但那要求 Windows 注册表里
+# 有 chrome-extension 这个协议的**关联程序**，而实测本机：
+#     HKCU\...\UrlAssociations\chrome-extension\UserChoice  → 不存在
+#     HKLM/HKCU\SOFTWARE\Classes\chrome-extension*          → 一个都没有
+# 也就是说 Windows 根本不认识这个协议。于是它按"找能打开它的应用"处理，
+# **弹出「你要如何打开?」并把人送去微软商店** —— 用户看到的就是这个。
+# 而且它不报错（Start-Process 不抛异常），所以当时的 catch 兜底永远不会触发。
+# 正解就是上面那样：自己定位浏览器 exe，把地址当命令行参数传给它。
+#
+# 另一个坑：**"默认浏览器"不等于"装着插件的浏览器"**。实测本机默认浏览器是猎豹
+# （D:\liebao\liebao.exe），而插件装在 Chrome 与 Edge 里 —— 按默认浏览器打开，
+# 只会得到一个"找不到扩展程序"的错误页。所以挑浏览器一律以"谁装了插件"为准
+# （Get-ReaderBrowsers 翻的就是各浏览器自己的插件清单），默认浏览器从来不参与。
+
+# 状态变量：开机先扫一遍，供右键菜单里的「阅读器用哪个浏览器」用（点那些菜单项会重扫）
+$script:readerBrowsers = @()
+$script:readerPick = $null
+$script:browserSource = ''
+
+
+# 扫描一次并刷新右键菜单里「阅读器用哪个浏览器」那一栏。
+# 为什么每次点菜单都重扫、而不是启动时扫一次：用户完全可能装着托盘的时候去装插件、
+# 或把某份扩展删掉。重扫一次的成本是读几个几百 KB 的文件（实测整轮约 400 ms），
+# 只在打开菜单/点这一栏时发生，不值得为它缓存出"菜单状态与事实不符"的问题。
+function Update-ReaderBrowserMenu {
+  $list = Get-ReaderBrowsers
+  $script:readerBrowsers = $list
+  $pref = Get-ReaderBrowserPref
+  # 子菜单的子项挂在 **DropDownItems** 上 —— ToolStripMenuItem.Items 是 null（实测），
+  # 顶层菜单（ContextMenuStrip）才用 .Items。写错的表现是点开这一项直接报 null 异常。
+  $script:readerMenu.DropDownItems.Clear()
+  if (-not $list -or $list.Count -eq 0) {
+    $none = New-Object System.Windows.Forms.ToolStripMenuItem
+    $none.Text = '（没找到装着 CoRead 插件的浏览器）'
+    $none.Enabled = $false
+    $script:readerMenu.DropDownItems.Add($none) | Out-Null
+    return
+  }
+  $pickKey = ''
+  if ($pref) {
+    $hit = $list | Where-Object { $_.Key -eq $pref -or $_.Name.ToLower() -eq $pref } | Select-Object -First 1
+    if ($hit) { $pickKey = $hit.Key }
+  }
+  foreach ($it in $list) {
+    $mi = New-Object System.Windows.Forms.ToolStripMenuItem
+    # 在用的那个打勾。勾是"当前设置"，不是"默认值"—— 只有一个可用时我们自动用它，也算在用。
+    $mi.Text = $(if ($it.Key -eq $pickKey) { "✔ $($it.Name)" } else { "   $($it.Name)" })
+    $mi.ToolTipText = "$($it.ExtId)`r`n来自：$($it.Path)"
+    # 闭包捕获：$it 是循环变量，事件触发时循环早已结束，不 GetNewClosure 会全部指向最后一个。
+    # （这是 PowerShell 的经典坑：不写它，"选 Edge"实际会把偏好写成最后那项。）
+    $mi.add_Click({ Set-ReaderBrowserPref $it.Key | Out-Null; Update-ReaderBrowserMenu }.GetNewClosure())
+    $script:readerMenu.DropDownItems.Add($mi) | Out-Null
+  }
+  $script:readerMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+  $auto = New-Object System.Windows.Forms.ToolStripMenuItem
+  $auto.Text = '每次让我选（清掉设置）'
+  # 删掉偏好文件 = 回到"每次都问"，与文件里写的说明一致
+  $auto.add_Click({ Remove-Item (Join-Path $PackageRoot 'data\config\reader-browser.txt') -Force -EA SilentlyContinue; Update-ReaderBrowserMenu })
+  $script:readerMenu.DropDownItems.Add($auto) | Out-Null
+  $again = New-Object System.Windows.Forms.ToolStripMenuItem
+  $again.Text = '重新检测'
+  $again.add_Click({ Update-ReaderBrowserMenu })
+  $script:readerMenu.DropDownItems.Add($again) | Out-Null
+}
+
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Icon = Get-TrayIcon
+# ⚠️ NotifyIcon.Text（图标名，不是下面那个气泡）有 **63 个字符**的硬上限，超了会直接抛
+# ArgumentException 让托盘起不来。现在这个 11 字的写法离上限很远，但**别在这条上堆文案**：
+# 想加说明就加到右键菜单项或气泡里（那两处没有这个限制）。
 $notify.Text = 'CoRead 共读'
 $notify.Visible = $true
 
@@ -621,8 +967,11 @@ $menu.Items.Add($itemQuit) | Out-Null
 
 $notify.ContextMenuStrip = $menu
 
-# 双击托盘图标 = 打开微信读书
-$notify.add_DoubleClick({ Start-Process 'https://weread.qq.com/' })
+# 双击托盘图标 = 打开 CoRead 阅读器（推荐的那个动作）。
+# 2026-10 改：以前双击是打开微信读书。改成自己的阅读器，是为了让"双击图标"这个
+# 最顺手的动作落在 CoRead 自己身上；微信读书仍在右键菜单第二项，没被拿走。
+# 拿不到扩展 ID 时 Open-Reader 会弹窗说明怎么让它可用，不会静默失败。
+$notify.add_DoubleClick({ Open-Reader })
 
 # ── 状态刷新 + 崩溃自愈 ─────────────────────────────────────────────
 $script:lastRestart = @{}

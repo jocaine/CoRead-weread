@@ -46,6 +46,7 @@
 
 import fs from 'fs'
 import path from 'path'
+import { createHash } from 'crypto'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -183,6 +184,74 @@ export const AGENT_CURSOR_FILE = path.join(RUNTIME_DIR, 'agent-cursor')
 export const AGENT_STATE_FILE = path.join(RUNTIME_DIR, 'agent-state.jsonl')
 export const STREAM_FILE = path.join(RUNTIME_DIR, 'stream.jsonl')
 
+// ── 浏览器插件的扩展 ID（2026-10：托盘「打开 CoRead 阅读器」用）───────────────
+// 它是干什么的：CoRead 自带的阅读器是**扩展自己的页面**，地址形如
+//     chrome-extension://<32 位扩展 ID>/reader.html
+// 托盘（tray.ps1）要拼这个地址，就得知道那份 ID。
+//
+// ⚠️ 2026-10-07 修正：**托盘的主路是自己算，不是读这个文件**。
+//   扩展 ID 就是"扩展目录绝对路径"的 SHA256 前 16 字节（十六进制再映射成 a~p），
+//   算法固定、可复现 —— 托盘直接算得出来，不需要问任何人。这个文件只是**回退**：
+//   万一哪天浏览器改了 ID 派生算法，浏览器亲口报的这个值更可信。
+//   为什么当初没这么设计：第一版拿"插件报到 → 接收端写文件 → 托盘读"当主路，
+//   而插件只在浏览器启动 / 插件重载 / 装上时报一次 —— 文件一旦缺失（比如被清理掉），
+//   用户浏览器又一直开着，就**再也不会有第二次机会**补上，功能直接断（实测踩到）。
+//
+// 为什么放 runtime\：它是"当前那份插件叫什么"，删了不影响任何用户数据，
+// 正是 runtime\ 这一格的定位（见文件头第 3 条分格依据）。
+//
+// 读取方式：**不要自己拼路径**（tray.ps1 读它；读不到时的降级行为由托盘自己处理）。
+export const EXTENSION_ID_FILE = path.join(RUNTIME_DIR, 'extension-id')
+
+/**
+ * Chrome 内核浏览器的扩展 ID 形状：**恰好 32 个字符，且只用 a~p 十六个字母**
+ * （ID 是公钥哈希的十六进制，再把 0-9a-f 映射到 a-p）。
+ * 校验它有两个用处：① 挡掉写进文件名/URL 里的怪字符串；② 托盘据此确认"这份 ID 是可信的"。
+ */
+const EXTENSION_ID_RE = /^[a-p]{32}$/
+
+/**
+ * 这个字符串像不像一个合法的扩展 ID。
+ * @param {unknown} id
+ * @returns {boolean}
+ */
+export function isExtensionId(id) {
+  return typeof id === 'string' && EXTENSION_ID_RE.test(id)
+}
+
+/**
+ * 由扩展 ID 拼出「CoRead 阅读器」的页面地址。
+ * 托盘（tray.ps1 的 Get-ReaderUrl）算出来后拼的是**同一个地址**，
+ * 改这里就要改那里 —— 两处必须给出一样的结果。
+ * @param {unknown} id
+ * @returns {string} 合法则返回地址；不合法返回空串（调用方自己决定怎么提示）
+ */
+export function extensionReaderUrl(id) {
+  return isExtensionId(id) ? `chrome-extension://${id}/reader.html` : ''
+}
+
+// ── 停止当前回答（2026-02 用户定调）──────────────────────────────────────────
+// 侧栏点「停止」→ receiver 写信号文件 → agent 在处理中读到就弃掉这一轮。
+// 为什么要落文件而不是别的：receiver 与 agent 是两个进程，能让 fetch 中断的
+// AbortController 是 agent 进程内的对象，另一个进程够不着，只能留一条信号让它自己看见。
+//
+// 文件名**按对话区分**（对话 key 的短 hash）：共用一个文件名的话，
+// 在 A 对话点停止会在 agent 处理 B 对话时被误判。hash 同时挡住路径穿越——
+// key 来自请求体，不能直接拼进文件名。
+const SESSION_STOP_RE = /^session-stop-[0-9a-f]{16}\.json$/
+export function sessionStopFile(conv) {
+  const h = createHash('sha256').update(String(conv || '')).digest('hex').slice(0, 16)
+  return path.join(RUNTIME_DIR, `session-stop-${h}.json`)
+}
+/** runtime\ 下现存的全部停止信号（启动清场用；文件是瞬态的，删了无害） */
+export function listSessionStopFiles() {
+  try {
+    return fs.readdirSync(RUNTIME_DIR)
+      .filter((n) => SESSION_STOP_RE.test(n))
+      .map((n) => path.join(RUNTIME_DIR, n))
+  } catch { return [] }
+}
+
 // toolbox\：翻译记录
 export const TOOL_HISTORY_FILE = path.join(TOOLBOX_DIR, 'translation-history.jsonl')
 
@@ -296,6 +365,7 @@ export const DATA_FILES = {  'knowledge-graph': GRAPH_FILE,
   'agent-cursor': AGENT_CURSOR_FILE,
   'agent-state': AGENT_STATE_FILE,
   stream: STREAM_FILE,
+  'extension-id': EXTENSION_ID_FILE,
   'tool-history': TOOL_HISTORY_FILE,
   'api-config': API_CONFIG_FILE,
   env: ENV_FILE,

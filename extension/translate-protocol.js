@@ -10,6 +10,38 @@ export const RECEIVER_URL = 'http://127.0.0.1:7239'
 export const API_CONFIG_PATH = '/api-config'
 
 /**
+ * 向本机服务报到一次（POST /hello），把**扩展 ID** 交给它。
+ *
+ * 为什么需要：托盘右键的「打开 CoRead 阅读器」要打开 chrome-extension://<ID>/reader.html，
+ * 而这个 ID 只有浏览器知道（就是下面的 chrome.runtime.id）。托盘是另一个进程，问不到它，
+ * 所以由插件每次启动主动报一次；接收端把它落到 data\runtime\extension-id，托盘读那个文件。
+ *
+ * 三条刻意的选择：
+ *   · **不 await、不重试、失败静默**：报到只服务"托盘的快捷方式能用"这一件事，
+ *     接收端没启动、或用户根本没装托盘，都不该影响浏览器的任何正常使用。
+ *   · **带上版本号**：接收端目前只用它打一行日志（便于排查"用户装的插件是旧的"），
+ *     真正用于校验的是 ID 本身。
+ *   · **放在本文件**：service_worker.js 与 sidebar.js 都要调，而这两个文件之间没有共享代码
+ *     （sidebar 是经典脚本，不 import）。真源放这儿，两边 import 同一份；
+ *     接收端地址也复用 RECEIVER_URL，不再各写一份 127.0.0.1:7239。
+ *
+ * @returns {Promise<boolean>} 报到成功与否（调用方通常直接忽略）
+ */
+export async function reportExtensionToHost() {
+  try {
+    const id = (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id) || ''
+    if (!id) return false
+    const res = await fetch(`${RECEIVER_URL}/hello`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, version: chrome.runtime.getManifest().version }),
+    })
+    return !!(res && res.ok)
+  } catch {
+    return false   // 本机服务没起：这不是错误，静默跳过
+  }
+}
+/**
  * chrome.storage.local 的键。侧栏工具箱写入，translate-background 读取。
  *
  * 配置策略：默认全部沿用 CoRead 的 agent/api-config.json（经 receiver 读取）。
