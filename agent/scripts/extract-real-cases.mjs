@@ -22,7 +22,7 @@ import { requireExportedJsonl, DEVDATA_DIR } from '../lib/paths.js'  // 数据�
 import { parseMessage } from '../lib/chat-input.js'
 
 const INBOX = requireExportedJsonl('input')
-// 产物落在仓库根的 devdata\（2026-10 从 agent/scripts/data/ 挪出来：私人语料不该躺在
+// 产物落在仓库根的 test\（2026-10 从 agent/scripts/data/ 挪出来：私人语料不该躺在
 // 打包源目录隔壁）。详见 lib/paths.js 里 DEVDATA_DIR 的注释。
 const DATA = path.join(DEVDATA_DIR, 'judge-real-cases.json')
 

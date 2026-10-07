@@ -210,8 +210,8 @@ CoRead-weread/
 │
 ├── Start-CoRead.vbs    # 开发入口（与包内 internal\Start-CoRead.vbs 同一个脚本）
 │
-├── devdata/            # 【开发期数据，不进包】judge / 图谱脚本的输入与产物。
-│                       # 全是本人真实阅读语料，已 gitignore（只有 README.txt 入库）
+├── test/               # 【AI 操作区 / 开发期数据，不进包】跑批产物、临时脚本、诊断输出。
+│                       # 含本人真实阅读语料，已 gitignore（只有 README.txt 入库）
 │
 └── 运行时生成（已 gitignore）：data\（你的全部数据）、logs\、builtin\（空目录）
 ```

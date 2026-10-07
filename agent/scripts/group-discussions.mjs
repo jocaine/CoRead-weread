@@ -43,7 +43,7 @@ function hashStr(s) {
 const INST_HASH = hashStr(buildSameProblemInstruction())
 const Q_INST_HASH = hashStr(buildQuestionInstruction())  // 归纳问题指令版本（threads.question 缓存）
 
-// judge-real-* 这对中间产物在仓库根的 devdata\（2026-10 从 agent/scripts/data/ 挪出来：
+// judge-real-* 这对中间产物在仓库根的 test\（2026-10 从 agent/scripts/data/ 挪出来：
 // 私人语料不该躺在打包源目录隔壁）。详见 lib/paths.js 里 DEVDATA_DIR 的注释。
 const DATA = path.join(DEVDATA_DIR, 'judge-real-cases.json')
 const RES = path.join(DEVDATA_DIR, 'judge-real-results.json')

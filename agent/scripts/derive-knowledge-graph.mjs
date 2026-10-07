@@ -41,7 +41,7 @@ import {
 import { completionOnce, MAX_JUDGE_TOKENS } from '../lib/llm-api.js'
 import { DEVDATA_DIR } from '../lib/paths.js'   // 开发期数据的唯一真源（不进包）
 
-// 输入与产物都在仓库根的 devdata\（2026-10 从 agent/scripts/data/ 挪出来）：
+// 输入与产物都在仓库根的 test\（2026-10 从 agent/scripts/data/ 挪出来）：
 // 那些是作者的私人语料（真实讨论单元、评判结果、读书会意图谱），放在打包源目录隔壁
 // 会被"整目录拷"捎带进发行包。详见 lib/paths.js 里 DEVDATA_DIR 的注释。
 const DATA = path.join(DEVDATA_DIR, 'judge-real-results.json')

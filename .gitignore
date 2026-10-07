@@ -49,10 +49,12 @@ agent/session_journal.jsonl.bak-*
 agent/topic_stack.json
 # profile/soul 重写前备份
 agent/*.bak
-# 开发期数据：作者的私人语料（真实讨论单元、判专题化结果、读书会意图谱、跑批日志）
-# 实测 18 个文件 / 4.4 MB，全部只存在于本机。
+# 非正式/过程性文件统一放 test\（2026-10-07 用户定规）：跑批产物、临时脚本、诊断输出、
+# 截图、一次性抽取都进这一格；用户明确表示**不查看它**，看到就知道是 AI 操作留下的。
+# 规矩原文见 AGENTS.md 第 7 条。实测这一格 8 个文件 / 1.9 MB（2026-10-07 清掉 11 个
+# 纯冗余件后），全部只存在于本机。
 #
-# 2026-10 从 agent/scripts/data/ 挪到独立的 devdata\ —— 那一格紧挨着**打包源目录**，
+# 2026-10 从 agent/scripts/data/ 挪出来 —— 那一格紧挨着**打包源目录**，
 # 摆在那儿意味着"整目录拷 agent\scripts\ 就会把私人数据打进发行包"。这不是假设：
 # 作者的读书会意图谱（55 节点/27 边，讲《静静的顿河》《学做工》）真被本地打包带出去过，
 # 而 CI 打包因为文件不在 git 里反而躲过了 —— 两边行为不一致、极难察觉。
@@ -61,10 +63,10 @@ agent/*.bak
 # agent/scripts/data/ 现在只剩两个**必须随包分发**的通用夹具
 # （judge-smoke-cases.json / smoke-stack-sequences.json），所以不再需要忽略规则：
 # 那一格若冒出任何新文件，都会在 git status 里显形，是好事。
-# 写成 `devdata/*` 而不是 `devdata/`：整个目录被忽略时，`!devdata/README.txt`
+# 写成 `test/*` 而不是 `test/`：整个目录被忽略时，`!test/README.txt`
 # 救不回来（同 data\ 那条的理由）。说明文件要跟仓库走，数据本身不跟。
-devdata/*
-!devdata/README.txt
+test/*
+!test/README.txt
 
 # 会意图数据文件（用户本地数据：一张图一个文件，含用户真实讨论；.bak 同目录一并忽略）
 agent/data/

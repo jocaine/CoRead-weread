@@ -22,7 +22,7 @@ import { messageUnit, parseMessage } from '../lib/chat-input.js'
 import { reconstructTopicized } from '../lib/results.js'
 import { DEVDATA_DIR } from '../lib/paths.js'   // 开发期数据的唯一真源（不进包）
 
-// 输入与结果都在仓库根的 devdata\（2026-10 从 agent/scripts/data/ 挪出来：那些是私人语料，
+// 输入与结果都在仓库根的 test\（2026-10 从 agent/scripts/data/ 挪出来：那些是私人语料，
 // 放在打包源目录隔壁会被"整目录拷"捎带进包）。详见 lib/paths.js 里 DEVDATA_DIR 的注释。
 const DATA = path.join(DEVDATA_DIR, 'judge-real-cases.json')
 const RES = path.join(DEVDATA_DIR, 'judge-real-results.json')
