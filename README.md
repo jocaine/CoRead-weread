@@ -167,7 +167,7 @@
 
 > ⚠️ **别放 `C:\Program Files`**——那里系统保护，程序写不进自己的数据。
 
-### 第 1 步：双击 `internal\Start-CoRead.vbs`
+### 第 1 步：双击包根那个 `Start-CoRead.vbs`
 
 右下角出现托盘图标，就是启动了。**不需要装 Node，不需要敲任何命令。**
 

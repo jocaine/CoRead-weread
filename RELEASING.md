@@ -29,7 +29,7 @@
 
 > **⚠️ 0.3.2 的实际情况（2026-10-06 记录）**：这一版**不是**小修 —— 它带了一个
 > **不兼容改动**：用户数据从 `internal\` 下搬到了包根 `data\`，启动入口也从
-> `01-START-CoRead.bat` 换成了 `internal\Start-CoRead.vbs`。按上面那张表，
+> `01-START-CoRead.bat` 换成了 `Start-CoRead.vbs`（2026-10-07 起在**包根**，不在 `internal\` 下）。按上面那张表，
 > 这类改动本该进次版本号或更高；这一版按发版时的决定出的是 0.3.2（补丁位）。
 > 留这条记录是为了让以后翻历史的人知道：**0.3.2 不是"改了几个字"**。
 >
@@ -147,8 +147,8 @@ CoRead-<版本>-portable\
 ├── README-FIRST.txt         一分钟上手
 ├── data\                    用户数据（**只有空目录壳 + README.txt**，不含任何配置文件）
 ├── extension\               浏览器插件
-├── internal\                程序本体 + 双击入口
-│   ├── Start-CoRead.vbs        ★用户双击这个启动（为什么不是 .bat 见下）
+├── Start-CoRead.vbs         ★用户双击这个启动（为什么不是 .bat 见下）
+├── internal\                程序本体（入口不在这一格里）
 │   ├── node.exe  tray.ps1  stop.bat  unblock.bat  instructions-zh.txt
 │   └── agent\  receiver\
 ├── builtin\                 空目录（2026-10 起不再随包分发图谱文件）
@@ -163,7 +163,7 @@ CoRead-<版本>-portable\
 脚本里三道闸门会在打包**中途失败**（不是打完才发现）：**`.ps1` 的 UTF-8 BOM 检查**、
 **`.bat`/`.vbs` 纯 ASCII 检查**，以及**敏感数据闸门**
 （`*.db`、`*.jsonl`、`*.env`、含 `sk-` 的配置、`data\` 下任何文件）。
-zip 校验清单里现在包含 `internal\Start-CoRead.vbs`、`data\README.txt` 与 `data\` 各格，
+zip 校验清单里现在包含 `Start-CoRead.vbs`（包根）、`data\README.txt` 与 `data\` 各格，
 少了会报 MISS。
 
 ### 本地怎么跑开发版
@@ -287,7 +287,7 @@ agent 启动时会自动体检（`detectUnmigrated()`），发现旧数据没搬
 
 ### 只发便携包（.exe 安装包路线已删除）
 
-**分发包只有一种形态：`CoRead-<版本>-portable.zip`。** 用户解压后双击 `internal\Start-CoRead.vbs` 即可，
+**分发包只有一种形态：`CoRead-<版本>-portable.zip`。** 用户解压后双击包根的 `Start-CoRead.vbs` 即可，
 不需要安装、不需要管理员权限。
 
 曾经有过一条 Inno Setup 的 `.exe` 安装包路线，2026-10-06 连同脚本一起删掉了

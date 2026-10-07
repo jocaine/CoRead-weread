@@ -29,7 +29,7 @@ Add-Type -AssemblyName System.Drawing
 # ── 目录约定（两种布局都支持，自动判断）─────────────────────────────
 # 便携包布局（读者用的）：
 #   <包根>\            用户看到的：data\、logs\、extension\、README-FIRST.txt
-#   <包根>\internal\   程序自己用的：node.exe、tray.ps1、Start-CoRead.vbs、agent\、receiver\
+#   <包根>\internal\   程序自己用的：node.exe、tray.ps1、agent\、receiver\
 #   <包根>\data\       用户数据（config/profile/sessions/reading/runtime/toolbox/backups）
 #   <包根>\builtin\    空目录（2026-10 起不再随包分发图谱文件；不是用户数据）
 #

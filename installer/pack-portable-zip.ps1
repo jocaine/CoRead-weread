@@ -64,6 +64,10 @@ Write-Host '✅ 仓库内 .ps1 均带 UTF-8 BOM'
 # 非 ASCII 会变乱码；cmd 还是边读边执行，乱码行会被当成命令去跑
 # （实测：中文注释被拆成 'is' / 'step' / 'emory' 之类的命令，满屏报错）。
 # 中文说明一律放 .txt / .md。
+# 另注：**UTF-8 BOM 也算非 ASCII 字节**（EF BB BF），所以这些文件必须既无 BOM 又纯 ASCII。
+# 2026-10-07 起排除 $StageDir（构建产物）：Start-CoRead.vbs 现在落在包根，
+# 于是它会出现在 installer\build\portable\ 下，扫仓库时被顺带扫到 —— 而那个副本的
+# ASCII 性由第 5b 步（直接扫 $StageDir）保证，比这里更严，不会漏。
 $nonAscii = @()
 foreach ($bf in Get-ChildItem $repo -Recurse -File -Include '*.bat', '*.vbs' -EA SilentlyContinue |
                    Where-Object { $_.FullName -notmatch '\\installer\\build\\|\\node_modules\\|\\\.git\\' }) {
@@ -85,7 +89,13 @@ Write-Host '✅ 仓库内 .bat / .vbs 均为纯 ASCII'
 # ── 版本号：从插件 manifest 读，保证一致 ────────────────────────────
 $manifest = Join-Path $repo 'extension\manifest.json'
 if (-not (Test-Path $manifest)) { Fail "找不到 extension\manifest.json" }
-$ver = (Get-Content $manifest -Raw | ConvertFrom-Json).version
+# ⚠️ 必须显式按 UTF-8 读，不能用 Get-Content -Raw（2026-10-07 实测踩坑）：Windows PowerShell
+# 5.1 对**无 BOM** 的文件按系统 ANSI（中文 Windows = GBK）解码，而 manifest.json 是入库的
+# 无 BOM UTF-8，于是 "name": "CoRead — AI 共读" 被读成乱码，ConvertFrom-Json 直接抛
+# ArgumentException —— 打包在"读版本号"这一步就中止，根本走不到后面。中文 Windows 上必现，
+# 英文 Windows（ANSI=CP1252）恰好不炸，所以 CI 看不出来（与 test\ 那类"本地/CI 行为不一致"同型）。
+# 别指望给 manifest.json 补 BOM 绕过：它是浏览器插件清单，入库形态就该是无 BOM。
+$ver = ([System.IO.File]::ReadAllText($manifest, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json).version
 if (-not $ver) { Fail '没能从 manifest 读出 version' }
 Write-Host "插件版本: $ver`n"
 
@@ -144,11 +154,14 @@ New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
 
 # ── 2. 建立两层结构 ─────────────────────────────────────────────────
 # 为什么这么分：用户打开文件夹时应该一眼看出"我只需要碰哪几个"。
-# 最外层只留四样：
-#     data\            ← 你的全部数据（备份就复制这一个文件夹）
-#     extension\       ← 浏览器插件（装插件时必须选它）
-#     internal\        ← 程序本体（Node 运行环境、引擎、接收端、说明书）
-#     几个 .bat / 说明  ← 双击启动、出问题看说明
+# 最外层放这些：
+#     Start-CoRead.vbs   ★双击这个启动（2026-10-07 从 internal\ 挪出来：它是用户唯一
+#                          要双击的东西，而 internal\ 的定位是"程序，别动"，放里面自相矛盾。
+#                          它自己会找 internal\tray.ps1，两种布局都认，所以放这儿不影响程序）
+#     README-FIRST.txt   ← 先看这个（一分钟上手）
+#     data\              ← 你的全部数据（备份就复制这一个文件夹）
+#     extension\         ← 浏览器插件（装插件时必须选它）
+#     internal\          ← 程序本体（Node 运行环境、引擎、接收端、说明书、排障脚本）
 # 另有 builtin\（现在是空目录）与 logs\（日志），两者都不是用户数据。
 # 数据能从 internal\ 里拿出来，靠的是 agent/lib/paths.js 这一处路径真源：
 # 它按"agent 是不是装在 internal\ 下"判断包根在哪，进而定位包根下的 data\。
@@ -331,9 +344,21 @@ Write-Step 'data\config\（空目录，不随包分发任何配置文件）'
 
 # ── 5. 启动器与说明文件 ─────────────────────────────────────────────
 Write-Host "`n--- 启动器与说明 ---"
-# 全部放 internal，它们是内部实现。其中 Start-CoRead.vbs 是**唯一入口**：
-# 用户双击它启动。为什么不是 .bat 见该文件头部注释（.bat 必被 cmd.exe 拉出黑框；
-# .vbs 由 GUI 的 wscript.exe 执行，一点窗口都不出现）。
+# 分两处放，判据是"用户会不会去碰它"：
+#
+#   Start-CoRead.vbs → **包根**（2026-10-07 挪出来的）
+#     它是用户唯一要双击的东西，就该跟 README-FIRST.txt 并排放在最外层。
+#     原先放在 internal\ 下自相矛盾：说明书把 internal\ 说成"程序本体、不放你的数据"，
+#     却让用户进去双击启动——同一条道理本脚本第 304 行已经用在 extension\ 上了
+#     （"藏进'不要动'的文件夹里说不通"），这里当时没照做。
+#     为什么不放 internal\ 也不影响程序：本文件自己会找 tray.ps1（先看 internal\，
+#     再看 installer\launcher\，最后看自己这格），两种布局都认。实测过。
+#
+#   tray.ps1 / stop.bat / unblock.bat / instructions-zh.txt → internal\
+#     tray.ps1 必须与 node.exe 同格：托盘用它判断"便携包还是开发目录"。
+#     另三个是排障用的，跟程序放一起，由说明书指路。
+#     为什么不是 .bat 做入口见 Start-CoRead.vbs 头部注释（.bat 必被 cmd.exe 拉出黑框；
+#     .vbs 由 GUI 的 wscript.exe 执行，一点窗口都不出现）。
 foreach ($f in @('tray.ps1', 'stop.bat')) {
   $p = Join-Path $PSScriptRoot "launcher\$f"
   if (-not (Test-Path $p)) { Fail "缺少 launcher\$f" }
@@ -342,8 +367,8 @@ foreach ($f in @('tray.ps1', 'stop.bat')) {
 }
 $starter = Join-Path $PSScriptRoot 'portable\Start-CoRead.vbs'
 if (-not (Test-Path $starter)) { Fail '缺少 portable\Start-CoRead.vbs' }
-Copy-Item $starter $internal
-Write-Step 'internal\Start-CoRead.vbs'
+Copy-Item $starter $StageDir
+Write-Step 'Start-CoRead.vbs（包根）'
 foreach ($f in @('unblock.bat', 'instructions-zh.txt')) {
   $p = Join-Path $PSScriptRoot "portable\$f"
   if (Test-Path $p) { Copy-Item $p $internal; Write-Step "internal\$f" }
@@ -385,7 +410,7 @@ $labels = @(
   @{ dir = (Join-Path $dataRoot 'reading'); name = '书与标注';                                tip = '划线标注、书库缓存（读过的章节原文）。'; files = $null }
   @{ dir = (Join-Path $dataRoot 'runtime'); name = '运行状态（可删）';                        tip = '处理进度之类的临时状态。删掉只会让程序重新扫一遍，不丢记录。'; files = $null }
   @{ dir = (Join-Path $dataRoot 'toolbox'); name = '翻译记录';                                tip = '工具箱的翻译历史。'; files = $null }
-  @{ dir = $internal;                       name = '程序文件（不要动）';                      tip = '程序自己用的文件：运行环境、代码、说明书。正常使用不需要打开这里。'; files = $null }
+  @{ dir = $internal;                       name = '程序文件（不要动）';                      tip = '程序自己用的文件：运行环境、代码、说明书。正常使用不需要打开这里（启动入口在旁边，不在里面）。'; files = $null }
   @{ dir = (Join-Path $StageDir 'extension'); name = '浏览器插件（装插件时选这个）';             tip = '在浏览器扩展页点「加载已解压的扩展程序」后，选中这个目录。'; files = $null }
   # 外层：文件夹本身不改名（保持解压出来的样子），但把说明文件显示成中文
   @{ dir = $StageDir; name = $null; tip = $null; files = @{ 'README-FIRST.txt' = '先看我，一分钟'; 'README-FIRST' = '先看我，一分钟' } }
@@ -556,7 +581,7 @@ $need = @(
   'README-FIRST.txt',
   # internal 里的程序与说明
   'internal\node.exe',
-  'internal\Start-CoRead.vbs',
+  'Start-CoRead.vbs',
   'internal\tray.ps1',
   'internal\stop.bat',
   'internal\unblock.bat',

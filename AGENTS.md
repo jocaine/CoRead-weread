@@ -95,10 +95,12 @@ PowerShell 5.1 的 `Get-Content -Raw` + `Set-Content` 会按 GBK 解码再写回
 改完搜一遍 `stop-request` 确认没有第三处 —— 2026-10 就是因为只改了托盘那处，
 导致开发脚本长期删/写一个不存在的旧文件。
 
-### 5. 启动入口只有一个：`Start-CoRead.vbs`（开发与发行共用，都在 `internal\` 或仓库根）
+### 5. 启动入口只有一个：`Start-CoRead.vbs`（开发与发行共用，都在**仓库根/包根**）
 
-2026-10 起，仓库根与便携包 `internal\` **各有一个同名入口** `Start-CoRead.vbs`，
-双击它启动。它自己干全部活：检查目录与 node → 隐藏启动 `tray.ps1` → 确认起来了，
+2026-10-07 起，仓库根与**便携包包根**各有一个**同名、逐字节相同**的入口 `Start-CoRead.vbs`，双击它启动。
+（原先便携包把它放在 `internal\` 下 —— 那与「`internal\` = 程序本体、别动」自相矛盾：用户唯一要双击的
+东西不该藏在「别动」的文件夹里。它自己会找 `tray.ps1`，两种布局都认，所以放包根不影响程序。）
+它自己干全部活：检查目录与 node → 隐藏启动 `tray.ps1` → 确认起来了，
 失败用 `MsgBox` 报错。
 
 ```
@@ -112,7 +114,7 @@ Start-CoRead.vbs
 2026-10 之前有个 `01-START-CoRead.bat` 做包装，已删除：它没有任何功能，
 只是加回 125 ms 的闪窗。
 
-**代价（明确接受）**：给用户的第一页要写"双击 `internal\Start-CoRead.vbs`"——
+**代价（明确接受）**：给用户的第一页要写"双击 `Start-CoRead.vbs`"——
 `.vbs` 是个陌生扩展名，所以 `README-FIRST.txt` 里专门解释了一句它是什么、为什么不是 .bat。
 
 - **便携包**：传 `internal\node.exe`；程序在 `internal\` 下
@@ -121,7 +123,7 @@ Start-CoRead.vbs
 - 数据路径那条规则与之对称：见 `lib/paths.js` 的 `PARENT_NAME === 'internal'`
 
 ⚠️ **VBS 里 `progDir` 与 `appRoot` 是两个不同的目录，别混**（这个文件就这么错过一次）：
-`progDir` 是 tray.ps1 与 node.exe 所在处（包里 = `internal\`），
+`progDir` 是 tray.ps1 与 node.exe 所在处（包里 = `internal\`；入口 `.vbs` 现在在**包根**，不在这一格里），
 `appRoot` 是**包根**（有 `data\`、`logs\` 的那层），`-AppDir` 必须传 appRoot。
 传错的表现是"托盘起来了但日志不写、数据找不到"，而且**不会报错**。
 

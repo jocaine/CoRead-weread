@@ -17,8 +17,10 @@ CoRead 详细说明与故障排查
     │   │                             （含 extension-id：插件编号，托盘打开阅读器要用）
     │   └── toolbox\                  ★翻译记录
     ├── extension\                 浏览器插件 ★装插件时选这个目录
-    ├── internal\                  程序本体（这里**不放**你的数据）
-    │   ├── Start-CoRead.vbs          ★启动入口（双击这个）
+    ├── Start-CoRead.vbs           ★启动入口（双击这个）
+    │                              （2026-10 从 internal\ 挪到包根：它是你唯一要双击的东西，
+    │                               不该放在"程序本体、别动"那一格里）
+    ├── internal\                  程序本体（这里**不放**你的数据，也不放入口）
     │   ├── node.exe                  运行环境（不用单独装 Node）
     │   ├── tray.ps1                  托盘程序
     │   ├── stop.bat                  兜底退出
@@ -53,7 +55,7 @@ CoRead 详细说明与故障排查
   不是病毒提示，也不是杀软拦截。
 
   处理：双击  internal\unblock.bat  一次，之后不再弹。
-  （或：右键 internal\Start-CoRead.vbs →「属性」→ 勾「解除锁定」→ 确定）
+  （或：右键 Start-CoRead.vbs →「属性」→ 勾「解除锁定」→ 确定）
 
 
 【杀毒软件报警，说"未知程序修改系统设置"】
@@ -79,13 +81,13 @@ CoRead 详细说明与故障排查
 
   1. 打开  logs\ ，看 tray.log / agent.out.log / receiver.out.log
   2. 最常见原因：端口 7239 被占用（之前启动过一份没关干净）
-     解决：先运行 internal\stop.bat，再重新双击 internal\Start-CoRead.vbs
+     解决：先运行 internal\stop.bat，再重新双击 Start-CoRead.vbs
   3. logs 里写了"启动失败"，把日志内容发到项目 issues
 
 
 【双击 Start-CoRead.vbs 完全没反应（连弹窗都没有）】
 
-  先确认入口文件还在：internal\Start-CoRead.vbs
+  先确认包根那个 Start-CoRead.vbs 还在（不是被移走了）
   再看 logs\tray.log 有没有新内容（起来了就一定会写）。
 
   另一种可能：这台机器把 VBScript 组件关掉了（Win11 24H2 起它是"可选功能"，
@@ -238,7 +240,7 @@ CoRead 详细说明与故障排查
   所以可能要等几秒）。
 
   说明：CoRead **不会开机自启** —— 每次开机后要自己双击
-  internal\Start-CoRead.vbs 启动。（这样它不会在你不知情的时候常驻。）
+  Start-CoRead.vbs 启动。（这样它不会在你不知情的时候常驻。）
 
 
 【彻底卸载】
