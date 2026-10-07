@@ -157,6 +157,11 @@ function loadSidebar({ convList = [], archiveOk = true } = {}) {
     chrome: chromeStub,
     fetch: fetchStub,
     EventSource: EventSourceStub,
+    // 轮询的超时中断（2026-10：连接状态改「轮询当唯一真源」，见 sidebar.js 的 pingOnce）。
+    // 浏览器里必然有，沙箱得显式给 —— 否则顶层那句 startPingLoop() 会抛
+    // ReferenceError: AbortController is not defined，整份 sidebar.js 都装不进来
+    // （实测：14 个测试一起失败，报错都指向 loadSidebar）。
+    AbortController,
     console: { log() {}, warn() {}, error() {} },
     // 定时器**不执行回调**：扩展页里的恢复轮询/防抖都是 setTimeout 驱动，同步执行会让
     // loadHistory ↔ scheduleRecoverPoll 互相递归到爆栈。测试只关心显式调用路径。
