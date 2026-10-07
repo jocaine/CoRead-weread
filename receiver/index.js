@@ -493,6 +493,16 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204); res.end(); return
   }
 
+  // 存活探测（2026-10）：插件侧栏每 5 秒轮询一次，用来驱动右上角那个连接指示灯，
+  // 并决定「能不能发送」。刻意做成极轻：不读盘、不查库、不碰任何数据、无副作用。
+  // 不做来源限制：它不返回任何数据（任意网页本来就能用 OPTIONS 预检探到这个端口开着），
+  // 而插件侧栏必须在任何情况下都能拿到明确答案。
+  if (req.method === 'GET' && req.url.split('?')[0] === '/ping') {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ ok: true, t: Date.now() }))
+    return
+  }
+
   // 历史记录（GET /history）
   if (req.method === 'GET' && req.url === '/history') {
     // 来源限制：只允许扩展读历史，任意网页不可读走聊天/标注数据（评审 P1）

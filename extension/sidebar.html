@@ -57,6 +57,16 @@
     }
     #header .title { font-weight: 400; font-size: 12px; color: #888; flex: 0 1 auto; min-width: 0; letter-spacing: 0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #dot { width: 7px; height: 7px; border-radius: 50%; background: #ddd; flex-shrink: 0; transition: background 0.3s; }
+    /* 本机程序没在运行时的横幅（2026-10）：常驻在消息区上方，恢复连接后自动隐藏 */
+    #offline-banner {
+      flex-shrink: 0;
+      padding: 7px 12px;
+      background: #fff7e6;
+      border-bottom: 1px solid #ffe0a3;
+      color: #8a5a00;
+      font-size: 12px;
+      line-height: 1.55;
+    }
     /* 模式开关左侧 auto 边距 → 和后续 ◎ / ⋯ 一起钉到最右 */
     #header .mode-switch { margin-left: auto; }
     /* 更多（⋯）按钮：头部右侧的二级入口 */
@@ -2353,7 +2363,7 @@
 <body>
   <div id="header">
     <span class="title" id="current-book"><em>We read to know we are not alone.</em></span>
-    <span id="dot" title="与服务连接状态"></span>
+    <span id="dot" title="本机程序连接状态（灰色 = 没在运行，消息发不出去）"></span>
     <button class="mode-switch" id="free-switch" role="switch" aria-checked="false"
             title="读书模式 / 自由模式（iPhone 滑动开关）：自由模式为临时测试对话，不固化进正式会意图">
       <span class="ms-state">读书</span>
@@ -2437,6 +2447,12 @@
     <span class="mb-hint">未在微信读书中打开</span>
     <button class="mb-btn" id="mb-switch-btn" title="切换另一本书">切换书籍</button>
     <button class="mb-btn mb-exit" id="mb-exit-btn" title="恢复跟随微信读书当前阅读">退出手动</button>
+  </div>
+
+  <!-- 本机程序未运行横幅（2026-10）：轮询探不到接收端时常驻显示；此时发送被拦下，
+       输入框里的原文原样保留，启动 CoRead 后直接再按一次发送即可。 -->
+  <div id="offline-banner" hidden>
+    ⚠️ 本机程序没在运行，消息发不出去。请双击 <b>Start-CoRead.vbs</b> 启动 CoRead，等托盘图标出现后再发。
   </div>
 
   <!-- 自由对话条（2026-11）：切到「自由」模式的**那一刻**就出现在消息区上方——当前对话

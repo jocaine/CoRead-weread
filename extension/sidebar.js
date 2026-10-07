@@ -244,8 +244,58 @@ const ICON_TRASH = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" 
 // 表头「删除当前引用」按钮统一填充 SVG 图标（HTML 里的 🗑 仅作兜底）
 try { document.getElementById('rc-del-btn').innerHTML = ICON_TRASH } catch {}
 
-function setDot(connected) {
-  document.getElementById('dot').style.background = connected ? '#07c160' : '#ddd'
+// ── 连接状态（2026-10 改：轮询当唯一真源）─────────────────────────────────
+// 谁说了算：**轮询**。插件每 5 秒敲一次接收端的 /ping，问的是"你现在答不答得上来"。
+// 为什么不用 SSE 的连接状态当判据：SSE 断线时浏览器会静默重连，状态可能长时间偏绿
+//   （半开连接），而"灯是绿的、消息却发不出去"正是要消灭的那个假象。
+// 为什么不在发送那一刻才探：那样用户打完字、按了发送才知道，字还可能被清掉。
+//   常驻轮询让用户在**打字之前**就看见。
+// 绿灯要同时满足两条：问得出去（轮询通过）+ 答得回来（SSE 连着）。
+let _backendAlive = false   // 轮询结果：接收端答不答得上来（决定能不能发送）
+let _sseOpen = false        // SSE 连接：回复能不能实时推过来（决定灯够不够绿）
+let _pingTimer = null
+
+function refreshDot() {
+  const dot = document.getElementById('dot')
+  if (!dot) return
+  dot.style.background = (_backendAlive && _sseOpen) ? '#07c160' : '#ddd'
+  dot.title = !_backendAlive
+    ? '本机程序没在运行 —— 消息发不出去。双击 Start-CoRead.vbs 启动它'
+    : (!_sseOpen ? '本机程序在运行，但推送通道断开（正在自动重连）' : '本机程序运行中')
+}
+
+function setBackendAlive(alive) {
+  const changed = alive !== _backendAlive
+  _backendAlive = alive
+  refreshDot()
+  if (!changed) return
+  const b = document.getElementById('offline-banner')
+  if (b) b.hidden = alive
+}
+
+function setSseOpen(open) {
+  if (open === _sseOpen) return
+  _sseOpen = open
+  refreshDot()
+}
+
+async function pingOnce() {
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), 2000)   // 卡住的请求也要有个头，否则轮询会堆积
+  try {
+    const r = await fetch(RECEIVER + '/ping', { signal: ctl.signal, cache: 'no-store' })
+    setBackendAlive(r.ok)
+  } catch {
+    setBackendAlive(false)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function startPingLoop() {
+  pingOnce()                                     // 立刻探一次，别让灯先灰 5 秒
+  if (_pingTimer) clearInterval(_pingTimer)
+  _pingTimer = setInterval(pingOnce, 5000)
 }
 
 // AI-004：智能滚动。用户已滚回上方阅读时不强制拉到底部；仅在接近底部时跟随新内容。
@@ -1671,7 +1721,7 @@ function connect() {
   const q = _lastEventId > 0 ? `?lastId=${_lastEventId}` : ''
   sseConn = new EventSource(`${RECEIVER}/events${q}`)
   sseConn.onopen = () => {
-    setDot(true)
+    setSseOpen(true)
     // 接收端此刻才起来时，把菜单里的「接收端未连接」刷成真实配置状态（只刷新不弹窗）
     refreshApiStatus()
     // AI-012：重连成功后自愈——补上断连期间漏掉的标注，无需重开面板。
@@ -1683,7 +1733,7 @@ function connect() {
     try {
       const d = JSON.parse(e.data)
       if (d._seq) _lastEventId = Math.max(_lastEventId, d._seq)  // 记录进度，供续传
-      if (d.type === 'connected') { setDot(true); return }
+      if (d.type === 'connected') { setSseOpen(true); return }
       // 会意图刷新（AI-020）：图文件更新 → 图视图开着就重拉
       if (d.type === 'graph-updated') { if (graphView?.isOpen()) graphView.reload(); return }
       // 2026-09：实时栈变化 → 重拉 /stack-hits，恢复/清除"当前讨论命中"高亮
@@ -1840,7 +1890,7 @@ function connect() {
     } catch {}
   }
   sseConn.onerror = () => {
-    setDot(false)
+    setSseOpen(false)
     sseConn.close()
     sseConn = null
     setTimeout(connect, 5000)
@@ -1884,6 +1934,14 @@ async function submit() {
   if (_freeMode && content === '/归档') {
     document.getElementById('cmd-menu').hidden = true
     openFreeArchive(_freeKey)
+    return
+  }
+  // 本机程序没在运行 → 拦在这里，不发（2026-10）：发出去只会失败，而且原文会被清掉。
+  // 字原样留在输入框里，用户启动 CoRead 后直接再按一次发送即可。
+  if (!_backendAlive) {
+    const gateBook = selectedAnn ? selectedAnn.bookId : effectiveBookBase()
+    renderSystemBubble('⚠️ 本机程序没在运行，这条消息没有发出去。请双击 Start-CoRead.vbs 启动 CoRead（等托盘图标出现），再按一次发送。', gateBook)
+    pingOnce()   // 立刻复探一次，让灯与横幅跟到真实状态
     return
   }
   input.value = ''
@@ -1961,6 +2019,15 @@ async function submit() {
     }
   } catch (e) {
     console.warn('[CoRead] chat POST failed:', e.message)
+    // 兜底（2026-10）：轮询最多滞后 5 秒，"刚好在断掉那一瞬间"发送仍会走到这里。
+    // 必须说一句 —— 否则屏幕上就是"我的话在、思考闪了一下、然后什么都没有"。
+    // 原文放回输入框：用户启动 CoRead 后可以直接重发，不用重打一遍。
+    try {
+      const inp = document.getElementById('input')
+      if (inp && !inp.value) { inp.value = content; inp.style.height = 'auto' }
+    } catch {}
+    renderSystemBubble('⚠️ 没能连上本机程序，这条消息没有发出去（原文已放回输入框）。右上角指示灯灰色 = CoRead 没在运行。', msgBook)
+    pingOnce()
     // 发送失败：这条消息没到 receiver、agent 不会回复。弹掉刚入队的自己的条目，
     // 避免它的最终记录永远不来、把后续真实回复的配对挤偏。不整队清空——前一条
     // 仍在流式的回复还需要自己的队项配对。
@@ -4073,6 +4140,7 @@ document.getElementById('bp-search')?.addEventListener('input', renderBookList)
 // applyPendingRefSearch 放在 loadHistory 之后：引用列表就绪后再打开抽屉搜索，
 // 否则搜索框填了词但列表还是空的（AI-011）。
 checkApiConfigOnOpen()  // 打开插件即检查模型 API：确认未配置就自动弹出配置弹窗（用户定调）
+startPingLoop()         // 存活轮询：驱动连接指示灯 + 决定能不能发送（见 setDot 上方说明）
 loadState()
   .then(loadHistory)
   .then(applyPendingRefSearch)
