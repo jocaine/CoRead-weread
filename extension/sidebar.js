@@ -260,39 +260,19 @@ function refreshDot() {
   if (!dot) return
   dot.style.background = (_backendAlive && _sseOpen) ? '#07c160' : '#ddd'
   dot.title = !_backendAlive
-    ? '本机程序没在运行 —— 消息发不出去。双击 Start-CoRead.vbs 启动它'
-    : (!_sseOpen ? '本机程序在运行，但推送通道断开（正在自动重连）' : '本机程序运行中')
+    ? '本机程序未运行'
+    : (!_sseOpen ? '推送通道已断开，正在重连' : '本机程序运行中')
 }
 
 function setBackendAlive(alive) {
-  // 注意：**不要**做"值没变就提前返回"的优化。开机时 _backendAlive 本来就是 false，
-  // 若第一次轮询也是"离线"，提前返回会让横幅永远不显示（HTML 里它是 hidden 的）——
-  // 而这恰恰是横幅最该出现的情况。写 DOM 是幂等的，每次都同步一遍最稳。
   _backendAlive = alive
-  refreshDot()
-  applySendEnabled()
-  const b = document.getElementById('offline-banner')
-  if (b) b.hidden = alive
+  refreshDot()   // 灯是唯一的常驻提示；发送被拦时的解释走弹窗（见 showSendFailedNotice）
 }
 
 function setSseOpen(open) {
   if (open === _sseOpen) return
   _sseOpen = open
   refreshDot()
-}
-
-let _noBook = false   // 有没有正在读/选中的书（由 renderNoBookView 维护）
-// 发送按钮的可用性 = "有书" **且** "本机程序在跑"。两个条件在这里合成一处，
-// 否则 renderNoBookView 与轮询各写一次 disabled，后写的会把前一个覆盖掉
-// （实测隐患：轮询说"在跑"就会把"无书"的禁用解开）。
-function applySendEnabled() {
-  const btn = document.getElementById('send-btn')
-  if (!btn) return
-  const offline = !_backendAlive
-  btn.disabled = _noBook || offline
-  btn.title = offline
-    ? '本机程序没在运行，发不出去 —— 请先双击 Start-CoRead.vbs 启动 CoRead'
-    : (_noBook ? '未检测到书籍' : '')
 }
 
 async function pingOnce() {
@@ -309,8 +289,6 @@ async function pingOnce() {
 }
 
 function startPingLoop() {
-  applySendEnabled()                             // 先按"离线"把发送按钮锁上：宁可晚几毫秒解开，
-                                                 // 也不要在第一次探测返回前放行一次注定失败的发送
   pingOnce()                                     // 立刻探一次，别让灯先灰 5 秒
   if (_pingTimer) clearInterval(_pingTimer)
   _pingTimer = setInterval(pingOnce, 5000)
@@ -1139,6 +1117,7 @@ function renderNoBookView() {
   // 提问浮窗（jump-fab）随之收起，不残留上一本书的跳转条
   if (noBook) applyBookFilter()
   const input = document.getElementById('input')
+  const sendBtn = document.getElementById('send-btn')
   const attachBtn = document.getElementById('attach-btn')
   if (input) {
     input.disabled = noBook
@@ -1146,8 +1125,7 @@ function renderNoBookView() {
       ? '未检测到书籍：打开微信读书中的书，或从已读书籍中选择'
       : '说点什么…'
   }
-  _noBook = noBook
-  applySendEnabled()   // 发送按钮 = 有书 && 本机程序在（见 applySendEnabled 的注释）
+  if (sendBtn) sendBtn.disabled = noBook
   if (attachBtn) attachBtn.disabled = noBook
   refreshWebBindEntry()  // AI-021：无书状态时按活动 tab 显示/隐藏网页绑定入口
 }
@@ -1954,13 +1932,11 @@ async function submit() {
     openFreeArchive(_freeKey)
     return
   }
-  // 兜底（2026-10）：正常情况下发送按钮已置灰、回车也按不动，走不到这里。
-  // 只有"轮询刚说在、说完就挂"这种 5 秒以内的竞态才会到 —— 此时绝不发，
-  // 原文原样留在输入框里，用户启动 CoRead 后直接再按一次发送即可。
+  // 本机程序没在运行 → 不发，弹窗告知（2026-10）。
+  // 拦在清空输入框之前：原文字样留着，用户启动 CoRead 后直接再按一次发送即可。
   if (!_backendAlive) {
-    const gateBook = selectedAnn ? selectedAnn.bookId : effectiveBookBase()
-    renderSystemBubble('⚠️ 本机程序没在运行，这条消息没有发出去。请双击 Start-CoRead.vbs 启动 CoRead（等托盘图标出现），再按一次发送。', gateBook)
-    pingOnce()   // 立刻复探一次，让灯与横幅跟到真实状态
+    showSendFailedNotice('本机程序未运行，消息未发送。请双击 Start-CoRead.vbs 启动后重试。')
+    pingOnce()   // 立刻复探一次，把灯刷成真实状态
     return
   }
   input.value = ''
@@ -2045,7 +2021,7 @@ async function submit() {
       const inp = document.getElementById('input')
       if (inp && !inp.value) { inp.value = content; inp.style.height = 'auto' }
     } catch {}
-    renderSystemBubble('⚠️ 没能连上本机程序，这条消息没有发出去（原文已放回输入框）。右上角指示灯灰色 = CoRead 没在运行。', msgBook)
+    showSendFailedNotice('本机程序未响应，消息未发送。原文已保留在输入框，可再次发送。')
     pingOnce()
     // 发送失败：这条消息没到 receiver、agent 不会回复。弹掉刚入队的自己的条目，
     // 避免它的最终记录永远不来、把后续真实回复的配对挤偏。不整队清空——前一条
@@ -2123,7 +2099,6 @@ document.getElementById('send-btn').addEventListener('click', submit)
 document.getElementById('input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
-    if (!_backendAlive) return   // 离线：回车不发送（按钮已置灰、横幅已在说明原因）
     const im = document.getElementById('cmd-menu')
     if (im) im.hidden = true
     if (document.getElementById('input').value.trim() === '/') return  // 纯 "/" 不发送（斜杠菜单占位）
@@ -2694,7 +2669,7 @@ function renderJumpBack() {
 // 所以本地移除不依赖 receiver 结果（receiver 同步是 best-effort）。
 // 自绘确认弹窗：扩展页面不能用原生 confirm()（Chrome 压制并恒返回假），
 // 这里用侧栏内的 overlay + 确认/取消按钮替代，返回 Promise<boolean>。
-function showConfirm(title, message) {
+function showConfirm(title, message, { okOnly = false, okText = '确认删除' } = {}) {
   return new Promise((resolve) => {
     const overlay = document.getElementById('confirm-overlay')
     document.getElementById('confirm-title').textContent = title
@@ -2702,6 +2677,10 @@ function showConfirm(title, message) {
     overlay.classList.add('on')
     const okBtn = document.getElementById('confirm-ok-btn')
     const cancelBtn = document.getElementById('confirm-cancel-btn')
+    // okOnly（2026-10）：只留一个确定按钮，用于"只告知、不需要用户做选择"的场景
+    // （例：本机程序没在运行时按了发送）。此时遮罩点击与 Esc 都按"知道了"处理。
+    okBtn.textContent = okText
+    cancelBtn.hidden = okOnly
     const cleanup = () => {
       overlay.classList.remove('on')
       okBtn.removeEventListener('click', onOk)
@@ -2719,10 +2698,10 @@ function showConfirm(title, message) {
     const onUp = (e) => {
       const onMask = downOnMask && e.target === overlay
       downOnMask = false
-      if (onMask) onCancel()
+      if (onMask) { if (okOnly) onOk(); else onCancel() }
     }
     const onKey = (e) => {
-      if (e.key === 'Escape') onCancel()
+      if (e.key === 'Escape') { if (okOnly) onOk(); else onCancel() }
       else if (e.key === 'Enter') onOk()
     }
     okBtn.addEventListener('click', onOk)
@@ -2730,8 +2709,16 @@ function showConfirm(title, message) {
     overlay.addEventListener('mousedown', onDown)
     overlay.addEventListener('mouseup', onUp)
     document.addEventListener('keydown', onKey)
-    cancelBtn.focus()  // 默认聚焦「取消」，防止误触回车直接删除
+    if (!okOnly) cancelBtn.focus()  // 默认聚焦「取消」，防止误触回车直接删除
   })
+}
+
+// 发送失败提示（2026-10）：本机程序没在运行（或发送途中断开）时告知用户。
+// 为什么用自绘弹窗而不是原生 alert()：扩展页面里原生对话框被 Chrome 压制
+//   （见 showConfirm 上方的注释），而且自绘的与侧栏视觉一致。
+// 为什么不 await：不必等用户点掉弹窗才结束 submit()，调用即返回。
+function showSendFailedNotice(message) {
+  return showConfirm('无法发送', message, { okOnly: true, okText: '知道了' })
 }
 
 // 自绘输入弹窗（2026-11：自由对话重命名）。与 showConfirm 同款 overlay，返回

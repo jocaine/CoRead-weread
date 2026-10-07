@@ -181,7 +181,7 @@ function loadSidebar({ convList = [], archiveOk = true, pingOk = true } = {}) {
   ctx.self = ctx
 
   const src = fs.readFileSync(JS, 'utf8')
-  const expose = '\n;globalThis.__X = { toggleFreeMode, renderFreeConvBar, renderFreeConvList, openFreeConvList, closeFreeConvList, openFreeArchive, closeFreeArchive, submitFreeArchive, switchFreeConversation, createFreeConversation, loadFreeConversations, freeConvTitle, freeConvMeta, freeConvIsEmpty, maybeFreeConvHint, effectiveBookBase, effectiveBook, isFreeConvKey, deleteFreeConversation, removeConversationBubbles, renderCurrentBook, applyBookFilter, getState: () => ({ freeMode: _freeMode, freeKey: _freeKey, freeConvs: _freeConvs, archived: _freeArchived }) };'
+  const expose = '\n;globalThis.__X = { toggleFreeMode, renderFreeConvBar, renderFreeConvList, openFreeConvList, closeFreeConvList, openFreeArchive, closeFreeArchive, submitFreeArchive, switchFreeConversation, submit, createFreeConversation, loadFreeConversations, freeConvTitle, freeConvMeta, freeConvIsEmpty, maybeFreeConvHint, effectiveBookBase, effectiveBook, isFreeConvKey, deleteFreeConversation, removeConversationBubbles, renderCurrentBook, applyBookFilter, getState: () => ({ freeMode: _freeMode, freeKey: _freeKey, freeConvs: _freeConvs, archived: _freeArchived }) };'
   vm.createContext(ctx)
   vm.runInContext(src + expose, ctx, { filename: 'sidebar.js' })
 
@@ -446,26 +446,35 @@ function htmlSource() {
   return fs.readFileSync(HTML, 'utf8')
 }
 // 取某条选择器规则体（第一个匹配到的），用于断言它是否设了 display
-// ── 本机程序没在运行：灯变灰 + 横幅出现 + 发送按钮按不动 ──────────────────────
-// 为什么这三条要一起断言：它们是同一次轮询结果的三个表现，任何一条漏了都会让用户
-// 看到自相矛盾的界面（比如按钮能按、却没有横幅解释为什么发不出去）。
+// ── 本机程序没在运行：灯变灰（文字说明原因）+ 按发送时弹窗拦住 ────────────────
 // 注：灯的"绿"需要 SSE 也连上，而测试里的 EventSourceStub 不会触发 onopen，
 //     所以这里只断言"离线时变灰"，不断言在线时变绿。
-test('本机程序没在运行时：灯变灰、横幅出现、发送按钮置灰并说明原因', async () => {
+test('本机程序没在运行时：灯变灰，提示文字直说"未运行"', async () => {
   const { getById } = loadSidebar({ convList: [], pingOk: false })
   await flush()
   assert.equal(getById('dot').style.background, '#ddd', '连接灯变灰')
-  assert.equal(getById('offline-banner').hidden, false, '离线横幅出现（开机即离线也要出现）')
-  assert.equal(getById('send-btn').disabled, true, '发送按钮按不动')
-  assert.match(getById('send-btn').title, /没在运行/, '按钮的悬停提示说明了原因')
-  assert.match(getById('dot').title, /没在运行/, '灯的悬停提示说明了原因')
+  assert.equal(getById('dot').title, '本机程序未运行', '提示文字直接说明是哪种断连')
+  assert.doesNotMatch(getById('dot').title, /重连/, '不能把"程序没运行"说成"正在重连"')
 })
 
-test('本机程序在运行时：不出现离线横幅', async () => {
+test('本机程序在运行时：灯的文字不说"未运行"', async () => {
   const { getById } = loadSidebar({ convList: [] })   // 默认 /ping 成功
   await flush()
-  assert.equal(getById('offline-banner').hidden, true, '在线时不显示横幅')
-  assert.doesNotMatch(getById('send-btn').title, /没在运行/, '按钮不再因离线而说明')
+  assert.doesNotMatch(getById('dot').title, /未运行/, '在线时不提"未运行"')
+})
+
+test('本机程序没在运行时按发送：不发出、弹出提示、原文留在输入框', async () => {
+  const { X, getById, calls } = loadSidebar({ convList: [], pingOk: false })
+  await flush()
+  getById('input').value = '这句话应该发不出去'
+  await X.submit()
+  await flush()
+  assert.equal(calls.filter((c) => c.url.endsWith('/chat')).length, 0, '没有发出任何消息')
+  assert.equal(getById('confirm-overlay').classList.contains('on'), true, '弹出了提示框')
+  assert.equal(getById('confirm-title').textContent, '无法发送', '弹窗标题')
+  assert.match(getById('confirm-msg').textContent, /未运行/, '弹窗说明了原因')
+  assert.equal(getById('confirm-cancel-btn').hidden, true, '只留确定按钮（不需要用户做选择）')
+  assert.equal(getById('input').value, '这句话应该发不出去', '原文原样留在输入框')
 })
 
 function cssRuleBody(html, selector) {
