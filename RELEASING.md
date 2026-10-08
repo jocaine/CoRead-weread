@@ -145,11 +145,12 @@ powershell -ExecutionPolicy Bypass -File installer\pack-portable-zip.ps1
 ```
 CoRead-<版本>-portable\
 ├── README-FIRST.txt         一分钟上手
+├── Update-CoRead.cmd        ★升级时用：把新 zip 拖到它上面（2026-11 起）
 ├── data\                    用户数据（**只有空目录壳 + README.txt**，不含任何配置文件）
 ├── extension\               浏览器插件
 ├── Start-CoRead.vbs         ★用户双击这个启动（为什么不是 .bat 见下）
 ├── internal\                程序本体（入口不在这一格里）
-│   ├── node.exe  tray.ps1  stop.bat  instructions-zh.txt
+│   ├── node.exe  tray.ps1  stop.bat  update.ps1  instructions-zh.txt
 │   └── agent\  receiver\
 ├── builtin\                 空目录（2026-10 起不再随包分发图谱文件）
 └── logs\                    空目录（托盘与子进程的日志）
@@ -186,6 +187,37 @@ zip 校验清单里现在包含 `Start-CoRead.vbs`（包根）、`data\README.tx
 开发时**没有** `> ` 前台提示符（刻意如此：让开发也走生产那条启停路径）。
 临时要看前台 REPL 时，先从托盘退出，再单独 `node agent\index.js`。
 
+### 更新脚本（2026-11 起随包分发）
+
+**用户怎么用**：把新下载的 zip 拖到包根 `Update-CoRead.cmd` 上（或双击它、在弹框里选 zip）。
+它调 `internal\update.ps1` 干活：停机 → 解压到 %TEMP% 并校验 → 预检占用 → 替换 → 复核 → 报告。
+
+**它治的是什么病**：在这之前升级只能"解压覆盖"，而覆盖**只能加文件、不能减文件**。
+后果不是"占点地方"这么轻——`builtin\knowledge-graph-results.json` 就是个活样本：
+2026-10 起不再随包分发，但 `agent/index.js` 的回退图**还在读它**，于是"装过老版本的人"
+与"全新安装的人"跑同一个版本号，行为不一样。
+
+**几条不能改坏的规矩**（改这个脚本前先读它头部注释）：
+
+| 规矩 | 为什么 |
+|---|---|
+| `data\`、`logs\` 一个字节都不碰，只补空目录 | 那是用户几年的记录；`update-script.test.js` 会逐字节断言 |
+| 先解压校验、后动老文件 | 一个没下完的 zip 不该把用户唯一的程序目录清掉 |
+| 删之前先做占用预检，有占用就整体中止 | 否则会留下"internal 删了、extension 没删"的半残状态 |
+| 停机复用 `internal\stop.bat` | 停机哨兵路径在 `paths.js` / `tray.ps1` / `stop.bat` 三处有约定，不许出现第四份 |
+| 根目录里不认识的文件只报告、不删 | 可能是用户自己的笔记、快捷方式、下载的 zip |
+
+**为什么入口是 `.cmd` 而不是像启动那样用 `.vbs`**：启动要零窗口，升级要看得见进度和错误，
+两者诉求正好相反。另外它会先把「自己 + `update.ps1`」复制到 %TEMP% 再干活 ——
+它要替换的目录里就包含它自己，而 cmd 是边读边执行的，替换正在运行的 .cmd 会读到乱码。
+
+**回归测试**：`agent/test/update-script.test.js` 造一个"攒了好几个版本残留"的老目录
+（含 `builtin\` 旧图谱、老入口、老隐藏启动脚本）跑一遍，断言残留清干净、用户数据一字节未动、
+递垃圾 zip 时拒绝且什么都不删。
+
+> **鸡生蛋**：这个脚本得装在包里才有用。所以带它的那一版，用户仍然要手动覆盖一次；
+> 从再下一版起才吃得到"拖 zip 升级"。发版说明里要写清这一点。
+
 ### 下载不动 node.exe 时
 
 官方分发包在 GitHub 上，国内偶尔慢。设一个镜像前缀即可：
@@ -213,11 +245,11 @@ CI 里则在仓库 Settings → Secrets and variables → Actions → Variables
    发现 `*.db` / `*.jsonl` / `api-config.json` 里有密钥等情况会**直接中止**。
    如果你新增了需要随包分发的文件，记得加进白名单，否则它不会进包。
 
-3. **`.bat` 与 `.vbs` 的执行部分必须纯 ASCII。**
+3. **`.bat` / `.cmd` 与 `.vbs` 的执行部分必须纯 ASCII。**
    cmd 与 Windows Script Host 都按系统 ANSI（中文 Windows 是 GBK）读取，
    UTF-8 中文会变乱码；cmd 还是边读边执行，文中途 `chcp 65001` 会让解析错位、
    把乱码当命令执行。中文说明一律放 `.txt`。
-   打包脚本会自动检查这一条，违规就中止。
+   打包脚本会自动检查这一条（2026-11 起 `.cmd` 也在检查范围内），违规就中止。
 
 ---
 

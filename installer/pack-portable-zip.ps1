@@ -71,11 +71,13 @@ Write-Host '✅ 仓库内 .ps1 均带 UTF-8 BOM'
 # （实测：中文注释被拆成 'is' / 'step' / 'emory' 之类的命令，满屏报错）。
 # 中文说明一律放 .txt / .md。
 # 另注：**UTF-8 BOM 也算非 ASCII 字节**（EF BB BF），所以这些文件必须既无 BOM 又纯 ASCII。
+# 2026-11 起把 .cmd 一并纳入：Update-CoRead.cmd 是升级入口，cmd.exe 读它的方式与
+# .bat 完全一样（同样的乱码 + 边读边执行风险），漏掉它就等于少一道闸门。
 # 2026-10-07 起排除 $StageDir（构建产物）：Start-CoRead.vbs 现在落在包根，
 # 于是它会出现在 installer\build\portable\ 下，扫仓库时被顺带扫到 —— 而那个副本的
 # ASCII 性由第 5b 步（直接扫 $StageDir）保证，比这里更严，不会漏。
 $nonAscii = @()
-foreach ($bf in Get-ChildItem $repo -Recurse -File -Include '*.bat', '*.vbs' -EA SilentlyContinue |
+foreach ($bf in Get-ChildItem $repo -Recurse -File -Include '*.bat', '*.cmd', '*.vbs' -EA SilentlyContinue |
                    Where-Object { $_.FullName -notmatch '\\installer\\build\\|\\node_modules\\|\\\.git\\' }) {
   $bytes = [System.IO.File]::ReadAllBytes($bf.FullName)
   $bad = 0
@@ -83,14 +85,14 @@ foreach ($bf in Get-ChildItem $repo -Recurse -File -Include '*.bat', '*.vbs' -EA
   if ($bad -gt 0) { $nonAscii += "$($bf.FullName.Replace($repo + '\', ''))（$bad 个非 ASCII 字节）" }
 }
 if ($nonAscii.Count) {
-  Write-Host '❌ 下列 .bat / .vbs 含非 ASCII 字节，打包中止：' -ForegroundColor Red
+  Write-Host '❌ 下列 .bat / .cmd / .vbs 含非 ASCII 字节，打包中止：' -ForegroundColor Red
   $nonAscii | ForEach-Object { Write-Host "   $_" }
   Write-Host ''
   Write-Host '   原因：cmd / WSH 按系统 ANSI 读取，中文会变乱码并被当作命令执行。'
   Write-Host '   修法：把这些文件里的中文改成英文，中文说明写到 .txt / .md 里。'
   exit 1
 }
-Write-Host '✅ 仓库内 .bat / .vbs 均为纯 ASCII'
+Write-Host '✅ 仓库内 .bat / .cmd / .vbs 均为纯 ASCII'
 
 # ── 版本号：从插件 manifest 读，保证一致 ────────────────────────────
 $manifest = Join-Path $repo 'extension\manifest.json'
@@ -375,7 +377,7 @@ Write-Host "`n--- 启动器与说明 ---"
 #     ③ 它并非必需：instructions-zh.txt 一直并列给了 Windows 原生做法
 #        「右键 Start-CoRead.vbs →「属性」→ 勾「解除锁定」」，只清用户实际要运行的那一个
 #        文件就够启动。留着它等于在排查路径上摆一个没人用、还指错路的脚本。
-foreach ($f in @('tray.ps1', 'stop.bat')) {
+foreach ($f in @('tray.ps1', 'stop.bat', 'update.ps1')) {
   $p = Join-Path $PSScriptRoot "launcher\$f"
   if (-not (Test-Path $p)) { Fail "缺少 launcher\$f" }
   Copy-Item $p $internal
@@ -385,6 +387,13 @@ $starter = Join-Path $PSScriptRoot 'portable\Start-CoRead.vbs'
 if (-not (Test-Path $starter)) { Fail '缺少 portable\Start-CoRead.vbs' }
 Copy-Item $starter $StageDir
 Write-Step 'Start-CoRead.vbs（包根）'
+# 升级入口（2026-11）：把新版本的 zip 拖到它上面即可升级。它会把「自己 + internal\update.ps1」
+# 复制到 %TEMP% 再干活 —— 因为它要替换的目录里就包含它自己（cmd 边读边执行，
+# 替换正在运行的 .cmd 会读到乱码，详见该文件头部注释）。
+$updater = Join-Path $PSScriptRoot 'portable\Update-CoRead.cmd'
+if (-not (Test-Path $updater)) { Fail '缺少 portable\Update-CoRead.cmd' }
+Copy-Item $updater $StageDir
+Write-Step 'Update-CoRead.cmd（包根，升级时才用）'
 # 详细排查手册（面向用户，说明书多处点名它）
 $diagDoc = Join-Path $PSScriptRoot 'portable\instructions-zh.txt'
 if (-not (Test-Path $diagDoc)) { Fail '缺少 portable\instructions-zh.txt' }
@@ -472,8 +481,8 @@ foreach ($l in $labels) {
 #
 # 中文面向用户的内容统一放 instructions-zh.txt，那些脚本文件只留英文。
 $scriptProblems = @()
-foreach ($f in (Get-ChildItem $StageDir -Recurse -File -Include '*.bat', '*.vbs' -EA SilentlyContinue)) {
-  $isBat = $f.Extension -eq '.bat'
+foreach ($f in (Get-ChildItem $StageDir -Recurse -File -Include '*.bat', '*.cmd', '*.vbs' -EA SilentlyContinue)) {
+  $isBat = $f.Extension -eq '.bat' -or $f.Extension -eq '.cmd'
   $lines = [System.IO.File]::ReadAllLines($f.FullName, [System.Text.Encoding]::UTF8)
   foreach ($l in $lines) {
     # 跳过注释行
@@ -600,6 +609,10 @@ $need = @(
   'Start-CoRead.vbs',
   'internal\tray.ps1',
   'internal\stop.bat',
+  # 升级通道：包根的入口 + 它调用的脚本。缺任何一个，用户就只能回到"解压覆盖"的老办法，
+  # 而那个办法会攒下旧版本残留（这正是 2026-11 加更新脚本要治的病）。
+  'Update-CoRead.cmd',
+  'internal\update.ps1',
   'internal\instructions-zh.txt',
   'internal\agent\index.js',
   'internal\agent\lib\paths.js',
