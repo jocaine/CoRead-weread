@@ -481,7 +481,10 @@ function Get-ReaderBrowsers {
     $profs += @(Get-ChildItem (Join-Path $ud 'Profile *') -Directory -EA SilentlyContinue |
                  Select-Object -ExpandProperty FullName)
     foreach ($pd in $profs) {
-      foreach ($ext in (Get-InstalledUnpackedExtensions $pd)) {
+      # @() 与函数末尾 `return ,$out` 是同一个理由：这个函数返回的是 hashtable 列表，
+      # 只剩一个时会被 PowerShell 拆包。这里纯属侥幸能用（foreach 遍历 hashtable 恰好
+      # 只迭代一次，`$ext.Path` 又正好是键查询），@() 把它变成不依赖巧合的写法。
+      foreach ($ext in @(Get-InstalledUnpackedExtensions $pd)) {
         $p = $ext.Path.TrimEnd('\')
         $pl = $p.ToLower()
         $isOurs = ($ours -contains $pl) -or $pl.Contains('\coread') -or $pl.Contains('\co-read')
@@ -496,7 +499,19 @@ function Get-ReaderBrowsers {
       }
     }
   }
-  return $out
+  # ⚠️ 这个逗号不能删（2026-10-07 实测踩到，症状就在"双击托盘图标"上）：
+  # PowerShell 的函数返回会把**只有一个元素的数组拆包**成那个元素本身。于是"只有一个
+  # 浏览器装着本插件"（最常见的情况）时，调用方拿到的不是数组、而是那张 hashtable：
+  # `$list.Count` 读出来是 7（它有 7 个键，不是 7 个浏览器），代码就判定成"多个浏览器
+  # 让你选"，弹框问用哪个（框里只列了一条，还写着"共 7 个可用"）；而 `$list[0]` 在
+  # hashtable 上取不到东西 → 返回空 → 紧接着又弹"没能打开 CoRead 阅读器"。
+  # `,$out` 是把数组再包一层，这样拆包就拆不掉它。
+  #
+  # ⚠️ 兜底只做在这一处，调用方**不要**再套 @()：两边同时做会反过来把"零个"算成"一个"
+  # （外层 @() 把那个空数组本身当成一个元素收进来）。实测三种情况：
+  #   零个 → Count 0（只写 @() 的话是 1，错，会走进"只有一个可用"的分支）
+  #   一个 → Count 1      多个 → Count N
+  return ,$out
 }
 
 # ── 用哪个浏览器打开：记在 data\config\reader-browser.txt ────────────────
@@ -541,9 +556,14 @@ function Set-ReaderBrowserPref([string]$Key) {
 
 # 当前该用哪个浏览器（结果放 $script:readerPick，同时把 $script:browserSource 写好）
 function Resolve-ReaderBrowser {
+  # 这里**不要**写成 @(Get-ReaderBrowsers)。兜底只做在函数那一侧（`return ,$out`）：
+  # 两边同时做会把"零个"算成"一个"（外层 @() 会把那个空数组本身当成一个元素收进来），
+  # 于是"一个浏览器都没装插件"会走进"只有一个可用"的分支，报出错误的理由。
+  # 实测数字：零个 → Count 0（对，只写 @() 的话是 1，错）。
   $list = Get-ReaderBrowsers
   $script:readerBrowsers = $list
   $script:readerPick = $null
+  $script:readerAsk = $false        # "该不该弹选择窗"在这里判定；真正弹窗的动作在 Open-Reader 里
   if (-not $list -or $list.Count -eq 0) {
     $script:browserSource = '清单里没有任何浏览器装着本插件'
     return $null
@@ -553,7 +573,7 @@ function Resolve-ReaderBrowser {
   if ($pref) {
     $hit = $list | Where-Object { $_.Key -eq $pref -or $_.Name.ToLower() -eq $pref } | Select-Object -First 1
     if ($hit) { $script:browserSource = "你指定过用 $($hit.Name)"; $script:readerPick = $hit; return $hit }
-    Write-Log 'tray' "设置里写的 $pref 没装着本插件，改回让你选"
+    Write-Log 'tray' "设置里写的 $pref 没装着本插件，重新判断该用哪个"
   }
   # ② 只有一个可用 → 直接用它（大多数用户是这种，不该被打扰）
   if ($list.Count -eq 1) {
@@ -561,21 +581,17 @@ function Resolve-ReaderBrowser {
     $script:readerPick = $list[0]
     return $list[0]
   }
-  # ③ 多个可用 → 让用户选，并把选择记下来
-  $msg = "CoRead 插件在下面这些浏览器里都装着，用哪一个打开阅读器？"
-  $msg += [Environment]::NewLine + "选定后会记住，下次直接用它（想换：右键托盘图标 →「阅读器用哪个浏览器」）。"
-  $msg += [Environment]::NewLine
-  foreach ($it in $list) {
-    $msg += [Environment]::NewLine + "  · $($it.Name)（$($it.Profile)）"
-    if ($it.Updated) { $msg += "  插件更新于 $($it.Updated)" }
-  }
-  $msg += [Environment]::NewLine + [Environment]::NewLine + "注意：两边的阅读进度（译文、读到第几页）各存各的，选哪个会影响你看到的进度。"
-  $msg += [Environment]::NewLine + "按「是」用第一个，按「否」用最后一个。"
-  $r = [System.Windows.Forms.MessageBox]::Show($msg, 'CoRead 阅读器：用哪个浏览器？', 'YesNo', 'Question')
-  if ($r -eq 'Yes') { $script:readerPick = $list[0] } else { $script:readerPick = $list[$list.Count - 1] }
-  $script:browserSource = "你刚选的（共 $($list.Count) 个可用）"
-  Set-ReaderBrowserPref $script:readerPick.Key | Out-Null
-  return $script:readerPick
+  # ③ 多个可用、又没设置过 → 交给"用哪个浏览器打开阅读器"那个选择窗（Show-ReaderPicker）。
+  #    这里只举手说"该问了"，不弹任何东西 —— 弹窗是界面的事，判定是这里的事，分开才测得动。
+  #
+  # 2026-10-07 换掉了原来的做法：那时是把名单打在 MessageBox 正文里，然后写一句
+  # 「按「是」用第一个，按「否」用最后一个」让用户自己数。用户原话："应该不会有任何其他
+  # 软件会这么设计"。四个毛病：① 是/否 与浏览器名字没有对应关系，3 个以上时中间那个根本
+  # 选不了；② 名单是文字、不可点；③ 它是模态的，开着期间托盘界面停摆；④ 系统 MessageBox
+  # 的按钮文字写死、改不了，所以只能靠一句解释去补。现在与"打开方式"那种系统对话框一致。
+  $script:readerAsk = $true
+  $script:browserSource = "多个可用（共 $($list.Count) 个），还没选过用哪个"
+  return $null
 }
 
 # 阅读器打不开时的说明。
@@ -595,21 +611,171 @@ function Show-ReaderHint([string]$Why) {
 }
 
 # 打开阅读器：**交给浏览器 exe**（不走协议关联，理由见下面那一段注释），地址按该浏览器的 ID 现拼。
-function Open-Reader {
-  $pick = Resolve-ReaderBrowser
-  if (-not $pick) {
-    Write-Log 'tray' "打不开 CoRead 阅读器：没有任何浏览器装着本插件（$($script:browserSource)）"
-    Show-ReaderHint ''
-    return
-  }
+# 拆成两个函数：Open-ReaderIn 只管"用这个浏览器打开"，Open-Reader 负责"先决定用哪个"。
+# 为什么必须拆：选择窗是**非模态**的 —— 窗口弹出去以后这次调用早就返回了，结果没法 return
+# 回来，只能由窗口自己回头调 Open-ReaderIn（模态 ShowDialog 能把值等回来，但会挡住托盘界面）。
+function Open-ReaderIn($pick, [string]$Why = '') {
+  if (-not $pick) { return }
   $url = "chrome-extension://$($pick.ExtId)/reader.html"
+  $src = if ($Why) { $Why } else { $script:browserSource }
   try {
     Start-Process -FilePath $pick.Exe -ArgumentList @($url)
-    Write-Log 'tray' "已打开 CoRead 阅读器（$($pick.Name) / $($pick.Exe)；选择依据：$($script:browserSource)）"
+    Write-Log 'tray' "已打开 CoRead 阅读器（$($pick.Name) / $($pick.Exe)；选择依据：$src）"
   } catch {
     Write-Log 'tray' "打开 CoRead 阅读器失败: $($_.Exception.Message)"
     Show-ReaderHint ("系统没能用这个浏览器打开地址：" + $pick.Exe)
   }
+}
+
+function Open-Reader {
+  $pick = Resolve-ReaderBrowser
+  if ($pick) { Open-ReaderIn $pick; return }
+  if ($script:readerAsk) { Show-ReaderPicker; return }   # 非模态：选完由窗口那边负责打开
+  Write-Log 'tray' "打不开 CoRead 阅读器：没有任何浏览器装着本插件（$($script:browserSource)）"
+  Show-ReaderHint ''
+}
+
+# ── "用哪个浏览器打开阅读器"选择窗（2026-10-07 换掉原来的 Yes/No 弹框）──────
+# 与"打开方式"那种系统对话框同一套路：每个浏览器一行、单选，底下带一个
+# 「以后都用它打开」的勾选框。勾了就写进 data\config\reader-browser.txt（下次不再问），
+# 不勾就只这一次生效（下次还问）。
+#
+# 为什么自建窗体（与文件靠下「装浏览器插件」那个窗同一条理由）：系统 MessageBox 只能选
+# 按钮组合，文字样式一概改不了 —— 想把浏览器逐个列出来就没法用它。
+# 为什么 Show 而不是 ShowDialog：非模态不挡托盘，开着的时候自愈轮询照常跑。
+#
+# ⚠️ 控件一律放 $script:（本文件已踩过）：事件处理器里的脚本块**看不到**外层局部变量；
+#    而 `.GetNewClosure()` 里的 $script: 又指向 closure 自己的模块作用域，写不回来。
+#    所以下面用 $script:readerPickerRadios / $script:readerPickerAlways 这两个中间变量。
+#
+# 用到的 Add-HelpLabel 定义在文件靠下那一节 —— 这里只是**定义**函数，真正被调用是用户双击
+# 图标之后（那时整份脚本早已执行完），所以先后顺序不影响。
+
+function Confirm-ReaderPick {
+  $item = $null
+  foreach ($r in $script:readerPickerRadios) { if ($r.Radio.Checked) { $item = $r.Item; break } }
+  if (-not $item) { return }
+  $always = [bool]($script:readerPickerAlways -and $script:readerPickerAlways.Checked)
+  $n = $script:readerPickerRadios.Count
+  $script:readerPickerForm.Close()      # 先关窗：FormClosed 会把上面两个 $script: 中间变量清空
+  if ($always) {
+    Set-ReaderBrowserPref $item.Key | Out-Null
+    Write-Log 'tray' "阅读器浏览器已记住：$($item.Name)（$($item.Key)）"
+    Update-ReaderBrowserMenu            # 右键菜单里那个 ✔ 跟着改
+  } else {
+    Write-Log 'tray' "本次用 $($item.Name) 打开阅读器（没写设置，下次还会问）"
+  }
+  Open-ReaderIn $item "你刚在窗口里选的（共 $n 个可用）"
+}
+
+function New-ReaderPickerForm($List) {
+  $form = New-Object System.Windows.Forms.Form
+  $form.Text = 'CoRead · 用哪个浏览器打开阅读器'
+  $form.StartPosition = 'CenterScreen'
+  $form.FormBorderStyle = 'FixedDialog'
+  $form.MaximizeBox = $false
+  $form.MinimizeBox = $false
+  $form.ShowInTaskbar = $true           # 要让用户找得到（他接下来要切回浏览器）
+  $form.TopMost = $true
+  try { $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9) } catch { }
+  try { $form.Icon = Get-TrayIcon } catch { }
+
+  $margin = 20
+  $w      = 520
+  $y      = 18
+  $fBase  = $form.Font
+  $fTitle = New-Object System.Drawing.Font($fBase.FontFamily, ($fBase.Size + 3), [System.Drawing.FontStyle]::Bold)
+  $fSmall = New-Object System.Drawing.Font($fBase.FontFamily, ($fBase.Size - 0.5))
+  $cText  = [System.Drawing.SystemColors]::ControlText
+  $cGray  = [System.Drawing.SystemColors]::GrayText
+
+  $y += (Add-HelpLabel $form '用哪个浏览器打开阅读器？' $margin $y $w $fTitle $cText) + 6
+  $y += (Add-HelpLabel $form 'CoRead 插件在下面这些浏览器里都装着。选一个用来打开阅读器。' $margin $y $w $fSmall $cGray) + 16
+
+  # 每个浏览器一行单选。同一容器里的 RadioButton 自动互斥，不用自己管
+  $script:readerPickerRadios = @()
+  $script:readerPickerTips = @()      # 悬停提示组件的引用（见循环里的说明）
+  $first = $true
+  foreach ($it in $List) {
+    $rb = New-Object System.Windows.Forms.RadioButton
+    $txt = "$($it.Name)（$($it.Profile)）"
+    if ($it.Updated) { $txt += "      插件更新于 $($it.Updated)" }
+    $rb.Text = $txt
+    $rb.Location = New-Object System.Drawing.Point($margin, $y)
+    $rb.Size = New-Object System.Drawing.Size($w, 24)
+    $rb.Checked = $first                  # 默认选第一个，回车即可用
+    # 编号与磁盘路径进悬停提示：正文只留人看得懂的名字，排查要用的东西也不丢
+    # ⚠️ $tip 得留个引用：ToolTip 是独立组件、不挂在窗体上，没人引用会被 GC 收走，提示就没了
+    $tip = New-Object System.Windows.Forms.ToolTip
+    $tip.SetToolTip($rb, "$($it.ExtId)`r`n$($it.Path)")
+    $script:readerPickerTips += $tip
+    $form.Controls.Add($rb)
+    $script:readerPickerRadios += @{ Radio = $rb; Item = $it }
+    $first = $false
+    $y += 26
+  }
+
+  $y += 4
+  $y += (Add-HelpLabel $form '注意：各浏览器里的阅读进度（译文、读到第几页）是各存各的，选哪个会影响你看到的进度。' $margin $y $w $fSmall $cGray) + 14
+
+  $chk = New-Object System.Windows.Forms.CheckBox
+  $chk.Text = '以后都用它打开，不再问我'
+  $chk.Checked = $true                    # 与"打开方式"一致：默认记住；想改见下面那行灰字
+  $chk.Location = New-Object System.Drawing.Point($margin, $y)
+  $chk.Size = New-Object System.Drawing.Size($w, 24)
+  $form.Controls.Add($chk)
+  $script:readerPickerAlways = $chk
+  $y += 26
+  $y += (Add-HelpLabel $form '（想改：右键托盘图标 →「阅读器用哪个浏览器」）' $margin $y $w $fSmall $cGray) + 18
+
+  $btnOpen = New-Object System.Windows.Forms.Button
+  $btnOpen.Text = '打开'
+  $btnOpen.Size = New-Object System.Drawing.Size(100, 32)
+  $btnOpen.Location = New-Object System.Drawing.Point(($margin + $w - 212), $y)
+  $btnOpen.add_Click({ Confirm-ReaderPick })
+  $form.Controls.Add($btnOpen)
+  $form.AcceptButton = $btnOpen           # 回车 = 打开
+
+  $btnCancel = New-Object System.Windows.Forms.Button
+  $btnCancel.Text = '取消'
+  $btnCancel.Size = New-Object System.Drawing.Size(100, 32)
+  $btnCancel.Location = New-Object System.Drawing.Point(($margin + $w - 100), $y)
+  $btnCancel.add_Click({ $script:readerPickerForm.Close() })
+  $form.Controls.Add($btnCancel)
+  $form.CancelButton = $btnCancel         # Esc = 取消
+
+  $y += 32 + 18
+  $form.ClientSize = New-Object System.Drawing.Size(($margin * 2 + $w), $y)
+
+  $form.add_FormClosed({
+    $script:readerPickerForm = $null
+    $script:readerPickerRadios = @()
+    $script:readerPickerAlways = $null
+  })
+  return $form
+}
+
+function Show-ReaderPicker {
+  # 已经开着 → 拉到前面，不再开第二个（与装插件指引窗同一处理）
+  $prev = $script:readerPickerForm
+  if ($prev -and -not $prev.IsDisposed) { $prev.Activate(); $prev.BringToFront(); return }
+  # 重扫一遍：上一次判定到现在，用户完全可能又装/又删了一份插件
+  $list = Get-ReaderBrowsers
+  if (-not $list -or $list.Count -eq 0) {
+    Write-Log 'tray' '打不开 CoRead 阅读器：没有任何浏览器装着本插件'
+    Show-ReaderHint ''
+    return
+  }
+  if ($list.Count -eq 1) {
+    # 重扫完只剩一个 → 没什么可问的，直接用（不再让用户白点一次）
+    Write-Log 'tray' "重扫后只剩 $($list[0].Name) 一个，直接用它打开"
+    Open-ReaderIn $list[0] '重扫后只有一个可用'
+    return
+  }
+  $form = New-ReaderPickerForm $list
+  $script:readerPickerForm = $form
+  $form.Show()          # Show = 非模态（ShowDialog 会挡住托盘那一摊）
+  $form.Activate()
 }
 
 # ── 找浏览器：不要交给 Windows 去猜（2026-10-07 实测踩到）────────────────
@@ -631,14 +797,19 @@ function Open-Reader {
 $script:readerBrowsers = @()
 $script:readerPick = $null
 $script:browserSource = ''
+$script:readerAsk = $false          # Resolve-ReaderBrowser 判定"要不要问用户"
+$script:readerPickerForm = $null    # 选择窗本体（非模态；同时只允许存在一个）
+$script:readerPickerRadios = @()    # 每项 @{ Radio = 单选钮; Item = 浏览器条目 }
+$script:readerPickerAlways = $null  # 「以后都用它打开」那个勾选框
 
 
-# 扫描一次并刷新右键菜单里「阅读器用哪个浏览器」那一栏。
+# 扫描一次并刷新「打开 CoRead 阅读器」那一项**底下**的子菜单（2026-10-07 起挂在那里）。
+# 子菜单里每一行就是"用这个浏览器打开"；打勾的那行 = 现在会用的那个（这就是"当前设置"）。
 # 为什么每次点菜单都重扫、而不是启动时扫一次：用户完全可能装着托盘的时候去装插件、
 # 或把某份扩展删掉。重扫一次的成本是读几个几百 KB 的文件（实测整轮约 400 ms），
 # 只在打开菜单/点这一栏时发生，不值得为它缓存出"菜单状态与事实不符"的问题。
 function Update-ReaderBrowserMenu {
-  $list = Get-ReaderBrowsers
+  $list = Get-ReaderBrowsers      # 别加 @()：兜底在函数那侧，见 Resolve-ReaderBrowser 里那段注释
   $script:readerBrowsers = $list
   $pref = Get-ReaderBrowserPref
   # 子菜单的子项挂在 **DropDownItems** 上 —— ToolStripMenuItem.Items 是 null（实测），
@@ -655,15 +826,31 @@ function Update-ReaderBrowserMenu {
   if ($pref) {
     $hit = $list | Where-Object { $_.Key -eq $pref -or $_.Name.ToLower() -eq $pref } | Select-Object -First 1
     if ($hit) { $pickKey = $hit.Key }
+  } elseif ($list.Count -eq 1) {
+    # 只有一个可用时托盘根本不问、直接用 —— 勾必须跟上（2026-10-07 补）：
+    # 以前这里不勾，于是"实际会用的那个"在菜单里看不出被选中，菜单与行为对不上。
+    $pickKey = $list[0].Key
   }
   foreach ($it in $list) {
     $mi = New-Object System.Windows.Forms.ToolStripMenuItem
-    # 在用的那个打勾。勾是"当前设置"，不是"默认值"—— 只有一个可用时我们自动用它，也算在用。
-    $mi.Text = $(if ($it.Key -eq $pickKey) { "✔ $($it.Name)" } else { "   $($it.Name)" })
-    $mi.ToolTipText = "$($it.ExtId)`r`n来自：$($it.Path)"
+    # 文案写成"用 X 打开"，让这一行自己说清点了会发生什么（旧版只有浏览器名字，
+    # 于是"点它是切换设置还是立刻打开"得靠猜）。
+    # 打勾的那行 = 现在会用的那个："当前设置"不是"默认值"—— 只有一个可用时我们自动用它，也算在用。
+    $label = "用 $($it.Name) 打开（$($it.Profile)）"
+    $mi.Text = $(if ($it.Key -eq $pickKey) { "✔ $label" } else { "   $label" })
+    # 编号与磁盘路径进悬停提示：正文只留人看得懂的东西，排查要用的信息也不丢
+    $mi.ToolTipText = "$($it.ExtId)`r`n配置：$($it.Profile)`r`n来自：$($it.Path)"
+    # 点了它 = 用这个浏览器打开阅读器，并把它记为当前设置（勾跟着走）。
+    # 为什么要写设置：不写的话，"勾"和"实际会用的那个"就会分家 —— 用户看着勾在 Chrome 上，
+    # 双击图标却弹选择窗，那种不一致比"顺手改了设置"更让人困惑。
+    #
     # 闭包捕获：$it 是循环变量，事件触发时循环早已结束，不 GetNewClosure 会全部指向最后一个。
-    # （这是 PowerShell 的经典坑：不写它，"选 Edge"实际会把偏好写成最后那项。）
-    $mi.add_Click({ Set-ReaderBrowserPref $it.Key | Out-Null; Update-ReaderBrowserMenu }.GetNewClosure())
+    # （这是 PowerShell 的经典坑：不写它，"点 Edge"实际会把偏好写成最后那项。）
+    $mi.add_Click({
+      Set-ReaderBrowserPref $it.Key | Out-Null
+      Open-ReaderIn $it "你刚在托盘菜单里选的"
+      Update-ReaderBrowserMenu
+    }.GetNewClosure())
     $script:readerMenu.DropDownItems.Add($mi) | Out-Null
   }
   $script:readerMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
@@ -700,15 +887,16 @@ $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 # 名字里都带"阅读"二字，但前面那个必须点明是 CoRead 自己的，否则两个条目分不清谁是谁。
 $itemReader = New-Object System.Windows.Forms.ToolStripMenuItem
 $itemReader.Text = '打开 CoRead 阅读器（推荐）'
-$itemReader.add_Click({ Open-Reader })
+# 2026-10-07 用户定调：**取消**原来单独那一行「阅读器用哪个浏览器」，把"用哪个浏览器"
+# 收进这一项的子菜单 —— 它是"打开阅读器"这件事的一部分设置，不该另起一行跟它并排。
+#
+# ⚠️ 这一项**故意不挂 add_Click**（实测过，别加回来）：WinForms 里带子菜单的菜单项被点击时，
+#    Click 事件**照样会触发**（我用真鼠标事件测的：parent.Click 触发 1 次，同时子菜单展开）。
+#    所以这里挂上 Open-Reader 的后果是 —— 用户只是想展开子菜单换个浏览器，浏览器窗口先自己
+#    开一个。"一键打开"这件事由**双击托盘图标**承担（那本来就是本程序最快的一条路）。
+$script:readerMenu = $itemReader        # 子菜单挂在它身上，内容由 Update-ReaderBrowserMenu 填
+Update-ReaderBrowserMenu                # 开机先填一次；之后选完 或 点「重新检测」都会刷新
 $menu.Items.Add($itemReader) | Out-Null
-
-# 阅读器用哪个浏览器（2026-10-07 用户提出"Edge 和 Chrome 都装了怎么办"）
-# 常驻菜单栏而不是"只在多选时才出现"：否则有得选的人反而发现不了入口。
-$readerMenu = New-Object System.Windows.Forms.ToolStripMenuItem
-$readerMenu.Text = '阅读器用哪个浏览器'
-Update-ReaderBrowserMenu      # 开机先填一次；之后选完 或 点「重新检测」都会刷新
-$menu.Items.Add($readerMenu) | Out-Null
 
 $itemOpen = New-Object System.Windows.Forms.ToolStripMenuItem
 $itemOpen.Text = '打开微信读书'

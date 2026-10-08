@@ -118,9 +118,32 @@ function toast(text, isError = false) {
 }
 
 // ── 书库（放进来过的 PDF，下次不用再手动选文件）──────────────────────────────
-// 原件存在 receiver/books/<hash>/source.pdf，列表来自 GET /reader-books。
+// 原件存在 data\reading\books\<hash>\source.pdf，列表来自 GET /reader-books。
 // receiver 没起来时不影响本地打开，只是没有历史可用。
 const LIB_TIMEOUT = 5000
+
+/**
+ * 阅读器这本书在**共读侧**的书 ID。
+ *
+ * 为什么要它（2026-11）：共读侧的"书 ID"以前只有微信读书有（内容脚本从阅读页 URL 取），
+ * 我们自己的阅读器是**另一套**（用 PDF 内容哈希当目录名，只存在 reader-meta.json，
+ * 见 receiver 的 listReaderBooks），于是：
+ *   · 打开 PDF 不进「已读过的书籍」列表；
+ *   · 阅读器里点「设为引用」被后台判成"当前页面未关联任何书籍"（报"未加入一本书籍"）。
+ * 这里给出阅读器侧的唯一 ID 形态：`rd_` + 64 位内容哈希。
+ *
+ * 三条约束（改动时别破坏）：
+ *   1) 只允许 `[A-Za-z0-9_]`——侧栏与 receiver 的书 ID 校验都是这个字符集
+ *      （sidebar.js 的 applyBookContext、receiver 的 sanitizePathPart），带点/横线会被剥。
+ *   2) 长度必须 ≥12——侧栏那条 `^[A-Za-z0-9_]{12,}$` 是硬门槛，短了直接被当成垃圾值丢掉，
+ *      `rd_` 前缀加哈希共 67 字符，稳过。
+ *   3) **与 PDF 内容哈希一一对应**：同一份文件重复打开必须是同一个 ID，否则同一本书
+ *      会攒出多条"已读书籍"记录、引用也会对不上。
+ * @param {string} hash 内容哈希（sha256Hex 的结果）
+ */
+function readerBookId(hash) {
+  return hash ? 'rd_' + hash : ''
+}
 
 async function receiverJson(path, opts = {}, timeout = LIB_TIMEOUT) {
   const ctl = new AbortController()
@@ -153,7 +176,12 @@ async function archiveToLibrary(bytes, name) {
   }
 }
 
-/** 更新书库里的元信息（书名、页数、译文条数、读到第几页） */
+/** 更新书库里的元信息（书名、页数、译文条数、读到第几页）
+ *
+ *  顺带办一件 2026-11 新增的事：把这本书登记到**共读侧**（receiver 会写
+ *  `<hash>/meta.json`，即「已读过的书籍」列表的数据源）。过去只有微信读书的书有这一步，
+ *  所以阅读器里打开过的 PDF 从来不出现在那个列表里。
+ *  写失败不提示——receiver 没起来时阅读照常，只是没有共读侧记录（与书库本身同款行为）。 */
 function touchLibraryMeta() {
   if (!state.hash) return
   receiverJson('/reader-book', {
@@ -161,6 +189,7 @@ function touchLibraryMeta() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       hash: state.hash,
+      bookId: readerBookId(state.hash),   // 共读侧 ID（receiver 据此写 meta.json）
       name: state.name,
       pages: state.doc ? state.doc.numPages : 0,
       entries: state.entries.length,
@@ -307,6 +336,8 @@ async function openBytes(bytes, name, opts = {}) {
     // 本地选的文件顺手存进书库；从书库打开的本来就在里面
     if (keepForUpload) archiveToLibrary(keepForUpload, state.name)
     else touchLibraryMeta()
+    // 刚打开一本书 → 立刻告诉侧栏"当前书换成这本了"（用户点「打开 PDF」时期望的就是它）
+    notifyBookChanged()
   } catch (e) {
     failOpen('无法打开该 PDF：' + ((e && e.message) || e))
   }
@@ -371,18 +402,23 @@ async function loadDocument(bytes, name) {
 }
 
 function closeDoc() {
+  const hadBook = !!state.doc
   io.disconnect()
   state.doc = null
   state.pages = []
   state.entries = []
   state.activeId = ''
   state.lastRenderError = null
+  state.hash = ''
   els.pages.replaceChildren()
   els.pages.style.setProperty('--total-scale-factor', String(state.scale))
   els.pageinfo.textContent = '—'
   els.scanHint.hidden = true
   clearHighlights()
   renderEntries()
+  // 关掉/换掉一本书也要说一声：侧栏据此离开这本书的上下文（否则会停在一本
+  // 阅读器里已经关掉的 PDF 上，用户看到"书名还在、但其实没在读"）
+  if (hadBook) notifyBookChanged()
 }
 
 // ── 懒渲染 ────────────────────────────────────────────────────────────────────
@@ -1026,6 +1062,7 @@ function renderImageMarks() {
 // 阅读器页面**不再自带对照栏**：那样一边开着 CoRead 侧栏、一边再来一栏，就是两栏并排。
 // 条目变化 → 经后台中继同步给侧栏；侧栏上的操作 → 经后台中继发回来（见 onReaderCommand）。
 let _syncTimer = null
+let _bookNotify = false   // 下一次同步要不要顺便让侧栏切到"当前这本书"（见 notesSnapshot/notifyBookChanged）
 
 function scheduleSync() {
   clearTimeout(_syncTimer)
@@ -1034,7 +1071,15 @@ function scheduleSync() {
 
 function notesSnapshot() {
   return {
-    book: state.doc ? { hash: state.hash, name: state.name } : null,
+    // bookId 是共读侧 ID（见 readerBookId）：侧栏的译文对照、引用归属都按它走，
+    // 不是每处各自用 hash 拼一遍
+    book: state.doc
+      ? { bookId: readerBookId(state.hash), hash: state.hash, name: state.name }
+      : null,
+    // notify：这份快照要不要顺带把侧栏的"当前书"切过来。只有**换书**（打开/切换/关掉
+    // 一份 PDF）才置真，"翻页/翻译出条新译文"这类同步不置 —— 否则每次滚动都会把侧栏
+    // 从用户手动翻看的另一本书上拽回来。
+    notify: !!_bookNotify,
     page: state.doc ? currentPage() : 0,
     total: state.doc ? state.doc.numPages : 0,
     activeId: state.activeId,
@@ -1054,9 +1099,20 @@ async function syncNotes() {
   clearTimeout(_syncTimer)      // 立即同步时就取消排队中的那次，免得白发两遍
   _syncTimer = null
   if (!canMessage()) return
+  const snap = notesSnapshot()
+  _bookNotify = false           // 只生效一次：下次同步回到"不打扰侧栏上下文"
   try {
-    await chrome.runtime.sendMessage({ action: 'readerSync', snapshot: notesSnapshot() })
+    await chrome.runtime.sendMessage({ action: 'readerSync', snapshot: snap })
   } catch (e) {}
+}
+
+/**
+ * 换书了（打开 / 切换 / 关掉一份 PDF）→ 立刻把快照推给侧栏，并让它把"当前书"切过来。
+ * 不排队（scheduleSync 那 200ms 防抖会让侧栏慢半拍），因为用户感知到的就是这个瞬间。
+ */
+function notifyBookChanged() {
+  _bookNotify = true
+  syncNotes()
 }
 
 /** 让侧栏打开译文对照页（顺便把侧栏本身打开） */
@@ -1225,7 +1281,15 @@ async function copyText(text) {
   }
 }
 
-/** 设为引用：沿用翻译那套（receiver 侧只设为当前引用，不触发 agent） */
+/**
+ * 设为引用：沿用翻译那套（receiver 侧只设为当前引用，不触发 agent）
+ *
+ * 2026-11 修：这里必须**把"这是哪本书"一起报上去**。旧版只报了 url/pageTitle，后台
+ * 于是去猜当前页面属于哪本书 —— 它只认微信读书阅读页与文库网页的绑定，我们自己的
+ * 阅读器（chrome-extension://…/reader.html）两条都不沾，必然猜不出来，用户看到的
+ * 就是那句莫名其妙的「当前页面未关联任何书籍…仅支持微信读书阅读页，或已加入一本书的页面」。
+ * 阅读器自己最清楚在看哪本（state.hash + state.name），别再让它猜。
+ */
 async function setAsReference(entry) {
   if (!entry || !entry.translation) return { ok: false, error: { message: '该条目暂无译文' } }
   const res = await callBackground({
@@ -1234,6 +1298,8 @@ async function setAsReference(entry) {
     translation: entry.translation,
     url: 'reader://' + state.hash + (state.name ? '#' + state.name : ''),
     pageTitle: state.name,
+    bookId: readerBookId(state.hash),   // 共读侧 ID：后台据此定书、接收端据此归属
+    bookTitle: state.name || '',
   })
   if (res && res.ok) toast('已设为引用')
   return res
@@ -1383,11 +1449,30 @@ async function onReaderCommand(msg) {
   return { ok: false, error: { message: '未知操作 ' + type } }
 }
 
+/**
+ * 后台问"这本书是哪本书"（2026-11）。
+ *
+ * 为什么不用后台缓存的那份快照：扩展重载 / service worker 被回收后缓存是空的，
+ * 而侧栏这时候正需要知道当前在看哪本 PDF。直接问页面最稳，"当前打开的是哪本"只有它知道。
+ * 页面没开 PDF 时返回 null，后台据此让侧栏回落到无书状态。
+ */
+function readerBookInfo() {
+  return {
+    ok: true,
+    book: state.doc && state.hash
+      ? { bookId: readerBookId(state.hash), hash: state.hash, bookTitle: state.name || '' }
+      : null,
+  }
+}
+
 // 侧栏（以及后台中继）发来的命令必须有监听者 —— 少了这一段，侧栏里点删除/重译/设为引用
 // 全都悄无声息（踩过：自测是直接调 onReaderCommand，正好绕过了消息链路）。
+// readerBookInfo 走同一个监听：后台问"当前在看哪本 PDF"（侧栏据此建立书籍上下文）。
 if (canMessage()) {
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (!msg || msg.action !== 'readerCommand') return
+    if (!msg) return
+    if (msg.action === 'readerBookInfo') { sendResponse(readerBookInfo()); return }
+    if (msg.action !== 'readerCommand') return
     Promise.resolve(onReaderCommand(msg))
       .then((r) => sendResponse(r || { ok: true }))
       .catch((e) => sendResponse({ ok: false, error: { message: String((e && e.message) || e) } }))

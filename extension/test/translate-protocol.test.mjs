@@ -193,9 +193,45 @@ test('classifyFetchError 区分超时、连不上与未知', () => {
 
   const netErr = new TypeError('Failed to fetch')
   assert.equal(classifyFetchError(netErr).code, 'NETWORK')
-  assert.match(classifyFetchError(netErr).message, /授权/)
+  // 文案必须指向真正该查的地方：浏览器对 DNS 失败/端口不通/地址缺协议头都只回一句
+  // Failed to fetch，所以「重新授权域名」是误导（授权失败有独立的 NEED_GRANT 文案）。
+  assert.doesNotMatch(classifyFetchError(netErr).message, /授权/)
+  assert.match(classifyFetchError(netErr).message, /API 地址/)
 
   assert.equal(classifyFetchError(new Error('怪错')).code, 'UNKNOWN')
+})
+
+test('classifyFetchError 把实际请求地址带进文案与 detail', () => {
+  const netErr = new TypeError('Failed to fetch')
+  const target = 'https://api.deepseek.com/chat/completions'
+  const out = classifyFetchError(netErr, target)
+  assert.ok(out.message.includes(target), '文案里要能看见打去的地址')
+  assert.ok(out.detail.includes(target), 'detail 里要能看见打去的地址')
+  assert.ok(out.detail.includes('TypeError'), 'detail 里要留下异常名')
+  // 不传 target 时不能出现空的「请求地址 」
+  assert.doesNotMatch(classifyFetchError(netErr).message, /请求地址/)
+})
+
+test('classifyFetchError 认得 DOMException 形态的网络错误', () => {
+  // 部分平台 fetch 失败抛的不是 TypeError 而是 DOMException: NetworkError。
+  // 漏掉这一支会让它落到 UNKNOWN，文案里连「网络」两个字都没有。
+  const domErr = new Error('NetworkError when attempting to fetch resource.')
+  domErr.name = 'DOMException'
+  assert.equal(classifyFetchError(domErr).code, 'NETWORK')
+  // 其它名字的 DOMException（如语法类）不该被误判成网络问题
+  const other = new Error('InvalidCharacterError')
+  other.name = 'DOMException'
+  assert.equal(classifyFetchError(other).code, 'UNKNOWN')
+})
+
+test('classifyFetchError 把连通性探测结论带进文案', () => {
+  const netErr = new TypeError('Failed to fetch')
+  const note = '另一项连通性探测也失败，本机当前访问外网很可能整体不通'
+  const out = classifyFetchError(netErr, 'https://api.deepseek.com/chat/completions', note)
+  assert.ok(out.message.includes(note), '探测结论要出现在文案里')
+  assert.ok(out.detail.includes(note), '探测结论也要进 detail')
+  // 没探测结果时不能留下多余的空句号
+  assert.doesNotMatch(classifyFetchError(netErr).message, /。。/)
 })
 
 // ── 重新定位（画布书专用：让模型看着屏幕找文字）──────────────────────────────

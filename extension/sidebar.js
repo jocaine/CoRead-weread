@@ -286,8 +286,12 @@ function refreshDot() {
 }
 
 function setBackendAlive(alive) {
+  const was = _backendAlive
   _backendAlive = alive
   refreshDot()   // 灯是唯一的常驻提示；发送被拦时的解释走弹窗（见 showSendFailedNotice）
+  // 本机服务刚起来（启动顺序常是"先开侧栏、后开 CoRead"）：无书界面正停在
+  // 「读不到已读书籍」的话顺手重拉一次书单，省得用户自己去找那个「重试」
+  if (alive && !was && _nbShown && _booksFailed) refreshNoBookBooks()
 }
 
 function setSseOpen(open) {
@@ -1063,6 +1067,20 @@ function onEffectiveContextChange() {
   refreshStackHits()
 }
 
+// 手动选书期间检测到真实阅读（选的就是这本也算"已在读"）：退出兜底的手动
+// 查看，恢复自动跟随。有效上下文没变（实时书 == 手动书）时不弹提示。
+//
+// 2026-11：这段逻辑从 applyBookContext 里抽出来单独一个函数——阅读器那条路
+//（refreshCurrentBook 问后台"阅读器里开着哪本 PDF"）也要用同一套退出规则，
+// 复制一遍必然走偏。
+function leaveManualBookIfRealRead(next) {
+  if (!_manualBook || !next || _freeMode) return
+  const switched = _manualBook.base !== next.base
+  _manualBook = null
+  saveState()
+  if (switched) showToast('检测到正在阅读《' + (next.bookTitle || '…') + '》，已恢复自动跟随')
+}
+
 // 应用阅读上下文：记录实时检测到的书；有效上下文变化时取消其他书的选中引用、
 // 刷新引用/消息过滤。手动选书期间，实时上下文不打断手动查看；一旦检测到真实
 // 阅读上下文（任何一本书），自动退出手动选书恢复跟随——手动选书是"无书时查看
@@ -1076,14 +1094,7 @@ function applyBookContext(ctx) {
   const next = base ? { base, bookTitle } : null
   const prevEffBase = effectiveBookBase()
   _currentBook = next
-  // 手动选书期间检测到真实阅读（选的就是这本也算"已在读"）：退出兜底的手动
-  // 查看，恢复自动跟随。有效上下文没变（实时书 == 手动书）时不弹提示。
-  if (_manualBook && next && !_freeMode) {
-    const switched = _manualBook.base !== next.base
-    _manualBook = null
-    saveState()
-    if (switched) showToast('检测到正在阅读《' + (next.bookTitle || '…') + '》，已恢复自动跟随')
-  }
+  leaveManualBookIfRealRead(next)
   const ctxChanged = !prevEffBase || prevEffBase !== effectiveBookBase()
   if (ctxChanged) onEffectiveContextChange()
   renderCurrentBook()
@@ -1098,12 +1109,34 @@ function applyBookContext(ctx) {
 // 直接定向问活动 tab 的顶层 frame（不走 runtime 广播）：广播会被每个 content
 // script 帧抢答、可能绑到非活动 tab 的书，这里点名唯一的目标（AI-008）。
 // bookId 为空（如无活动阅读页）也走 applyBookContext：把当前书重置为无书状态。
+//
+// 2026-11：**先问 CoRead 自己是不是开着**。旧版只查 weread.qq.com 的 tab，于是
+// 用我们自己的阅读器看 PDF 时，侧栏显示"未检测到正在阅读的书籍"—— 引用/提问都没有
+// 归属，阅读器里点「设为引用」还会被判成"当前页面未关联任何书籍"。阅读器开着 PDF 时
+// 它就是当前阅读上下文，优先级与微信读书阅读页相同（谁在活动 tab 就算谁）。
 async function refreshCurrentBook() {
   // 自由模式期间保持自由上下文：不被面板重开/活动 tab 变化刷新覆盖（退出时手动恢复）
   if (_freeMode) {
     applyBookContext({ bookId: _freeKey || FREE_KEY, bookTitle: freeConvTitle(_freeKey) })
     return
   }
+  // ① 我们自己的阅读器（是它 → 上下文就是它开着的那本 PDF；没开 PDF → 无书）
+  try {
+    const r = await chrome.runtime.sendMessage({ action: 'readerBookInfo' })
+    if (r && r.ok && r.notReader === false) {
+      const b = r.book
+      if (b && b.bookId) {
+        // 记进 _lastWereadContext？不：那个变量是"最近的微信读书上下文"，退出自由模式
+        // 时恢复用；把 PDF 塞进去会让退出自由模式后显示一本没在微读里打开的书。
+        leaveManualBookIfRealRead({ base: baseBookId(b.bookId), bookTitle: String(b.bookTitle || '').trim() })
+        applyBookContext({ bookId: b.bookId, bookTitle: b.bookTitle })
+      } else {
+        applyBookContext({ bookId: '' })
+      }
+      return
+    }
+  } catch {}
+  // ② 微信读书阅读页（原逻辑）
   try {
     let ctx = null
     const [tab] = await chrome.tabs.query({ url: 'https://weread.qq.com/*', active: true, lastFocusedWindow: true })
@@ -1119,12 +1152,51 @@ async function refreshCurrentBook() {
   } catch {}
 }
 
-// ── 无书默认界面 / 已读书籍手动选择（2026-10）───────────────────────────────
-// 读书模式未检测到阅读书籍时，消息区显示默认界面（不再残留上一本书的内容），
-// 提供「从已读过的书籍中选择」入口——已读完的书在微信读书外没有聊天记录入口，
-// 从这里手动选书即可查看/继续它的讨论。手动选书期间消息、引用、命中、发送归属
-// 全部按选中的书工作（effectiveBook 统一判定）；检测到真实阅读后自动退出。
-let _bookPickerList = []  // GET /books 的原始结果，供弹窗搜索过滤
+/**
+ * 阅读器换书了（打开 / 切换 / 关掉一份 PDF）——**它自己报上来的**，直接切过去。
+ *
+ * 为什么不复用 refreshCurrentBook（2026-11 用户实测"打开 PDF 但侧栏没跟过去"）：
+ * 那条路要反过来问后台"现在哪个 tab 是活动的、它是不是阅读器"，而"活动 tab"这件事
+ * 并不总是答案 —— 侧栏在 DevTools 里、用户刚点过别的 tab、面板刚打开还没轮到它，
+ * 都会问出一个"不是阅读器"的结果，于是上下文没跟过去，而且**时灵时不灵**。
+ * 换书是阅读器自己知道的事实，它推过来的那一刻就是最可靠的信号，直接采用。
+ */
+function applyReaderBookFromSnapshot(snapshot) {
+  if (_freeMode) return                       // 自由模式优先，别被阅读器拽走
+  const b = snapshot && snapshot.book
+  const base = b ? baseBookId(b.bookId) : ''
+  if (!base) {                                // 阅读器回到书库了 → 离开这本书
+    if (_currentBook && String(_currentBook.base).startsWith('rd_')) applyBookContext({ bookId: '' })
+    return
+  }
+  const next = { base, bookTitle: String(b.name || '').trim() }
+  if (_manualBook) {
+    // 用户手动翻着另一本书时，不硬拽：只把实时上下文记下来（与微信读书那条路的规矩一致）
+    if (_manualBook.base !== base) { _currentBook = next; return }
+    leaveManualBookIfRealRead(next)
+  }
+  applyBookContext({ bookId: b.bookId, bookTitle: b.name })
+  // 兜底：侧栏刚打开时可能还没跑完历史回放（那之前消息区是空的），而 applyBookFilter
+  // 只对**已在 DOM 里**的气泡生效。loadHistory 幂等（_histKeys 去重），重跑只补增量。
+  loadHistory().catch(() => {})
+}
+
+// ── 无书默认界面 / 已读书籍（2026-10；2026-11 改版）────────────────────────
+// 读书模式未检测到阅读书籍时，消息区显示默认界面（不再残留上一本书的内容）。
+// 手动选书（_manualBook）解决的是同一件事：已读完的书在微信读书里不会再打开，
+// 需要一个入口翻它的旧账。手动选书期间消息、引用、命中、发送归属全部按选中的书
+// 工作（effectiveBook 统一判定）；一旦检测到真实阅读就自动退出。
+//
+// 2026-11 改版（用户要求）：**已读书籍直接列在界面上**，不必再点「从已读书籍中
+// 选择」进弹窗。同一份书单（_bookPickerList）仍被弹窗复用——书读着的时候（无书
+// 界面不可见）也要能从「⋯ 菜单 / 手动选书横幅」翻别本书的记录。
+let _bookPickerList = []   // GET /books 的结果（无书界面书单 + 弹窗共用一份）
+let _booksLoaded = false   // 成功拉到过（有缓存就不再重复打请求）
+let _booksFailed = false   // 上次拉取失败（本机服务没起来）→ 界面显示「重试」
+let _booksLoading = false  // 正在拉取（首屏没缓存时显示「加载中…」）
+let _nbShown = false       // 无书界面上一轮是否可见：只在「隐藏 → 显示」那一刻拉一次
+let _nbRenderKey = null    // 上次渲染的书单指纹：没变就不重建 DOM（见 renderNoBookList）
+const NB_SEARCH_MIN = 6    // 书多于这个数才显示搜索框（书少时它只是白占一行）
 
 // 无书默认界面：显示/隐藏 + 同步禁用聊天输入（无书时发消息没有归属书，历史
 // 回放无从展示，直接禁用输入让行为规范）
@@ -1143,12 +1215,159 @@ function renderNoBookView() {
   if (input) {
     input.disabled = noBook
     input.placeholder = noBook
-      ? '未检测到书籍：请打开微信读书中的书，或从已读书籍中选择'
+      ? '未检测到书籍：请打开微信读书中的书'   // 输入框只有 ~18 个字宽，再长会被截断
       : '输入你的问题…'
   }
   if (sendBtn) sendBtn.disabled = noBook
   if (attachBtn) attachBtn.disabled = noBook
+  // 内联书单：进无书界面那一刻刷新一次（本函数被 applyBookContext 频繁调用——
+  // 切 tab / 切上下文都会走——所以只在「隐藏 → 显示」时打请求，其余时候用缓存渲染）
+  if (noBook && !_nbShown) refreshNoBookBooks()
+  _nbShown = noBook
+  renderNoBookList()
   refreshWebBindEntry()  // AI-021：无书状态时按活动 tab 显示/隐藏网页绑定入口
+}
+
+// 拉取已读书籍列表（GET /books → { books: [{ base, bookTitle, wereadBookId, updatedAt }] }）。
+// force=false 且已成功拉过 → 直接用缓存，不打请求。
+// 失败时**保留上一次的书单**：本机服务短暂没应声，不该把界面上已有的书清空。
+async function loadBooks(force) {
+  if (!force && _booksLoaded) return true
+  _booksLoading = true
+  try {
+    const r = await fetch(`${RECEIVER}/books`)
+    const d = await r.json()
+    _bookPickerList = Array.isArray(d && d.books) ? d.books : []
+    _booksLoaded = true
+    _booksFailed = false
+  } catch {
+    _booksFailed = true   // _booksLoaded 保持 false → 下次调用自动重试
+  }
+  _booksLoading = false
+  return !_booksFailed
+}
+
+// 无书界面书单的刷新：先按缓存渲染（避免闪一下空白），拉完再渲染一次
+async function refreshNoBookBooks() {
+  if (_booksLoading) return
+  const p = loadBooks(true)   // 内部同步置 _booksLoading，下面这次渲染就能显示「加载中…」
+  renderNoBookList()
+  await p
+  renderNoBookList()
+}
+
+// 书单里的时间：越近说得越口语（今天 / 昨天 / 3 天前），远了才报日期。一排
+// "2026/10/8" 既占地方又不好扫；这样一眼能看出"哪几本是最近在读的"。
+function fmtBookDate(ts) {
+  const t = Number(ts) || 0
+  if (!t) return ''
+  const d = new Date(t)
+  if (Number.isNaN(d.getTime())) return ''
+  const midnight = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime()
+  const days = Math.round((midnight(new Date()) - midnight(d)) / 86400000)
+  if (days <= 0) return '今天'
+  if (days === 1) return '昨天'
+  if (days < 30) return `${days} 天前`
+  const md = `${d.getMonth() + 1}月${d.getDate()}日`
+  return d.getFullYear() === new Date().getFullYear() ? md : `${d.getFullYear()}年${md}`
+}
+
+// 书脊色块：一长串书名看着是一堵墙，给每本配一枚"首字色块"就有颜色和辨识度了。
+// 颜色按**书 ID**取（改名不会变色），固定六色，只做区分、不承载任何含义。
+const SPINE_COLORS = ['#4f8f74', '#5f7ea6', '#9a7550', '#836791', '#6f8055', '#9c6363']
+function spineOf(b) {
+  const key = String((b && b.base) || (b && b.bookTitle) || '')
+  let h = 0
+  for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) | 0
+  const title = String((b && b.bookTitle) || '').trim()
+  return {
+    color: SPINE_COLORS[Math.abs(h) % SPINE_COLORS.length],
+    // 中文取首字；西文取头两个字母（一个字母认不出来是哪本）
+    text: /^[A-Za-z]/.test(title) ? title.slice(0, 2) : (title.slice(0, 1) || '书'),
+  }
+}
+
+// 一条已读书籍（无书界面书单与弹窗共用同一套结构）：
+// 整行点击 = 手动查看它的历史记录（pickBook），右侧垃圾桶 = 删掉它的全部存档。
+// 版式是**单行**：色块 + 书名（占满）+ 最近更新的时间 —— 两行式在窄侧栏里一行只能
+// 装一本书，扫起来太慢。类名沿用弹窗那套 .bp-item / .bi-*（样式在 sidebar.html）。
+function buildBookItem(b) {
+  const item = document.createElement('div')
+  item.className = 'bp-item'
+  const spine = spineOf(b)
+  const time = fmtBookDate(b.updatedAt)
+  const exact = b.updatedAt ? new Date(b.updatedAt).toLocaleDateString() : ''
+  item.innerHTML =
+    `<span class="book-spine" style="background:${spine.color}">${esc(spine.text)}</span>` +
+    `<div class="bi-main">` +
+      `<div class="bi-title">${esc(b.bookTitle || '（书名未知）')}</div>` +
+    `</div>` +
+    (time ? `<span class="bi-meta" title="最近更新 ${exact}">${time}</span>` : '') +
+    `<button class="bi-del" title="删除这本书的记录">${ICON_TRASH}</button>`
+  item.addEventListener('click', () => pickBook(b))
+  item.querySelector('.bi-del').addEventListener('click', (e) => {
+    e.stopPropagation()  // 不触发行点击的选书
+    deleteBook(b)
+  })
+  return item
+}
+
+// 无书界面的已读书籍书单（内联渲染，不用点按钮）：加载中 / 服务未启动 / 空 /
+// 无匹配 / 正常书单，五种面貌都在这里定。
+function renderNoBookList() {
+  const listEl = document.getElementById('nb-list')
+  if (!listEl) return
+  const msgEl = document.getElementById('nb-empty')
+  const searchEl = document.getElementById('nb-search')
+  const countEl = document.getElementById('nb-books-count')
+  const total = _bookPickerList.length
+  // 书少时不显示搜索框（一行白白占掉一本书的位置）
+  const showSearch = total > NB_SEARCH_MIN
+  if (searchEl) searchEl.hidden = !showSearch
+  if (countEl) { countEl.textContent = total ? String(total) : ''; countEl.hidden = !total }
+  // 搜索框藏起来时它里面的旧关键词不参与过滤——否则重新进界面会被静默滤空
+  const q = (showSearch && searchEl ? searchEl.value : '').trim().toLowerCase()
+  const list = q
+    ? _bookPickerList.filter(b => String(b.bookTitle || '').toLowerCase().includes(q))
+    : _bookPickerList
+
+  // 指纹没变就直接返回：本函数会被 renderNoBookView 频繁带着跑（切 tab 就会走一遍
+  // applyBookContext），重建 DOM 会把用户滚到一半的书单弹回顶部
+  const key = [total, q, _booksLoading ? 'L' : '', _booksFailed ? 'F' : '',
+    list.map(b => b.base + '\u0001' + (b.bookTitle || '') + '\u0001' + (b.updatedAt || 0)).join('\u0002')].join('|')
+  if (key === _nbRenderKey) return
+  _nbRenderKey = key
+
+  // 状态消息统一版式：一枚图标 + 一句话 + 可选的一行小字（都比纯文字居中好看，
+  // 也和上面那张状态卡用的是同一枚图标）
+  const showMsg = (title, sub, opts) => {
+    listEl.hidden = true
+    if (!msgEl) return
+    msgEl.className = 'nb-msg' + (opts && opts.err ? ' err' : '')
+    msgEl.innerHTML =
+      `<span class="nb-badge lg"><svg><use href="#nb-book-glyph"></use></svg></span>` +
+      `<div class="nb-msg-title">${title}</div>` +
+      (sub ? `<div class="nb-msg-sub">${sub}</div>` : '') +
+      (opts && opts.retry ? '<button class="nb-retry">重试</button>' : '')
+    msgEl.hidden = false
+    if (opts && opts.retry) {
+      msgEl.querySelector('.nb-retry')?.addEventListener('click', () => refreshNoBookBooks())
+    }
+  }
+
+  if (!total && _booksLoading) return showMsg('正在读取已读书籍…')
+  if (!total && _booksFailed) {
+    return showMsg('读不到已读书籍', 'CoRead 本机服务没在运行<br>启动后点下面的「重试」',
+      { err: true, retry: true })
+  }
+  if (!list.length) {
+    return showMsg(q ? '没有匹配的书名' : '还没有已读书籍',
+      q ? '换个词试试' : '在微信读书里划过线、提过问的书，会出现在这里')
+  }
+  listEl.hidden = false
+  if (msgEl) msgEl.hidden = true
+  listEl.innerHTML = ''   // 元素随节点一起丢弃，事件监听不会残留
+  for (const b of list) listEl.appendChild(buildBookItem(b))
 }
 
 // ── AI-021 网页阅读源：无书视图的『绑定当前网页页面』入口 ────────────────
@@ -1201,7 +1420,8 @@ function renderManualBanner() {
   }
 }
 
-// 打开已读书籍选择弹窗：从 receiver 拉书籍列表（按最近更新倒序）
+// 打开已读书籍选择弹窗（入口：⋯ 菜单 / 手动选书横幅的「切换书籍」；无书界面不再
+// 用它——那边直接把书单列出来了）。每次打开强制拉一次：书读着的时候进来的，图的就是「最新」。
 async function openBookPicker() {
   const overlay = document.getElementById('book-picker')
   if (!overlay) return
@@ -1210,24 +1430,22 @@ async function openBookPicker() {
   const emptyEl = document.getElementById('bp-empty')
   if (listEl) listEl.innerHTML = '<div class="bp-msg">加载中…</div>'
   if (emptyEl) emptyEl.hidden = true
-  try {
-    const r = await fetch(`${RECEIVER}/books`)
-    const d = await r.json()
-    _bookPickerList = Array.isArray(d.books) ? d.books : []
-  } catch {
-    _bookPickerList = []
-    if (listEl) listEl.innerHTML = '<div class="bp-msg bp-err">CoRead 本机服务未启动，无法读取已读书籍</div>'
-    return
-  }
-  renderBookList()
+  await loadBooks(true)
   const search = document.getElementById('bp-search')
-  if (search) { search.value = ''; setTimeout(() => search.focus(), 100) }
+  if (search) search.value = ''   // 每次打开都从全量书单开始（旧关键词不该接着过滤）
+  renderBookList()
+  if (search) setTimeout(() => search.focus(), 100)
 }
 
+// 弹窗里的书单（与无书界面书单共用 _bookPickerList / buildBookItem，只是有自己的搜索词）
 function renderBookList() {
   const listEl = document.getElementById('bp-list')
   const emptyEl = document.getElementById('bp-empty')
   if (!listEl) return
+  if (_booksFailed && !_bookPickerList.length) {
+    listEl.innerHTML = '<div class="bp-msg bp-err">CoRead 本机服务未启动，无法读取已读书籍</div>'
+    return
+  }
   const searchEl = document.getElementById('bp-search')
   const q = (searchEl ? searchEl.value : '').trim().toLowerCase()
   const list = _bookPickerList.filter(b => !q || (b.bookTitle || '').toLowerCase().includes(q))
@@ -1240,23 +1458,7 @@ function renderBookList() {
     return
   }
   if (emptyEl) emptyEl.hidden = true
-  for (const b of list) {
-    const item = document.createElement('div')
-    item.className = 'bp-item'
-    const time = b.updatedAt ? new Date(b.updatedAt).toLocaleDateString() : ''
-    item.innerHTML =
-      `<div class="bi-main">` +
-        `<div class="bi-title">${esc(b.bookTitle || '（书名未知）')}</div>` +
-        (time ? `<div class="bi-meta">最近更新 ${time}</div>` : '') +
-      `</div>` +
-      `<button class="bi-del" title="删除这本书的记录">${ICON_TRASH}</button>`
-    item.addEventListener('click', () => pickBook(b))
-    item.querySelector('.bi-del').addEventListener('click', (e) => {
-      e.stopPropagation()  // 不触发行点击的选书
-      deleteBook(b)
-    })
-    listEl.appendChild(item)
-  }
+  for (const b of list) listEl.appendChild(buildBookItem(b))
 }
 
 // 删除一本书：确认后调 receiver /book-delete 清理该书全部存档（划线/章节缓存/聊天），
@@ -1298,9 +1500,10 @@ async function deleteBook(b) {
   renderCurrentBook()
   renderNoBookView()
   renderManualBanner()
-  // 刷新已读书籍列表
+  // 刷新已读书籍列表（弹窗 + 无书界面的内联书单是同一份数据）
   _bookPickerList = _bookPickerList.filter(x => x.base !== b.base)
   renderBookList()
+  renderNoBookList()
   // AI-021：广播删除事件，网页适配器（source-mia.js）据此清理本地页面→书绑定，
   // 避免残留绑定下次访问页面时把已删的书重新建出来
   try { chrome.runtime.sendMessage({ action: 'coreadBookDeleted', base: b.base }) } catch {}
@@ -4327,8 +4530,10 @@ for (const id of ['api-base', 'api-key', 'api-model']) {
   })
 }
 
-// ── 无书默认界面 / 已读书籍选择的事件绑定（2026-10）────────────────────────
-document.getElementById('nb-pick-btn')?.addEventListener('click', openBookPicker)
+// ── 无书默认界面 / 已读书籍的事件绑定（2026-10；2026-11 改版）──────────────
+// 无书界面已无「从已读书籍中选择」按钮：书单直接列在那里（renderNoBookList），
+// 搜索框只在书多时出现，输入即过滤
+document.getElementById('nb-search')?.addEventListener('input', renderNoBookList)
 document.getElementById('mm-pick-book')?.addEventListener('click', () => {
   if (moreMenu) moreMenu.classList.remove('on')
   openBookPicker()
@@ -4440,12 +4645,21 @@ async function refreshTranslateStatus() {
   const st = resp && resp.ok ? resp.status : null
   trStatus = st
   const baseEl = document.getElementById('tr-base-model')
+  const endpointEl = document.getElementById('tr-endpoint')
   const warn = document.getElementById('tr-grant-warn')
   const originEl = document.getElementById('tr-origin')
   if (baseEl) {
     if (!st) baseEl.textContent = '读取失败'
     else if (!st.configured) baseEl.textContent = '未配置'
     else baseEl.textContent = (st.model || '（未填模型）') + (st.usingOverride ? '（自定义）' : '')
+  }
+  // 实际会去打的那个地址（含覆盖项生效后的结果）。报 NETWORK 时先看这一行：
+  // 它若是空的或不合法的（没有 https://），就不是授权问题，是地址问题。
+  if (endpointEl) {
+    if (!st) endpointEl.textContent = '读取失败'
+    else if (!st.apiBase) endpointEl.textContent = '未配置'
+    else endpointEl.textContent = st.apiBase
+    endpointEl.title = endpointEl.textContent
   }
   renderEnableSwitch(!st || st.enabled !== false)
   if (warn) warn.hidden = !(st && st.configured && st.origin && !st.granted)
@@ -4668,6 +4882,11 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || !msg.action) return
   if (msg.action === 'readerUpdate') {
     if (notesPanel && msg.snapshot) notesPanel.update(msg.snapshot)
+    // 2026-11：换书（打开/切换/关掉 PDF）时阅读器会把 notify 置真 —— 那是"把侧栏切到
+    // 这本书"的可靠信号，直接用，不再反过来问"哪个 tab 是活动的"（问法不可靠，
+    // 用户实测过"打开 PDF 但侧栏没跟过去"）。
+    // 翻页 / 新译文这类同步不带 notify：不打扰用户当前翻看的书。
+    if (msg.snapshot && msg.snapshot.notify) applyReaderBookFromSnapshot(msg.snapshot)
     return
   }
   if (msg.action === 'notesOpen') { openNotes(); return }

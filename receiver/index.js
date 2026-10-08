@@ -357,21 +357,84 @@ function conversationsSnapshot() {
 }
 
 // ── 阅读器书库 ────────────────────────────────────────────────────────────────
-// 放进来过的 PDF 存原件，下次不用再手动选文件。位置：receiver/books/<hash>/
+// 放进来过的 PDF 存原件，下次不用再手动选文件。位置：data\reading\books\<hash>\
 //   source.pdf       原件
-//   reader-meta.json 书名、页数、打开时间等（列表就靠它）
+//   reader-meta.json 书名、页数、打开时间等（书库列表就靠它）
+//   meta.json        共读侧记录（书名/更新时间）——「已读过的书籍」列表靠它，
+//                    由 registerReaderBook 写；见下面那段"删除语义严格分开"的说明
 // 书的内容哈希当目录名，所以同一份文件重复打开只会有一份。
 const READER_META = 'reader-meta.json'
 const MAX_READER_FILE = 300 * 1024 * 1024     // 单个 PDF 上限 300MB
 
-/** 只接受十六进制内容哈希当目录名：顺手把路径穿越挡在外面 */
+/** 阅读器哈希的校验：只接受十六进制内容哈希（带不带 `rd_` 前缀都认，顺手挡路径穿越） */
 function normalizeReaderHash(h) {
-  const s = String(h || '').trim().toLowerCase()
+  let s = String(h || '').trim().toLowerCase()
+  if (s.startsWith('rd_')) s = s.slice(3)
   return /^[a-f0-9]{16,64}$/.test(s) ? s : ''
 }
 
-function readerDir(hash) { return path.join(BOOKS_DIR, hash) }
+// 阅读器的书**只有一个目录名**：`rd_` + 内容哈希。
+//
+// 为什么必须只有一种写法（2026-11 实测踩到）：书库侧与共读侧共用同一个目录，
+// 若书库侧按裸哈希建 `books\<hash>\`、共读侧按 `rd_<hash>` 建，同一本 PDF 会裂成
+// 两个目录 —— 实测表现是 reader-meta.json 与 meta.json 各躺一边，而
+// `reader-book-file?hash=<hash>` 找不到原件（它落在另一个目录里）。
+// 所以：**进来先归一化**。裸哈希（老扩展 / 老书库列表）与带前缀的都认，出来一律带前缀。
+const READER_BOOK_PREFIX = 'rd_'
+
+/** 阅读器元信息里的"新鲜度"字段：合并时取两边较新者，不参与"信息是否已覆盖"的比对 */
+const RECENCY_KEYS = new Set(['lastOpenedAt', 'updatedAt'])
+
+/** 任意形态的阅读器哈希/书 ID → 目录名（`rd_<32~64位十六进制>`）；不像则返空串 */
+function readerBookHash(input) {
+  const s = String(input || '').trim().toLowerCase()
+  const bare = s.startsWith(READER_BOOK_PREFIX) ? s.slice(READER_BOOK_PREFIX.length) : s
+  const hash = normalizeReaderHash(bare)
+  return hash ? READER_BOOK_PREFIX + hash : ''
+}
+
+function readerDir(hash) { return path.join(BOOKS_DIR, readerBookHash(hash) || String(hash || '')) }
 function readerFilePath(hash) { return path.join(readerDir(hash), 'source.pdf') }
+
+// ── 阅读器的书在「共读侧」的身份（2026-11）─────────────────────────────────────
+// 背景：以前只有微信读书的书有共读侧身份（内容脚本从阅读页 URL 取 bookId），我们自己的
+// 阅读器是另一套（内容哈希 + reader-meta.json）。后果：打开 PDF 不进「已读过的书籍」，
+// 在阅读器里点「设为引用」被后台判成"当前页面未关联任何书籍"。
+//
+// 现在统一成一个 ID 形态：`rd_` + PDF 内容哈希。开口在 extension/reader.js 的
+// readerBookId，**两处必须一致**；它与 PDF 一一对应，也与微信读书的 CB_xxx 天然不撞。
+/** 这个共读侧 bookId 是不是阅读器的书 */
+function isReaderBookId(bookId) {
+  const s = String(bookId || '')
+  return s.startsWith(READER_BOOK_PREFIX) && /^[a-f0-9]{32,64}$/i.test(s.slice(READER_BOOK_PREFIX.length))
+}
+
+/** 阅读器书 ID → 内容哈希（不是阅读器的书返空串） */
+function readerHashOf(bookId) {
+  return isReaderBookId(bookId) ? String(bookId).slice(READER_BOOK_PREFIX.length).toLowerCase() : ''
+}
+
+/**
+ * 把阅读器的书登记到共读侧（写 `<hash>/meta.json`，即「已读过的书籍」列表的数据源）。
+ *
+ * ⚠️ 与书库那条线的关系（动这里之前先读这段）：
+ *   · `<hash>/reader-meta.json` + `source.pdf` = **书库侧**：PDF 原件、页数、阅读器进度/译文；
+ *   · `<hash>/meta.json` + `chapters/`         = **共读侧**：书名、引用、聊天记录。
+ * 两边共用同一个目录（都挂在 data\reading\books\ 下），但**删除语义严格分开**：
+ *   · /book-delete        只清共读侧，**绝不删 source.pdf**；
+ *   · /reader-book-delete 只清书库侧，**绝不删 meta.json / 引用 / 聊天**。
+ * 即使用同一个书 ID 把两边串起来展示，两个删除入口也不互相触发、不做"是否一并删除"的联动。
+ *
+ * reader-meta.json 不存在时补一份：这样书库列表（listReaderBooks）也能看到这本，
+ * 用户在阅读器书库里能直接删原件。目录名是原件内容的指纹，补 writeReaderMeta 是安全的。
+ */
+function registerReaderBook({ bookId, name = '' }) {
+  const hash = readerHashOf(bookId)
+  if (!hash) return null
+  fs.mkdirSync(readerDir(hash), { recursive: true })
+  if (!readReaderMeta(hash)) writeReaderMeta(hash, { name: String(name || '').slice(0, 200) })
+  return writeBookMeta(bookId, { bookId, baseBookId: bookId, bookTitle: String(name || '') })
+}
 
 function readReaderMeta(hash) {
   try { return JSON.parse(fs.readFileSync(path.join(readerDir(hash), READER_META), 'utf8')) } catch { return null }
@@ -385,7 +448,113 @@ function writeReaderMeta(hash, patch) {
   return next
 }
 
+/**
+ * 把老目录名（裸哈希）**合并进**规范目录（`rd_` + 哈希）。返回合并了几本。
+ *
+ * 为什么必须有这一步（2026-11 实测踩到，用户当场看到"书库里两条相同的项、都点不动"）：
+ * 目录名曾经是裸哈希，后来规范成 `rd_<hash>`。只要有一瞬间的读写不同步
+ *（最典型：扩展已更新、本机服务还是旧进程），同一本 PDF 就会裂成两个目录 ——
+ * 老目录里有 source.pdf，新目录里只有记录。列表按"有没有 reader-meta.json"判定，
+ * 于是同一本书出现两条；两条又都因为"记录在 A、原件在 B"而 hasFile=0，全部变灰不可点。
+ *
+ * 所以合并做成**读列表时的常规动作**，不指望"大家都记得重启"。规则：
+ *   · 规范目录里的东西（更新的元信息、共读侧 meta.json/引用/聊天）**一律不动**；
+ *   · 只从老目录搬走缺的东西（原件、缺失的元信息字段），然后把老目录清掉；
+ *   · 老目录里若有认不出的文件（用户自己放的笔记之类）→ **不删目录**，只提示，绝不吞数据。
+ * 幂等：合并过一次之后，老目录已不存在，之后再跑什么都不做。
+ */
+function mergeLegacyReaderDirs() {
+  let names = []
+  try { names = fs.readdirSync(BOOKS_DIR) } catch { return 0 }
+  let merged = 0
+  for (const name of names) {
+    if (name.startsWith(READER_BOOK_PREFIX)) continue          // 已是规范目录名
+    const bare = normalizeReaderHash(name)
+    if (!bare || bare !== name) continue                       // 不是裸哈希目录，别碰
+    const legacyDir = path.join(BOOKS_DIR, name)
+    const canonDir = readerDir(bare)                           // = rd_<hash>
+    if (legacyDir === canonDir) continue
+    let st = null
+    try { st = fs.statSync(legacyDir) } catch { continue }
+    if (!st.isDirectory()) continue
+    const legacyHasReaderMeta = fs.existsSync(path.join(legacyDir, READER_META))
+    const legacyHasSource = fs.existsSync(path.join(legacyDir, 'source.pdf'))
+    if (!legacyHasReaderMeta && !legacyHasSource) continue     // 老目录里没有书库侧的东西 → 与本次合并无关
+
+    try {
+      fs.mkdirSync(canonDir, { recursive: true })
+      let moved = ''
+      if (legacyHasSource && !fs.existsSync(readerFilePath(bare))) {
+        fs.copyFileSync(path.join(legacyDir, 'source.pdf'), readerFilePath(bare))
+        moved = 'source.pdf'
+      }
+      if (legacyHasReaderMeta) {
+        // 缺什么补什么：规范目录里已有的字段不动（那边的 lastOpenedAt/pages 更新）
+        const legacyMeta = JSON.parse(fs.readFileSync(path.join(legacyDir, READER_META), 'utf8'))
+        const cur = readReaderMeta(bare) || {}
+        const patch = {}
+        for (const [k, v] of Object.entries(legacyMeta)) {
+          if (RECENCY_KEYS.has(k)) continue                  // 新鲜度字段：取两边里更新的那个
+          if (cur[k] === undefined || cur[k] === '' || cur[k] === null) patch[k] = v
+        }
+        // 老目录更晚打开过（少见但可能：先老后新之后又用旧版扩展打开过）→ 新鲜度也取较大的
+        if (Number(legacyMeta.lastOpenedAt) > Number(cur.lastOpenedAt || 0)) patch.lastOpenedAt = legacyMeta.lastOpenedAt
+        if (Object.keys(patch).length) {
+          writeReaderMeta(bare, patch)
+          moved = moved ? moved + '+meta' : 'meta'
+        }
+      }
+      // 老目录里的残留：只删"内容已经被规范目录覆盖"的同名文件，认不出的一律留着。
+      //   · source.pdf      → 两处都逐字节读出来比，一致才删（原件是用户的东西，从严）
+      //   · reader-meta.json → **不是比字节，是比信息**：老文件里每个字段在规范目录里
+      //     都有相同值（合并时"缺什么补什么"已把它带过去了），老文件就是冗余的。
+      //     踩过两次：先是把刚复制走的原件当成"未知文件"→ 老目录永远留着、列表永远两条；
+      //     再是要求两文件逐字节相同 → 只差一个 lastOpenedAt 就被判成"内容不同"，
+      //     同样卡住不删。判据必须是"信息是否已经都在"，不是"字节是否一样"。
+      const sameFile = (a, b) => {
+        try {
+          const x = fs.readFileSync(a)
+          const y = fs.readFileSync(b)
+          // 注意：node:fs 的 readFileSync 返回 **Buffer**（Uint8Array），Buffer 没有
+          // Uint8Array.prototype.equals —— 写成 x.equals(y) 会抛 TypeError，被 catch
+          // 吞掉后一律判成"不一致"。用 Buffer.compare。
+          return x.length === y.length && Buffer.compare(x, y) === 0
+        } catch { return false }
+      }
+      const metaCovered = () => {
+        try {
+          const legacyMeta = JSON.parse(fs.readFileSync(path.join(legacyDir, READER_META), 'utf8'))
+          const cur = readReaderMeta(bare) || {}
+          // 时间戳这类"新鲜度"字段不参与比对：规范目录那边本来就更新，取值以它为准
+          // （比 lastOpenedAt 是踩过的坑：老=1、新=2 被判成"信息没覆盖"，老目录就永远删不掉）
+          return Object.entries(legacyMeta)
+            .every(([k, v]) => RECENCY_KEYS.has(k) || cur[k] === v)
+        } catch { return false }
+      }
+      const sourceCovered = () => sameFile(path.join(legacyDir, 'source.pdf'), readerFilePath(bare))
+      const leftovers = fs.readdirSync(legacyDir).filter((n) => {
+        if (n === 'source.pdf') return !sourceCovered()
+        if (n === READER_META) return !metaCovered()
+        return true                                  // 不认识的东西：留着，不删
+      })
+      if (leftovers.length) {
+        console.log(`[reader] 老目录 ${name.slice(0, 12)}… 合并了 ${moved}，但还剩 ${leftovers.join(',')}，暂不删除`)
+      } else {
+        fs.rmSync(legacyDir, { recursive: true, force: true })
+        console.log(`[reader] 老目录 ${name.slice(0, 12)}… 已并入 ${path.basename(canonDir).slice(0, 15)}…（${moved || '无文件'}）`)
+      }
+      merged++
+    } catch (e) {
+      console.log(`[reader] 合并老目录失败（跳过，不影响其它书）：${name.slice(0, 12)}… ${e.message}`)
+    }
+  }
+  return merged
+}
+
 function listReaderBooks() {
+  // 先合并历史遗留的目录名（幂等，见函数内注释）：不合并的话同一本 PDF 会列出两条、
+  // 且因为"记录在一边、原件在另一边"而两条都点不动
+  mergeLegacyReaderDirs()
   const out = []
   let names = []
   try { names = fs.readdirSync(BOOKS_DIR) } catch { return out }
@@ -394,7 +563,9 @@ function listReaderBooks() {
     if (!meta) continue                       // 不是阅读器的书（微信读书的书目录没有这个文件）
     let size = 0
     try { size = fs.statSync(readerFilePath(name)).size } catch {}
-    out.push(Object.assign({}, meta, { size, hasFile: size > 0 }))
+    // hash 回裸哈希（去掉目录名上的 rd_ 前缀）：扩展那边一律用裸哈希当键
+    //（chrome.storage 的 rd:book:<hash>、/reader-book-file?hash=），别在这里换形态
+    out.push(Object.assign({}, meta, { hash: normalizeReaderHash(name), size, hasFile: size > 0 }))
   }
   out.sort((a, b) => (b.lastOpenedAt || 0) - (a.lastOpenedAt || 0))
   return out
@@ -821,8 +992,7 @@ const server = http.createServer(async (req, res) => {
     const hash = normalizeReaderHash(u.searchParams.get('hash'))
     if (!hash) { res.writeHead(400); res.end('bad hash'); return }
     let buf
-    try { buf = fs.readFileSync(readerFilePath(hash)) } catch { res.writeHead(404); res.end('not found'); return }
-    res.writeHead(200, {
+    try { buf = fs.readFileSync(readerFilePath(hash)) } catch { res.writeHead(404); res.end('not found'); return }    res.writeHead(200, {
       'Content-Type': 'application/pdf',
       'Content-Length': buf.length,
       'Cache-Control': 'no-store',
@@ -935,6 +1105,8 @@ const server = http.createServer(async (req, res) => {
       fs.writeFileSync(readerFilePath(hash), buf)
       const name = decodeURIComponent(u.searchParams.get('name') || '')
       const meta = writeReaderMeta(hash, { name, size: buf.length, lastOpenedAt: Date.now() })
+      // 存原件的同时登记共读侧（此时书名一定拿得到——浏览器给的文件名）
+      registerReaderBook({ bookId: READER_BOOK_PREFIX + hash, name })
       console.log(`[reader] 存入书库 ${hash.slice(0, 12)}… ${name || '(未命名)'} ${(buf.length / 1048576).toFixed(1)}MB`)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ ok: true, hash, size: meta.size }))
@@ -1025,6 +1197,11 @@ const server = http.createServer(async (req, res) => {
       const line = JSON.stringify({ ...data, receivedAt: Date.now() })
       fs.appendFileSync(path.join(INBOX_DIR, 'annotations.jsonl'), line + '\n')
       writeBookMeta(data.bookId, data)
+      // 阅读器来的引用（2026-11）：顺手把这本书登记齐（共读侧 meta.json + 书库侧
+      // reader-meta.json）。为什么在这里也要做：阅读器可能没走 /reader-book
+      //（receiver 当时没起来、或引用来自更早的版本），但"有引用"就说明这本书
+      // 确实被读过——列表里该有它，书库里也该能删它的原件。
+      if (isReaderBookId(data.bookId)) registerReaderBook({ bookId: data.bookId, name: data.bookTitle || '' })
       console.log(`[annotation] ${data.bookTitle} · ${data.chapter} · "${data.selectedText?.slice(0, 20)}..."`)
       // AI-010：标注一律是"引用"（划线共读设为引用 / 微信读书划线同步），不触发 agent
       // 自动讨论、不推 annotation 消息气泡；只按来源推送引用事件让侧栏实时加进引用列表。
@@ -1108,11 +1285,19 @@ const server = http.createServer(async (req, res) => {
 
     } else if (url === '/book-delete') {
       // 删除一本书（侧栏「已读过的书籍」列表的删除操作）。清理三处：
-      // 1) books/<base>/ 目录（meta/章节缓存/discussions/progress，含书籍足迹数据源）；
+      // 1) 该书的共读侧存档（meta.json/章节缓存/discussions/progress，含书籍足迹数据源）；
       // 2) annotations.jsonl 中该书标注（引用列表数据源，删净后不再出现在 /history）；
       // 3) 聊天库中该对话的全部消息与事件（事务删除、按 conv 精确命中）。
       // 2026-10-02（方案 B）：3) 以前是"读 63MB chat_output + 按 bookKey/配对归属过滤 + 整文件重写"，
       // 那个重写空窗正是 09-28 重放事故的起点；现在是一条 DELETE。
+      //
+      // 2026-11（阅读器的书进入这个列表后新增）：**这个入口只清共读侧，绝不碰 PDF 原件。**
+      // 阅读器的书与书库共用 data\reading\books\<hash>\ 一个目录，其中
+      //   source.pdf + reader-meta.json = 书库侧（用户的书）
+      //   meta.json + chapters/         = 共读侧（聊天与引用的记录）
+      // 所以这里改成"删指定文件"而不是 `rm -rf 整个目录`——旧写法在阅读器的书上一跑
+      // 就会把 PDF 原件一起删掉。反方向同理：/reader-book-delete 只删书库侧两件，
+      // 不碰 meta.json / 引用 / 聊天。两个入口互不触发，也不做"是否一并删除"的联动。
       const { base } = data
       if (!base || !/^[A-Za-z0-9_]{12,}$/.test(base) || base.startsWith('__')) {
         res.writeHead(400); res.end(JSON.stringify({ error: 'invalid base' })); return
@@ -1138,16 +1323,36 @@ const server = http.createServer(async (req, res) => {
       const chatRemoved = (() => {
         try { return chatStore().deleteConversation(base) } catch (e) { console.log('[book-delete] 删库失败: ' + e.message); return { messages: 0, events: 0 } }
       })()
+      // 共读侧存档：逐件删（白名单式列举，删错了也不会误伤书库侧的两个文件）。
+      // 实测这些目录里出现过的文件就这四样（另加 chapters/ 目录）。
+      const bookDirPath = path.join(BOOKS_DIR, norm)
+      const CHAT_SIDE = ['meta.json', 'progress.json', 'chapters', 'discussions.jsonl']
+      const removedFiles = []
+      const keptFiles = []
+      let entries = []
+      try { entries = fs.readdirSync(bookDirPath) } catch { entries = [] }
+      for (const name of entries) {
+        const full = path.join(bookDirPath, name)
+        if (CHAT_SIDE.includes(name)) {
+          try { fs.rmSync(full, { recursive: true, force: true }); removedFiles.push(name) } catch {}
+        } else {
+          // 剩下的就是书库侧的 source.pdf / reader-meta.json（以及将来新增的别的东西）——留着
+          keptFiles.push(name)
+        }
+      }
+      // 共读侧的东西删干净了、书库侧也没东西 → 目录本身是空的，可以收掉；
+      // 只要还留着原件（或任何不认识的残留文件）就不动目录
       let dirRemoved = false
-      try {
-        fs.rmSync(path.join(BOOKS_DIR, norm), { recursive: true, force: true })
-        dirRemoved = true
-      } catch {}
-      console.log('[book-delete] base=' + norm.slice(0, 16) + '… dir=' + dirRemoved + ' ann=' + annRemoved +
+      if (!keptFiles.length) {
+        try { fs.rmdirSync(bookDirPath); dirRemoved = true } catch {}
+      }
+      console.log('[book-delete] base=' + norm.slice(0, 16) + '… 共读侧删=' + removedFiles.join(',') +
+        ' 保留=' + (keptFiles.join(',') || '无') + ' ann=' + annRemoved +
         ' messages=' + chatRemoved.messages + ' events=' + chatRemoved.events)
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({
         ok: true, dirRemoved, annRemoved,
+        removedFiles, keptFiles,
         chatInRemoved: chatRemoved.messages, chatOutRemoved: chatRemoved.events,
       }))
       return
@@ -1357,7 +1562,11 @@ const server = http.createServer(async (req, res) => {
 
     } else if (url === '/reader-book') {
       // 登记/更新一本阅读器里的书（书库列表的元信息）。原件走 /reader-book-file。
-      const hash = normalizeReaderHash(data && data.hash)
+      //
+      // 2026-11：这一步同时把书登记到**共读侧**（meta.json），于是「已读过的书籍」
+      // 列表里会出现这本 PDF、在阅读器里对它提问也才有归属书。bookId 可选：
+      // 老版扩展只发 hash，这里自己拼成 rd_<hash>，语义一致。
+      const hash = normalizeReaderHash(data && data.hash) || readerHashOf(data && data.bookId)
       if (!hash) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
         res.end('{"ok":false,"error":"bad hash"}')
@@ -1369,21 +1578,40 @@ const server = http.createServer(async (req, res) => {
       if (Number.isFinite(data.entries)) patch.entries = data.entries
       if (data.page !== undefined) patch.page = data.page
       const meta = writeReaderMeta(hash, patch)
+      // 共读侧记录：page/entries 是阅读器专有的，不进 meta.json（那是给共读列表看的）
+      registerReaderBook({ bookId: READER_BOOK_PREFIX + hash, name: patch.name !== undefined ? patch.name : (meta.name || '') })
+      // hash 回**裸哈希**（不带 rd_）：扩展那边 state.hash 一直就是这个形态，
+      // 内部目录名带前缀是实现细节，不该从接口漏出去（回传前缀会与扩展的旧记录对不上）
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, meta }))
+      res.end(JSON.stringify({ ok: true, meta: Object.assign({}, meta, { hash }) }))
       return
     } else if (url === '/reader-book-delete') {
-      // 从书库删掉一本（连同原件）
+      // 从书库删掉一本（连同原件）。
+      //
+      // 2026-11：**这个入口只清书库侧**——source.pdf 与 reader-meta.json。
+      // 同一目录里的 meta.json / chapters / 引用 / 聊天记录是共读侧的东西，一律不动：
+      // 书库侧和共读侧是两条独立的线，删原件不等于删掉"读过这本书"的记录
+      //（反方向见 /book-delete：那边也绝不碰原件）。不做"是否一并删除"的联动。
       const hash = normalizeReaderHash(data && data.hash)
       if (!hash) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
         res.end('{"ok":false,"error":"bad hash"}')
         return
       }
-      fs.rmSync(readerDir(hash), { recursive: true, force: true })
-      console.log(`[reader] 已从书库删除 ${hash.slice(0, 12)}…`)
+      const dir = readerDir(hash)
+      const removedFiles = []
+      for (const name of ['source.pdf', READER_META]) {
+        try { fs.rmSync(path.join(dir, name), { force: true }); removedFiles.push(name) } catch {}
+      }
+      // 书库侧两件都清掉了、目录里也没别的东西（没有 meta.json 等共读侧残留）→ 收掉空目录
+      let dirRemoved = false
+      try {
+        if (!fs.readdirSync(dir).length) { fs.rmdirSync(dir); dirRemoved = true }
+      } catch {}
+      console.log(`[reader] 已从书库删除 ${hash.slice(0, 12)}…（${removedFiles.join(',') || '无文件'}）` +
+        '，共读侧记录保留:' + (dirRemoved ? '目录已空' : '有'))
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end('{"ok":true}')
+      res.end(JSON.stringify({ ok: true, removedFiles, dirRemoved }))
       return
     } else if (url === '/tool-record') {
       // 翻译记录：扩展每次翻译成功后落一行，「贴回本页译文」据此把气泡还原回原位。

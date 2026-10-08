@@ -320,19 +320,34 @@ export function classifyHttpError(status, bodyText) {
   return { code: 'UPSTREAM', message: '模型服务返回错误（HTTP ' + status + '）' + (detail ? '：' + detail : ''), detail }
 }
 
-/** 把 fetch 抛出的异常翻译成可诊断的 code + 中文文案。 */
-export function classifyFetchError(err) {
+/**
+ * 把 fetch 抛出的异常翻译成可诊断的 code + 中文文案。
+ *
+ * 浏览器对「域名解析不了 / 端口没人监听 / 地址缺协议头 / 被代理挡住」**一律只给
+ * TypeError: Failed to fetch**（部分平台给 DOMException: NetworkError），这一句话本身分不出是
+ * 哪一种。所以文案里必须带上两样东西：**异常名**与**请求打去的实际地址**
+ * （target，由调用方传入 chatCompletionsUrl 的结果）——否则用户和排查者都只能靠猜。
+ *
+ * @param {unknown} err fetch 抛出的异常
+ * @param {string} target 实际请求的完整地址
+ * @param {string} probeNote 调用方补做的连通性探测结论（见 translate-background.js 的 probeInternet）
+ */
+export function classifyFetchError(err, target = '', probeNote = '') {
   const name = String(err?.name ?? '')
   const msg = String(err?.message ?? err ?? '')
+  const where = target ? '，请求地址 ' + target : ''
+  const note = probeNote ? '。' + probeNote : ''
   if (name === 'AbortError' || /abort/i.test(msg)) {
     return { code: 'TIMEOUT', message: '模型服务 60 秒内未响应，请重试或更换模型', detail: msg }
   }
-  if (name === 'TypeError') {
+  // TypeError 是各平台通用形态；DOMException/NetworkError 是另一副面孔，两者都算连不上。
+  if (name === 'TypeError' || (name === 'DOMException' && /network/i.test(msg))) {
     return {
       code: 'NETWORK',
-      message: '无法连接模型服务。请检查 API 地址，或在工具箱翻译页重新授权该域名',
-      detail: msg,
+      message: '无法连接模型服务' + where + note
+        + '。请检查或清空「自定义模型配置 → API 地址」，并确认网络能到达该地址',
+      detail: name + ': ' + msg + (target ? ' | target=' + target : '') + (probeNote ? ' | probe=' + probeNote : ''),
     }
   }
-  return { code: 'UNKNOWN', message: '请求失败：' + msg, detail: msg }
+  return { code: 'UNKNOWN', message: '请求失败：' + msg + where, detail: msg }
 }

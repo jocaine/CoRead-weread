@@ -44,6 +44,10 @@ const MAX_TEXT_CHARS = 6000
 const ACTION_TITLE = 'CoRead'
 const OVERLAY_FILE = 'translate-overlay.js'
 
+// 连通性探测用的地址：一个只回 204 空响应的公共端点，用来回答「是网络整体不通，还是只有模型地址不通」。
+const PROBE_URL = 'https://www.gstatic.com/generate_204'
+const PROBE_TIMEOUT_MS = 5000
+
 const HANDLERS = {
   getTranslateStatus,
   startSelection,
@@ -58,6 +62,7 @@ const HANDLERS = {
   relocateAnchor,
   readerSync,
   readerGet,
+  readerBookInfo,
   readerCommand,
   notesOpen,
   notesClose,
@@ -393,6 +398,33 @@ async function getTranslateStatus() {
 }
 
 // ── 调用模型 ──────────────────────────────────────────────────────────────────
+
+/**
+ * 模型请求失败后补做的一次连通性探测：拿一个与模型服务无关的公共端点试一下。
+ *
+ * 为什么需要：浏览器对「DNS 失败 / 端口不通 / 地址缺协议头 / 被系统代理挡住」只回同一句
+ * Failed to fetch，光看那句话无法判断该去修配置还是修网络。探测结果让文案能直接说清楚：
+ *   · 探测也失败 → 连别的外网也不通（常见元凶：系统代理指向了一个没在跑的端口）
+ *   · 探测成功   → 网络整体是通的，问题只在这个模型地址（域名/端口/被单独拦）
+ * 只在出错路径上跑一次，正常翻译完全不受影响；探测失败也不上报，只当没探到。
+ *
+ * @returns {Promise<string>} 结论句子；探不出来时返回空串
+ */
+async function probeInternet() {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS)
+  try {
+    await fetch(PROBE_URL, { method: 'GET', signal: controller.signal, cache: 'no-store' })
+    return '但本机访问其它外网是通的，问题只在这个模型地址'
+  } catch (e) {
+    const nm = String(e?.name ?? '')
+    if (nm === 'AbortError') return '另一项连通性探测也超时，本机当前访问外网很可能整体不通'
+    return '另一项连通性探测也失败，本机当前访问外网很可能整体不通'
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 async function chat({ content, maxTokens = 2048 }) {
   const cfg = await readConfig()
   if (!cfg.apiBase || !cfg.apiKey) {
@@ -413,9 +445,10 @@ async function chat({ content, maxTokens = 2048 }) {
 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS)
+  const target = chatCompletionsUrl(cfg.apiBase)
   let resp
   try {
-    resp = await fetch(chatCompletionsUrl(cfg.apiBase), {
+    resp = await fetch(target, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -425,7 +458,9 @@ async function chat({ content, maxTokens = 2048 }) {
       signal: controller.signal,
     })
   } catch (e) {
-    return { ok: false, error: classifyFetchError(e) }
+    // 带上 target：浏览器对 DNS 失败 / 端口不通 / 地址缺协议头 / 被系统代理挡住都只回一句
+    // Failed to fetch，没有这个地址与这次探测，就无法区分是「配置写错了」还是「网络到不了」。
+    return { ok: false, error: classifyFetchError(e, target, await probeInternet()) }
   } finally {
     clearTimeout(timer)
   }
@@ -549,6 +584,54 @@ async function readerSync(msg) {
 
 async function readerGet() {
   return { ok: true, snapshot: readerNotesSnapshot }
+}
+
+/**
+ * 「当前在看哪本 PDF」（2026-11 新增，给侧栏用）。
+ *
+ * 侧栏判断"当前在读哪本书"一直是去问活动的**微信读书** tab（sidebar.js 的
+ * refreshCurrentBook），阅读器页面不在它的查询范围内 —— 所以一边用阅读器看 PDF、
+ * 一边开着侧栏时，侧栏显示的是"未检测到正在阅读的书籍"，引用/消息也就没有归属。
+ *
+ * 这里让侧栏能问后台：阅读器开着哪本书。
+ * **直接问页面**，不用缓存的那份快照：扩展重载或 service worker 被回收后缓存是空的，
+ * 而"当前打开的是哪本"只有页面自己知道（页面的 state 是权威）。
+ *
+ * 怎么找阅读器 tab（2026-11 加固，起因是用户实测"打开 PDF 但侧栏没跟过去"）：
+ *   ① 先看**活动 tab** 是不是阅读器 —— 是就用它，这是最常见的场景；
+ *   ② 不是的话再**按 URL 找**阅读器 tab（不管它在哪个窗口）；
+ *   ③ 都没有 → notReader，侧栏照旧去问微信读书 tab。
+ * 为什么必须有 ②：侧栏自己的页面在 DevTools 里、或者用户点开侧栏前先点了别的 tab 时，
+ * "活动 tab"并不是阅读器；只认活动 tab 会让上下文时有时无 —— 这正是"有时候跟不过去"
+ * 的来源。第 ② 步只在活动 tab **不是**阅读源页面时才生效，所以用户在微信读书里
+ * 切书时不会被一个后台挂着的阅读器抢走上下文。
+ */
+async function readerBookInfo() {
+  let tab = await activeTab()
+  if (!isReaderUrl(tab && tab.url)) {
+    const others = await chrome.tabs.query({ url: chrome.runtime.getURL('reader.html') + '*' }).catch(() => [])
+    const active = tab
+    // 活动 tab 是微信读书 / 文库页面 → 那是用户当下真正在读的地方，别抢
+    const activeUrl = String((active && active.url) || '')
+    const activeIsReadingSource = /(^|\.)weread\.qq\.com/.test(safeHost(activeUrl)) || isPageSourceUrl(activeUrl)
+    if (!activeIsReadingSource && others && others.length) tab = others[0]
+  }
+  if (!isReaderUrl(tab && tab.url)) return { ok: true, notReader: true, book: null }
+  try {
+    const r = await chrome.tabs.sendMessage(tab.id, { action: 'readerBookInfo' })
+    return { ok: true, notReader: false, book: (r && r.book) || null, tabId: tab.id }
+  } catch (e) {
+    // 页面没起来 / 正在重载：当作"阅读器开着但没打开 PDF"，让侧栏回落无书状态
+    return { ok: true, notReader: false, book: null, tabId: tab && tab.id }
+  }
+}
+
+function safeHost(url) {
+  try { return new URL(String(url || '')).hostname.toLowerCase() } catch { return '' }
+}
+function isPageSourceUrl(url) {
+  const h = safeHost(url)
+  return h === 'marxists.org' || h.endsWith('.marxists.org') || h === 'bilibili.com' || h === 'www.bilibili.com'
 }
 
 async function readerCommand(msg) {
@@ -841,11 +924,23 @@ async function clearTranslations() {
 
 // ── 送去共读 ──────────────────────────────────────────────────────────────────
 /**
- * 判断当前页面属于哪本书：微读从 URL 取 bookId；文库页面（marxists / bilibili）
- * 问页面自己的绑定（source-mia.js 维护 miaBindings，已有 coreadBindingQuery 接口）。
+ * 判断当前页面属于哪本书。三条路，按优先级：
+ *   1. 我们自己的阅读器页面 —— 它自己报书 ID（msg.bookId，见 reader.js 的 setAsReference）。
+ *      2026-11 新增：此前只有下面两条路，阅读器两条都不沾，于是"设为引用"永远失败，
+ *      用户看到的是「当前页面未关联任何书籍…仅支持微信读书阅读页，或已加入一本书的页面」。
+ *   2. 微读：从阅读页 URL 取 bookId。
+ *   3. 文库页面（marxists / bilibili）：问页面自己的绑定（miaBindings）。
+ * @param {chrome.tabs.Tab} tab 活动标签页
+ * @param {object} [msg] 发起方的原始消息（阅读器会把 bookId/bookTitle 放在里面）
  */
-async function resolveBookContext(tab) {
+async function resolveBookContext(tab, msg) {
   const url = String((tab && tab.url) || '')
+  // 1) 我们自己的阅读器：书 ID 由页面自报，不猜
+  if (isReaderUrl(url)) {
+    const bookId = String((msg && msg.bookId) || '').trim()
+    if (!bookId) return null          // 没开 PDF 的阅读器页：确实没有书，让调用方报错
+    return { bookId, bookTitle: String((msg && msg.bookTitle) || (msg && msg.pageTitle) || '').trim() }
+  }
   try {
     const u = new URL(url)
     if (/(^|\.)weread\.qq\.com$/.test(u.hostname)) {
@@ -890,11 +985,13 @@ async function setTranslationRef(msg) {
   const tab = await activeTab()
   if (!tab) return fail('NO_TAB', '没有可用的标签页')
 
-  const ctx = await fillBookTitle(await resolveBookContext(tab))
+  const ctx = await fillBookTitle(await resolveBookContext(tab, msg))
   if (!ctx) {
     return fail(
       'NO_BOOK',
-      '当前页面未关联任何书籍，无法设为引用。仅支持微信读书阅读页，或已「加入一本书」的页面。',
+      isReaderUrl(tab && tab.url)
+        ? '阅读器里还没打开 PDF，无法设为引用。'
+        : '当前页面未关联任何书籍，无法设为引用。仅支持微信读书阅读页、CoRead 阅读器，或已「加入一本书」的页面。',
     )
   }
 

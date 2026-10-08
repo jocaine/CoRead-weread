@@ -1929,44 +1929,164 @@
     .cmd-name { font-weight: 600; color: #07c160; white-space: nowrap; font-size: 13px; }
     .cmd-desc { font-size: 12px; color: #888; }
 
-    /* ── 无书默认界面（2026-10）：读书模式未检测到阅读书籍时显示，不再残留上一本
-       书的内容；提供「从已读过的书籍中选择」入口（已读完的书不在微信读书中打开
-       时查看聊天记录的解决方案）。sidebar.js renderNoBookView 控制显示。 */
+    /* ── 无书默认界面（2026-10；2026-11 改版）：读书模式未检测到阅读书籍时显示，不再
+       残留上一本书的内容。改版两件事：① 已读书籍**直接列在界面上**，不用先点按钮再进
+       弹窗；② 版式按"一整页"来做 —— 整页白底，顶部是标题块，下面是书单，行与行之间
+       只用一条细线分隔（不再是一堆卡片浮在灰底上：那样看着像设置页，且满屏都是框）。
+       配色沿用插件既有语言（#07c160 主绿、#f0faf3 浅绿、#f2f2f2 分隔线）。
+       显示 / 隐藏与书单渲染见 sidebar.js renderNoBookView / renderNoBookList。 */
     #no-book-view {
+      flex: 1;
+      min-height: 0;        /* 让中间的 .nb-list 自己滚，而不是把整块顶高 */
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background: #fff;
+    }
+    #no-book-view[hidden] { display: none; }
+    /* 标题块：一页的开头（就是"这个页面在说什么"），不是一张提示卡 */
+    .nb-head {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 18px 16px 0;
+      flex-shrink: 0;
+    }
+    /* 图标底座：浅绿圆角块 + 绿色线性图标。不用彩色 emoji —— 它是整页最花的东西，
+       和插件的绿/灰配色打架 */
+    .nb-badge {
+      flex: 0 0 auto;
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      background: #f0faf3;
+      border: 1px solid #d9eee3;
+      color: #07c160;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .nb-badge svg { width: 16px; height: 16px; }
+    /* 空态里的同一枚图标，放大一圈（sidebar.js 的消息里用） */
+    .nb-badge.lg { width: 44px; height: 44px; border-radius: 12px; }
+    .nb-badge.lg svg { width: 22px; height: 22px; }
+    .nb-head-text { min-width: 0; padding-top: 1px; }
+    .nb-title { font-size: 14px; font-weight: 600; color: #222; line-height: 1.45; }
+    .nb-desc { margin-top: 5px; font-size: 12px; color: #9a9a9a; line-height: 1.65; }
+    /* 面板被拖得很矮时：说明文字让位给书单 —— 它只是解释，不是内容。
+       （不这么做的话，300px 高的面板里两行说明能把整屏吃掉，只看得见一本书） */
+    @media (max-height: 460px) {
+      .nb-desc { display: none; }
+      .nb-head { padding: 12px 16px 0; }
+      .nb-books-head { padding-top: 12px; }
+    }
+    /* 已读书籍区：标题行固定，书单自己滚 */
+    .nb-books { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+    .nb-books-head {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      padding: 18px 16px 8px;
+      flex-shrink: 0;
+    }
+    .nb-books-title { font-size: 12px; color: #8a8a8a; }
+    /* 数量：跟在标题后面的一枚淡数字，不做成徽标 —— 它只是"有几本"，不是按钮 */
+    .nb-count {
+      flex: 0 0 auto;
+      font-size: 11px;
+      color: #c0c0c0;
+      font-variant-numeric: tabular-nums;
+    }
+    .nb-count[hidden] { display: none; }
+    .nb-search {
+      margin: 0 16px 4px;
+      border: 1px solid transparent;
+      background: #f4f5f6;
+      border-radius: 8px;
+      padding: 7px 10px;
+      font-size: 12px;
+      font-family: inherit;
+      color: #333;
+      outline: none;
+      flex-shrink: 0;
+    }
+    .nb-search::placeholder { color: #b0b0b0; }
+    .nb-search:focus { background: #fff; border-color: #07c160; }
+    .nb-search[hidden] { display: none; }
+    .nb-list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 16px 12px; }
+    .nb-list[hidden] { display: none; }
+    /* 书单条目复用弹窗那套 .bp-item / .bi-*（同一个 buildBookItem 渲染）：这里不要
+       卡片、不要边框，只留一条行间细线 —— 一整页读下来才顺。
+       悬停按本插件既有的"文字变绿"惯例（见 #ref-current .rc-preview:hover），
+       不铺底色、不加阴影；删除按钮平时隐形，指到哪一行才出现。 */
+    #nb-list .bp-item {
+      background: transparent;
+      border: 0;
+      border-bottom: 1px solid #f2f2f2;
+      border-radius: 0;
+      margin: 0;
+      padding: 9px 0;
+      gap: 10px;
+    }
+    #nb-list .bp-item:last-child { border-bottom: 0; }
+    #nb-list .bp-item:hover { background: transparent; }
+    #nb-list .bp-item:hover .bi-title { color: #07c160; }
+    #nb-list .bp-item .bi-title { line-height: 1.45; }
+    /* 删除按钮收小一号：它是常驻的 flex 项，24px 会把每一行都撑高 6px */
+    #nb-list .bp-item .bi-del { width: 20px; height: 20px; }
+    #nb-list .bi-del { opacity: 0; }
+    #nb-list .bp-item:hover .bi-del,
+    #nb-list .bi-del:focus-visible { opacity: 1; }
+    /* 书脊色块：书名首字 + 按书 ID 取的一个固定色（见 sidebar.js spineOf）。
+       一长串书名看着是一堵墙，有这枚色块才有"每本书各是各的"的辨识度。
+       六色都是低饱和的中间调，白字在它们上面的对比度 3.6:1 以上，不刺眼也读得清。 */
+    .book-spine {
+      flex: 0 0 auto;
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      letter-spacing: .5px;
+    }
+    /* 空态 / 加载中 / 本机服务未启动：占满书单区居中 */
+    .nb-msg {
       flex: 1;
       display: flex;
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 10px;
-      padding: 24px;
+      gap: 9px;
+      padding: 16px 28px 34px;
       text-align: center;
-      flex-shrink: 0;
-      overflow-y: auto;
     }
-    #no-book-view[hidden] { display: none; }
-    .nb-icon { font-size: 36px; line-height: 1; }
-    .nb-title { font-size: 15px; font-weight: 600; color: #444; }
-    .nb-desc { font-size: 12px; color: #999; line-height: 1.7; }
-    .nb-pick-btn {
-      margin-top: 8px;
-      border: 1px solid #bfe3cc;
+    .nb-msg[hidden] { display: none; }
+    .nb-msg-title { font-size: 12.5px; color: #777; }
+    .nb-msg-sub { font-size: 11.5px; color: #aaa; line-height: 1.7; }
+    .nb-msg.err .nb-msg-title { color: #cf6b62; }
+    .nb-retry {
+      margin-top: 2px;
+      border: 1px solid #cfeadd;
       background: #f0faf3;
       color: #07c160;
       border-radius: 8px;
-      padding: 9px 20px;
-      font-size: 13px;
-      cursor: pointer;
+      padding: 5px 18px;
+      font-size: 12px;
       font-family: inherit;
+      cursor: pointer;
     }
-    /* 网页阅读源入口卡（AI-021）：路径独占一行 chip，文案与按钮分开，避免长句换行难看 */
+    .nb-retry:hover { background: #e5f6ec; border-color: #a9dcc1; }
+    /* 网页阅读源入口卡（AI-021）：常驻在书单下面（不跟着书单滚）；路径独占一行 chip，
+       文案与按钮分开，避免长句换行难看 */
     .nb-web-card {
-      margin-top: 14px;
-      padding-top: 12px;
-      border-top: 1px dashed #e3e3e3;
-      width: 100%;
-      max-width: 280px;
-      text-align: left;
+      flex-shrink: 0;
+      padding: 10px 16px 12px;
+      background: #fafbfa;
+      border-top: 1px solid #ececec;
       box-sizing: border-box;
     }
     .nb-web-eyebrow { font-size: 11px; font-weight: 600; color: #aaa; letter-spacing: .4px; margin-bottom: 6px; }
@@ -1995,7 +2115,6 @@
       font-family: inherit;
     }
     .nb-web-act:hover { background: #fdf3d8; }
-    .nb-pick-btn:hover { border-color: #06ad56; color: #06ad56; background: #e0f4e7; }
 
     /* ── 手动选书横幅（2026-10）：手动查看某本已读书籍的历史记录时，显示在消息区
        上方，标明当前不是自动跟随，并提供切换/退出入口 */
@@ -2120,7 +2239,14 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .bp-item .bi-meta { font-size: 11px; color: #999; margin-top: 3px; }
+    /* 最近更新：与书名同一行、靠右。等宽数字，几条并排时日期不会左右跳 */
+    .bp-item .bi-meta {
+      flex: 0 0 auto;
+      font-size: 11px;
+      color: #b3b3b3;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
     .bp-msg { text-align: center; color: #bbb; font-size: 12px; padding: 22px 10px; }
     .bp-msg.bp-err { color: #e74c3c; }
 
@@ -2451,13 +2577,40 @@
     </div>
   </div>
 
-  <!-- 无书默认界面（2026-10）：读书模式未检测到阅读书籍时显示，替代"残留上一本书
-       内容"的旧行为；「从已读过的书籍中选择」= 已读完书籍聊天记录的查看入口 -->
+  <!-- 无书默认界面（2026-10；2026-11 改版）：读书模式未检测到阅读书籍时显示，替代
+       "残留上一本书内容"的旧行为。
+       改版要点（用户要求）：**已读书籍直接列在这里**，不再需要先点「从已读书籍中选择」
+       再进弹窗；顶部那段文案缩成一张状态卡，回答"为什么是空的 / 怎么让它自动跟过来"，
+       书单自己带一行小标题。
+       结构：状态卡（.nb-head）→ 书单区（.nb-books，自己滚）→ 网页阅读源卡片（AI-021，
+       常驻底部）。显示 / 隐藏与书单渲染见 sidebar.js renderNoBookView / renderNoBookList。 -->
   <div id="no-book-view" hidden>
-    <div class="nb-icon">📖</div>
-    <div class="nb-title">未检测到正在阅读的书籍</div>
-    <div class="nb-desc">打开微信读书中的书籍后自动同步该书讨论；<br>已读书籍可手动查看历史记录</div>
-    <button class="nb-pick-btn" id="nb-pick-btn">📚 从已读书籍中选择</button>
+    <!-- 书本图标只写一遍：状态卡与空态（sidebar.js 的消息里）都用 <use> 引它 -->
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+      <symbol id="nb-book-glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 6.8C10.3 5.6 8.3 5 6 5H4v13h2c2.3 0 4.3.6 6 1.8"/>
+        <path d="M12 6.8C13.7 5.6 15.7 5 18 5h2v13h-2c-2.3 0-4.3.6-6 1.8"/>
+        <path d="M12 6.8v13"/>
+      </symbol>
+    </svg>
+    <div class="nb-head">
+      <span class="nb-badge"><svg><use href="#nb-book-glyph"></use></svg></span>
+      <div class="nb-head-text">
+        <div class="nb-title">未检测到正在阅读的书籍</div>
+        <div class="nb-desc">打开微信读书中的书籍后自动同步该书讨论<br>已读过的书，点开可翻看以前的讨论</div>
+      </div>
+    </div>
+    <div class="nb-books">
+      <div class="nb-books-head">
+        <span class="nb-books-title">已读书籍</span>
+        <span class="nb-count" id="nb-books-count" hidden></span>
+      </div>
+      <!-- 搜索框只在书多时出现（sidebar.js renderNoBookList 按数量显示） -->
+      <input type="text" id="nb-search" class="nb-search" dir="ltr" placeholder="搜索书名…" hidden>
+      <div class="nb-list" id="nb-list"></div>
+      <div class="nb-msg" id="nb-empty" hidden></div>
+    </div>
     <div class="nb-web-card" id="nb-web-card" hidden>
       <div class="nb-web-eyebrow">网页阅读源</div>
       <div class="nb-web-url" id="nb-web-url"></div>
@@ -2703,6 +2856,10 @@
           <div class="tr-row">
             <span class="tr-label">当前模型</span>
             <span class="tr-val" id="tr-base-model">读取中…</span>
+          </div>
+          <div class="tr-row">
+            <span class="tr-label">实际请求地址</span>
+            <span class="tr-val" id="tr-endpoint">读取中…</span>
           </div>
           <details class="tr-adv" id="tr-adv">
             <summary>自定义模型配置（未填写的项沿用模型 API 配置）</summary>
