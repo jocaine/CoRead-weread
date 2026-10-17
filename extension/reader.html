@@ -6,47 +6,86 @@
 <title>CoRead 阅读器</title>
 <link rel="stylesheet" href="vendor/pdfjs/text-layer.css">
 <link rel="stylesheet" href="reader.css">
+<!-- 教程书的样式（只有书页排版）。这一版书里不再有"演一遍"的假界面：
+     一章 = 一课，课在**真实侧栏**里跑，引导层样式见 tutorial-guide.js。 -->
+<link rel="stylesheet" href="tutorial/tutorial.css">
 </head>
 <body>
 
 <header class="rd-bar">
+  <!-- 顶栏哪些元素在哪种状态下出现，由 reader.js 的 CHROME 三态表说了算（见那里的长注释）。
+       一句话版：书库界面只留「品牌 + 状态那格（显示"书库"）」，其余全藏。
+
+       ── 版式（2026-11 重排，用户："一堆乱七八糟的东西"）──────────────────────
+       分两组，中间用留白隔开：
+         左 = 文件与导航：打开 PDF · 书库 │ 目录 │ 书名
+         右 = 视图与翻译：− 100% ＋ │ 框选翻译 · 译文
+       重排时去掉 / 合并了三处：
+         · 缩放原来被页码和状态隔成"− … 100% … ＋"三格，现在贴成一组；
+           「适宽」并进这一组——**点百分比数字就回到适宽**（原先 100% 时点「适宽」没反应，
+           所以那个按钮多数时候是个死键）。
+         · 渲染状态**平时不显示**（`hidden`），只在渲染出错 / 首页画布空白时冒头；
+           详细数字挂 title，排查时鼠标停上去还在（见 reader.js 的 updateStatus）。
+         · 分组之间不靠零散按钮撑，靠 `.rd-bar-sep` 那条极淡竖线。
+         注：`rd-fit` 保留在 DOM 里但默认隐藏——给"适宽"留个可显式调用的落点，
+         快捷键 Ctrl+0 与自检都还在用它（见 reader.js）。
+  -->
   <span class="rd-brand">CoRead 阅读器</span>
   <button id="rd-open" class="rd-btn rd-btn-primary" type="button">打开 PDF</button>
   <button id="rd-library-btn" class="rd-btn" type="button" title="回到书库（打开过的 PDF）">书库</button>
   <input id="rd-file" type="file" accept="application/pdf,.pdf" hidden>
+  <button id="rd-toc-btn" class="rd-btn" type="button" title="章节目录：跳章 / 跳页">目录</button>
   <span id="rd-name" class="rd-name">未打开 PDF</span>
   <span class="rd-spacer"></span>
-  <span id="rd-status" class="rd-muted" title="页面渲染状态"></span>
-  <span id="rd-pageinfo" class="rd-muted">—</span>
-  <button id="rd-zoom-out" class="rd-btn" type="button" title="缩小">−</button>
-  <span id="rd-zoom" class="rd-muted">100%</span>
-  <button id="rd-zoom-in" class="rd-btn" type="button" title="放大">＋</button>
-  <button id="rd-box" class="rd-btn" type="button"
-          title="进入一次框选：在页面拖出选区，由模型读图翻译（Alt+S）">框选翻译</button>
-  <button id="rd-fit" class="rd-btn" type="button" title="按窗口宽度缩放">适宽</button>
+  <!-- 视图组：缩放三格贴在一起，百分比那格点一下＝适宽 -->
+  <button id="rd-zoom-out" class="rd-btn" type="button" title="缩小（Ctrl+-）">−</button>
+  <button id="rd-zoom" class="rd-btn rd-btn-flat" type="button" title="点一下回到「适宽」">100%</button>
+  <button id="rd-zoom-in" class="rd-btn" type="button" title="放大（Ctrl++）">＋</button>
+  <button id="rd-fit" class="rd-btn" type="button" title="按窗口宽度缩放（Ctrl+0）" hidden>适宽</button>
+  <span class="rd-bar-sep" aria-hidden="true"></span>
+  <!-- 翻译组 -->
+  <button id="rd-box" class="rd-btn" type="button" aria-pressed="false"
+          title="进入框选：在页面上拖出选区，由模型读图翻译（Alt+S 来一下就走）">框选翻译</button>
   <button id="rd-notes" class="rd-btn" type="button" title="在侧栏打开译文对照">译文</button>
+  <!-- 渲染状态与页码：状态平时藏（见 updateStatus），页码常驻 -->
+  <span id="rd-status" class="rd-muted" hidden></span>
+  <span id="rd-pageinfo" class="rd-muted">—</span>
 </header>
 
 <main class="rd-main">
+  <!-- 框选模式的常驻提示（2026-11）：只在框选模式里显示，横在正文上方。
+       为什么必须有它：工具栏那枚「框选翻译」是切换式的，而**忘了退出**正是这个功能
+       历来最大的坑（以前切模式时，忘了退就"划不中字了"，用户以为界面坏了）。
+       有这条常驻提示，用户随时看得见自己在什么模式里，切换式才敢用。 -->
+  <div id="rd-box-bar" class="rd-box-bar" hidden>
+    <span class="rd-box-bar-txt">框选模式：在页面上拖出选区翻译</span>
+    <span class="rd-box-bar-key">Esc 退出</span>
+    <button id="rd-box-exit" class="rd-box-bar-btn" type="button">退出</button>
+  </div>
   <div id="rd-scroll" class="rd-scroll">
     <div id="rd-pages" class="rd-pages"></div>
     <div id="rd-empty" class="rd-empty">
-      <h1>读外文，边读边译</h1>
-
+      <!-- 空状态排版的取舍（2026-11，按 coread-visual-spec 重做）─────────────────
+           原先这里是"大标题 + 说明 + 书库 + 找文件"，四块平铺、全部居中、标题 20px。
+           三个问题：① 20px 不在规格的字号档里（上限是标题 17px），而且**占着最贵的位置
+           却说了一句广告语**；② 书库左对齐、能点，却排在说明文字下面——那是主要资产，
+           该在上面；③ 说明把"场景 + 异常 + 定位"塞进一句，读起来像内部备注。
+           现在：
+             · 书库升为主角，动作（打开本地 PDF）并进它的标题行右端，不再单占一块；
+             · hero 去掉，说明只在**书库里没有你自己放过的书**时才出现（有书就叫他从上面挑）；
+             · 文案由 reader.js 按书库状态填（见 renderEmptyNote），不是写死在 HTML 里。 -->
       <div id="rd-library">
         <div class="rd-lib-head">
-          <span>书库</span>
+          <span class="rd-lib-title">书库</span>
           <span id="rd-lib-status" class="rd-muted">读取中…</span>
+          <span class="rd-spacer"></span>
+          <button id="rd-open-main" class="rd-btn rd-btn-primary" type="button">打开本地 PDF</button>
         </div>
         <div id="rd-lib-list" class="rd-lib-list"></div>
       </div>
 
-      <div class="rd-open-row">
-        <button id="rd-open-main" class="rd-btn rd-btn-primary" type="button">从本地打开 PDF</button>
-        <span class="rd-muted">或将 PDF 拖到此处</span>
-      </div>
-
-      <p class="rd-hint">正文是真实文字，<b>划词即可翻译</b>；译文按段落锚定在原文上，改变窗口大小、缩放或重新打开，位置都不会偏移。</p>
+      <p class="rd-empty-note" id="rd-empty-note" hidden></p>
+      <p class="rd-hint" id="rd-drag-hint">也可以把 PDF 直接拖到窗口里。</p>
       <p class="rd-hint rd-warn" id="rd-scan-hint" hidden>本 PDF 没有文字层（扫描件，页面内容为图片），无法使用划词翻译。请点击工具栏的<b>「框选翻译」</b>（或按 Alt+S），在页面上拖出选区，由模型读图翻译，译文同样会贴回本页。</p>
     </div>
   </div>
@@ -58,6 +97,46 @@
 <div id="rd-tip" class="rd-tip" hidden>
   <button id="rd-tip-translate" type="button">翻译</button>
   <button id="rd-tip-copy" type="button" title="仅复制原文">复制</button>
+</div>
+
+<!-- 章节目录（2026-11）：
+     · 教程书 → 书自带的七章（这本是我们的，章节表就在书里）
+     · PDF    → pdf.js 读到的**真书签目录**（b.getOutline()，很多学术 PDF 都有），
+                外加一条页码滑杆；没有书签的 PDF 就只剩滑杆。
+     为什么不做"靠字号猜章节"：猜错的目录比没有目录更烦人，而且无从解释。 -->
+<div id="rd-toc" class="rd-toc" hidden>
+  <div class="rd-toc-panel">
+    <div class="rd-toc-head">
+      <span class="rd-toc-title">目录</span>
+      <span id="rd-toc-kind" class="rd-muted"></span>
+      <button id="rd-toc-close" class="rd-toc-close" type="button" title="关闭">✕</button>
+    </div>
+    <div id="rd-toc-jump" class="rd-toc-jump">
+      <button id="rd-toc-first" class="rd-btn rd-btn-sm" type="button" title="首页">⤒</button>
+      <input id="rd-toc-range" type="range" min="1" max="1" value="1">
+      <button id="rd-toc-last" class="rd-btn rd-btn-sm" type="button" title="末页">⤓</button>
+      <span id="rd-toc-pos" class="rd-muted"></span>
+    </div>
+    <div id="rd-toc-list" class="rd-toc-list"></div>
+  </div>
+</div>
+
+<!-- 删除弹窗（2026-11）：与侧栏同款自绘弹窗。
+     为什么不用原生 confirm()：扩展页面里 Chrome 压制它（恒返回假），侧栏早就踩过这个坑。
+     为什么弹在阅读器里、而不是让侧栏弹：用户是在**阅读器的书库**里点的删除，
+     弹窗跑到旁边的侧栏去，人根本看不见（侧栏可能压根没开）。
+     ⚠️ **只有"确定 / 取消"两个答案**：书库这一项代表的就是那个 PDF 原件，
+     删除没有第二种解释。（曾经加过"只删记录 / 连原件一起删"的第三按钮，用户否掉了那个模型：
+     记录归侧栏管、原件归这里管，两个界面各代表一样东西。） -->
+<div id="rd-del-overlay" hidden>
+  <div class="rd-del-box">
+    <div class="rd-del-title" id="rd-del-title">删除</div>
+    <div class="rd-del-msg" id="rd-del-msg"></div>
+    <div class="rd-del-actions">
+      <button class="rd-del-btn rd-del-cancel" id="rd-del-cancel" type="button">取消</button>
+      <button class="rd-del-btn rd-del-ok" id="rd-del-ok" type="button">确认删除</button>
+    </div>
+  </div>
 </div>
 
 <div id="rd-toast" class="rd-toast" hidden></div>

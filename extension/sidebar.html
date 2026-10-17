@@ -34,8 +34,13 @@
     }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Helvetica Neue', sans-serif;
-      font-size: 14px;
-      background: #f5f5f5;
+      font-size: 15px;
+      /* 壳层：**暖灰**（2026-11 用户定调：不要纯白——"太白了也有一点晃眼睛"）。
+         取值过程：原来的 #f5f5f5 → 纯白 #fff（用户嫌晃眼）→ #faf9f6（暖灰，定案）。
+         为什么带一点点暖：开场那两行是**宋体 + 暖墨**，壳层跟着偏暖才是一套气质；
+         纯中性灰（#f5f5f5）不带任何色相，跟谁都搭不上，那才是"丑"的真正来源。
+         注意分工：**消息区仍是纯白**（那是纸面），暖灰只给壳层（顶栏/底栏/留白）。 */
+      background: #faf9f6;
       height: 100vh;
       display: flex;
       flex-direction: column;
@@ -44,7 +49,9 @@
       --msg-font-size: 13px;
     }
     #header {
-      background: #fff;
+      /* 壳层色与 body 同源（暖灰）：顶栏是"外框"的一部分，不该是另一块白。
+         分区靠下面那条 1px 线，不靠色差。 */
+      background: #faf9f6;
       border-bottom: 1px solid #ececec;
       /* 2026-09：去掉书名前 📖 图标后，左右 12px 与下方引用窗体/消息区左缘对齐；
          上 5px：单行头部纵向留白 */
@@ -118,7 +125,7 @@
       background: #fff;
       color: #666;
       border-radius: 4px;
-      font-size: 10px;
+      font-size: 11px;
       line-height: 1;
       padding: 4px 5px;
       cursor: pointer;
@@ -139,7 +146,7 @@
       font-family: inherit;
     }
     .mode-switch .ms-state {
-      font-size: 10px;
+      font-size: 11px;
       line-height: 1;
       color: #8e8e93;
       transition: color 0.25s;
@@ -215,6 +222,58 @@
       white-space: nowrap;
     }
     #free-refs .fr-pick-btn:hover { border-color: #06ad56; color: #06ad56; background: #e0f4e7; }
+    /* 折叠按钮：与读书模式「当前引用」表头按钮同款（2026-11 用户要求两种模式的
+       引用框行为一致——自由模式的窗体原先只能整块占着消息区上方，收不起来） */
+    #free-refs .fr-collapse-btn {
+      flex: 0 0 auto;
+      border: 1px solid #ddd;
+      background: #fff;
+      color: #666;
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #free-refs .fr-collapse-btn:hover { border-color: #07c160; color: #07c160; background: #f6fdf8; }
+    /* 展开态限高（2026-11 用户要求）：条数多时窗体不再一路长高把消息区挤没，
+       超过这个高度改在框内滚动。数值与读书模式「当前引用」正文区
+       （#ref-current .rc-body .rc-text 的 AI-018 限高）取同一个 130px —— 两种模式的
+       引用框都"最多占这么高"。按一行 26px（12px 字 × 1.5 行高 + 上下 4px 内边距）算，
+       130px 正好露出 5 行。 */
+    #free-refs .fr-list {
+      max-height: 130px;
+      overflow-y: auto;
+    }
+    /* 折叠态：清单收成一行缩略概览（条数 + 节点名），点它展开——与读书模式折叠后
+       「仍看得见当前引用」同一意图（AI-018），空态提示一并收起（空清单会自动展开） */
+    #free-refs.collapsed .fr-list,
+    #free-refs.collapsed .fr-empty { display: none; }
+    #free-refs .fr-preview {
+      display: none;
+      padding: 2px 10px 7px 12px;
+      font-size: 11px;
+      color: #666;
+      line-height: 1.5;
+      cursor: pointer;
+      user-select: none;
+    }
+    #free-refs.collapsed .fr-preview { display: block; }
+    #free-refs .fr-preview .frp-count {
+      color: #444;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #free-refs .fr-preview .frp-items {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;       /* 最多两行，超长省略，不撑高窗体 */
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      word-break: break-word;
+    }
+    #free-refs .fr-preview:hover .frp-items { color: #07c160; }
     #free-refs .fr-item {
       display: flex;
       align-items: flex-start;
@@ -228,7 +287,7 @@
     #free-refs .fr-item .fr-idx {
       flex: 0 0 auto;
       color: #aaa;
-      font-size: 10px;
+      font-size: 11px;
       padding-top: 2px;
       font-variant-numeric: tabular-nums;
     }
@@ -245,7 +304,7 @@
       transition: opacity 0.15s;
     }
     #free-refs .fr-item:hover .fr-x { opacity: 1; }
-    #free-refs .fr-item .fr-x:hover { color: #e74c3c; }
+    #free-refs .fr-item .fr-x:hover { color: #a82e22; }
     #free-refs .fr-empty {
       /* 无引用时的单行提示：一行内超长省略，避免撑高窗体（2026-09） */
       padding: 3px 10px 5px 12px;
@@ -263,12 +322,12 @@
       cursor: pointer;
       padding: 0 2px;
     }
-    #free-refs .fr-clear-all:hover { color: #e74c3c; }
+    #free-refs .fr-clear-all:hover { color: #a82e22; }
     /* 锁定条目（2026-10）：实时栈命中并入窗体 = 历史消息已提交的引用，随讨论自动
        更新、不可删除——与图上的栈命中高亮同一数据源（/stack-hits），窗体与图一致 */
     #free-refs .fr-locked-hd {
       padding: 6px 10px 1px 12px;
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 600;
       color: #b9b9b9;
       letter-spacing: 0.2px;
@@ -276,7 +335,7 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    #free-refs .fr-item.fr-locked .fr-idx { font-size: 9px; color: #c9a06a; }
+    #free-refs .fr-item.fr-locked .fr-idx { font-size: 11px; color: #c9a06a; }
     #free-refs .fr-item.fr-locked .fr-point { color: #8d8d8d; }
     #free-refs .fr-item.fr-locked:hover { background: #f7f7f7; }
 
@@ -332,7 +391,7 @@
     /* 对话总数徽标：一眼看出"自由模式里可以有很多场对话" */
     #free-conv-bar .fc-count {
       flex: 0 0 auto;
-      font-size: 10px;
+      font-size: 11px;
       color: #07c160;
       background: #f0faf3;
       border: 1px solid #cfeadd;
@@ -341,7 +400,7 @@
       line-height: 15px;
       font-variant-numeric: tabular-nums;
     }
-    #free-conv-bar .fc-caret { flex: 0 0 auto; color: #aaa; font-size: 10px; }
+    #free-conv-bar .fc-caret { flex: 0 0 auto; color: #aaa; font-size: 11px; }
     #free-conv-bar .fc-btn {
       flex: 0 0 auto;
       border: 1px solid #ddd;
@@ -412,7 +471,7 @@
       border-bottom: 1px solid #ececec;
       flex-shrink: 0;
     }
-    .fcv-title { flex: 1; font-size: 14px; font-weight: 600; color: #333; }
+    .fcv-title { flex: 1; font-size: 15px; font-weight: 600; color: #333; }
     .fcv-close { border: none; background: none; font-size: 15px; cursor: pointer; color: #aaa; padding: 0 4px; }
     .fcv-close:hover { color: #333; }
     .fcv-hint {
@@ -447,7 +506,7 @@
     .fcv-item .fci-meta { font-size: 11px; color: #999; margin-top: 3px; }
     .fcv-item .fci-badge {
       flex: 0 0 auto;
-      font-size: 10px;
+      font-size: 11px;
       color: #07c160;
       border: 1px solid #bfe3cc;
       background: #f0faf3;
@@ -470,7 +529,7 @@
       justify-content: center;
     }
     .fcv-item .fci-act:hover { color: #d98613; background: #fff8ec; }
-    .fcv-item .fci-act.fci-del:hover { color: #e74c3c; background: #fdf0ee; }
+    .fcv-item .fci-act.fci-del:hover { color: #a82e22; background: #fdf0ee; }
     .fcv-msg { text-align: center; color: #bbb; font-size: 12px; padding: 22px 10px; }
     .fcv-arch {
       flex-shrink: 0;
@@ -497,7 +556,7 @@
       text-overflow: ellipsis;
       color: #666;
     }
-    .fcv-arch-item .fca-meta { font-size: 10.5px; color: #bbb; margin-top: 2px; }
+    .fcv-arch-item .fca-meta { font-size: 12px; color: #bbb; margin-top: 2px; }
     .fcv-new {
       flex-shrink: 0;
       margin: 8px 12px 12px;
@@ -519,7 +578,7 @@
       padding: 14px 16px 12px;
       box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
     }
-    .fa-title { font-size: 14px; font-weight: 600; color: #333; }
+    .fa-title { font-size: 15px; font-weight: 600; color: #333; }
     .fa-conv {
       margin-top: 4px;
       font-size: 12px;
@@ -528,7 +587,7 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
-    .fa-desc { margin: 8px 0 10px; font-size: 11.5px; color: #888; line-height: 1.7; }
+    .fa-desc { margin: 8px 0 10px; font-size: 12px; color: #888; line-height: 1.7; }
     .fa-desc strong { color: #e6a23c; font-weight: 600; }
     .fa-opt {
       display: flex;
@@ -543,7 +602,7 @@
     .fa-opt:hover { border-color: #bfe3cc; background: #fafffb; }
     .fa-opt input { margin: 2px 0 0; flex: 0 0 auto; accent-color: #07c160; }
     .fa-opt .fa-opt-main { flex: 1; min-width: 0; }
-    .fa-opt .fa-opt-name { display: block; font-size: 12.5px; font-weight: 600; color: #333; }
+    .fa-opt .fa-opt-name { display: block; font-size: 13px; font-weight: 600; color: #333; }
     .fa-opt .fa-opt-desc { display: block; font-size: 11px; color: #999; line-height: 1.6; margin-top: 2px; }
     .fa-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
     .fa-btn {
@@ -558,7 +617,7 @@
     }
     .fa-btn:hover { border-color: #bbb; }
     .fa-btn.fa-ok { border-color: #e6a23c; background: #fff8ec; color: #d98613; font-weight: 600; }
-    .fa-btn.fa-ok:hover { background: #fdf0ee; border-color: #e74c3c; color: #e74c3c; }
+    .fa-btn.fa-ok:hover { background: #fdf0ee; border-color: #a82e22; color: #a82e22; }
     .fa-btn:disabled { opacity: 0.5; cursor: default; }
     #ref-current .rc-head {
       display: flex;
@@ -590,8 +649,8 @@
       white-space: nowrap;
     }
     #ref-current .rc-head button:hover { background: #f0f0f0; color: #07c160; }
-    #ref-current .rc-head .rc-deselect { color: #ccc; border: none; background: none; font-size: 14px; padding: 0 2px; }
-    #ref-current .rc-head .rc-deselect:hover { color: #e74c3c; }
+    #ref-current .rc-head .rc-deselect { color: #ccc; border: none; background: none; font-size: 15px; padding: 0 2px; }
+    #ref-current .rc-head .rc-deselect:hover { color: #a82e22; }
     #ref-current .rc-head .rc-del {
       color: #ccc;
       font-size: 12px;
@@ -601,7 +660,7 @@
       justify-content: center;
     }
     #ref-current .rc-head .rc-del svg { width: 12px; height: 12px; }
-    #ref-current .rc-head .rc-del:hover { color: #e74c3c; border-color: #e74c3c; }
+    #ref-current .rc-head .rc-del:hover { color: #a82e22; border-color: #a82e22; }
     #ref-current .rc-body {
       padding: 8px 12px 10px;
       font-size: 12px;
@@ -628,6 +687,35 @@
       max-height: 130px;
       overflow-y: auto;
       word-break: break-word;
+    }
+    /* 引用正文里那份**译文**（2026-11）：PDF 那条引用显示的是它。
+       多行照原样折行（一段译文常常好几行，折叠掉就变成一整行）。 */
+    #ref-current .rc-body .rc-text .rc-main {
+      white-space: pre-wrap;
+    }
+    /* 原文（折叠可查）：与译文分开、明显是次要信息 —— 小一号、灰一点、一条细线隔开。
+       为什么不藏死：原文是这条引用的身份，用户核对"引的到底是哪句"时要看它。 */
+    #ref-current .rc-body .rc-text .rc-orig {
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px dashed #e3e6e9;
+    }
+    #ref-current .rc-body .rc-text .rc-orig-toggle {
+      border: 0;
+      background: none;
+      padding: 0;
+      font: inherit;
+      font-size: 11px;
+      color: #888;
+      cursor: pointer;
+    }
+    #ref-current .rc-body .rc-text .rc-orig-toggle:hover { color: #07883f; }
+    #ref-current .rc-body .rc-text .rc-orig-text {
+      margin-top: 4px;
+      font-size: 11px;
+      line-height: 1.5;
+      color: #777;
+      white-space: pre-wrap;
     }
     #ref-current .rc-body .rc-meta {
       font-size: 11px;
@@ -713,7 +801,7 @@
     }
     #ref-drawer .drawer-head .drawer-title {
       flex: 1;
-      font-size: 1em;
+      font-size: 13px;
       font-weight: 600;
       color: #333;
       min-width: 0;
@@ -724,7 +812,7 @@
     #ref-drawer .drawer-head .drawer-close {
       border: none;
       background: none;
-      font-size: 1.38em;
+      font-size: 17px;
       cursor: pointer;
       color: #aaa;
       padding: 0 4px;
@@ -752,7 +840,7 @@
       margin-bottom: 2px;
     }
     #ref-drawer .drawer-item .di-num {
-      font-size: 0.77em;
+      font-size: 11px;
       font-weight: 700;
       color: #07c160;
       background: #e8f5e9;
@@ -761,13 +849,13 @@
       flex-shrink: 0;
     }
     #ref-drawer .drawer-item .di-book {
-      font-size: 0.77em;
+      font-size: 11px;
       color: #555;
       font-weight: 600;
       margin-bottom: 2px;
     }
     #ref-drawer .drawer-item .di-chapter {
-      font-size: 0.77em;
+      font-size: 11px;
       color: #aaa;
       margin-bottom: 3px;
     }
@@ -776,7 +864,7 @@
       border: 1px solid #ddd;
       border-radius: 6px;
       padding: 5px 8px;
-      font-size: 0.92em;
+      font-size: 12px;
       outline: none;
       margin-top: 6px;
       font-family: inherit;
@@ -785,7 +873,7 @@
     }
     #drawer-search:focus { border-color: #07c160; }
     #ref-drawer .drawer-item .di-text {
-      font-size: 0.92em;
+      font-size: 12px;
       color: #555;
       line-height: 1.5;
     }
@@ -793,7 +881,7 @@
     #ref-drawer .drawer-item .di-full {
       display: none;
       margin-top: 4px;
-      font-size: 0.92em;
+      font-size: 12px;
       color: #444;
       line-height: 1.7;
     }
@@ -806,7 +894,7 @@
       color: inherit;
     }
     #ref-drawer .drawer-item .di-toggle {
-      font-size: 0.77em;
+      font-size: 11px;
       color: #07c160;
       cursor: pointer;
       margin-top: 3px;
@@ -823,7 +911,7 @@
       background: #fff;
       border-radius: 4px;
       padding: 2px 8px;
-      font-size: 0.77em;
+      font-size: 11px;
       cursor: pointer;
       color: #666;
       margin-right: 4px;
@@ -834,7 +922,7 @@
       background: #fff;
       border-radius: 4px;
       padding: 2px 8px;
-      font-size: 0.77em;
+      font-size: 11px;
       cursor: pointer;
       color: #bbb;
       margin-left: 4px;
@@ -843,19 +931,23 @@
       justify-content: center;
     }
     #ref-drawer .drawer-item .di-del-btn svg { width: 11px; height: 11px; }
-    #ref-drawer .drawer-item .di-del-btn:hover { border-color: #e74c3c; color: #e74c3c; }
+    #ref-drawer .drawer-item .di-del-btn:hover { border-color: #a82e22; color: #a82e22; }
 
     /* ── 消息区 ────────────────────────────────── */
     #msgs {
       flex: 1;
       overflow-y: auto;
-      padding: 16px;
+      /* 左右 12px：与下方「当前引用」卡片同一条左右缘（那条也是 12px）。
+         用 12 而不是 16，是因为侧栏可以被拖到 300px 以下，16px 会把内容挤得太窄
+         （开场那句文案就更容易断行——2026-11 实测）。上下仍是 16px。 */
+      padding: 16px 12px;
       display: flex;
       flex-direction: column;
       gap: 10px;
     }
     #footer {
-      background: #fff;
+      /* 与 #header / body 同一壳层色（暖灰）：输入区属于"外框"，消息区才是纸面 */
+      background: #faf9f6;
       border-top: 1px solid #ececec;
       padding: 10px 12px;
       display: flex;
@@ -863,6 +955,13 @@
       align-items: flex-end;
       flex-shrink: 0;
     }
+    /* 无书状态下整条输入区让位给「PDF 阅读器」常驻条（2026-11）。
+       为什么要这条：`#footer { display:flex }` 会**压掉** `hidden` 属性的默认
+       `display:none`（同行内样式/更高特异性胜出），不加它 `footer.hidden = true` 是没用的。
+       切换逻辑在 sidebar.js 的 renderNoBookView：
+       无书且本机服务正常 → 藏输入框、露 PDF 条；服务没起来 → 反过来留着输入框
+       （那时该看见的是"读不到已读书籍 + 重试"，不是一枚点了会报错的 PDF 入口）。 */
+    #footer[hidden] { display: none; }
     /* 上传文本附件（📎）：读取进本次讨论，不落盘保存原文件、不建已上传列表 */
     #attach-btn {
       flex-shrink: 0;
@@ -935,6 +1034,54 @@
     #toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
     #toast.err { background: rgba(180, 52, 45, 0.95); }
 
+    /* 输入框外壳：为了把命令 chip 贴在框内左侧（chip 是绝对定位的兄弟节点，不进 textarea） */
+    #input-wrap {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      position: relative;
+    }
+    /* 待提交命令 chip（规格：字号 12 / 字重 600 / 圆角 4 / 动效 120ms；
+       色值沿用 #attach-chip 同族 = accent-soft / accent-border / accent-text） */
+    #cmd-chip {
+      position: absolute;
+      left: 10px;
+      top: 8px;
+      z-index: 1;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 4px 2px 6px;
+      border: 1px solid #d5f2e1;
+      background: #f0faf3;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 1.4;
+      color: #0a7d43;
+      transition: background 120ms cubic-bezier(.4, 0, .2, 1), border-color 120ms cubic-bezier(.4, 0, .2, 1);
+    }
+    #cmd-chip[hidden] { display: none; }
+    #cmd-chip-remove {
+      border: none;
+      background: none;
+      color: #0a7d43;
+      opacity: .6;
+      cursor: pointer;
+      font-size: 11px;
+      line-height: 1;
+      padding: 2px;
+      font-family: inherit;
+      border-radius: 4px;
+    }
+    #cmd-chip-remove:hover { opacity: 1; color: #e25252; }
+    #cmd-chip-remove:focus-visible {
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(10, 125, 67, 0.18);
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #cmd-chip { transition: none; }
+    }
     #input {
       flex: 1;
       border: 1px solid #ddd;
@@ -1033,15 +1180,31 @@
       line-height: 1.3;
       flex-shrink: 0;
     }
+    /* 竖排书名条里的章节（2026-11 加「章节」标签）：条宽只有 40px，「章节：」连同值
+       一起竖排会又高又难读（冒号紧贴数字），所以拆两行——「章节」二字竖排当标签，
+       值横排贴在下边（JS 已把值截到 2 字，否则"卷二 第五章"会把条撑宽）。 */
     .ref-bar .ref-chapter {
-      writing-mode: vertical-lr;
-      font-size: 9px;
-      color: #888;
-      margin-top: 6px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
       padding-top: 6px;
+      margin-top: 6px;
       border-top: 1px solid #b7e4c0;
-      line-height: 1.3;
       flex-shrink: 0;
+    }
+    .ref-bar .ref-chapter .rc-label {
+      writing-mode: vertical-lr;
+      font-size: 11px;
+      color: #888;
+      line-height: 1.3;
+    }
+    .ref-bar .ref-chapter .rc-val {
+      writing-mode: horizontal-tb;
+      font-size: 12px;
+      font-weight: 600;
+      color: #555;
+      line-height: 1.2;
     }
     .ref-bar .ref-num {
       font-size: 11px;
@@ -1060,6 +1223,31 @@
       cursor: pointer;
     }
     .bubble .ref-quote-preview:hover { color: #07c160; }
+    /* 带引用的提问气泡（2026-11 用户定调）：引用原文走**上方横幅**——回答气泡的
+       .ref-quote-preview 是同一套视觉（小字 + 虚线下边框 + 引号包住原文），只是配色要落到
+       绿底上：白字 + 半透明白虚线。**不出竖条**（竖排书名条 .ref-bar 是回答气泡专属），
+       **也不显示书名章节**：横幅上就一句原文，跟回答气泡那条一样（见 sidebar.js 的
+       userQuoteBubbleHTML）。
+       正文单起一块 .uq-body：气泡自身是 pre-wrap，横幅若和正文同一个文本流，那条虚线会
+       把整段提问一起划上。 */
+    .msg-user .bubble .uq-quote {
+      font-size: 11px;
+      line-height: 1.45;
+      color: rgba(255, 255, 255, 0.82);
+      border-bottom: 1px dashed rgba(255, 255, 255, 0.45);
+      padding-bottom: 4px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      /* 引用块可能是多行（PDF 译文一段就是好几行，见 sidebar.js 的 buildQuotedQuestion）：
+         不写 pre-wrap 的话换行被折叠成空格，译文会挤成一整行。 */
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .msg-user .bubble .uq-quote:hover {
+      color: #fff;
+      border-bottom-color: rgba(255, 255, 255, 0.85);
+    }
+    .msg-user .bubble .uq-body { white-space: pre-wrap; }
     .msg-assistant .bubble {
       background: #fff;
       border: 1px solid #ececec;
@@ -1082,12 +1270,12 @@
     .bubble.md p { margin: 0 0 0.55em; }
     .bubble.md h3, .bubble.md h4, .bubble.md h5, .bubble.md h6 {
       margin: 0.75em 0 0.35em;
-      font-size: 1em;
+      font-size: 13px;
       font-weight: 700;
       line-height: 1.45;
       color: #111;
     }
-    .bubble.md h3 { font-size: 1.06em; }
+    .bubble.md h3 { font-size: 14px; }
     .bubble.md ul, .bubble.md ol { margin: 0 0 0.55em; padding-left: 1.35em; }
     .bubble.md li { margin: 0.1em 0; }
     .bubble.md li.md-sub { margin-left: 12px; list-style-type: circle; color: #444; }
@@ -1104,7 +1292,7 @@
       border-radius: 4px;
       padding: 0.08em 0.34em;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.92em;
+      font-size: 12px;
       color: #c7254e;
       word-break: break-word;
     }
@@ -1119,7 +1307,7 @@
     }
     .bubble.md pre.md-pre code {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.92em;
+      font-size: 12px;
       color: #333;
       background: none;
       padding: 0;
@@ -1129,7 +1317,7 @@
     .bubble.md table.md-table {
       border-collapse: collapse;
       margin: 0 0 0.55em;
-      font-size: 0.95em;
+      font-size: 12px;
       display: block;
       max-width: 100%;
       overflow-x: auto;
@@ -1344,7 +1532,11 @@
       position: fixed;
       inset: 0;
       background: rgba(0, 0, 0, .35);
-      z-index: 1200;  /* 高于 #book-picker(1100)：书籍选择弹窗里的删除确认要盖在弹窗之上 */
+      /* 1250 = 高于 #book-picker(1100) **与译文对照面板 #reader-notes(1200)**。
+         原先是 1200，与面板同值；而面板在 DOM 里更靠后、又是不透明白底铺满整栏，
+         于是"从译文面板里删引用"弹出的确认框会被面板整个盖住 —— 表现是点了删除没反应。
+         压在 toolbox(1300) 之下：那时不该有浮层工具条同时开着。 */
+      z-index: 1250;
       align-items: center;
       justify-content: center;
     }
@@ -1357,7 +1549,7 @@
       padding: 18px 16px 14px;
       box-shadow: 0 4px 20px rgba(0, 0, 0, .15);
     }
-    .confirm-title { font-size: 14px; font-weight: 600; color: #222; margin-bottom: 8px; text-align: center; }
+    .confirm-title { font-size: 15px; font-weight: 600; color: #222; margin-bottom: 8px; text-align: center; }
     .confirm-msg {
       font-size: 12px; color: #666; line-height: 1.6; margin-bottom: 16px;
       text-align: center; word-break: break-word; max-height: 90px; overflow-y: auto;
@@ -1373,8 +1565,8 @@
     }
     .confirm-cancel { background: #f0f0f0; color: #555; }
     .confirm-cancel:hover { background: #e5e5e5; }
-    .confirm-ok { background: #e74c3c; color: #fff; }
-    .confirm-ok:hover { background: #d43c2f; }
+    .confirm-ok { background: #c0392b; color: #fff; }
+    .confirm-ok:hover { background: #a82e22; }
 
     /* 通知型弹窗（2026-10：本机程序没在运行时按了发送）—— 只告知，不需要用户做选择。
        与确认框的区别，都是为了读起来舒服：
@@ -1390,7 +1582,7 @@
     #confirm-overlay.notice .confirm-box { width: 300px; max-width: 92%; }
     #confirm-overlay.notice .confirm-msg {
       white-space: pre-line;
-      font-size: 12.5px;
+      font-size: 13px;
       line-height: 1.75;
       color: #555;
       margin-bottom: 18px;
@@ -1471,7 +1663,7 @@
       white-space: nowrap;
     }
     .gv-badge {
-      font-size: 10px;
+      font-size: 11px;
       color: #b45309;
       background: #fef3c7;
       border: 1px solid #fde68a;
@@ -1570,7 +1762,7 @@
       position: absolute;
       bottom: 8px;
       left: 10px;
-      font-size: 10px;
+      font-size: 11px;
       color: #7c848d;
       pointer-events: none;
       user-select: none;
@@ -1644,7 +1836,7 @@
     .gv-detail .gd-title {
       flex: 1;
       min-width: 0;
-      font-size: 1em;
+      font-size: 13px;
       font-weight: 600;
       color: #222;
       line-height: 1.55;
@@ -1658,7 +1850,7 @@
       background: none;
       cursor: pointer;
       color: #aaa;
-      font-size: 14px;
+      font-size: 15px;
       padding: 0 2px;
     }
     .gv-detail .gd-close:hover { color: #333; }
@@ -1685,7 +1877,7 @@
       line-height: 1.78;
     }
     .gv-detail .gd-label {
-      font-size: 0.74em;
+      font-size: 11px;
       color: #6a7178;
       font-weight: 600;
       letter-spacing: 0.02em;
@@ -1697,7 +1889,7 @@
       border-radius: 8px;
       padding: 7px 10px;
       margin-bottom: 6px;
-      font-size: 0.9em;
+      font-size: 13px;
       color: #3f4550;
       line-height: 1.7;
     }
@@ -1708,7 +1900,7 @@
       padding: 0 1px;
       color: inherit;
     }
-    .gv-detail .gd-none { color: #bbb; font-size: 0.85em; }
+    .gv-detail .gd-none { color: #bbb; font-size: 13px; }
     .gv-detail .gd-disc {
       border: 1px solid #eceef1;
       border-radius: 10px;
@@ -1717,7 +1909,7 @@
       background: #fcfcfd;
     }
     .gv-detail .gd-disc .q { color: #222; line-height: 1.6; }
-    .gv-detail .gd-disc .meta { font-size: 0.72em; color: #7c848d; margin-top: 4px; }
+    .gv-detail .gd-disc .meta { font-size: 11px; color: #7c848d; margin-top: 4px; }
     .gv-detail .gd-disc .gd-q {
       display: flex;
       align-items: flex-start;
@@ -1731,7 +1923,7 @@
     .gv-detail .gd-disc .gd-q:hover { color: #5b5fe8; }
     .gv-detail .gd-disc .gd-caret {
       flex-shrink: 0;
-      font-size: 0.72em;
+      font-size: 11px;
       color: #8a92a6;
       margin-top: 2px;
       transition: transform 0.15s;
@@ -1744,14 +1936,14 @@
       max-height: 360px;   /* AI-038：正文独立小滚动区，排号钉在正上方不随正文滚走 */
       overflow-y: auto;
     }
-    .gv-detail .gd-disc .gd-qbody .meta { font-size: 0.78em; color: #7c848d; margin-bottom: 8px; }
+    .gv-detail .gd-disc .gd-qbody .meta { font-size: 12px; color: #7c848d; margin-bottom: 8px; }
     /* 每轮交锋为独立区块（AI-032）：问/答分行、轮与轮间隔舒展（首轮不额外留白） */
     .gv-detail .gd-round + .gd-round { margin-top: 10px; }
     .gv-detail .gd-ex {
       display: flex;
       align-items: flex-start;
       gap: 8px;
-      font-size: 0.92em;
+      font-size: 12px;
       color: #3f4550;
       line-height: 1.8;
       padding: 2px 0;
@@ -1765,13 +1957,13 @@
       line-height: 1.5em;
       text-align: center;
       border-radius: 4px;
-      font-size: 0.74em;
+      font-size: 11px;
       color: #5b5fe8;
       background: #eef0fd;
       margin-top: 2px;
     }
     .gv-detail .gd-ex .gd-ext { flex: 1; min-width: 0; word-break: break-word; }
-    .gv-detail .gd-meta { font-size: 0.88em; color: #6a7178; line-height: 1.75; }
+    .gv-detail .gd-meta { font-size: 13px; color: #6a7178; line-height: 1.75; }
     .gv-detail .gd-actions {
       display: flex;
       gap: 6px;
@@ -1793,7 +1985,7 @@
       min-width: 22px;
       height: 22px;
       padding: 0 6px;
-      font-size: 0.8em;
+      font-size: 12px;
       line-height: 1;
       font-weight: 600;
       color: #5b5fe8;
@@ -1828,7 +2020,7 @@
     .gv-detail .gd-pip-tip.on { display: block; }
     .gv-detail .gd-note {
       margin-top: 10px;
-      font-size: 10px;
+      font-size: 11px;
       color: #b45309;
       background: #fef9ec;
       border: 1px solid #fdecc8;
@@ -1889,6 +2081,79 @@
       display: none !important;
     }
 
+    /* ── 会话开场（2026-11 第一版是"开场卡"，同月按用户定调去掉了盒子）────────
+       这一段对话还没有任何气泡时，消息区只落这几行。**刻意不是一张卡**：第一版做成
+       白底描边卡 + 标题行 + 引文块 + 两颗占满整宽的按钮 + 末行小字，用户的原话是
+       "太重、太像说明书"——那一格的信息量是别处的三倍，读起来像表单，不像对话的开场。
+       现在只剩两样：
+         · 一行 13px 的话，回答"我在哪"（引文用行内小引子的形态，靠一道绿竖线做锚点，
+           不再套第二个框）
+         · 一行小胶囊，回答"能做什么"（不占满整宽，所以读起来是"提议"不是"表单"）
+       产品规则那两句话（"它知道你读到哪" / "自由对话不会被自动写进会意图"）没删，
+       挪进了标题元素的 title 属性：悬停可见，不占屏幕。
+       整块居中（见 #msgs.intro-on）：空态只占中间一小条，上下留白。
+       显示逻辑见 sidebar.js syncIntro；整块 data-book = 当前书/当前对话，切上下文
+       （切书、切对话、进出自由模式）自动跟着换内容，首条消息一落即摘。 */
+    /* ── 会话开场（2026-11 第五版：主句在前，箴言当底子）────────────────────
+       形态演进（每一版都是被用户否掉才走到下一步，别往回退）：
+         v1 白底描边卡 + 标题 + 引文块 + 两颗整宽按钮 + 末行小字 → "太重、太像说明书"
+         v2 两行居中、去掉盒子与按钮                       → "太空旷了"
+         v3 推到底部左对齐、"用位置去救空旷"                → 治错了病
+         v4 箴言当重心（箴言最大最深）                      → 层次反了
+         v5 现在：**主句在前、箴言次之**。
+       为什么 v4 是反的（2026-11 用户原话）："是不是应该让'还一句话没聊过'为主，
+       然后我们的箴言次之呢"——用户在空态里**首先需要知道"这是哪、什么场合"**
+       （语用需求），箴言只是把空白填得有分量（审美需求）。修辞不该压过信息。
+       所以：主句 15px/#333/#555 在前，箴言 13px/#aaa 在后，出处只留人名。
+       箴言的作用是"填空"，不是"当主角"——字号必须比主句小、颜色比主句浅。 */
+    #msgs.intro-on { justify-content: center; align-items: center; }
+    /* ⚠️ 这里**故意不限宽**（2026-11 踩过）：
+       原先写的是 `max-width: 284px` + `padding: 0 6px`，文字可用宽只剩 272px。
+       而文案长度是**书名决定的**——"《失明症漫记（罗翔推荐）》还一句话没聊过"正好
+       要 ≈270px，只差几像素就断行（用户实测报"这么短的话还能分行"）。
+       死数字和内容长度没关系，这种组合必然在某个书名上崩掉。
+       现在交给父容器（#msgs 减去它的内边距），跟着侧栏宽自动伸缩：
+       侧栏越窄、每行越短，但断行位置始终由**可用宽**决定，不再由一个拍出来的常数决定。 */
+    #intro { text-align: center; }
+    #intro[hidden] { display: none; }
+    /* 主句 = 这一格的主角：用户要知道"这是哪、有没有聊过"。16px、最深、字距略开。
+       ⚠️ **衬线**（2026-11 用户定调"字体我觉得宋体好"）：中文里的"文艺"基本等于
+       衬线 + 拉开的字距；黑体（微软雅黑那一类）是屏幕 UI 脸，用在书页语境里不对味。
+       字体栈按"有就更好、没有也能看"排：Songti SC / STSong 是 macOS 的宋体，
+       思源宋体（Source Han Serif / Noto Serif CJK）屏显质量最好，
+       SimSun 是 Windows 自带的兜底（偏细，最后顺位）。 */
+    #intro .it-cap {
+      font-family: 'Songti SC', 'STSong', 'Source Han Serif SC', 'Noto Serif CJK SC', 'SimSun', serif;
+      font-size: 15px;                 /* 规格：强调正文档（原 16px 越界） */
+      color: #2f2a24;
+      line-height: 1.8;
+      letter-spacing: 0.07em;
+    }
+    /* ⚠️ 开场**没有引文块**（2026-11 用户定调："开场里不该显示那行划线"）。
+       曾经在这里拼过一行划线（先是绿竖线的行内引子，后来改成无装饰的普通正文），
+       两次都是多余的：划线是**内容**，不是提示——下方「📌 当前引用」卡片已经在显示它。
+       开场这一格的职责只有两件：说清状态（主句）+ 填空（箴言）。
+       所以现在**永远三行**：主句 15px / 箴言 13px / 署名 11px。
+       别再往这里加第二条内容——尤其别再显示划线。 */
+    /* 箴言：**底子**，不是主角。压在最后、更小更浅——它负责填空，不负责被读到。
+       同样走衬线，但字距拉得更开（0.1em）：宋体的气质靠字距出来，
+       而且它是"写在纸上的引文"，跟主句区分开。 */
+    #intro .it-motto {
+      font-family: 'Songti SC', 'STSong', 'Source Han Serif SC', 'Noto Serif CJK SC', 'SimSun', serif;
+      font-size: 13px;                 /* 规格：正文档（原 14px 越界） */
+      color: #a49c92;
+      line-height: 1.8;
+      letter-spacing: 0.1em;
+      margin-top: 16px;
+    }
+    /* 署名只留人名（用户定调：别写书名号那一串出处）。比箴言再浅一点 */
+    #intro .it-from {
+      font-size: 11px;
+      color: #c4bcb2;
+      margin-top: 5px;
+      letter-spacing: 0.04em;
+    }
+
     /* 系统提示气泡（2026-09）：/收口 等系统反馈，区别于普通消息 */
     .msg-system { display: flex; justify-content: center; margin: 6px 0; }
     .msg-system .bubble {
@@ -1900,7 +2165,12 @@
       max-width: 90%;
       word-break: break-word;
       text-align: center;
+      /* 回执里带换行（/相处 的清单、/归档 的产物说明）：默认排版会把 \n 折成空格、
+         整段挤成一行，所以必须保留换行。2026-10 修 */
+      white-space: pre-wrap;
     }
+    /* 多行的系统回执：居中读清单很难受，改左对齐；单行短提示（/收口 等）照旧居中 */
+    .msg-system.multi .bubble { text-align: left; }
 
     /* 斜杠命令菜单（2026-09）：输入 / 弹出可用操作，点击即执行 */
     #footer { position: relative; }
@@ -1926,6 +2196,13 @@
       cursor: pointer;
     }
     .cmd-item:hover { background: #f2f7f5; }
+    /* ⚠️ 这条必须有：上面 .cmd-item 的 display:flex 会盖掉 [hidden] 的浏览器默认 display:none，
+       于是"按模式隐藏的项"照样显示（读书模式下也能看见 /归档），而键盘导航是按 hidden 属性
+       过滤的 —— 结果就是"看得见、选不中"。2026-10 修。 */
+    .cmd-item[hidden] { display: none; }
+    /* 键盘选中态（输入 / 后自动落第一项，↑↓ 移动、Enter 选中；鼠标划过也同步）：
+       与 :hover 同权重，所以这条必须写在它之后才生效 */
+    .cmd-item.on, .cmd-item.on:hover { background: #f0faf3; }
     .cmd-name { font-weight: 600; color: #07c160; white-space: nowrap; font-size: 13px; }
     .cmd-desc { font-size: 12px; color: #888; }
 
@@ -1971,8 +2248,32 @@
     .nb-badge.lg { width: 44px; height: 44px; border-radius: 12px; }
     .nb-badge.lg svg { width: 22px; height: 22px; }
     .nb-head-text { min-width: 0; padding-top: 1px; }
-    .nb-title { font-size: 14px; font-weight: 600; color: #222; line-height: 1.45; }
+    .nb-title { font-size: 15px; font-weight: 600; color: #222; line-height: 1.45; }
     .nb-desc { margin-top: 5px; font-size: 12px; color: #9a9a9a; line-height: 1.65; }
+    /* 状态卡里那条"外部"入口（PDF 阅读器，2026-11 加）──
+       位置经过一轮实测改动，别凭感觉挪：
+         · 第一版钉在状态卡里、做成整页唯一的**实心主绿**按钮 → 用户说"首页排版不太好看"
+           （复盘：这张卡是**状态说明**，"读 PDF"是第三条路，不该比"打开微信读书里的书"更响）；
+         · 第二版降级成浅绿次级按钮，仍在卡里；
+         · 第三版（现在）听用户的：**搬到面板底部常驻一条**（`#nb-reader-bar`），
+           并且**取代输入框那一格**——无书时那个输入框是禁用的，只写着
+           "未检测到书籍：请打开微信读书中的书"，那 36px 高的地方不如拿来放一条真的门。
+       候选版式与理由都画在 `test\scratch\make-nobook-compare.mjs` 生成的对比页里，
+       要再调先看那里，别再重画一遍。 */
+    .nb-reader-btn {
+      display: block;
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid #d9eee3;
+      background: #f0faf3;
+      color: #07c160;
+      border-radius: 8px;
+      padding: 6px 12px;
+      font-size: 12.5px;
+      font-family: inherit;
+      cursor: pointer;
+    }
+    .nb-reader-btn:hover { background: #e5f6ec; border-color: #a9dcc1; }
     /* 面板被拖得很矮时：说明文字让位给书单 —— 它只是解释，不是内容。
        （不这么做的话，300px 高的面板里两行说明能把整屏吃掉，只看得见一本书） */
     @media (max-height: 460px) {
@@ -2065,8 +2366,8 @@
       text-align: center;
     }
     .nb-msg[hidden] { display: none; }
-    .nb-msg-title { font-size: 12.5px; color: #777; }
-    .nb-msg-sub { font-size: 11.5px; color: #aaa; line-height: 1.7; }
+    .nb-msg-title { font-size: 13px; color: #777; }
+    .nb-msg-sub { font-size: 12px; color: #aaa; line-height: 1.7; }
     .nb-msg.err .nb-msg-title { color: #cf6b62; }
     .nb-retry {
       margin-top: 2px;
@@ -2089,9 +2390,31 @@
       border-top: 1px solid #ececec;
       box-sizing: border-box;
     }
+    /* PDF 阅读器常驻条（2026-11，无书界面的"第三版"版式）──
+       为什么是"条"而不是卡：它只有一个动作（去读 PDF），没有要读的说明、没有第二条路，
+       所以不需要卡片的抬头与层级，一条就够。
+       为什么在**底部**：这一格原本是输入框（`#footer`），无书时它被禁用、只写着一句
+       "请打开微信读书中的书"；把真正的门放在同一位置，既不新占空间，也回答了那句话
+       解决不了的问题。显示/隐藏在 sidebar.js 的 renderNoBookView（与 #footer 互斥）。 */
+    #nb-reader-bar {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px 12px;
+      border-top: 1px solid #ececec;
+      background: #fafbfa;
+      box-sizing: border-box;
+    }
+    #nb-reader-bar[hidden] { display: none; }
+    /* 左边这句是**理由**，不是标题：它回答"我为什么要用这个"。
+       窄侧栏里它会折成两行，所以行高和字号都按"能读下去"来定，不做成装饰性小字。 */
+    .nb-reader-txt { flex: 1; min-width: 0; font-size: 12px; color: #7a7a7a; line-height: 1.5; }
+    /* 这一条里按钮不再撑满整行：文字与按钮并排，读起来是"一句话 + 一个动作" */
+    #nb-reader-bar .nb-reader-btn { width: auto; flex: 0 0 auto; padding: 5px 12px; font-size: 12px; }
     .nb-web-eyebrow { font-size: 11px; font-weight: 600; color: #aaa; letter-spacing: .4px; margin-bottom: 6px; }
     .nb-web-url {
-      font-size: 11.5px;
+      font-size: 12px;
       color: #555;
       background: #f4f4f4;
       border-radius: 6px;
@@ -2130,6 +2453,58 @@
       flex-shrink: 0;
     }
     #manual-banner[hidden] { display: none; }
+    /* 「继续教程」条（2026-11）：暂停提示。样式跟手动选书横幅同族，但用绿底强调
+       "这里有一件事可以点"。 */
+    #tut-resume-bar {
+      background: #eaf7f0;
+      border-bottom: 1px solid #cfe6d8;
+      padding: 6px 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #0a7d43;
+      flex-shrink: 0;
+    }
+    #tut-resume-bar[hidden] { display: none; }
+    #tut-resume-bar .trb-icon { flex: 0 0 auto; font-size: 11px; }
+    #tut-resume-bar .trb-text {
+      flex: 1;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 600;
+    }
+    #tut-resume-bar .trb-btn {
+      flex: 0 0 auto;
+      font: inherit;
+      font-size: 11px;
+      border: 1px solid #9fd0b4;
+      background: #fff;
+      color: #0a7d43;
+      border-radius: 4px;
+      padding: 2px 8px;
+      cursor: pointer;
+    }
+    #tut-resume-bar .trb-go { background: #0a7d43; border-color: #0a7d43; color: #fff; font-weight: 600; }
+    #tut-resume-bar .trb-drop { color: #6b7c73; border-color: #d6e2da; }
+    /* 抽屉里的「教程例句」分组（2026-11）：教程自带，不写进用户引用库。
+       单独给它一行小标题，用户才知道这几条不是他划的。 */
+    .drawer-tut-head {
+      padding: 7px 12px 5px;
+      font-size: 11px;
+      color: #0a7d43;
+      background: #f2faf5;
+      border-bottom: 1px solid #e2f1e8;
+    }
+    .drawer-tut-item {
+      background: #fbfefc;
+      border-left: 3px solid #9fd0b4;
+      cursor: pointer;
+    }
+    .drawer-tut-item:hover { background: #f2faf5; }
+    .drawer-tut-item .di-note { font-size: 11px; color: #7d8f86; margin-top: 2px; }
     .mb-book {
       flex: 1;
       min-width: 0;
@@ -2153,7 +2528,7 @@
     }
     .mb-btn:hover { border-color: #06ad56; color: #06ad56; }
     .mb-exit { color: #999; border-color: #ddd; }
-    .mb-exit:hover { border-color: #e74c3c; color: #e74c3c; }
+    .mb-exit:hover { border-color: #a82e22; color: #a82e22; }
 
     /* ── 已读书籍选择弹窗（2026-10）：无书默认界面 / 更多菜单 → 从已读过的书籍中
        选择，手动查看该书聊天记录（openBookPicker / pickBook） */
@@ -2185,7 +2560,7 @@
       border-bottom: 1px solid #ececec;
       flex-shrink: 0;
     }
-    .bp-title { flex: 1; font-size: 14px; font-weight: 600; color: #333; }
+    .bp-title { flex: 1; font-size: 15px; font-weight: 600; color: #333; }
     .bp-close { border: none; background: none; font-size: 15px; cursor: pointer; color: #aaa; padding: 0 4px; }
     .bp-close:hover { color: #333; }
     #bp-search {
@@ -2229,8 +2604,24 @@
       align-items: center;
       justify-content: center;
     }
-    .bp-item .bi-del:hover { color: #e74c3c; background: #fdf0ee; }
+    .bp-item .bi-del:hover { color: #a82e22; background: #fdf0ee; }
     .bp-item .bi-del svg { width: 13px; height: 13px; }
+    /* 「去读」按钮（2026-11）：**只出现在阅读器里的书**上。
+       微信读书的书在这条书单里只能看讨论记录，点了也读不了，所以不给这个按钮——
+       有没有这枚按钮，本身就是"这本能不能在这儿读"的答案。 */
+    .bp-item .bi-open {
+      flex: 0 0 auto;
+      height: 22px;
+      padding: 0 8px;
+      border: 1px solid #a8dcc0;
+      background: #eaf7f0;
+      color: #0a7d43;
+      border-radius: 6px;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .bp-item .bi-open:hover { background: #dff2e8; }
     .bp-item .bi-title {
       font-size: 13px;
       font-weight: 600;
@@ -2248,7 +2639,7 @@
       font-variant-numeric: tabular-nums;
     }
     .bp-msg { text-align: center; color: #bbb; font-size: 12px; padding: 22px 10px; }
-    .bp-msg.bp-err { color: #e74c3c; }
+    .bp-msg.bp-err { color: #c0392b; }
 
     /* ── 模型 API 配置弹窗（2026-10）──────────────────────────────
        入口在头部「⋯」菜单（#mm-api-config）；首次使用 / 当前未配置时打开插件自动弹出
@@ -2280,7 +2671,7 @@
       padding: 10px 14px;
       border-bottom: 1px solid #ececec;
     }
-    .api-title { flex: 1; font-size: 14px; font-weight: 600; color: #333; }
+    .api-title { flex: 1; font-size: 15px; font-weight: 600; color: #333; }
     .api-close { border: none; background: none; font-size: 15px; cursor: pointer; color: #aaa; padding: 0 4px; }
     .api-close:hover { color: #333; }
     .api-body { padding: 12px 14px 0; }
@@ -2315,7 +2706,7 @@
       color: #333;
     }
     .api-input:focus { border-color: #07c160; background: #fff; }
-    .api-err { font-size: 11px; color: #e74c3c; line-height: 1.6; min-height: 15px; margin-bottom: 6px; }
+    .api-err { font-size: 11px; color: #c0392b; line-height: 1.6; min-height: 15px; margin-bottom: 6px; }
     .api-actions { display: flex; gap: 8px; padding: 0 14px 14px; }
     .api-actions button {
       flex: 1;
@@ -2345,7 +2736,9 @@
     #toolbox.on { display: flex; }
     .tb-panel { width: min(380px, 92%); }
 
-    /* 译文对照（入口：「⋯」菜单 / 阅读器里翻译时自动弹出）
+    /* 译文对照（入口：**只有阅读器顶栏的「译文」**，外加阅读器里翻译完成时自动弹出。
+       2026-11 用户定调删掉了「⋯」菜单里那一项：译文对照是"阅读器里那本书"的东西，
+       两个入口两套说法，用户还得猜哪个是新的。）
        挂在这里而不是阅读器页面里 —— 一边开着侧栏一边再来一栏就是两栏并排。
        显示成侧栏里的一整栏（铺满、白底、带返回），不是浮在中间的弹窗。 */
     #reader-notes {
@@ -2370,7 +2763,7 @@
       background: none;
       padding: 8px 10px;
       margin-bottom: -1px;
-      font-size: 12.5px;
+      font-size: 13px;
       font-family: inherit;
       color: #777;
       cursor: pointer;
@@ -2464,14 +2857,14 @@
       justify-content: space-between;
       margin-bottom: 10px;
     }
-    .tr-enable-label { font-size: 12.5px; font-weight: 600; color: #333; }
+    .tr-enable-label { font-size: 13px; font-weight: 600; color: #333; }
     /* 「改快捷键」这类文字入口 */
     .tr-links { display: flex; justify-content: flex-end; margin-top: -2px; }
     .tr-link {
       border: none;
       background: none;
       padding: 0;
-      font-size: 11.5px;
+      font-size: 12px;
       font-family: inherit;
       color: #07c160;
       text-decoration: underline;
@@ -2498,7 +2891,7 @@
     .tr-act:disabled .tr-key { color: #c8c8c8; }
     /* 自定义模型配置（可选覆盖） */
     .tr-adv { margin: 2px 0 10px; padding-top: 8px; border-top: 1px dashed #ececec; }
-    .tr-adv > summary { font-size: 11.5px; color: #6b7075; cursor: pointer; outline: none; }
+    .tr-adv > summary { font-size: 12px; color: #6b7075; cursor: pointer; outline: none; }
     .tr-adv[open] > summary { margin-bottom: 8px; }
     .tr-adv-hint { font-size: 11px; color: #999; line-height: 1.6; }
     .tr-adv .api-field:last-of-type { margin-bottom: 6px; }
@@ -2522,9 +2915,16 @@
       <span class="ms-state">自由</span>
     </button>
     <button class="hdr-icon" id="graph-btn" title="会意图（知识点拓扑图）">◎</button>
+    <!-- 顶部的「教程」按钮已去掉（2026-11 用户要求）。
+         它原先在这里、只在当前书是那本手册时露头，作为"开始引导课"的入口。
+         课本身没删：书页上的「开始本课」仍然能把课交给侧栏（见 sidebar.js 的
+         coreadTutorialLesson）。要重新给侧栏一个入口时，别忘了一并想清楚
+         "当前书是教程书"这个判据——它同时也是"侧栏认的书被抢走了"的症状。 -->
     <button class="hdr-icon" id="more-btn" title="更多设置">⋯</button>
-    <!-- 更多设置菜单（字号等）：作为 #header（position:relative）子元素锚定到右上 -->
-    <div id="more-menu">
+    <!-- 更多设置菜单（字号等）：作为 #header（position:relative）子元素锚定到右上。
+         data-guide-pin：教程第 6 课要指着菜单里的「📕 PDF 阅读器」讲，
+         没有这个标记的话菜单整块被引导遮罩压暗，用户根本看不见被指的那一条。 -->
+    <div id="more-menu" data-guide-pin>
       <div class="mm-font">
         <span class="mm-font-label">消息字号</span>
         <button class="fs-btn" id="fs-down" title="减小字号">Ａ−</button>
@@ -2534,14 +2934,29 @@
         <span class="mm-name">🔑 模型 API 配置</span>
         <span class="mm-desc" id="mm-api-desc">读取中…</span>
       </div>
-      <div class="mm-item" id="mm-toolbox" title="工具箱：翻译与 PDF 阅读器">
+      <!-- PDF 阅读器（2026-11 从工具箱提到这里）────────────────────────────────
+           它原先在「⋯ → 🧰 工具箱 → 阅读器页 → 打开阅读器」里，路上四个步骤、
+           而且整条路上没有一个字写着"读"。但阅读器不是配置项，是 CoRead 三条阅读
+           通道之一（微信读书 / 网页阅读源 / 自己读 PDF），与「工具箱」（配置类东西
+           的收纳盒）不是一类。
+           为什么排在这里、而不是排在「工具箱」下面：它是**打开一个页面**，
+           这一格其余几项里只有「📚 从已读书籍中选择」与它同族（都是开一个列表/面板），
+           配置项排在一起、入口排在一起。
+           （「📖 译文对照」原先是它的邻居，2026-11 已从菜单移除，入口只在阅读器顶栏。）
+           托盘图标双击也能开它（installer\launcher\tray.ps1 的 add_DoubleClick），
+           那条路是给"已经知道有它"的用户走的近路，不能拿来当唯一的门。 -->
+      <div class="mm-item" id="mm-reader" title="打开 CoRead 自己的 PDF 阅读器：划词翻译、扫描件框选翻译">
+        <span class="mm-name">📕 PDF 阅读器</span>
+        <span class="mm-desc">读 PDF · 划词翻译</span>
+      </div>
+      <div class="mm-item" id="mm-toolbox" title="工具箱：翻译的设置与手动触发">
         <span class="mm-name">🧰 工具箱</span>
-        <span class="mm-desc">框选翻译 · 划词翻译</span>
+        <span class="mm-desc">翻译开关 · 框选 / 划词翻译</span>
       </div>
-      <div class="mm-item" id="mm-notes" title="PDF 阅读器中的译文对照">
-        <span class="mm-name">📖 译文对照</span>
-        <span class="mm-desc">PDF 阅读器翻译过的段落</span>
-      </div>
+      <!-- 「📖 译文对照」入口已删（2026-11 用户定调）：译文对照是**阅读器里那本书**的东西，
+           入口只留阅读器顶栏的「译文」一处——两个入口两套说法，用户还得猜哪个是新的。
+           注意：删的只是**菜单那一项**，译文对照面板本身照旧（侧栏里的 #reader-notes），
+           阅读器点「译文」仍然通过后台把它打开（见 sidebar.js 的 openNotes 与 notesOpen 广播）。 -->
       <div class="mm-item" id="mm-pick-book" title="查看已读书籍的讨论记录（无需在微信读书中打开）">
         <span class="mm-name">📚 从已读书籍中选择</span>
         <span class="mm-desc">手动查看某本书的讨论记录</span>
@@ -2550,12 +2965,20 @@
         <span class="mm-name">↩ 停止手动选书</span>
         <span class="mm-desc">恢复自动跟随</span>
       </div>
+      <!-- 自检（2026-11）：在**真实环境**里跑一遍关键流程并把结果写成报告。
+           为什么要有它：Chrome 137 起自动化浏览器装不进未打包扩展，AI 助手没法自己验，
+           只能靠人肉点 + 口述现象，来回猜。有了它，用户点一下、助手读文件。
+           它不修任何东西、不写用户数据，只读一遍再上报，所以放在菜单末尾不打扰日常使用。 -->
+      <div class="mm-item" id="mm-selfcheck" title="跑一遍自检并把结果写成报告（排查问题用）">
+        <span class="mm-name">🩺 自检</span>
+        <span class="mm-desc">跑一遍关键流程，结果写给 AI 助手</span>
+      </div>
     </div>
   </div>
 
   <!-- 引用列表抽屉 -->
   <div id="ref-drawer">
-    <div class="drawer-panel">
+    <div class="drawer-panel" data-guide-pin>
       <div class="drawer-head">
         <span class="drawer-title" id="drawer-title">全部引用</span>
         <button class="drawer-close" id="drawer-close-btn">✕</button>
@@ -2565,7 +2988,7 @@
     </div>
   </div>
 
-  <!-- 删除确认弹窗（替代扩展页不可用的原生 confirm()） -->
+  <!-- 删除确认弹窗（替代扩展页不可用的原生 confirm()）：只有"确定 / 取消"两个答案 -->
   <div id="confirm-overlay">
     <div class="confirm-box">
       <div class="confirm-title" id="confirm-title">删除引用</div>
@@ -2617,6 +3040,42 @@
       <div class="nb-web-desc">将当前页面加入一本书后，在本页选中文字即可划线共读。</div>
       <button class="nb-web-act" id="nb-bind-btn" title="将当前页面加入一本书">加入一本书</button>
     </div>
+    <!-- PDF 阅读器常驻条（2026-11）：无书时**取代输入框那一格**（见 sidebar.js 的
+         renderNoBookView，两者互斥）。
+
+        文案按**产品定位**定（2026-11 用户明确）：PDF 的默认路径是**传进微信读书**读
+         （排版好、能划线共读），本地阅读器留给两类情况——
+          ① **外文 PDF**：微读的转版对版式复杂的外文书最不友好，翻译体验也差，
+             而我们这边是"划词就译 + 译文按段落锚定在原文上"；
+          ② 中文 PDF 里**微读转不了 / 转成电子书会错版**的（扫描件最典型）。
+        所以这条说的是**判断**（"外文 → 用这里"），不是功能描述：读者一眼就知道
+        自己属不属于这个场景。
+
+        ⚠️ 这一格的字被用户打回过三次，教训留在这儿，别再往回走：
+          ① "也可以直接读本地 PDF" —— 陈述功能，看完不知道该干什么；
+          ② "PDF 也能直接打开" —— **没有主语**：谁能打开？打开什么？"也能"是比什么也能？
+          ③ "本地 PDF 也能读" —— 补上了主语，但**没说什么时候该用**，等于没说；
+        三次同源：想在一条窄栏里同时说完"是什么 + 定位 + 约束"，就成了必须解码的句子。
+        现在只留**一个场景**（外文）——那是最强的那个；中文书的兜底场景不塞进这七个字，
+        留给阅读器空态和教程去讲。
+
+        按钮写「打开 PDF →」而不是「打开阅读器 →」：点了弹出来的是**选文件**对话框，
+        而本地 PDF 是它唯一能选的东西（书库里的书要进阅读器里再点「书库」）。 -->
+    <div id="nb-reader-bar" hidden>
+      <span class="nb-reader-txt">外文 PDF，用这里读</span>
+      <button class="nb-reader-btn" id="nb-reader-btn" type="button"
+              title="CoRead 阅读器：划词就译、译文按段落锚在原文上（微读传不上去的那种 PDF 也能读）">打开 PDF →</button>
+    </div>
+  </div>
+
+  <!-- 「继续教程」条（2026-11）：教程中途被关掉时，下次打开侧栏**不自动开始上课**，
+       只显示这一条，由用户点「继续」才接上（用户实测报过"更新扩展后一打开就冒出教程"）。
+       引导层会把它排除在遮罩之外（见 tutorial-guide.js 的 data-guide-pin）。 -->
+  <div id="tut-resume-bar" data-guide-pin hidden>
+    <span class="trb-icon">▶</span>
+    <span class="trb-text">教程暂停中</span>
+    <button class="trb-btn trb-go" type="button">继续</button>
+    <button class="trb-btn trb-drop" type="button" title="不再继续这条教程记录">不再继续</button>
   </div>
 
   <!-- 手动选书横幅（2026-10）：手动查看某本已读书籍时显示在消息区上方 -->
@@ -2643,7 +3102,17 @@
     <div class="fc-hint" id="fc-hint" hidden></div>
   </div>
 
-  <div id="msgs"></div>
+  <div id="msgs">
+    <!-- 会话开场（2026-11）：这场对话还没有任何气泡时落在这里，内容由 sidebar.js
+         的 syncIntro 生成（按当前书 / 当前自由对话取引文与动作）。
+         形态是**几行居中内容 + 一行小胶囊**（不是卡片：盒子、标题行、末行小字都已去掉，
+         见上面 #intro 的样式注释）。#msgs.intro-on 负责把它整块居中（空态只占中间一条）。
+         为什么占一个 DOM 节点、而不是由脚本 createElement 现建：applyBookFilter 按
+         data-book 过滤**子元素**，节点先在这里，切书/切对话时过滤规则才管得到它。
+         初始 hidden 要留着——它同时兜住"侧栏刚注入、历史还没回放完"那一小段空窗
+         （否则会先闪一下，再被真实消息替换掉）。 -->
+    <div id="intro" hidden></div>
+  </div>
 
   <!-- 当前选中的引用卡片（AI-003：固定在底部输入框上方，随当前书切换） -->
   <div id="ref-current">
@@ -2673,7 +3142,11 @@
     <div class="fr-head">
       <span class="fr-label" id="fr-label">🔗 本次引用</span>
       <button class="fr-pick-btn" id="fr-pick-btn" title="打开会意图：单击查看详情，双击设为引用">＋ 会意图选取</button>
+      <button class="fr-collapse-btn" id="fr-collapse-btn" title="折叠 / 展开">▾</button>
     </div>
+    <!-- 折叠态缩略概览（与读书模式「当前引用」的 AI-018 同款）：条数 + 节点名，
+         点击展开窗体 -->
+    <div class="fr-preview" id="fr-preview"></div>
     <div class="fr-list" id="fr-list"></div>
     <div class="fr-empty" id="fr-empty">暂无引用：可自动并入，或从会意图选取</div>
   </div>
@@ -2695,10 +3168,23 @@
         <span class="cmd-name">/归档</span>
         <span class="cmd-desc">归档当前自由对话（保存记忆 / 收口进会意图）</span>
       </div>
+      <!-- 相处规则（2026-10）：与读书/自由模式无关，两种模式都显示 -->
+      <div class="cmd-item" data-cmd="/相处" data-when="both" data-prefill="1" title="相处规则：点开后直接说你的要求（AI 会整理成条目、合并重复、报告冲突）；只想看清单就直接回车">
+        <span class="cmd-name">/相处</span>
+        <span class="cmd-desc">相处规则（点它后直接说要求，例：以后别老用比喻）</span>
+      </div>
     </div>
     <button id="attach-btn" title="上传文本附件（.md / .txt）：内容读入本次讨论，不留存原文件">📎</button>
     <input type="file" id="file-input" accept=".md,.markdown,.txt,.text" hidden>
-    <textarea id="input" dir="ltr" placeholder="输入你的问题…" rows="1"></textarea>
+    <div id="input-wrap">
+      <!-- 待提交的命令（点斜杠菜单里的项后出现）：贴在输入框内左侧，与后面打的要求是一个整体；
+           框里为空时按退格、或点 ✕，一起移除。提交时拼成「/相处 你的要求」 -->
+      <span id="cmd-chip" hidden>
+        <span id="cmd-chip-name"></span>
+        <button id="cmd-chip-remove" type="button" title="移除命令（输入框为空时按退格也可）">✕</button>
+      </span>
+      <textarea id="input" dir="ltr" placeholder="输入你的问题…" rows="1"></textarea>
+    </div>
     <button id="send-btn">发送</button>
   </div>
 
@@ -2734,7 +3220,7 @@
         <input type="checkbox" id="fa-memory">
         <span class="fa-opt-main">
           <span class="fa-opt-name">保存记忆</span>
-          <span class="fa-opt-desc">将这场对话中你的情况、偏好与观点合并进长期记忆（你的阅读画像与它的自画像），此后每次共读都会带上</span>
+          <span class="fa-opt-desc">将这场对话中关于你自己的内容（你的处境、你在做的事、你关心什么）合并进长期画像，此后每次共读都会带上</span>
         </span>
       </label>
       <label class="fa-opt" for="fa-graph">
@@ -2815,8 +3301,14 @@
   <!-- 工具箱（入口：头部「⋯」菜单）：按 tab 分页，当前只有「翻译」一页。
        加新工具 = 在 #tb-tabs 里加一个 data-tab 按钮 + 在 .tb-body 里加一个同名的 .tb-page，
        切换逻辑在 sidebar.js 里是通用的，不用改代码。
-       模型配置默认沿用「⋯ → 🔑 模型 API 配置」，翻译页只提供三个可选的按字段覆盖项。 -->
-  <div id="toolbox">
+       模型配置默认沿用「⋯ → 🔑 模型 API 配置」，翻译页只提供三个可选的按字段覆盖项。
+
+       ⚠️ 2026-11：**PDF 阅读器从这里移走了**（原本它是第二个 tab）。理由不是"藏得深"
+       而是分类错了——工具箱收的是配置类东西，阅读器是一个页面入口；而且那个 tab 里
+       其实只有一段说明书加一枚「打开阅读器」按钮，真正的入口不该是二段跳。
+       现在它在「⋯」菜单顶层（`#mm-reader`）。要往里加东西之前先想清楚：
+       **这玩意是配置，还是入口？** 入口不要放这里。 -->
+  <div id="toolbox" data-guide-pin>
     <div class="api-panel tb-panel">
       <div class="api-head">
         <span class="api-title">工具箱</span>
@@ -2824,16 +3316,8 @@
       </div>
       <div class="tb-tabs" id="tb-tabs">
         <button class="tb-tab on" data-tab="translate">翻译</button>
-        <button class="tb-tab" data-tab="reader">阅读器</button>
       </div>
       <div class="tb-body">
-        <div class="tb-page" data-page="reader">
-          <div class="api-hint">在 CoRead 阅读器中阅读 PDF。正文是真实文字，<b>划选一段按 Alt+T 即可翻译</b>，译文显示在右侧对照栏，并标回原文。</div>
-          <button class="tr-act" id="rd-open-btn">打开阅读器</button>
-          <div class="tr-sep"></div>
-          <div class="api-hint">改变窗口大小、缩放或重新打开浏览器，译文仍锚定原文段落，不会移位。书页进度与译文按文件内容自动保存，再次打开同一份 PDF 会回到原处。</div>
-          <div class="api-hint">文字版 PDF 划选即可翻译。<b>扫描件</b>（整页为图片、没有文字层）请用工具栏的<b>「框选翻译」</b>：在页面拖出选区，由模型读图翻译。</div>
-        </div>
         <div class="tb-page" data-page="translate">
           <div class="tr-enable-row">
             <span class="tr-enable-label">启用翻译</span>
@@ -2923,6 +3407,13 @@
 
   <script src="reader-notes.js"></script>
   <script src="graph-view.js"></script>
+  <!-- 教程的"引导模式"（2026-11）：聚光灯挖洞 + 在真实侧栏里逐步引导用户动手。
+       这两个文件不用在这里引 —— sidebar.js 用到时按需 import()（见那边的 loadTutorial）。
+       为什么：sidebar.js 是经典脚本（它头部写了原因），引了也用不上 import 的模块。
+
+       预设例句**不走模块这条路**：它是数据，放在 tutorial/sample-refs.json 里，
+       由 sidebar.js 启动时读一次——明确、失败有痕迹，而且没有"模块还没加载完"的空窗。
+       用户的原话是"你直接给他添加些预设的例句有什么难的"：静态内容就不该有"还没到"这种状态。 -->
   <script src="sidebar.js"></script>
 </body>
 </html>

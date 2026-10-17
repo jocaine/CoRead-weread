@@ -58,6 +58,10 @@
     }
   },
   "commands": {
+    "_execute_action": {
+      "suggested_key": { "default": "Alt+Shift+U" },
+      "description": "打开 CoRead 面板"
+    },
     "translate-region": {
       "suggested_key": { "default": "Alt+S" },
       "description": "框选翻译（框选屏幕区域后翻译）"

@@ -12,6 +12,9 @@
   --rd-card: #ffffff;
   --rd-accent: #0a7d43;
   --rd-accent-soft: #eaf7f0;
+  /* 强调描边（2026-11 加）：先前 `#bfe3cd` / `#cfe9da` / `#a8dcc0` 三个近似值散在各处，
+     规格里这叫"无意识漂移"，收敛成一个角色。取值取中间那个，肉眼分不出差别。 */
+  --rd-accent-border: #bfe3cd;
   --rd-mark: rgba(122, 205, 150, 0.5);   /* 原文高亮 */
   --rd-mark-active: rgba(255, 196, 92, 0.6);
 }
@@ -50,25 +53,84 @@ body { display: flex; flex-direction: column; }
 .rd-spacer { flex: 1; }
 .rd-muted { color: var(--rd-muted); font-variant-numeric: tabular-nums; }
 
+/* 分组竖线（2026-11 顶栏重排）：把"视图"与"翻译"两组分开。
+   用极淡的一条，不抢眼——分组是信息，不是装饰（规格里"结构装置要编码信息"那条）。 */
+.rd-bar-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 2px;
+  background: var(--rd-line);
+  flex: 0 0 auto;
+}
+
+/* 缩放组里那个百分比：它现在**可点**（点一下回到适宽），所以要有按钮的样子。
+   平时不画边框和底（避免三个方块挤在一起更乱），悬停才浮出来。 */
+.rd-btn-flat {
+  border-color: transparent;
+  background: transparent;
+  font-variant-numeric: tabular-nums;
+  min-width: 52px;
+}
+.rd-btn-flat:hover { background: #f0f2f4; border-color: var(--rd-line); }
+
 .rd-btn {
   border: 1px solid var(--rd-line);
   background: #fff;
   color: var(--rd-fg);
   font: inherit;
   padding: 4px 10px;
-  border-radius: 6px;
+  border-radius: 8px;   /* 规格 3 档：4（标签）/ 8（按钮·输入框）/ 12（面板）。原为 6px，不在档上 */
   cursor: pointer;
 }
 .rd-btn:hover { background: #f4f6f8; }
 .rd-btn:disabled { color: #b8bcc2; border-color: #e8eaed; background: #fafbfc; cursor: default; }
 .rd-btn-sm { padding: 2px 8px; font-size: 12px; }
-.rd-btn-primary { border-color: #a8dcc0; color: var(--rd-accent); background: var(--rd-accent-soft); }
-.rd-btn-primary:hover { background: #dff2e8; }
+.rd-btn-primary { border-color: var(--rd-accent-border); color: var(--rd-accent); background: var(--rd-accent-soft); }
+.rd-btn-primary:hover { background: #e0f3e8; }
 
 /* ── 主体：左边书页，右边对照栏 ───────────────────────────────────────────── */
-.rd-main { flex: 1; display: flex; min-height: 0; }
+.rd-main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 
-.rd-scroll { flex: 1; overflow: auto; position: relative; }
+/* 框选模式的常驻提示（2026-11）：切换式按钮的安全网——让人随时看得见自己在什么模式里。
+   为什么不再用 toast：toast 会自己消失，而"忘了自己在框选模式"正是这个功能历来的坑
+   （以前忘了退出就"划不中字了"，用户以为界面坏了）。这条一直在，直到退出模式。 */
+.rd-box-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--rd-accent-soft);
+  border-bottom: 1px solid var(--rd-accent-border);
+  color: var(--rd-accent);
+  font-size: 12px;
+}
+.rd-box-bar[hidden] { display: none; }
+.rd-box-bar-txt { flex: 1; min-width: 0; }
+/* 快捷键提示：做成一枚小键帽的样子，跟正文分开 */
+.rd-box-bar-key {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid var(--rd-accent-border);
+  border-radius: 4px;
+  background: #fff;
+  font-size: 11px;
+}
+.rd-box-bar-btn {
+  flex: 0 0 auto;
+  border: 1px solid var(--rd-accent-border);
+  background: #fff;
+  color: var(--rd-accent);
+  border-radius: 8px;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.rd-box-bar-btn:hover { background: #e0f3e8; }
+.rd-box-bar-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(10, 125, 67, 0.18); }
+
+.rd-scroll { flex: 1; overflow: auto; position: relative; min-height: 0; }
 
 .rd-pages {
   display: flex;
@@ -103,36 +165,146 @@ body { display: flex; flex-direction: column; }
 .rd-page-idle { background: #fff; }
 
 /* ── 空状态 / 书库 ─────────────────────────────────────────────────────────── */
-.rd-empty { max-width: 620px; margin: 8vh auto; text-align: center; color: var(--rd-muted); }
-.rd-empty h1 { font-size: 20px; color: var(--rd-fg); margin: 0 0 16px; }
-.rd-hint { line-height: 1.7; }
+/* 空状态（2026-11 按 coread-visual-spec 重排）：
+   书库是主角 —— 左对齐、贴页面顶端、标题 17px/600（规格里的"区块标题"档）。
+   下面那两行说明是**次要信息**，所以：小一号（12px）、居中、而且用 `margin-top:auto`
+   坠到这一屏的底部。这样"主要内容"和"注脚"在视觉上分得开，不用靠线框或色块。
+   `8vh` 那个顶上留白去掉了：它不在 4px 节奏上，还把书库推到屏幕中段，
+   一屏能看见的书从 5 本掉到 3 本。 */
+.rd-empty {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 24px 16px 24px;
+  color: var(--rd-muted);
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100% - 48px);
+}
+.rd-hint { line-height: 1.7; text-align: center; margin: 0; }
 .rd-warn { color: #9a5b00; }
+/* 拖拽入口：说明性的那一行，坠到底部 */
+#rd-drag-hint { margin-top: auto; padding-top: 24px; }
+
+/* 场景说明：**只在书库里没有你自己放过的书时才出现**（见 reader.js 的 renderEmptyNote）。
+   它是这一页唯一"讲道理"的地方，所以给它左侧一道细线——读起来是注脚，不是标语。 */
+.rd-empty-note {
+  margin: 16px 0 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--rd-line);
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--rd-muted);
+  text-align: left;
+}
 
 #rd-library { text-align: left; margin: 0 0 16px; }
 .rd-lib-head {
-  display: flex; align-items: center; justify-content: space-between;
-  font-weight: 600; color: var(--rd-fg); padding: 0 2px 6px;
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 2px 8px;
   border-bottom: 1px solid var(--rd-line);
 }
+/* 书库标题：规格里"区块标题 17px / 600"。它现在是这一页最大的字，因为它是主要内容 */
+.rd-lib-title { font-size: 17px; font-weight: 600; color: var(--rd-fg); }
+.rd-lib-status { font-size: 12px; }
 .rd-lib-list {
   display: flex; flex-direction: column; gap: 6px;
-  max-height: 44vh; overflow: auto; padding-top: 6px;
+  max-height: 44vh; overflow: auto; padding-top: 8px;
 }
 .rd-lib-item {
-  display: flex; flex-direction: column; gap: 2px; text-align: left;
+  /* 一行两列：左边书名+元信息（自己一列，所以里面是纵向的），右边删除按钮。
+     原来是纯纵向 flex，加了删除按钮后必须改成横向，否则桶会掉到第三行去。 */
+  display: flex; flex-direction: row; align-items: center; gap: 8px;
+  text-align: left;
   border: 1px solid var(--rd-line); background: #fff; border-radius: 8px;
   padding: 8px 10px; cursor: pointer; font: inherit;
 }
-.rd-lib-item:hover { background: #f4f7f5; border-color: #bfe3cd; }
+.rd-lib-item:hover { background: #f4f7f5; border-color: var(--rd-accent-border); }
 .rd-lib-item:disabled { color: #b8bcc2; cursor: default; background: #fafbfc; }
+/* 焦点环按规格：绝不用 #07c160（对浅底只有 2.30，低于 3.0），用 --rd-accent */
+.rd-lib-item:focus-visible,
+.rd-btn:focus-visible {
+  outline: none;
+  border-color: var(--rd-accent);
+  box-shadow: 0 0 0 3px rgba(10, 125, 67, 0.18);
+}
 .rd-lib-name { color: var(--rd-fg); font-weight: 500; }
 .rd-lib-item:disabled .rd-lib-name { color: #b8bcc2; }
 .rd-lib-meta { font-size: 12px; color: var(--rd-muted); }
 
-.rd-open-row {
-  display: flex; align-items: center; justify-content: center; gap: 10px;
-  margin-bottom: 14px;
+/* 空书库时的引导（renderEmptyNote 填的那种）：居中一行，不抢书库的位 */
+.rd-lib-empty { padding: 20px 2px; text-align: center; font-size: 12px; line-height: 1.7; }
+
+/* 书库条目里的删除按钮（2026-11）：一行两列——左边书名+元信息，右边一枚小垃圾桶。
+   桶平时半透明、指到那一行才实心（与侧栏书单同一套做法：常驻会把每行都撑得吵）。 */
+.rd-lib-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; text-align: left; }
+.rd-lib-del {
+  flex: 0 0 auto;
+  width: 26px; height: 26px;
+  border: 0; background: none; padding: 0;
+  border-radius: 4px;
+  color: var(--rd-muted);
+  opacity: .45;
+  cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
 }
+.rd-lib-del svg { width: 14px; height: 14px; }
+.rd-lib-item:hover .rd-lib-del { opacity: 1; }
+.rd-lib-del:hover { color: #b03a2e; background: #fdeceb; opacity: 1; }
+.rd-lib-del:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(10, 125, 67, 0.18); opacity: 1; }
+
+/* ── 删除弹窗（2026-11）───────────────────────────────────────────────────────
+   与侧栏的 #confirm-overlay 同款：遮罩 + 面板 + 三个按钮（取消 / 只删记录 / 连原件一起删）。
+   两个动作"都不安全"，所以都不做成中性色：浅红=删记录（留原件），深红=连原件一起删。
+   红色是破坏性动作的专用色（与侧栏 #confirm-overlay 的约定一致）。 */
+#rd-del-overlay {
+  position: fixed; inset: 0; z-index: 70;
+  background: rgba(24, 27, 32, .38);
+  display: flex; align-items: center; justify-content: center;
+}
+#rd-del-overlay[hidden] { display: none; }
+.rd-del-box {
+  width: 400px; max-width: 92vw;
+  background: var(--rd-card);
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .28);
+  padding: 16px;
+}
+.rd-del-title { font-size: 15px; font-weight: 600; color: var(--rd-fg); }
+.rd-del-msg { margin-top: 8px; font-size: 12px; line-height: 1.7; color: var(--rd-muted); }
+.rd-del-actions { display: flex; gap: 8px; margin-top: 16px; }
+.rd-del-btn {
+  flex: 1;
+  border: 0; border-radius: 8px;
+  padding: 8px 0;
+  font: inherit; font-size: 12px;
+  cursor: pointer;
+}
+.rd-del-cancel { background: #f0f0f0; color: #555; }
+.rd-del-cancel:hover { background: #e5e5e5; }
+.rd-del-alt { background: #fdeceb; color: #a82e22; }
+.rd-del-alt:hover { background: #f9dcd9; }
+.rd-del-alt[hidden] { display: none; }
+.rd-del-ok { background: #c0392b; color: #fff; }
+.rd-del-ok:hover { background: #a82e22; }
+.rd-del-btn:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(10, 125, 67, 0.18); }
+
+/* 内置手册的标记（2026-11）：书单里一眼看出"这本是自带的，不是你放进去的" */
+.rd-lib-tag {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--rd-accent);
+  background: var(--rd-accent-soft);
+  border: 1px solid var(--rd-accent-border);
+  border-radius: 4px;
+  padding: 0 5px;
+  vertical-align: 1px;
+}
+
+/* ⚠️ `.rd-open-row` 已删（2026-11）："打开本地 PDF" 并进了 `.rd-lib-head` 的右端
+   （它是书库那行的次级动作，不该再占一整块）。CSS 里留着不用的规则会让人以为
+   那个块还在，所以一并清掉。 */
 
 /* ── 译文对照不在这里：它挂在 CoRead 侧栏里（reader-notes.js）。
    阅读器页面只保留书页、划词浮标与提示条。 */
@@ -154,7 +326,7 @@ body { display: flex; flex-direction: column; }
   color: #fff;
   font: inherit;
   padding: 3px 8px;
-  border-radius: 5px;
+  border-radius: 4px;   /* 规格：行内小块用 4px（原 5px 不在档上） */
   cursor: pointer;
 }
 .rd-tip button:hover { background: rgba(255, 255, 255, .16); }
@@ -226,7 +398,7 @@ body { display: flex; flex-direction: column; }
 }
 
 .rd-btn.is-on {
-  border-color: #a8dcc0;
+  border-color: var(--rd-accent-border);
   color: var(--rd-accent);
   background: var(--rd-accent-soft);
 }
@@ -235,3 +407,86 @@ body { display: flex; flex-direction: column; }
    用 outline 而不是动画 box-shadow：书页动辄一两千像素高，
    对这么大的元素做逐帧动画等于每帧重绘一大片，会明显掉帧。 */
 .rd-flash { outline: 2px solid rgba(240, 192, 112, .95); outline-offset: 2px; }
+
+/* ── 章节目录（2026-11）───────────────────────────────────────────────────── */
+.rd-toc {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(24, 27, 32, .38);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+}
+.rd-toc-panel {
+  margin-top: 56px;
+  width: min(460px, 88vw);
+  max-height: 76vh;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, .28);
+  overflow: hidden;
+}
+.rd-toc-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--rd-line);
+  flex: none;
+}
+.rd-toc-title { font-weight: 600; }
+.rd-toc-close {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  font-size: 15px;
+  color: var(--rd-muted);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+.rd-toc-close:hover { background: #f0f2f4; color: var(--rd-fg); }
+
+/* 跳页：页码滑杆。PDF 与教程书都有——书签目录未必有，滑杆永远有 */
+.rd-toc-jump {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--rd-line);
+  flex: none;
+}
+#rd-toc-range { flex: 1; accent-color: var(--rd-accent); }
+#rd-toc-pos { min-width: 6.5em; text-align: right; font-variant-numeric: tabular-nums; }
+
+.rd-toc-list { overflow: auto; padding: 6px 0 10px; }
+.rd-toc-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: var(--rd-fg);
+  padding: 7px 14px 7px 16px;
+  cursor: pointer;
+  line-height: 1.5;
+}
+.rd-toc-item:hover { background: #f4f7f5; }
+.rd-toc-item.is-on { background: var(--rd-accent-soft); color: var(--rd-accent); font-weight: 600; }
+/* 层级：书签是树，缩进表示层级（教程章节没有层级，全是 0） */
+.rd-toc-item[data-depth="1"] { padding-left: 30px; font-size: 12px; }
+.rd-toc-item[data-depth="2"] { padding-left: 44px; font-size: 12px; color: #4b5563; }
+.rd-toc-item[data-depth="3"] { padding-left: 58px; font-size: 12px; color: #4b5563; }
+.rd-toc-page { float: right; color: var(--rd-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.rd-toc-empty { padding: 14px 16px; color: var(--rd-muted); line-height: 1.7; }
+.rd-toc-sec {
+  padding: 12px 16px 4px;
+  font-size: 11px;   /* 规格 6 档里的"元信息"档；原 11.5px 是半像素（非整数缩放会发虚） */
+  color: var(--rd-muted);
+  letter-spacing: .04em;
+}

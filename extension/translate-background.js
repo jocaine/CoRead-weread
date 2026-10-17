@@ -59,10 +59,13 @@ const HANDLERS = {
   restoreTranslations,
   clearTranslations,
   setTranslationRef,
+  openReaderBook,
+  openSidePanelForLesson,
   relocateAnchor,
   readerSync,
   readerGet,
   readerBookInfo,
+  readerContextQuery,
   readerCommand,
   notesOpen,
   notesClose,
@@ -88,6 +91,7 @@ export function installTranslateBackground() {
   })
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg[RELAY_MARK]) return undefined
     const handler = HANDLERS[msg?.action]
     if (!handler) return undefined
     Promise.resolve(handler(msg, sender))
@@ -425,7 +429,43 @@ async function probeInternet() {
   }
 }
 
-async function chat({ content, maxTokens = 2048 }) {
+/** 上一次请求时上游是否拒了 thinking / response_format。拒过就不再发，免得每次都白跑 400。 */
+let thinkingRejected = false
+let jsonModeRejected = false
+
+/** 发一次 chat/completions（超时/网络异常原样抛给调用方，它要带着地址分类）。 */
+async function postChat(target, apiKey, opts) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS)
+  try {
+    return await fetch(target, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + apiKey,
+      },
+      body: JSON.stringify(buildChatBody(opts)),
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * 发一次模型请求，取回正文。
+ *
+ * 2026-11 为「重译结果格式不正确」这条报错改过三处（现场见 translate-protocol.js 的
+ * buildChatBody 注释）：
+ *   ① 默认关思考、开 JSON 模式 —— 思考会把 max_tokens 吃光，答案根本没机会生成；
+ *   ② 这两个字段都不是所有上游都认（thinking 是 DeepSeek 系的写法，response_format
+ *      有些网关会拒），所以 400 时按"去掉一个再试"的顺序降级，并把被拒的字段记住；
+ *   ③ 真的被截断时如实报"额度用完了"，不再笼统地说成格式问题。
+ *
+ * @param {boolean} jsonMode 这次调用要不要开 JSON 模式。连通性探测那种"只回两个字"的
+ *   请求必须关掉（prompt 里没有 JSON 字样，开了反而可能被判格式不符）。
+ */
+async function chat({ content, maxTokens = 8192, jsonMode = true }) {
   const cfg = await readConfig()
   if (!cfg.apiBase || !cfg.apiKey) {
     return fail('NOT_CONFIGURED', '尚未配置模型 API。请在侧栏「⋯ → 🔑 模型 API 配置」中填写地址与 Key')
@@ -443,29 +483,38 @@ async function chat({ content, maxTokens = 2048 }) {
     }
   } catch {}
 
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS)
   const target = chatCompletionsUrl(cfg.apiBase)
-  let resp
-  try {
-    resp = await fetch(target, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: 'Bearer ' + cfg.apiKey,
-      },
-      body: JSON.stringify(buildChatBody({ model: cfg.model, content, maxTokens })),
-      signal: controller.signal,
-    })
-  } catch (e) {
-    // 带上 target：浏览器对 DNS 失败 / 端口不通 / 地址缺协议头 / 被系统代理挡住都只回一句
-    // Failed to fetch，没有这个地址与这次探测，就无法区分是「配置写错了」还是「网络到不了」。
-    return { ok: false, error: classifyFetchError(e, target, await probeInternet()) }
-  } finally {
-    clearTimeout(timer)
-  }
+  const wantJson = jsonMode && !jsonModeRejected
+  const attempts = [{ jsonMode: wantJson, noThinking: !thinkingRejected }]
+  if (!thinkingRejected) attempts.push({ jsonMode: wantJson, noThinking: false })
+  if (wantJson) attempts.push({ jsonMode: false, noThinking: false })
 
-  const body = await resp.text()
+  let resp
+  let body = ''
+  let okAt = -1
+  for (let i = 0; i < attempts.length; i++) {
+    const opt = attempts[i]
+    try {
+      resp = await postChat(target, cfg.apiKey, { model: cfg.model, content, maxTokens, ...opt })
+    } catch (e) {
+      // 带上 target：浏览器对 DNS 失败 / 端口不通 / 地址缺协议头 / 被系统代理挡住都只回一句
+      // Failed to fetch，没有这个地址与这次探测，就无法区分是「配置写错了」还是「网络到不了」。
+      return { ok: false, error: classifyFetchError(e, target, await probeInternet()) }
+    }
+    body = await resp.text()
+    if (resp.ok) { okAt = i; break }
+    // 只在"还有备选、且像是字段不被认"时才降级：400 是这一类的典型表现
+    if (resp.status !== 400 || i === attempts.length - 1) break
+  }
+  // 认账：哪一次成了，就把"失败的尝试里有、成功的那次里没有"的开关记下来 ——
+  // 只记真正被去掉的那个（早先一版会把两个都记上，于是白白丢掉了 JSON 模式的好处）。
+  if (okAt > 0) {
+    const good = attempts[okAt]
+    for (let i = 0; i < okAt; i++) {
+      if (attempts[i].noThinking && !good.noThinking) thinkingRejected = true
+      if (attempts[i].jsonMode && !good.jsonMode) jsonModeRejected = true
+    }
+  }
   if (!resp.ok) return { ok: false, error: classifyHttpError(resp.status, body) }
 
   let payload
@@ -474,8 +523,18 @@ async function chat({ content, maxTokens = 2048 }) {
   } catch {
     return { ok: false, error: { code: 'UPSTREAM', message: '模型服务返回的内容不是 JSON', detail: body.slice(0, 200) } }
   }
+  const choice = payload?.choices?.[0]
   const text = extractReplyText(payload)
-  if (!text) return { ok: false, error: { code: 'UPSTREAM', message: '模型未返回内容' } }
+  if (!text) {
+    if (choice?.finish_reason === 'length') {
+      const used = payload?.usage?.completion_tokens_details?.reasoning_tokens
+      return fail('TRUNCATED',
+        '模型把输出额度（' + maxTokens + ' tokens）用完了，答案没写完就被截断'
+        + (used ? '，其中 ' + used + ' 花在"思考"上' : '')
+        + '。请重试；若反复如此，请在工具箱里换一个非推理模型')
+    }
+    return { ok: false, error: { code: 'UPSTREAM', message: '模型未返回内容' } }
+  }
   return { ok: true, text }
 }
 
@@ -513,13 +572,22 @@ async function translateText(msg) {
   const prompt = msg?.source === 'selection' ? SELECTION_PROMPT : RETRANSLATE_PROMPT
   const r = await chat({ content: buildTextContent(prompt, text) })
   if (!r.ok) return r
-  let data
   try {
-    data = parseTranslation(r.text)
-  } catch {
-    return fail('PARSE_ERROR', '重译结果格式不正确')
+    return { ok: true, data: { original: text, translation: parseTranslation(r.text).translation } }
+  } catch {}
+
+  // 解析失败补救一次：把同一段原文再要一遍，这次明确要求只吐 JSON。
+  // 不把上一次的输出贴回去让它"整理" —— 万一那段是模型的思考过程，
+  // 整理出来的就是一段**说得通但翻错了**的译文，比直接报错更糟。
+  const retry = await chat({ content: buildTextContent(prompt + '\n上一次没有按格式返回。这次只输出那一个 JSON 对象，不要任何解释、前缀或代码块。', text) })
+  if (retry.ok) {
+    try {
+      return { ok: true, data: { original: text, translation: parseTranslation(retry.text).translation }, retried: true }
+    } catch {}
   }
-  return { ok: true, data: { original: text, translation: data.translation } }
+  // 两次都不成：把模型原文的头一段留在控制台，下次不必再靠猜（这条报错本身看不出模型回了什么）
+  console.warn('[翻译] 两次都没解析出 JSON，模型原文前 200 字：', String(r.text).slice(0, 200))
+  return fail('PARSE_ERROR', '重译结果格式不正确')
 }
 
 /**
@@ -576,10 +644,37 @@ async function relocateAnchor(msg) {
  */
 let readerNotesSnapshot = null
 
-async function readerSync(msg) {
+async function readerSync(msg, sender) {
   readerNotesSnapshot = msg && msg.snapshot ? msg.snapshot : null
-  broadcast({ action: 'readerUpdate', snapshot: readerNotesSnapshot })
+  // `fromActive` = 这份快照是不是**活动标签页**推上来的（见 senderTabActive）。
+  // 侧栏据此决定"要不要把当前书切过去"：没在看的阅读器标签页不许改侧栏的当前书。
+  const fromActive = await senderTabActive(sender)
+  broadcast({ action: 'readerUpdate', snapshot: readerNotesSnapshot, fromActive })
   return { ok: true }
+}
+
+/**
+ * 这条消息是不是来自**活动标签页**？—— true / false，判不出来 = null。
+ *
+ * 为什么要问这个（2026-11 二次改版，用户要求"侧栏只跟随当前标签页"）：
+ * 阅读器页面**加载时**会自己打开 URL 里指定的那本书（深链 `?open=`），并推一份
+ * "我换书了"的快照。扩展一重载、或者浏览器恢复上次的会话，几个后台阅读器标签页会
+ * 同时加载、各推一份 —— 采纳它们等于让"用户根本没在看的标签页"改掉侧栏的当前书。
+ * 有了这个字段，侧栏只认从用户正看着的那个标签页推上来的那一份。
+ *
+ * 判不出来（拿不到 tab、`tabs.get` 抛错）时如实报 null：**调用方按"就当它是"处理**。
+ * 宁可放过一份可疑的快照，也不要把"我问不出来"变成"侧栏不跟了"。
+ */
+async function senderTabActive(sender) {
+  const id = sender && sender.tab ? sender.tab.id : undefined
+  if (typeof id !== 'number') return null        // 不是从标签页来的（扩展页面自己发的消息）
+  try {
+    const t = await chrome.tabs.get(id)
+    return !!t.active
+  } catch (e) {
+    // `tabs.get` 失败（标签页刚被关掉）时退回消息自带的快照值；连它都没有就报"判不出来"
+    return sender.tab && typeof sender.tab.active === 'boolean' ? sender.tab.active : null
+  }
 }
 
 async function readerGet() {
@@ -587,7 +682,7 @@ async function readerGet() {
 }
 
 /**
- * 「当前在看哪本 PDF」（2026-11 新增，给侧栏用）。
+ * 「当前在看哪本书」（2026-11 新增，给侧栏用）。
  *
  * 侧栏判断"当前在读哪本书"一直是去问活动的**微信读书** tab（sidebar.js 的
  * refreshCurrentBook），阅读器页面不在它的查询范围内 —— 所以一边用阅读器看 PDF、
@@ -597,33 +692,118 @@ async function readerGet() {
  * **直接问页面**，不用缓存的那份快照：扩展重载或 service worker 被回收后缓存是空的，
  * 而"当前打开的是哪本"只有页面自己知道（页面的 state 是权威）。
  *
- * 怎么找阅读器 tab（2026-11 加固，起因是用户实测"打开 PDF 但侧栏没跟过去"）：
- *   ① 先看**活动 tab** 是不是阅读器 —— 是就用它，这是最常见的场景；
- *   ② 不是的话再**按 URL 找**阅读器 tab（不管它在哪个窗口）；
- *   ③ 都没有 → notReader，侧栏照旧去问微信读书 tab。
- * 为什么必须有 ②：侧栏自己的页面在 DevTools 里、或者用户点开侧栏前先点了别的 tab 时，
- * "活动 tab"并不是阅读器；只认活动 tab 会让上下文时有时无 —— 这正是"有时候跟不过去"
- * 的来源。第 ② 步只在活动 tab **不是**阅读源页面时才生效，所以用户在微信读书里
- * 切书时不会被一个后台挂着的阅读器抢走上下文。
+ * ── ⚠️ 2026-11 二次改版：**只认活动标签页** ─────────────────────────────────
+ * 旧版在"活动 tab 不是阅读器"时会再**按 URL 在整条标签栏里找一个开着的阅读器 tab**
+ * （标成 `via:'background'` 交给侧栏）。那条兜底是治"打开 PDF 但侧栏没跟过去"时加的，
+ * 但它把"阅读器开着"当成了"正在读"，于是：用户在微读里读书、或者干脆在看新闻，
+ * 只要那个 PDF 标签页还开在标签栏里，侧栏就一直挂着它的会话 ——
+ * 用户实测报的正是"即使当前在毫不相关的标签页，只要标签栏内有其标签页，侧栏就一直
+ * 显示着这个会话"。而微信读书那本书不是这样：离开它的标签页，侧栏就回到书单界面。
+ * 现在两边一致（用户 2026-11 定调）：
+ *
+ *   活动标签页 = 我们的阅读器  → 问它开着哪本（`activeKind:'reader'`）
+ *   活动标签页 = 别的任何页面  → **没有书**，不再拿后台挂着的阅读器顶替
+ *
+ * 注意"活动标签页是哪一类页面"只查 URL、**不依赖任何消息往返**（见 activeTabKind），
+ * 所以侧栏据此清空是安全的：问不倒的事实才配决定"有没有书"。
+ *
+ * ── 侧栏问"我现在该认哪本书" ─────────────────────────────────────────────────
+ * ⚠️⚠️ 为什么不能让侧栏直接广播 `readerBookInfo`：
+ * 那条消息**打开着的阅读器页面也会收到并作答**（reader.js 的 onMessage 就是为"后台点名问页面"
+ * 写的），而广播是**先答的赢**。页面的答复只能说明"我这儿开着哪本"——它**不知道自己是前台
+ * 还是后台标签页**，也没有"活动标签页是不是微读"这个信息。
+ *
+ * 实测后果（2026-11 用户报"回到微信读书看《大国大城》，侧栏没跟过去"）：
+ * 用户切回微读 → 侧栏问"认哪本" → **阅读器页面抢先答"我这儿开着教程书"** →
+ * 侧栏把教程书当成当前书，**根本走不到"问微信读书页"那一步**。
+ *（上一版给两份答复补齐了 `notReader` 字段，反而让页面这份答复变成了"合法答案"。）
+ *
+ * 修法：这一条**只给后台**（页面没有这个动作的处理分支，答不了），
+ * 并且带一个 `req` 随机串、要求原样回传——将来再冒出第三个应答者也骗不过侧栏。
  */
+async function readerContextQuery(msg) {
+  const r = await readerBookInfo()
+  return Object.assign({ req: (msg && msg.req) || '' }, r)
+}
+
 async function readerBookInfo() {
-  let tab = await activeTab()
-  if (!isReaderUrl(tab && tab.url)) {
-    const others = await chrome.tabs.query({ url: chrome.runtime.getURL('reader.html') + '*' }).catch(() => [])
-    const active = tab
-    // 活动 tab 是微信读书 / 文库页面 → 那是用户当下真正在读的地方，别抢
-    const activeUrl = String((active && active.url) || '')
-    const activeIsReadingSource = /(^|\.)weread\.qq\.com/.test(safeHost(activeUrl)) || isPageSourceUrl(activeUrl)
-    if (!activeIsReadingSource && others && others.length) tab = others[0]
+  const tab = await activeTab()
+  const url = String((tab && tab.url) || '')
+  /**
+   * ① 活动标签页**就是**我们的阅读器 → 问它开着哪本。
+   *
+   * `activeKind:'reader'` 是给侧栏看的结论（它不再需要自己判断"这个 tab 是什么"）。
+   * 这里**不再有"按 URL 找一个后台阅读器"那一步**：理由见上面的改版说明。
+   */
+  if (isReaderUrl(url)) {
+    try {
+      const r = await chrome.tabs.sendMessage(tab.id, { action: 'readerBookInfo' })
+      /**
+       * ⚠️ **"答非所问"也必须算 unknown**（2026-11 用户实测，真正的根因在这里）。
+       *
+       * `tabs.sendMessage` 在"页面在、但还没有监听器"时**不抛错**，它会 resolve 成
+       * `undefined`——于是走进成功分支、`(r && r.book) || null` 得到 `null`，
+       * 后台回了一句"阅读器开着、但没有书"。侧栏照做会把当前书清掉：
+       * 书单铺开、底部那格换成 PDF 入口条、引用"暂未关联书籍"。
+       * 用户看到的就是那句"**底层界面回到选择书界面**"。
+       *
+       * 判据：**只有当答复明确是那条 bookInfo 的答复**（带 `ok:true`）时才认它的话；
+       * 否则一律当"它现在答不上来"。这一条同时覆盖了页面正在加载、模块还没跑起来、
+       * 以及任何"回了但不是我要问的那件事"的情况。
+       */
+      if (!r || typeof r !== 'object' || r.ok !== true) {
+        return { ok: true, notReader: false, activeKind: 'reader', unknown: true, book: null, tabId: tab.id, url }
+      }
+      // 页面**正在打开书**（深链 `?open=` 刚到、书还没落地）：这也是"还没准备好"。
+      // 少了这一条，侧栏会在"打开阅读器"之后的一两秒里收到"没有书"并把当前书清掉。
+      if (r.loading) {
+        return { ok: true, notReader: false, activeKind: 'reader', unknown: true, loading: true, book: null, tabId: tab.id, url }
+      }
+      return { ok: true, notReader: false, activeKind: 'reader', book: r.book || null, tabId: tab.id, url }
+    } catch (e) {
+      /**
+       * **问不到 ≠ 没有书**（2026-11 用户实测）：阅读器**正在加载/重载**时消息就是发不进去的，
+       * 如实回报 `unknown: true`，侧栏据此保留上一次已知的书。
+       */
+      return { ok: true, notReader: false, activeKind: 'reader', unknown: true, book: null, tabId: tab.id, url }
+    }
   }
-  if (!isReaderUrl(tab && tab.url)) return { ok: true, notReader: true, book: null }
-  try {
-    const r = await chrome.tabs.sendMessage(tab.id, { action: 'readerBookInfo' })
-    return { ok: true, notReader: false, book: (r && r.book) || null, tabId: tab.id }
-  } catch (e) {
-    // 页面没起来 / 正在重载：当作"阅读器开着但没打开 PDF"，让侧栏回落无书状态
-    return { ok: true, notReader: false, book: null, tabId: tab && tab.id }
+  /**
+   * ② 活动标签页不是阅读器 → 侧栏该认哪本由 `activeKind` 说话（侧栏据此决定：
+   * 微读书页去问它 / 其它页面就是"没有书"）。
+   *
+   * `tabId` 一并带上：侧栏要问微读页面时，问的就是**这一个**标签页 ——
+   * 不让它再自己去 `tabs.query` 一次（两次查询之间用户切了 tab，两个答案就会打架）。
+   */
+  return { ok: true, notReader: true, activeKind: activeTabKind(url), book: null, tabId: tab && tab.id, url }
+}
+
+/**
+ * 活动标签页属于哪一类页面（2026-11 二次改版）。
+ *
+ * **只看 URL，不问页面**——这是"侧栏该不该认一本书"的唯一依据，所以它必须是问不倒的事实。
+ * 消息往返会失败、页面会还没起来，而"你现在停在哪个网址上"不会。
+ *
+ *   'reader'        我们的 PDF 阅读器页面（由 isReaderUrl 先判掉，这里不重复）
+ *   'weread-book'   微信读书的**书页**（`/web/reader/<书 ID>`）→ 侧栏去问它要书名
+ *   'weread'        微信读书的其它页（书架 / 详情 / 搜索…）→ 无书
+ *   'page'          文库类网页阅读源（marxists / bilibili）→ 无书（绑定与否由页面自己报）
+ *   'other'         跟阅读毫无关系的页面 → 无书
+ *   'unknown'       拿不到活动标签页（没有窗口 / 查询失败）→ **什么都不知道，别动侧栏**
+ */
+export function activeTabKind(url) {
+  const s = String(url || '')
+  if (!s) return 'unknown'
+  const host = safeHost(s)
+  if (host === 'weread.qq.com' || host.endsWith('.weread.qq.com')) {
+    try {
+      return /^\/web\/reader\/[^/]+/.test(new URL(s).pathname) ? 'weread-book' : 'weread'
+    } catch (e) {
+      return 'weread'
+    }
   }
+  if (isPageSourceUrl(s)) return 'page'
+  return 'other'
 }
 
 function safeHost(url) {
@@ -634,16 +814,41 @@ function isPageSourceUrl(url) {
   return h === 'marxists.org' || h.endsWith('.marxists.org') || h === 'bilibili.com' || h === 'www.bilibili.com'
 }
 
+/**
+ * 「这条消息是后台自己广播出去的」标记。
+ *
+ * 用途只有一个：**别处理自己发出去的消息**（否则 readerCommand 会无限自环，
+ * 见那个函数里的说明）。字符串取这个名字是为了不可能与真实字段撞车。
+ */
+const RELAY_MARK = '__coreadFromBackground'
+
 async function readerCommand(msg) {
   const payload = {
     action: 'readerCommand',
     type: msg && msg.type,
     id: msg && msg.id,
     text: msg && msg.text,
+    // quote = 用户在**译文里划出来的那一段**（2026-11，侧栏译文卡片的"划选共读"）。
+    // 只有 reference 用得上；漏掉它的话阅读器只能退回"整卡"，表现是"划了半句、
+    // 进引用的却是整页译文"——而且不报错。转发是白名单式的，所以新增字段必须加成这里。
+    quote: msg && msg.quote,
   }
-  // 只转发给阅读器页面，并**等它的真实结果**再回给侧栏。
-  // 不能"广播完就回 ok"：那样侧栏拿到的是假回执 —— 删除失败、设为引用失败都看不出来。
-  // （发送方收不到自己发的消息，所以这里不会自环。）
+  /**
+   * ⚠️ **自环闸门**（2026-11 修，这是"设为引用点不动"的根因）。
+   *
+   * 这一条原本写着"发送方收不到自己发的消息，所以这里不会自环"——**那句是错的**：
+   * 后台用 `chrome.runtime.sendMessage` 广播出去的消息，**后台自己的 onMessage 也会收到**
+   * （service worker 是发送方，它收不到的是"回执"，不是消息本身）。
+   * 于是：后台转发 → 自己又收到 → 再进 readerCommand → 再转发…… 无限自环，
+   * 阅读器一次都没被调到，面板永远等不到回执 —— 用户看到的就是
+   * "点了设为引用，面板不收、划线不出"（而且不报错）。
+   *
+   * 修法用**标记**而不是换 API：转换 tabs.sendMessage 需要先知道"哪个 tab 是阅读器"，
+   * 而这一条的设计前提就是"不猜、广播给所有扩展页面，谁认领谁答"。
+   * 带上 RELAY_MARK，后台见到就跳过 —— 同一条规矩本仓库已有先例（sidebar.js 的
+   * readerContextQuery 用一个 req 串防"第三个应答者"）。
+   */
+  payload[RELAY_MARK] = 1
   try {
     const res = await chrome.runtime.sendMessage(payload)
     return res || { ok: false, error: { message: '阅读器未返回结果' } }
@@ -655,7 +860,7 @@ async function readerCommand(msg) {
 /** 把快捷键转成给阅读器的命令（阅读器页面收不到 chrome.commands，侧栏有焦点时也收不到按键） */
 async function relayToReader(type) {
   try {
-    await chrome.runtime.sendMessage({ action: 'readerCommand', type })
+    await chrome.runtime.sendMessage({ action: 'readerCommand', type, [RELAY_MARK]: 1 })
     return { ok: true }
   } catch (e) {
     return { ok: false, error: { message: String((e && e.message) || e) } }
@@ -683,13 +888,15 @@ async function notesClose() {
 /** 广播给所有扩展页面（侧栏、阅读器、popup）。没有任何接收方时会 reject，忽略。 */
 function broadcast(message) {
   try {
-    const p = chrome.runtime.sendMessage(message)
+    const p = chrome.runtime.sendMessage(typeof message === 'object' && message ? { ...message, [RELAY_MARK]: 1 } : message)
     if (p && p.catch) p.catch(() => {})
   } catch (e) {}
 }
 
 async function testConnection() {
-  const r = await chat({ content: buildTextContent('只回复两个字：正常', ''), maxTokens: 32 })
+  // 连通性探测要的是"能回两个字"，所以这里**不开** JSON 模式（prompt 里没有 JSON 字样，
+  // 开了反而可能被上游按格式不符拒掉）；思考照旧关掉，否则 32 个 token 会被思考吃光。
+  const r = await chat({ content: buildTextContent('只回复两个字：正常', ''), maxTokens: 32, jsonMode: false })
   if (!r.ok) return r
   return { ok: true, text: r.text }
 }
@@ -977,10 +1184,55 @@ async function fillBookTitle(ctx) {
  * 走 receiver 的 /annotation（setRef: true）：它只推送 annotation-select 事件，
  * 侧栏收到后把这条加进引用列表并选中为当前引用，不触发 agent 讨论。
  * 用户之后在侧栏输入框里自己提问，走正常的共读链路。
+ *
+ * `msg.context` = **划线附近的一段原文**（阅读器算好的，见 extension/reader.js 的
+ * contextAround）。它随标注一起落盘，agent 处理这条引用时用它当上下文 —— PDF 没有
+ * 章节正文可查，只有这一份。别的地方（划词浮层、教程书）不带这个字段，行为不变。
+ *
+ * `msg.translation` = **用户读到的那半边**（2026-11）。PDF 场景下原文是外文，用户看不懂，
+ * 所以引用卡与对话里的引用横幅都以它为主体（原文另行可查）。它随标注落盘，
+ * 与 `selectedText`（原文，仍是这条引用的身份）并存 —— 两条腿都要，缺一条就是
+ * 「设为引用之后译文不见了」。
+ *
+ * ── 三个字段的分工（2026-11 三次修，别混）────────────────────────────────────
+ *   original    原文。文字段落有（划词抽出来的）；**扫描件天然没有**（图片页没有文字层）
+ *   quote       用户在侧栏译文里划出来的那一段（见 reader-notes.js 的划选共读）
+ *   translation 显示用的那半边。划选时就是 quote，否则是整段译文
+ * 引用的内容（selectedText）按 `original || quote || translation` 取：
+ *   · 文字段落 → 原文（与微信读书那条路的语义一致：引用身份是原文）
+ *   · 扫描件   → 那段译文（原文压根不存在，硬要"原文优先"只会得到一条空引用）
+ * 这个回落顺序是这次改动的关键：以前只写了 `original || translation`，扫描件整页
+ * 译文进引用卡，用户想讨论的那一句被埋在里面。
  */
+/** 附近原文的长度上限（阅读器给的是前后各 300 字，这里只防上游塞进来一个超大字段）。 */
+const MAX_CONTEXT_CHARS = 2000
+/** 译文的长度上限（receiver 侧还有一道同样的闸；这里防的是把一个超大字段发出去）。 */
+const MAX_TRANSLATION_CHARS = 4000
+
+/**
+ * 扫描件（图片页）那条路**没有**"附近原文"可给：图片页没有文字层，contextAround
+ * 必然返回空串。以前这就等于什么都不给，agent 那边只能落成"（暂无这本书的原文足迹…）"，
+ * 而它其实连"为什么没有"都不知道。这里换成一句**说清缺什么**的话。
+ *
+ * 为什么不做 OCR 补一段真原文：那是又一次模型调用，要等、要花钱，而用户此刻正在
+ * 等着设引用；而且 OCR 出来的文字与用户框选的那块未必对得上，"给错上下文"比
+ * "明说没有上下文"更坏（同 contextAround 的既有原则）。
+ */
+const IMAGE_CONTEXT_NOTE = '（本段来自扫描件的框选翻译：这一页没有可提取的文字层，'
+  + '因此没有原文可查，也没有划线附近的原文。判断依据只有下面这段译文本身。）'
+
 async function setTranslationRef(msg) {
-  const original = String(msg?.original || '').trim() || String(msg?.translation || '').trim()
-  if (!original) return fail('BAD_REQUEST', '没有可设为引用的内容')
+  const original = String(msg?.original || '').trim()
+  const quote = String(msg?.quote || '').trim().slice(0, MAX_TRANSLATION_CHARS)
+  const isImage = msg?.image === true
+  // 引用的内容：原文优先（那是引用身份），扫描件才落到摘录/整段译文上
+  const selected = original || quote || String(msg?.translation || '').trim()
+  if (!selected) return fail('BAD_REQUEST', '没有可设为引用的内容')
+  // 图片条目缺原文时，用那句话替代空上下文（见 IMAGE_CONTEXT_NOTE）
+  const context = String(msg?.context || '').trim().slice(0, MAX_CONTEXT_CHARS)
+    || (isImage && !original ? IMAGE_CONTEXT_NOTE : '')
+  // 显示用的那半边：划选了就是那一段，否则整段译文
+  const translation = (quote || String(msg?.translation || '').trim()).slice(0, MAX_TRANSLATION_CHARS)
 
   const tab = await activeTab()
   if (!tab) return fail('NO_TAB', '没有可用的标签页')
@@ -1002,7 +1254,11 @@ async function setTranslationRef(msg) {
       body: JSON.stringify({
         bookId: ctx.bookId,
         bookTitle: ctx.bookTitle || '',
-        selectedText: original,
+        selectedText: selected,   // original || quote || translation（见函数头那段分工）
+        ...(context ? { context } : {}),
+        // 译文（2026-11）：只有真的翻过才带。浮层那条（translate-overlay）也带它，
+        // 但那份"原文"是 textarea 里可编辑的稿子，语义已在调用处说明。
+        ...(translation ? { translation } : {}),
         setRef: true,             // 只设为当前引用，不触发 agent（receiver 据此推 annotation-select）
         source: 'translate-tool',
         sourceUrl: String(msg?.url || ''),
@@ -1016,7 +1272,227 @@ async function setTranslationRef(msg) {
   // 顺手把侧栏打开。拿不到用户手势时会失败，失败也无所谓：引用已入列表，打开侧栏就能看到。
   try { await chrome.sidePanel.open({ tabId: tab.id }) } catch (e) {}
 
+  // 留下"待选引用"标记：侧栏**之后**才打开（或刚被回收重建）时靠它把这条自动选中。
+  // 为什么必须有（2026-11 用户实测"设了引用，侧栏里没见着选中"）：
+  // 走 SSE 的实时路径要求侧栏此刻正在收——阅读器里划词点「共读」时侧栏往往还没开，
+  // 那条 annotation-select 广播就落进了空气。这个标记是"下次打开时补上"，
+  // 与划线共读（content.js 那条路）用的是同一个键，语义一致。
+  try {
+    await chrome.storage.local.set({
+      pendingSelectRef: {
+        bookId: ctx.bookId,
+        bookTitle: ctx.bookTitle || '',
+        selectedText: selected,
+        // 译文（2026-11）：待选标记也要带，否则"侧栏当时没开"这条路的译文又丢了 ——
+        // 实时通道（SSE）与待选标记是同一件事的两条路，只补一条等于修了一半。
+        ...(translation ? { translation } : {}),
+        chapter: '',
+        chapterUid: '',
+        sourceUrl: String(msg?.url || ''),
+      },
+    })
+  } catch (e) {}
+
   return { ok: true, bookTitle: ctx.bookTitle || '' }
+}
+
+/**
+ * 打开「我们自己的阅读器」里的一本书（2026-11 用户实测："我点击第一次共读对话的时候
+ * 阅读器并没有自己弹出来"）。
+ *
+ * 侧栏为什么会点到它却没反应：书单里那几本 `rd_` 开头的书是**阅读器放进去的**，
+ * 而侧栏的"点一本"从一开始只做一件事——把聊天记录的归属切到那本书（手动选书）。
+ * 它压根不负责打开 PDF，也从没有过"去读"的入口。这里补上这条动作。
+ *
+ * 为什么由后台开标签页而不是侧栏自己开：侧栏页面没有开标签页的能力，
+ * 只有后台有。书已经在书库里（原件在接收端），所以带上 `?open=<hash>` 让阅读器自己取。
+ */
+/**
+ * 后台侧的调试上报（写进 `logs\debug.jsonl`，与 sidebar.js 的 postSidebarDebug 同一落点）。
+ *
+ * 为什么后台也要报：有些链路**只能靠用户点**（比如侧栏里点一本书去打开阅读器），
+ * 我没法自动跑，出事时唯一的现场记录就是这个日志。上一轮自检报告里
+ * "reused:false 而 URL 又没有 ?open="这种自相矛盾，如果有这条日志一眼就能看出走了哪条路。
+ * 静默失败：接收端没起时这不是错误。
+ */
+function reportDebug(data) {
+  try {
+    fetch(RECEIVER_URL + '/debug', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'background', ...data, timestamp: Date.now() }),
+    }).catch(() => {})
+  } catch (e) {}
+}
+
+/**
+ * 打开侧栏并让它接上课（书里「开始本课」按钮走这条）。
+ *
+ * ⚠️ `chrome.sidePanel.open()` 是**必须由用户手势触发**的接口（浏览器策略，不是我们的 bug）：
+ * 手势能不能穿过 sendMessage 传到后台，各版本行为不一致——实测有时成功、有时报
+ * "may only be called in response to a user gesture"。
+ * 所以这里**如实回报 opened**，让书页那个按钮能说真话（"侧栏没自动打开，请手动开一下"），
+ * 而不是假装开始了。真正的接续不靠这个调用：引导状态在 chrome.storage 里，
+ * 侧栏一打开就 restoreRun() 接上。
+ */
+/**
+ * 请侧栏开某一课（书里「开始本课」按钮走这条）。
+ *
+ * ── 两件事必须分开做（2026-11 用户实测踩到）────────────────────────────────
+ * ① **广播**：告诉侧栏"读一下 storage、把那一课接上"。
+ * ② **打开侧栏**：`chrome.sidePanel.open()` 是**必须由用户手势触发**的接口。
+ *
+ * 原先把 ② 写在前面、① 跟在后面，于是 `open()` 一失败（实测**每次都失败**，见下）
+ * 就把 ① 也一起带走了——侧栏明明开着，却收不到"开始这一课"的通知。这是最坏的一种：
+ * 功能其实可用，只因为顺序写错而整条失效。
+ *
+ * ── 为什么 open() 必然失败（实测三次，日志在 logs\debug.jsonl）──────────────
+ *   15:45:56 / 15:46:52  open-side-panel-lesson  opened=false
+ *   error=`sidePanel.open()` may only be called in response to a user gesture.
+ * 手势**不会**穿过 sendMessage 从阅读器页传到后台。这是浏览器的安全边界，不是 bug，
+ * 所以只能如实告知用户去点一下工具栏图标；打开时靠 restoreRun() 自动接上（① 那条路）。
+ *
+ * ── 为什么要先查"侧栏在不在"────────────────────────────────────────────────
+ * 侧栏开着的时候**根本不需要** open()。先用 getContexts 查一次，在就跳过，
+ * 这样最坏情况下也不会白报一个失败给用户看。
+ */
+async function openSidePanelForLesson(msg) {
+  // ① 广播（无条件，与"能不能打开"完全无关）
+  const ping = () => {
+    try {
+      const p = chrome.runtime.sendMessage({ action: 'coreadTutorialLesson', chapter: msg?.chapter })
+      if (p && p.catch) p.catch(() => {})
+    } catch (e) {}
+  }
+  ping()
+  setTimeout(ping, 500)     // 侧栏刚被打开时脚本可能还没就绪，再补一次
+
+  // ② 侧栏已经在？那就不用 open() 了
+  let alreadyOpen = false
+  try {
+    if (chrome.runtime.getContexts) {
+      const ctxs = await chrome.runtime.getContexts({ contextTypes: ['SIDE_PANEL'] })
+      alreadyOpen = !!(ctxs && ctxs.length)
+    }
+  } catch (e) {}
+
+  let opened = alreadyOpen
+  let error = ''
+  if (!alreadyOpen) {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
+      await chrome.sidePanel.open({ windowId: tab ? tab.windowId : undefined })
+      opened = true
+    } catch (e) {
+      // 最常见的失败就是"缺手势"。如实回报，让书里那块卡片能说真话：
+      // 引导在右侧侧栏，点一下工具栏图标就接上了（状态在 storage 里等着）。
+      error = String((e && e.message) || e)
+    }
+  }
+
+  reportDebug({
+    source: 'open-side-panel-lesson', stage: 'done',
+    broadcast: true, alreadyOpen, opened, error,
+    // ⚠️ `chapter` 传 0 时原来会被省略，于是日志里根本看不出"调用方到底传没传"。
+    // 我因此误判过一次"用户跑的是旧版本"——其实是新版本、只是没写这个字段。
+    // 诊断字段宁可冗余：现场只有一次，缺一个字段就要多跑一轮。
+    inChapter: Number(msg?.chapter) || 0,
+    chapter: Number(msg?.chapter) || 0,
+  })
+  return { ok: true, broadcast: true, alreadyOpen, opened, error }
+}
+
+/**
+ * 拼「打开阅读器里的某一本」的 URL。
+ *
+ * 抽成纯函数是为了**能被自测直接验**：这条链路在真实浏览器里只能靠用户点，
+ * 而"URL 到底拼成什么样"恰恰是上一轮报告里唯一说不清的地方
+ * （后台回报 reused:false，而标签页 URL 里却没有 ?open= —— 两个事实对不上）。
+ * 抽出来之后 test/selftest 可以直接把各种书 ID 喂进来，看拼出来的东西对不对。
+ *
+ * @param {string} base 书 ID（`rd_<hash>`）
+ * @param {string} [name] 书名（可选，只用来让阅读器少查一次）
+ * @returns {string} 合法则返回完整 URL；不像书 ID 则返空串（调用方报错）
+ */
+export function buildReaderBookUrl(base, name, chapter) {
+  const id = String(base || '').trim()
+  if (!/^rd_[A-Za-z0-9_]{8,}$/i.test(id)) return ''
+  const hash = id.replace(/^rd_/i, '').toLowerCase()
+  if (!/^[a-f0-9]{16,64}$/.test(hash)) return ''
+  const reader = (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getURL)
+    ? chrome.runtime.getURL('reader.html')
+    : 'reader.html'
+  const ch = Number(chapter) > 0 ? '&chapter=' + Math.floor(Number(chapter)) : ''
+  return reader + '?open=' + hash + (name ? '&name=' + encodeURIComponent(String(name).slice(0, 120)) : '') + ch
+}
+
+async function openReaderBook(msg) {
+  const base = String(msg?.base || '').trim()
+  if (!/^rd_[A-Za-z0-9_]{8,}$/i.test(base)) {
+    return fail('BAD_BOOK', '这不是阅读器里的书（只有我们自己阅读器放进去的书能这样打开）')
+  }
+  const hash = base.replace(/^rd_/i, '').toLowerCase()
+  if (!/^[a-f0-9]{16,64}$/.test(hash)) return fail('BAD_BOOK', '书 ID 形态不对')
+  const url = buildReaderBookUrl(base, msg?.name, msg?.chapter)
+  // 已经开着阅读器（不管在哪个窗口）就地切过去并打开那本，而不是再开一个新标签：
+  // 开第二个阅读器页会让"当前在看哪本书"这件事出现两个答案。
+  let reused = false
+  let action = ''
+  const wantChapter = Number(msg?.chapter) || 0
+  try {
+    const opened = await chrome.tabs.query({ url: chrome.runtime.getURL('reader.html') + '*' })
+    if (opened && opened.length) {
+      reused = true
+      const tab = opened[0]
+      /**
+       * ⚠️ **已经开着这一本、又没有指定要翻到哪一章时，只切前台，不做任何导航。**
+       *
+       * 为什么（2026-11 用户实测）：`chrome.tabs.update` 只要 URL 变一点点就是**真导航**，
+       * 而扩展页面一导航就整页重载——阅读器回到初始空状态，**闪出书库（选书界面）**，
+       * 然后才重新打开那一本。用户看到的就是"底层界面回到了选择书籍的界面"。
+       *
+       * 这条规则对所有调用方都成立（侧栏的 📍、书里的入口、书单的「读」），
+       * 所以修在这里最省事、也最不容易漏：**没有新意图就不要重新加载页面**。
+       */
+      let sameBook = false
+      try {
+        const cur = new URL(tab.url || '')
+        sameBook = (cur.searchParams.get('open') || '').toLowerCase() === hash
+      } catch (e) {}
+      if (sameBook && wantChapter === 0) {
+        await chrome.tabs.update(tab.id, { active: true })
+        action = `focus tab ${tab.id}（已在读这一本，不重新加载）`
+        try { await chrome.windows.update(tab.windowId, { focused: true }) } catch (e) {}
+      } else {
+        await chrome.tabs.update(tab.id, { active: true, url })
+        action = `update tab ${tab.id}`
+        // 切窗口只是顺手，失败无所谓 —— 但**绝不能因为它失败就改变返回值**：
+        // 曾经把这三行包在同一个 try 里、后面跟着 return，一旦 windows.update 抛错
+        // 就掉进"没找到标签页"的分支，于是又开一个新标签（自检报告里表现为
+        // reused:false 与"URL 里没有 ?open="同时出现，自相矛盾）。
+        try { await chrome.windows.update(tab.windowId, { focused: true }) } catch (e) {}
+      }
+    }
+  } catch (e) { action = 'query/update 抛错: ' + String((e && e.message) || e) }
+
+  try {
+    if (!reused) {
+      const t = await chrome.tabs.create({ url })
+      action = `create tab ${t && t.id}`
+    }
+  } catch (e) {
+    return fail('OPEN_FAILED', '打不开阅读器页面：' + String((e && e.message) || e))
+  }
+
+  // 把这次到底走了哪条路写进 debug 日志：这条链路只能靠用户点，日志是唯一的现场记录
+  reportDebug({
+    source: 'open-reader-book', stage: 'done',
+    reused, action, hash: hash.slice(0, 12), url,
+    // `chapter` 一定要写（哪怕是 0）：日志里缺这个字段，就分不清"调用方没传"和
+    // "版本旧、压根没这个功能"——我因此误判过一次（详见 docs 的教训一节）
+    chapter: Number(msg?.chapter) || 0,
+  })
+  return { ok: true, reused, hash, url, action }
 }
 
 /** 工具箱里关掉翻译时，四个入口统一挡在这里（「测试连接」不受影响，方便关着也能验证配置）。 */

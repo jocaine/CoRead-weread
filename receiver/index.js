@@ -10,7 +10,7 @@ import fs from 'fs'
 import path from 'path'
 import { execSync } from 'child_process'
 import { fileURLToPath } from 'url'
-import { GRAPH_FILE, FREE_GRAPH_FILE, readGraphFile, readFreeGraphFile, buildDemoGraph } from './graph-data.js'  // AI-020：会意图图数据
+import { GRAPH_FILE, readGraphFile, buildDemoGraph, readTutorialGraph } from './graph-data.js'  // AI-020：会意图图数据
 import { writeApiConfig, validateApiConfigInput, resolveApiConfig, isConfigured } from '../agent/lib/api-config.js'  // 模型 API 配置（侧栏「⋯」入口的读写端）
 // 自由模式多对话（2026-11 用户定调）：对话注册表（新建 / 列表 / 重命名 / 删除 + 消息计数）。
 // agent 在归档时写同一份注册表（留墓碑记录），两边都用同一个 lib 保证读写口径一致。
@@ -31,7 +31,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // 2026-10 目录重构：数据集中在 <包根>\data\，按类型分格；路径规则与分格依据见该文件头部。
 import {
   CHAT_DB, STREAM_FILE, AGENT_STATE_FILE, TOPIC_STACK_FILE, TOOLBOX_DIR, TOOL_HISTORY_FILE,
-  BOOKS_DIR, ANNOTATIONS_FILE, SESSIONS_DIR, DEBUG_LOG, layoutSummary, ensureDirs,
+  BOOKS_DIR, ANNOTATIONS_FILE, SESSIONS_DIR, DEBUG_LOG, LOGS_DIR, layoutSummary, ensureDirs,
   sessionStopFile, EXTENSION_ID_FILE, isExtensionId,
 } from '../agent/lib/paths.js'
 
@@ -42,6 +42,7 @@ const TOOL_HISTORY = TOOL_HISTORY_FILE
 
 // 数据目录先建齐（全新安装时 data\ 整个不存在）。幂等，agent 启动时也会调一次。
 ensureDirs()
+
 
 // ── SSE ──────────────────────────────────────────────────────────────────────
 const sseClients = new Set()
@@ -175,23 +176,17 @@ setInterval(() => {
 }, 100)
 
 // AI-020：会意图图文件变化轮询（3s 一次 stat）→ mtime 变化时 SSE graph-updated，
-// 侧栏图视图开着就自动重拉（图由会意系统固化到 agent/data/knowledge-graph.json）。
-// 自由模式沙盒图（knowledge-graph.free.json）单独轮询：测试固化也实时通知，
-// 图视图保持当前模式（正式/自由）重拉。
+// 侧栏图视图开着就自动重拉（图由会意系统固化到 data\profile\knowledge-graph.json）。
+// 2026-11：沙盒图（knowledge-graph.free.json）的轮询已删——自由对话不再写沙盒图
+// （收编与否由归档弹窗决定，收编就直接写正式图），所以它永远不会有 mtime 变化，
+// 那条推送是死代码。
 let _graphFileMtime = 0
-let _freeGraphFileMtime = 0
 setInterval(() => {
   let m = 0
   try { m = fs.statSync(GRAPH_FILE).mtimeMs } catch {}
   if (m > 0 && m !== _graphFileMtime) {
     _graphFileMtime = m
     pushSSE('graph-updated', {})
-  }
-  let fm = 0
-  try { fm = fs.statSync(FREE_GRAPH_FILE).mtimeMs } catch {}
-  if (fm > 0 && fm !== _freeGraphFileMtime) {
-    _freeGraphFileMtime = fm
-    pushSSE('graph-updated', { free: true })
   }
 }, 3000)
 
@@ -382,6 +377,119 @@ function normalizeReaderHash(h) {
 // 所以：**进来先归一化**。裸哈希（老扩展 / 老书库列表）与带前缀的都认，出来一律带前缀。
 const READER_BOOK_PREFIX = 'rd_'
 
+// ── 内置教程书（2026-11）──────────────────────────────────────────────────────
+/**
+ * 教程书在共读侧的固定书 ID：`rd_` + 一个 64 位十六进制常量。
+ *
+ * ⚠️ 三处必须逐字相同：这里、`extension/tutorial/index.js` 的 TUTORIAL_HEX、
+ * `extension/reader.js` 的 TUTORIAL_HEX（静态闸门 test/selftest/check-tutorial.mjs 会比对）。
+ * 为什么是固定常量而不是真哈希：教程书没有文件，而书 ID 必须过三处正则
+ * （本文件 :370 与 :407、sidebar.js 的 applyBookContext），取
+ * sha256('CoRead 使用手册 v1') 当常量就一次通过，三处校验一个字都不用改。
+ */
+const TUTORIAL_HEX = 'e0c91cb6aa56dd0057235ba7374c03e599e1e37e09b3bc9f55f64e1a5b98a25e'
+const TUTORIAL_BOOK_ID = READER_BOOK_PREFIX + TUTORIAL_HEX
+
+/**
+ * 教程书正文在哪：**扩展目录**里（`<父目录>\extension\tutorial\book`），不在 data\ 下。
+ *
+ * 为什么接收端要自己找它（而不是等扩展来报）：教程书是**随包分发**的，
+ * 而「已读书籍」列表来自 data\reading\books\ —— 用户可能先开侧栏（那时阅读器还没
+ * 打开过教程书），不先在启动时登记进去，第一次安装的用户会看不到这本书。
+ * 扩展打开教程书时也会走一次 /reader-book，那是同一个登记动作的第二次机会。
+ *
+ * 目录推导为什么这么写：父目录是 agent 与 receiver 的共同父目录
+ * （开发时 = 仓库根；便携包里 = internal\），两种布局下 `extension\` 都在它下面。
+ * 判定依据与 agent/lib/paths.js 的 PARENT_NAME 同源，但**这不是数据路径**，
+ * 所以不进那个文件的真源表——它是"程序自带的只读内容"，不是用户数据。
+ */
+function tutorialBookDir() {
+  const fatherDir = path.join(__dirname, '..')
+  for (const rel of [['extension', 'tutorial', 'book'], ['internal', 'extension', 'tutorial', 'book']]) {
+    const p = path.join(fatherDir, ...rel)
+    try { if (fs.statSync(p).isDirectory()) return p } catch {}
+  }
+  return ''
+}
+
+/**
+ * 扩展目录（开发时 = 仓库根的 `extension\`；便携包里 = `internal\extension\`）。
+ * 用途和 tutorialBookDir 同一类：读**程序自带的只读内容**（教程的会意图种子），
+ * 不是用户数据，所以同样不进 agent/lib/paths.js 的真源表。
+ * @returns {string} 找到的扩展目录；找不到返回空串（调用方自己兜底）
+ */
+function extensionDir() {
+  const fatherDir = path.join(__dirname, '..')
+  for (const rel of [['extension'], ['internal', 'extension']]) {
+    const p = path.join(fatherDir, ...rel)
+    try { if (fs.statSync(p).isDirectory()) return p } catch {}
+  }
+  return ''
+}
+
+function readJsonIfExists(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null }
+}
+
+/**
+ * 把一章的**正文字块**拼成给 agent 用的纯文本。
+ *
+ * 为什么这一步不是可有可无：agent 是拿划线原文去 `chapters\*.txt` 里找
+ * "你已经读过的那几章"（agent/index.js:435-489）。没有这份文本，用户在教程书里
+ * 划的线就找不到正文，那一问会得到一句"未找到对应章节"——书就白做成一本书了。
+ */
+function tutorialChapterText(chapter) {
+  const parts = []
+  for (const b of (chapter && chapter.blocks) || []) {
+    if (!b) continue
+    // 「课」块本身没有正文（它的标题与步骤是界面上说的，不是书里读的），跳过。
+    // 但课块的 intro 若有文字要算正文——那是写给读者看的，agent 也该看得到。
+    if (b.type === 'lesson') { if (b.text) parts.push(b.text); continue }
+    if (b.text) parts.push(b.text)
+    if (Array.isArray(b.items)) parts.push(...b.items)
+    if (b.attribution) parts.push(b.attribution)
+  }
+  return parts.join('\n\n')
+}
+
+/**
+ * 登记教程书 + 导出它的章节正文。**每次接收端启动都做一遍**（幂等）。
+ *
+ * 为什么不"只在缺失时写一次"：教程正文随版本走。升级之后用户该看到新内容，
+ * 而 data\ 里那份是上一版导出的。每次重写最简单，代价只是七个小文件。
+ * 明确接受的代价：**用户手改 data\reading\books\<教程>\chapters\ 下的文本会被覆盖**——
+ * 那本来就不是他的东西（正文的真源在扩展里），要改内容得改代码。
+ *
+ * @returns {{ok:boolean, reason?:string, chapters?:number, title?:string}}
+ */
+function ensureTutorialBook() {
+  const dir = tutorialBookDir()
+  if (!dir) return { ok: false, reason: '找不到教程书目录（extension/tutorial/book）' }
+  const manifest = readJsonIfExists(path.join(dir, 'book.json'))
+  if (!manifest || !Array.isArray(manifest.chapters) || !manifest.chapters.length) {
+    return { ok: false, reason: 'book.json 读不到或没有章节' }
+  }
+  const target = bookDir(TUTORIAL_BOOK_ID)          // 顺带建好 chapters\ 目录
+  const chaptersDir = path.join(target, 'chapters')
+  fs.mkdirSync(chaptersDir, { recursive: true })
+  let written = 0
+  for (const c of manifest.chapters) {
+    if (!c || !c.key) continue
+    const chapter = readJsonIfExists(path.join(dir, c.key, 'chapter.json'))
+    if (!chapter) continue
+    const text = tutorialChapterText(chapter)
+    if (!text) continue
+    fs.writeFileSync(path.join(chaptersDir, sanitizePathPart(c.key) + '.txt'), text)
+    written++
+  }
+  writeBookMeta(TUTORIAL_BOOK_ID, {
+    bookId: TUTORIAL_BOOK_ID,
+    baseBookId: TUTORIAL_BOOK_ID,
+    bookTitle: String(manifest.title || '第一次共读'),
+  })
+  return { ok: true, chapters: written, title: manifest.title || '' }
+}
+
 /** 阅读器元信息里的"新鲜度"字段：合并时取两边较新者，不参与"信息是否已覆盖"的比对 */
 const RECENCY_KEYS = new Set(['lastOpenedAt', 'updatedAt'])
 
@@ -395,6 +503,34 @@ function readerBookHash(input) {
 
 function readerDir(hash) { return path.join(BOOKS_DIR, readerBookHash(hash) || String(hash || '')) }
 function readerFilePath(hash) { return path.join(readerDir(hash), 'source.pdf') }
+
+/**
+ * 这个名字是**真书名**，还是"磁盘上的兜底文件名"？（2026-11 加，用户实测踩到）
+ *
+ * ── 为什么必须有这道判断 ──────────────────────────────────────────────────────
+ * 书库把原件统一存成 `<hash>\source.pdf`。于是"这个文件叫什么"和"这本书叫什么"
+ * 在**一条路径上重合了**：从书库里再打开一次原件、或者把那份原件拖进窗口，
+ * 浏览器给出来的文件名就是 `source.pdf` —— 它会被当成书名一路存下去。
+ * 而 `writeReaderMeta` 是**合并覆盖**（后写的盖先写的），所以真名一旦被这么盖掉
+ * 就再也回不来了：用户在书库界面看到的就是一本叫 `source.pdf` 的书。
+ * 用户实测报的正是这个（两本真书的名字都变成了 `source.pdf`）。
+ *
+ * ── 判据取"我们自己的内部文件名"，而不是"看着像不像书名" ─────────────────────
+ * 只挡两种我们**自己制造**的名字：
+ *   · `source.pdf`  —— 书库内部原件的固定名（见 readerFilePath）
+ *   · `未命名.pdf`  —— 阅读器读不到文件名时的占位（extension/reader.js）
+ * 不挡 `sample.pdf` / `scan.pdf` / `many.pdf` 这类：它们**可能真是用户自己的文件名**，
+ * 挡掉等于替用户判断"你这名字不像书名"——那是越权，而且会静默吞掉真名。
+ *
+ * ⚠️ 只在**已经有真名**时才拿它做判据（见 writeReaderMeta）：首次存书时哪怕名字是
+ * `source.pdf` 也照存——空着比存个兜底名更糟，而且用户能自己改。
+ */
+const GENERIC_READER_NAMES = new Set(['source.pdf', '未命名.pdf'])
+function isRealBookName(name) {
+  const n = String(name == null ? '' : name).trim()
+  if (!n) return false
+  return !GENERIC_READER_NAMES.has(n.toLowerCase())
+}
 
 // ── 阅读器的书在「共读侧」的身份（2026-11）─────────────────────────────────────
 // 背景：以前只有微信读书的书有共读侧身份（内容脚本从阅读页 URL 取 bookId），我们自己的
@@ -443,7 +579,27 @@ function readReaderMeta(hash) {
 function writeReaderMeta(hash, patch) {
   const dir = readerDir(hash)
   fs.mkdirSync(dir, { recursive: true })
-  const next = Object.assign({}, readReaderMeta(hash) || {}, patch, { hash, updatedAt: Date.now() })
+  const prev = readReaderMeta(hash) || {}
+  /**
+   * ⚠️ **兜底文件名不许覆盖已有的真名**（2026-11，用户实测报的 bug）。
+   *
+   * 这是全仓库唯一写 `reader-meta.json` 的地方，三条路都经过它：
+   *   · `POST /reader-book-file`（打开本地文件、或把书库原件再打开一次）
+   *   · `POST /reader-book`（阅读器保存进度时顺带报名字，见 reader.js 的 touchLibraryMeta）
+   *   · `registerReaderBook`（登记共读侧）
+   * 其中第二条每次翻页/翻译都会调，所以一旦某个调用方手里是错名字，
+   * 一次误写就会被**反复加固**、再也回不去。
+   *
+   * 留痕：被挡下来时把那个名字记进 `nameRejected`，不是静默丢弃——
+   * 排查"书名怎么不对"时，这一格直接告诉你"有人拿 source.pdf 想覆盖过"。
+   */
+  const next = Object.assign({}, prev, patch, { hash, updatedAt: Date.now() })
+  if (isRealBookName(prev.name) && 'name' in patch && !isRealBookName(patch.name)) {
+    next.name = prev.name
+    next.nameRejected = String(patch.name == null ? '' : patch.name).slice(0, 200)
+    next.nameRejectedAt = Date.now()
+    console.log(`[reader] 拒绝用兜底文件名覆盖书名：${hash.slice(0, 12)}… 保留「${prev.name}」，挡下「${next.nameRejected}」`)
+  }
   fs.writeFileSync(path.join(dir, READER_META), JSON.stringify(next, null, 2))
   return next
 }
@@ -563,9 +719,57 @@ function listReaderBooks() {
     if (!meta) continue                       // 不是阅读器的书（微信读书的书目录没有这个文件）
     let size = 0
     try { size = fs.statSync(readerFilePath(name)).size } catch {}
+    /**
+     * ⚠️ **原件不在了 = 这一项就不存在**（2026-11 用户定调："没有就是没有了"）。
+     *
+     * 为什么不留"只有记录"的空项：书库这一栏代表的就是**那个 PDF 文件**。
+     * 文件没了，留一条点不开、又删不掉的记录只会让人困惑——
+     * 用户实测报过两轮："书库里有一个 sample.pdf 无法删除"。
+     * 所以规则只有一条，不再看名字、不再看别的条件：**没有 source.pdf 就不列**，
+     * 顺手把那份 reader-meta.json 清掉（否则它会一直躺在那儿）。
+     *
+     * 代价（用户明确接受）：这份文件上"读到第几页、译过哪些段落"的记录跟着没。
+     * 侧栏的划线 / 讨论 / 聊天不受影响（那是共读侧，另一条线，见 /reader-book-delete）。
+     *
+     * 历史（别再走回去）：我们试过两种折中，都被否了——
+     *   · 列出来但点不动（用户："无法删除"）；
+     *   · 列出来并给一个"清掉这一项"的按钮（用户："我们为什么要有借书卡这个机制"）。
+     */
+    if (size === 0) {
+      try {
+        fs.rmSync(path.join(readerDir(name), READER_META), { force: true })
+        console.log(`[reader] 原件不在了，清掉这一项记录：${normalizeReaderHash(name).slice(0, 12)}…`)
+      } catch (e) {
+        console.log(`[reader] 清记录失败（跳过，不影响其它书）：${name.slice(0, 12)}… ${e.message}`)
+      }
+      continue
+    }
     // hash 回裸哈希（去掉目录名上的 rd_ 前缀）：扩展那边一律用裸哈希当键
     //（chrome.storage 的 rd:book:<hash>、/reader-book-file?hash=），别在这里换形态
     out.push(Object.assign({}, meta, { hash: normalizeReaderHash(name), size, hasFile: size > 0 }))
+  }
+  // 内置教程书补进书库列表（2026-11）：它注册时写的是共读侧 meta.json，
+  // 没有 reader-meta.json，所以上面那个循环看不见它。而用户在阅读器「书库」里
+  // 需要能点开它——它不是靠自己出场的，得有人把它放进去。
+  // 为什么在这里补而不是让扩展自己拼：这个接口是"书库里有什么"的唯一答案，
+  // 让调用方各自补一条，迟早会补出两种说法。
+  const tdir = path.join(BOOKS_DIR, TUTORIAL_BOOK_ID)
+  if (!out.some((b) => normalizeReaderHash(b.hash) === TUTORIAL_HEX) && fs.existsSync(tdir)) {
+    const bm = readJsonIfExists(path.join(tdir, 'meta.json')) || {}
+    const rm = readReaderMeta(TUTORIAL_HEX) || {}
+    out.push({
+      hash: TUTORIAL_HEX,
+      name: bm.bookTitle || rm.name || '第一次共读',
+      pages: rm.pages || 0,
+      entries: 0,
+      builtin: true,
+      // 永远排在最前面：新手第一眼要看到的就是这本
+      lastOpenedAt: Math.max(Number(rm.lastOpenedAt) || 0, Date.now() + 31536000000),
+      size: 0,
+      // 没有 PDF 原件，但有正文——所以 hasFile 必须为真，否则书库里那一条会被点灰
+      hasFile: true,
+      isTutorial: true,
+    })
   }
   out.sort((a, b) => (b.lastOpenedAt || 0) - (a.lastOpenedAt || 0))
   return out
@@ -600,6 +804,24 @@ function looksWereadEncoded(text) {
 
 function cjkCount(text) {
   return (String(text || '').match(/[\u4e00-\u9fff]/g) || []).length
+}
+
+/**
+ * 译文（2026-11）：PDF 阅读器「设为引用」时随标注一起报上来的那半边。
+ *
+ * 为什么要在这里收口：它从 /annotation 的请求体一路被写进 annotations.jsonl，
+ * 再由 SSE 推送、GET /annotations、/history 三条路读回去。只要有一处漏掉，
+ * 用户看到的就是"设为引用之后译文不见了"——2026-11 之前三处全漏，
+ * 译文压根没落过盘（实测 data\reading\annotations.jsonl 里 19 条 translate-tool
+ * 记录一条都没有这个字段）。所以长度上限只在这一处定，别的分支一律用它。
+ *
+ * 超长直接截断而不是拒绝：引用本身仍然可用（原文才是引用的身份），
+ * 不该因为译文过长让整次「设为引用」失败。
+ */
+const MAX_TRANSLATION_CHARS = 4000
+function annTranslation(v) {
+  const t = String(v || '').trim()
+  return t ? t.slice(0, MAX_TRANSLATION_CHARS) : ''
 }
 
 function safeWriteContent(bookId, chapterUid, text, selectedText) {
@@ -707,6 +929,9 @@ const server = http.createServer(async (req, res) => {
     for (const d of readJsonl(path.join(INBOX_DIR, 'annotations.jsonl'))) {
       annItems.push({ role: 'annotation', content: `《${d.bookTitle}》${d.chapter || ''}`,
         selectedText: d.selectedText, userNote: d.userNote || '',
+        // 译文（2026-11）：回放时也要带上，否则侧栏重开一次（本地引用被对账清理掉后
+        // 从 /history 重建）译文就没了——那正是用户看到"时好时坏"的成因。
+        ...(d.translation ? { translation: d.translation } : {}),
         bookId: d.bookId, bookTitle: d.bookTitle,
         chapter: d.chapter || '', chapterUid: d.chapterUid || '', chapterUidInt: d.chapterUidInt || 0,
         bookmarkRange: d.bookmarkRange || '', bookmarkId: d.bookmarkId || '',
@@ -714,6 +939,39 @@ const server = http.createServer(async (req, res) => {
         _ts: d.receivedAt || d.timestamp * 1000 })
     }
     const chatItems = []
+    /**
+     * 「带引用的提问」回放时要按原文认回译文（2026-11）。
+     *
+     * 为什么要在这里做：译文只存在标注存档里（annotations.jsonl 的 `translation`），
+     * 聊天库的 messages 表没这一列 —— 而 PDF 那条引用的横幅该显示译文。
+     * 与其给表加一列、改 schema、迁移历史库（为一个纯展示字段不值得），
+     * 不如回放时按「书 + 原文」把译文认回来：这两样消息里都有（bookId / selectedText）。
+     *
+     * 键用**归一化后的原文**（去掉所有空白）：pdf.js 抽文字时行尾断词会让同一段文字
+     * 在标注里与消息里差一个空格（agent 侧 findAnnotationContext 也是这个口径）。
+     */
+    const translationIndex = new Map()
+    for (const d of readJsonl(path.join(INBOX_DIR, 'annotations.jsonl'))) {
+      const tr = annTranslation(d.translation)
+      if (!tr || !d.selectedText) continue
+      translationIndex.set(baseBookId(d.bookId) + '::' + normalizeText(d.selectedText), tr)
+    }
+    /** 这条消息的引用有没有译文（认不到 → 'undefined'，侧栏照旧显示原文）。 */
+    const translationOf = (m) => {
+      if (!m.selectedText) return undefined
+      const tr = translationIndex.get(baseBookId(m.bookId) + '::' + normalizeText(m.selectedText))
+      if (tr) return tr
+      // 兜底：按前 24 字找（与阅读器 locateText 同一个口径）——重开一本书之后再点同一条
+      // 引用，两次抽出来的文字可能在断词处差一个字符，精确比不中。
+      const head = normalizeText(m.selectedText).slice(0, 24)
+      if (!head) return undefined
+      const b = baseBookId(m.bookId) + '::'
+      for (const [k, v] of translationIndex) {
+        if (k.startsWith(b) && k.slice(b.length).startsWith(head)) return v
+      }
+      return undefined
+    }
+
     // 聊天消息来自聊天库（一个查询，替代"读两个 jsonl 再各自排序拼接"）：
     // id 序 = 到达顺序；回答带 reply_to，与提问天然相邻。
     //
@@ -731,13 +989,19 @@ const server = http.createServer(async (req, res) => {
       console.error(`[history] 库=${CHAT_DB}` + (fs.existsSync(CHAT_DB + '-shm') ? '（-shm 存在：可能是 -shm/-wal 状态异常，先退出主程序再重启）' : ''))
     }
     for (const m of chatRows) {
-      // "排队中"的提问不回放（2026-02）：它是还没被回答的在途消息，侧栏发送时已经画过气泡，
-      // 回放只会让它长出第二个；而且它会被"未回复提问恢复"当成等待回答的提问，
-      // 弹出一个永远转圈的思考气泡。
-      if (m.status === 'pending') continue
+      // 「在途提问」也要回放（2026-11 修）。原先这里是不管角色一律 `status==='pending'` 跳过，
+      // 后果实测成一条 bug：面板在 AI 回答期间被关掉再打开时，库里只有这条 pending 提问、
+      // 回复还没落库 —— 把它滤掉，侧栏就既画不出提问气泡、也恢复不了"思考中"状态
+      //（恢复轮询本来就是靠"最新一条是提问、且没有回复"触发的），屏幕上空的，只能等回复
+      // 落库后再重开面板才看得见。所以 user 行的 pending **要**回放，并带上 pending 标记，
+      // 侧栏据此把它当"还在等回答"处理（气泡重复由侧栏的 _histKeys 幂等挡住：面板自己
+      // 发出去的那条提问在发送成功时就登记过 key）。
+      // 非 user 的 pending 行仍然跳过：assistant 落库即 ok/failed，本来不存在"在途回答"。
+      if (m.status === 'pending' && m.role !== 'user') continue
       if (m.role === 'user') {
         // 带书上下文的消息保留 bookId，供侧栏按书隔离引用与对话（AI-001）
         const item = { role: 'user', content: m.content, _ts: m.timestamp }
+        if (m.status === 'pending') item.pending = true
         if (m.bookId) {
           item.bookId = m.bookId
           item.bookTitle = m.bookTitle || ''
@@ -745,6 +1009,10 @@ const server = http.createServer(async (req, res) => {
           item.chapterUid = m.chapterUid || ''
           item.chapterUidInt = 0
           item.selectedText = m.selectedText || ''
+          // 译文（2026-11）：PDF 引用的横幅要显示用户读到的那句。认不到就不带字段，
+          // 侧栏一律回落原文（微读的提问、没翻译过的段落都走这条）。
+          const tr = translationOf(m)
+          if (tr) item.translation = tr
         }
         chatItems.push(item)
       } else {
@@ -848,24 +1116,40 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  // 会意图拓扑图（GET /graph[?demo=1][?free=1]）——AI-020
-  // 返回 { nodes, edges, updatedAt, demo, free, source }：节点 = 知识点（point/aliases/discussions），
-  // 边 = 用户问题意识轨迹（from → to，kind: user|derived）。数据源 = agent/data/
-  // knowledge-graph.json（会意系统固化的图文件，一张图一个文件，§5.3）；?demo=1 时
-  // 用演示拓扑（scripts/data/knowledge-graph-demo.json）重建，供侧栏图视图在真实图
-  // 为空时预览交互与命中高亮；?free=1 时返回自由模式沙盒图（agent/data/
-  // knowledge-graph.free.json，自由模式测试固化产物；文件不存在则回退正式图）。
+  // 会意图拓扑图（GET /graph[?demo=1][?free=1][?tutorial=1]）——AI-020
+  // 返回 { nodes, edges, updatedAt, demo, free, source, tutorial }：节点 = 知识点
+  // （point/aliases/discussions），边 = 用户问题意识轨迹（from → to，kind: user|derived）。
+  //
+  // 数据源按参数**互斥**地选一条，绝不混：
+  //   · 默认（不带参数）→ data\profile\knowledge-graph.json，用户自己的图
+  //   · ?demo=1     → 演示拓扑（builtin\knowledge-graph-demo.json），真实图为空时预览用
+  //   · ?tutorial=1 → **教程专用样例图**（扩展自带的 tutorial/graph-seed.json）
+  //
+  // ?free=1（2026-11 起**不再切换数据源**）：旧实现返回 knowledge-graph.free.json——
+  // 那是 2026-09 自由模式沙盒的产物（正式图深拷贝 + 测试节点）。沙盒早已没有写入方，
+  // 文件冻结在 2026-09-19；而 2026-11 的自由对话产物一律写正式图。两侧错位导致
+  // "归档后自由模式里看不到新节点"。现在这个参数被忽略、一律返回正式图——
+  // 老侧栏仍会带它发请求，所以参数本身不能删（删了老版本侧栏会拿到别的分支）。
+  //
+  // 为什么要最后那条（2026-11 用户要求）：教程要教"收口/命中"，而新用户的图是空的，
+  // 空图讲不了；但往用户自己的图里塞假节点更糟（那是他的资产）。
+  // 所以教程那条路**单独一份数据、单独一个开关**，默认的 /graph 一个字都不碰——
+  // "教程里看得见图"与"用户的图干净"因此可以同时成立。
   if (req.method === 'GET' && req.url.split('?')[0] === '/graph') {
     // 来源限制：只允许扩展读图（评审 P1 同款）
     if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
     const u = new URL(req.url, 'http://localhost')
     let out = readGraphFile()
-    if (u.searchParams.get('demo') === '1') {
+    if (u.searchParams.get('tutorial') === '1') {
+      // 教程图**只**来自扩展里那份种子，读不到就返回空图（不回退到用户的图——
+      // 一回退就等于把用户的节点混进来了，正是用户明确不要的）
+      const tg = readTutorialGraph(path.join(extensionDir(), 'tutorial', 'graph-seed.json'))
+      out = tg
+        ? { nodes: tg.nodes, edges: tg.edges, updatedAt: Date.now(), tutorial: true }
+        : { nodes: [], edges: [], updatedAt: Date.now(), tutorial: true, empty: true }
+    } else if (u.searchParams.get('demo') === '1') {
       const dg = buildDemoGraph()
       if (dg) out = { nodes: dg.nodes, edges: dg.edges, updatedAt: Date.now(), demo: true }
-    } else if (u.searchParams.get('free') === '1') {
-      const fg = readFreeGraphFile()
-      if (fg) out = fg
     }
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify(out))
@@ -952,7 +1236,15 @@ const server = http.createServer(async (req, res) => {
           let slot = ''
           if (/^[te]_\d+$/.test(base)) slot = base
           else if (/^\d+$/.test(base)) chapterUid = base
-          else { const m = base.match(/(?:^|_)([te]_\d+)$/); slot = m ? m[1] : '' }
+          else {
+            const m = base.match(/(?:^|_)([te]_\d+)$/)
+            if (m) slot = m[1]
+            // 都不是：**文件名本身就是它的章节标识**（内置教程书用的就是这种，如 `c01`）。
+            // 为什么要回填而不是留空：agent 那边是拿 chapterUid 去拼 `chapters\<uid>.txt` 的
+            //（agent/index.js:442），留空就只能靠"扫全部文件 + 模糊匹配"兜底，能work但绕远。
+            // 回填成文件名正好对上——文件就叫这个名字。
+            else chapterUid = base
+          }
           best = { filename: name, chapterUid, slot }
         }
       }
@@ -1021,6 +1313,9 @@ const server = http.createServer(async (req, res) => {
           if (d.bookId && baseBookId(d.bookId) === base) {
             out.push({
               selectedText: d.selectedText,
+              // 译文（2026-11）：PDF 阅读器那条引用才有。侧栏靠它显示"你读到的那句"，
+              // 与 SSE 推送（annotation-select）保持同一份字段，两条路各漏一处就会时有时无。
+              ...(d.translation ? { translation: d.translation } : {}),
               chapter: d.chapter || '',
               chapterUid: d.chapterUid || '',
               chapterUidInt: d.chapterUidInt || 0,
@@ -1124,6 +1419,32 @@ const server = http.createServer(async (req, res) => {
   const url = req.url
 
   try {
+    // 自检报告落盘（POST /selfcheck）——**只给开发者用**，进 logs\ 不进 data\：
+    // 它不是用户数据，是"扩展在真实环境里跑了一遍自检"的结果，给 AI 助手读回来定位问题。
+    // 为什么要这条通道：Chrome 137 起 --load-extension 被移除，自动化浏览器装不进未打包
+    // 扩展（本机 154 实测，连最小扩展也装不进去），于是"侧栏里的东西"没法自动验。
+    // 就让扩展在用户真实的浏览器里自己跑一遍、把结构化结果写出来——
+    // 这比让用户口述现象可靠得多。
+    //
+    // 为什么放在这个 try 里面（而不是上面那个 GET 分发里）：POST 的请求体是在这里
+    // 才解析好的（上面的 `data = await readBody(req)`），放外面会拿到 404 与空 body。
+    if (url === '/selfcheck') {
+      if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
+      const file = path.join(LOGS_DIR, 'selfcheck.json')
+      try {
+        fs.mkdirSync(LOGS_DIR, { recursive: true })
+        fs.writeFileSync(file, JSON.stringify(data, null, 2))
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: e.message }))
+        return
+      }
+      console.log(`[selfcheck] 收到自检报告：${data && data.passed}/${data && data.total} 项通过 → ${file}`)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, file }))
+      return
+    }
+
     if (url === '/hello') {
       // 插件报到（2026-10）：把**扩展 ID** 落到 data\runtime\extension-id。
       //
@@ -1194,7 +1515,18 @@ const server = http.createServer(async (req, res) => {
 
     } else if (url === '/annotation') {
       // 标注写入 inbox
-      const line = JSON.stringify({ ...data, receivedAt: Date.now() })
+      //
+      // 译文（2026-11）在这里收口成 `translation` 一个字段：写盘、下面三处读回
+      //（SSE / GET /annotations / GET /history）都只认它。空字符串 = 这条引用没有译文
+      //（微信读书的划线、PDF 里没翻译过的段落），此时**不写这个字段**——老记录里
+      // 没有它是常态，读取侧一律按"没有译文"回落原文。
+      const translation = annTranslation(data.translation)
+      const { translation: _dropTranslation, ...rest } = data
+      const line = JSON.stringify({
+        ...rest,
+        ...(translation ? { translation } : {}),
+        receivedAt: Date.now(),
+      })
       fs.appendFileSync(path.join(INBOX_DIR, 'annotations.jsonl'), line + '\n')
       writeBookMeta(data.bookId, data)
       // 阅读器来的引用（2026-11）：顺手把这本书登记齐（共读侧 meta.json + 书库侧
@@ -1212,6 +1544,10 @@ const server = http.createServer(async (req, res) => {
         pushSSE('message', {
           role: 'annotation-select',
           selectedText: data.selectedText,
+          // 译文（2026-11）：PDF 阅读器那条路才有。**必须透传**——侧栏的引用卡与
+          // 对话里的引用横幅显示的是"用户读到的那半边"，而 PDF 场景下用户读的是译文。
+          // 落盘时如果把它筛掉，用户看到的就是"设为引用之后译文不见了"。
+          ...(translation ? { translation } : {}),
           bookId: data.bookId,
           bookTitle: data.bookTitle,
           chapter: data.chapter || '',
@@ -1444,8 +1780,16 @@ const server = http.createServer(async (req, res) => {
       // 回填原文），不等回执，否则 agent 被强杀时按钮会永远卡在「停止」。
       const conv = baseBookId(String((data && data.conv) || ''))
       const targetTs = Number((data && data.targetTs) || 0)
-      // 校验：key 来自请求体，不能直接拼进文件名（路径穿越）。两个入口都只认已知形态。
-      const okShape = conv === '_common' || /^mia_[0-9a-z]+$/i.test(conv) || isFreeKey(conv)
+      // 会话 key 形态闸（2026-11 修）：文件名本身是 key 的 sha256 短哈希（见 paths.js
+      // sessionStopFile），所以这里挡的是"垃圾 key 落盘"，不是路径穿越。原先只认
+      // _common / mia_ / 自由对话三种，于是**微信读书的书 ID 与阅读器的 rd_ 书全被 400 拒掉**
+      // —— 表现为"在微读书里点「停止」从来没生效过"：本地气泡先删了、看着像停了，
+      // 而 agent 那头还在生成（信号文件压根没写）。这里补齐实际的对话 key 形态。
+      const okShape = conv === '_common'
+        || /^mia_[0-9a-z]+$/i.test(conv)          // marxists.org 网页阅读源
+        || /^[0-9a-f]{16,}$/i.test(conv)          // 微信读书：纯十六进制书 ID
+        || /^rd_[0-9a-f]+$/i.test(conv)           // CoRead 自己的阅读器（PDF）
+        || isFreeKey(conv)                        // 自由对话（哨兵 + 多对话）
       if (!conv || !okShape) {
         res.writeHead(400); res.end(JSON.stringify({ error: 'bad conv' })); return
       }
@@ -1714,6 +2058,17 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`Annotations: ${ANNOTATIONS_FILE}`)
   console.log(`Books:       ${BOOKS_DIR}`)
   console.log(`Chat DB:     ${CHAT_DB}`)
+  // 内置教程书：登记 + 导出章节正文（幂等，每次启动重做一遍，理由见该函数注释）。
+  // 放启动时做而不是等扩展来报：用户可能先开侧栏，「已读书籍」里就该有这本书。
+  try {
+    const t = ensureTutorialBook()
+    console.log(t.ok
+      ? `Tutorial:    ${t.title}（已登记，导出 ${t.chapters} 章正文）`
+      : `Tutorial:    跳过（${t.reason}）`)
+  } catch (e) {
+    // 教程书出问题不该拦住整个接收端：它是附加内容，坏了也要能正常共读别的书
+    console.log(`Tutorial:    登记失败（${e.message}）`)
+  }
 })
 
 // ── 优雅退出 ─────────────────────────────────────────────────────────────────

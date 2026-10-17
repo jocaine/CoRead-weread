@@ -344,6 +344,21 @@ let _pendingRefSearch = null  // AI-011：划线内容"引用栏搜索"的待搜
 // 当前阅读的书籍（AI-001 隔离）：由 content.js 广播 / 侧栏主动查询获得。
 // 切书后只显示当前书的引用与对话，其他书的上下文隐藏不删除。
 let _currentBook = null  // { base, bookTitle }
+/**
+ * 阅读器此刻**明确**报着一本真书吗（2026-11）。
+ *
+ * 用途：清空"当前书"之前的最后一道防线——**挡住那些"猜出来的清空"**（消息往返失败、
+ * 页面还没起来之类）。与 `_currentBook` 的区别：这个是"阅读器说的"，
+ * 那个是"侧栏当前认定的"，两者可能因为时序而不一致。
+ *
+ * ⚠️ 它**不等于**"用户在看这本书"（2026-11 二次改版）：阅读器标签页开着、但用户切到了
+ * 别的标签页时，清空是**对的**（与微信读书那本书表现一致）。所以由"活动标签页身份"
+ * 得出的清空会带 `authoritative` 绕过这道防线，见 applyBookContext。
+ */
+let _readerReportsBook = false
+// 上面那个事实是"什么时候知道的"（2026-11）。日志里带上它，
+// 才能一眼分清"阅读器刚说过有书"和"是很久以前说的、中间可能已经关掉了"。
+let _readerReportsBookAt = 0
 // 手动选书（2026-10）：读书模式未检测到阅读书籍时，从「已读过的书籍」里手动选择
 // 一本书查看它的历史记录——已读完的书在微信读书外没有聊天记录入口，这是查看/
 // 继续讨论的兜底。有效上下文优先级：自由模式 > 手动选书 > 实时检测到的书；
@@ -415,7 +430,11 @@ function serializeRefs() {
     chapterUid: a.chapterUid, chapterUidInt: a.chapterUidInt || 0,
     bookmarkRange: a.bookmarkRange || '', bookmarkId: a.bookmarkId || '',
     sourceUrl: a.sourceUrl || '',
-    selectedText: a.selectedText, refNum: a.refNum
+    selectedText: a.selectedText,
+    // 译文（2026-11）：不写进这里，面板重开后引用卡就变回原文显示 ——
+    // "刚设完是译文、重开一次成原文"正是这一处会漏的。
+    ...(a.translation ? { translation: a.translation } : {}),
+    refNum: a.refNum
   }))
 }
 function flushRefsSave() {
@@ -438,7 +457,10 @@ function saveState() {
         chapterUidInt: selectedAnn.chapterUidInt || 0,
         bookmarkRange: selectedAnn.bookmarkRange || '', bookmarkId: selectedAnn.bookmarkId || '',
         sourceUrl: selectedAnn.sourceUrl || '',
-        selectedText: selectedAnn.selectedText, refNum: selectedAnn.refNum
+        selectedText: selectedAnn.selectedText,
+        // 译文（2026-11）：同上——选中的那条也要带着，否则重开后卡片又显示原文
+        ...(selectedAnn.translation ? { translation: selectedAnn.translation } : {}),
+        refNum: selectedAnn.refNum
       } : null,
       // 2026-10：手动选书持久化——面板重开后保持上次手动查看的书；
       // refreshCurrentBook 启动时会检测真实阅读上下文，检测到书则自动退出
@@ -552,12 +574,170 @@ function applySetRef(ann) {
 }
 
 // 划线共读的直接消息通道（来自 content.js）：即使 receiver 未重启（没有 annotation-select SSE），
-// 侧栏已打开时也能实时把该标注设为当前引用
-chrome.runtime.onMessage.addListener((msg) => {
+// 侧栏已打开时也能实时把该标注设为当前引用。
+// 2026-11 起 content.js 真的会发它（画一条微信读书划线时）：面板关着时这条消息没有收件人
+// （静默失败），靠的是同一个动作里写下的 pendingSelectRef 待选标记——见 content.js 的
+// syncBookmarkRef 与下面的 applyPendingSelect。
+//
+// ⚠️ 参数列表必须带 `sendResponse`：里面有分支要**同步回答**（侧栏探针），
+// 漏了就报 `sendResponse is not defined`——自检报告里当场现形（2026-11）。
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // 书里点了「开始本课」：这一课在**侧栏**里跑（引导要高亮侧栏的真实控件）。
+  // 状态是书那边写进 storage 的，所以这里不接参数、直接 restoreRun() 读——
+  // 单一真源，避免"消息里带一份、storage 里又一份"两边不一致。
+  //
+  // 每一步都写 debug 日志（2026-11）：这条链路跨三个上下文，断了**不报错、只是没反应**。
+  // 上一轮用户报"侧栏没带起来"时，日志里只有后台那一条、侧栏这边完全空白，
+  // 于是分不清"广播没送到"还是"送到了但起不来"。补上这几条就能一眼分开。
+  if (msg?.action === 'coreadTutorialLesson') {
+    postSidebarDebug({ stage: 'tutorial-lesson-ping', chapter: msg.chapter, freeMode: _freeMode })
+    /**
+     * 开始上课时**必须先退出自由模式**（2026-11 自检抓到）。
+     *
+     * 用户在书里点了「开始本课」，意图是"在这本书上走一遍共读流程"；而自由模式是
+     * "没有书的随手记"。两者互斥——留在自由模式里，侧栏认的是一段自由对话而不是这本书，
+     * 课的每一步都会落空：例句不显示（见 tutorialSampleAnns）、引用卡是自由模式那一套、
+     * 引导层指着的地方点不动。用户看到的就是"教程没反应"。
+     * 这里替用户切回来（`toggleFreeMode` 自带 toast，用户看得见模式被切了）。
+     */
+    if (_freeMode) {
+      try {
+        toggleFreeMode()
+        postSidebarDebug({ stage: 'tutorial-lesson-exit-free' })
+      } catch (e) {
+        postSidebarDebug({ stage: 'tutorial-lesson-exit-free-failed', error: String((e && e.message) || e) })
+      }
+    }
+    loadTutorial()
+      .then((t) => {
+        // ⚠️ 这里把 `t` 的**真实形状**也报上去（2026-11）：实测出现过 `hasRestore:false`
+        // 而代码里 `loadTutorial()` 明明返回 `{guide, script}` —— 只看一个布尔值
+        // 分不清是"形状不对"还是"模块没导出那个函数"。报上类型与键名就能一眼分开。
+        postSidebarDebug({
+          stage: 'tutorial-lesson-loaded',
+          type: typeof t,
+          isArray: Array.isArray(t),
+          keys: t && typeof t === 'object' ? Object.keys(t).join(',') : String(t),
+          scriptKeys: t && t.script ? Object.keys(t.script).join(',') : '(无 script)',
+          // ⚠️ 查的是 `t.script.restoreRun`（`loadTutorial()` 返回 `{guide, script}`）。
+          // 先前写成 `t.restoreRun`——那是 undefined，于是**永远**回报 hasRestore:false、
+          // 永远不接课。实测日志里就是这样：ping → loaded(hasRestore:false) → restored(ok:false)。
+          // 这种错不报错、只是没反应，靠日志里那个 false 才看出来。
+          hasRestore: !!(t && t.script && t.script.restoreRun),
+        })
+        if (!t || !t.script || !t.script.restoreRun) return 'BAD_SHAPE'
+        return t.script.restoreRun()
+      })
+      .then((ok) => postSidebarDebug({ stage: 'tutorial-lesson-restored', ok: String(ok) }))
+      .catch((e) => postSidebarDebug({ stage: 'tutorial-lesson-failed', error: String((e && e.message) || e) }))
+    return
+  }
+  if (msg?.action === 'coreadTutorialProbe') {
+    // 教程 / 自检问侧栏的真实状态（2026-11）。为什么要这个口子：
+    // 用户连报几轮"还是不行"，而我只能从日志反推"他点的是哪个按钮、抽屉里到底有没有东西"。
+    // 有了它，自检可以直接问侧栏要一份**可读的事实**，不用猜。
+    //
+    // 注意是**同步回答**（sendResponse 立刻回，不返回 true 等异步）：
+    // 它只读内存里的几个变量，没有异步成分，而调用方（教程）等不起往返。
+    try {
+      sendResponse(tutorialProbe())
+    } catch (e) {
+      sendResponse({ ok: false, error: String((e && e.message) || e) })
+    }
+    return
+  }
+  /**
+   * 自检要能"**真的点一下**"（2026-11 用户质问："为什么不能用插件内的来试试看"）。
+   *
+   * ── 为什么必须加这条通道 ────────────────────────────────────────────────────
+   * 上面那条 `coreadTutorialProbe` 只能**问**状态，点不了任何东西。而用户报的
+   * "点切换引用之后底层界面跳回选书界面"——问的时候一切正常，**点下去**才出事。
+   * 于是自检一直是绿的，用户那边一直是坏的。
+   *
+   * 为什么不能让自检页自己去点：`chrome.scripting` / `tabs.sendMessage` 只能注入**网页**，
+   * 侧栏是扩展自己的页面，浏览器**没有**任何 API 能从外面往里注入脚本。
+   * 所以"点一下会怎样"只能在侧栏内部发生：这里列一张**动作表**，自检报动作名，
+   * 侧栏真的去 `.click()` 那个真按钮——走的是用户点它时**完全同一条**代码路径。
+   *
+   * ⚠️ 只认表里的名字，**不接受代码字符串**：MV3 的 CSP 是 `script-src 'self'`，
+   * `eval` / `new Function` 会被浏览器当场拒绝（踩过，见 selfcheck.js 里 readerOp 的注释）。
+   */
+  if (msg?.action === 'coreadSelfcheckOp') {
+    /** 用户眼睛能看到的那几件事：当前书、无书视图露没露、抽屉开着没、引用卡上是什么 */
+    const sideState = () => {
+      const nbView = document.getElementById('no-book-view')
+      return {
+      book: effectiveBookBase(),
+      picker: !!document.getElementById('book-picker')?.classList?.contains('on'),
+      drawer: !!document.getElementById('ref-drawer')?.classList?.contains('on'),
+      ref: String((document.getElementById('rc-text') || {}).textContent || ''),
+      sampleItems: document.querySelectorAll('#drawer-list .drawer-tut-item').length,
+      // 「回到选书界面」的**准确**判据（2026-11 自检实测订正）：
+      // 原先我用的是书单浮层 `#book-picker`，而用户看到的那一跳其实是**无书视图**
+      //（`#no-book-view`：内联已读书籍列表 + 底部那格换成 PDF 入口条）。
+      // 判据挂错元素 = 真出事时它还是绿的（实测：book 已经变空，picker 却是 false）。
+      noBook: !!nbView && nbView.hidden === false,
+      readerHasBook: _readerReportsBook,
+      }
+    }
+    const selfcheckOps = {
+      state: sideState,
+      /**
+       * 自检跑「切换引用」这一段之前先退出自由模式（2026-11 实测）。
+       *
+       * 为什么自检要动这个开关：自由模式里侧栏认的不是这本书，引用卡是另一套 UI，
+       * 这一段的前提根本不成立（实测红了两条前置断言）。让自检**把状态摆对**，
+       * 好过让它在一个跑不了的状态下报一堆看不懂的红。
+       * 与产品行为一致：开始上课时侧栏自己也会退出自由模式（见 coreadTutorialLesson）。
+       */
+      exitFreeMode() {
+        const was = _freeMode
+        if (_freeMode) toggleFreeMode()
+        return { ok: true, wasFree: was }
+      },
+      /** 用户点「切换引用 ▸」：就是那个按钮、就是那个处理器（openDrawer + 快照） */
+      clickSwitchRef() {
+        const b = document.getElementById('rc-switch-btn')
+        if (!b) return { ok: false, error: '#rc-switch-btn 不在（界面改过？）' }
+        b.click()
+        return { ok: true, clicked: 'rc-switch-btn' }
+      },
+      /** 用户点抽屉里的第 N 条教程例句：走它自己的 click 处理器（pickReference + 关抽屉） */
+      clickSample(arg) {
+        const i = Number(arg) || 0
+        const items = document.querySelectorAll('#drawer-list .drawer-tut-item')
+        if (!items[i]) return { ok: false, error: '抽屉里没有第 ' + i + ' 条（当前 ' + items.length + ' 条）' }
+        // 报回去的是**例句原文**（`.di-text` 里那一句），不是整个条目的文字——
+        // 条目里还带注释（"第 1 章 · …"），拿它去比对引用卡会永远对不上。
+        const text = String((items[i].querySelector('.di-text') || {}).textContent || '')
+        items[i].click()
+        return { ok: true, clicked: i, text: text }
+      },
+      closeRefDrawer() {
+        closeDrawer()
+        return { ok: true }
+      },
+    }
+    const fn = selfcheckOps[String(msg.op || '')]
+    if (!fn) {
+      sendResponse({ ok: false, error: '未知动作：' + String(msg.op) + '（可用：' + Object.keys(selfcheckOps).join('/') + '）' })
+      return
+    }
+    try {
+      const r = fn(msg.arg)
+      sendResponse(Object.assign({ ok: true }, r && typeof r === 'object' ? r : { value: r }))
+    } catch (e) {
+      sendResponse({ ok: false, error: String((e && e.message) || e) })
+    }
+    return
+  }
   if (msg?.action === 'coreadSetRefApply' && msg.ref) {
     const r = msg.ref
+    // 带上划线定位字段（bookmarkRange / bookmarkId）：与 receiver 的 annotation-sync
+    // 事件同形，删除引用时才认得出"是这条划线的引用"（否则同文本的多条会连坐）
     applySetRef({ bookId: r.bookId, bookTitle: r.bookTitle, chapter: r.chapter || '',
       chapterUid: r.chapterUid || '', chapterUidInt: r.chapterUidInt || 0, selectedText: r.selectedText,
+      bookmarkRange: r.bookmarkRange || '', bookmarkId: r.bookmarkId || '',
       sourceUrl: r.sourceUrl || '' })
   }
   // AI-021 网页阅读源：读者在网页上手动建书/绑定页面后，把该书设为手动查看的书
@@ -585,15 +765,155 @@ chrome.runtime.onMessage.addListener((msg) => {
     if (typeof msg.bookId === 'string') {
       _lastWereadContext = { base: baseBookId(msg.bookId), bookTitle: String(msg.bookTitle || '').trim() }
     }
-    applyBookContext(msg)
+    applyWereadBroadcast(msg, sender)
   }
 })
 
-// 解析用户消息中的 [引用] 标记，提取引用信息
+// 解析用户消息中的 [引用] 标记，提取引用信息。
+// ⚠️ 走 splitQuotedQuestion，**不要**自己写正则：引用块可能是多行（译文一换行就会），
+// 而正文里那个换行会提前结束引用块 —— 单行正则在这里会截出半句、进而配错引用。
 function parseRefFromContent(content) {
-  const match = (content || '').match(/^\[引用\]《(.+?)》([^\n]*)\n> "(.+?)"/)
-  if (!match) return null
-  return { bookTitle: match[1], chapter: match[2]?.trim(), selectedText: match[3] }
+  const q = splitQuotedQuestion(content)
+  return q ? { bookTitle: q.book, chapter: q.chapter, selectedText: q.quote } : null
+}
+
+/**
+ * 拆一条「带引用的提问」的 content：`[引用]《书名》章节` + `> "划线原文"` + 空行 + 提问正文。
+ *
+ * 为什么要拆：库里 user 消息对引用提问是**带前缀的**（写入侧见 submit 里的 body.content），
+ * 而气泡以前只喂正文（本地回显就是正文），于是同一条提问有两种长相——刚发出去是干净的
+ * 提问，重开面板后从历史回放却会连着 `[引用]《书名》…` 和 `> "原文"` 一起显示在绿气泡里。
+ * 现在发送与回放**喂同一份文本**（见 submit 的 bubbleText），气泡把这段前缀渲染成
+ * **上方横幅**（与回答气泡的 .ref-quote-preview 同一套视觉），正文另起一块。
+ *
+ * 返回 null = 不是引用提问（自由提问 / 斜杠命令 / 附件开头的消息），气泡照旧整段纯文本。
+ * 注意**只在开头认**：附件消息是 `[附件]《…》…\n\n[引用]…`，前缀不在行首就整段照旧，
+ * 免得把附件正文也误当引用块啃掉。
+ */
+function splitQuotedQuestion(content) {
+  const s = String(content || '')
+  const m = s.match(/^\[引用\]《([^》]*)》([^\n]*)\n/)
+  if (!m) return null
+  const lines = s.slice(m[0].length).split('\n')
+  const quotes = []
+  let i = 0
+  for (; i < lines.length; i++) {
+    const t = lines[i].trim()
+    if (t.startsWith('>')) { quotes.push(t.replace(/^>\s?/, '').replace(/^"|"$/g, '')); continue }
+    if (!t) { if (quotes.length) i++; break }   // 空行 = 引用块到此为止
+    break
+  }
+  if (!quotes.length) return null
+  return {
+    book: (m[1] || '').trim(),
+    chapter: (m[2] || '').trim(),
+    quote: quotes.join('\n'),
+    body: lines.slice(i).join('\n').replace(/^\n+/, '').replace(/\s+$/, ''),
+  }
+}
+
+/**
+ * 一个引用标记成什么文本：**扩展把译文设成的引用显示译文**（2026-11 用户定调）。
+ *
+ * 为什么要有这一层：PDF 场景下原文是外文、用户读的是译文，所以引用卡与对话里那条
+ * 引用横幅都该显示译文；但原文仍是这条引用的**身份**（判重、删除匹配、跳回原文全用它，
+ * 见 sameRef / refMatches），一个字都不能动。有译文用译文，没有就回落原文 ——
+ * 微信读书的划线、以及没翻译过的段落都走回落，长相与改动前完全一致。
+ */
+function refDisplayText(a) {
+  if (!a) return ''
+  return String(a.translation || '').trim() || String(a.selectedText || '')
+}
+
+// 引用横幅里最多显示多少字：与回答气泡的引用条同一个 80 字口径（超出打省略号），
+// 全文放 title —— 提问气泡的横幅是"这条提问引了哪段"，不是给人读原文的地方。
+const QUOTE_BANNER_MAX = 80
+
+/**
+ * 把一条提问拼成 `[引用]《书名》章节` + `> "引用块"` + 空行 + 正文。
+ * 引用块可多行：每行都带 `>`，因为正文里的换行会**提前结束**引用块（见 splitQuotedQuestion）。
+ */
+function buildQuotedQuestion(book, chapter, quoteText, body) {
+  const quoted = String(quoteText || '').split('\n')
+    .map((line) => '> "' + line + '"')
+    .join('\n')
+  return `[引用]《${book || ''}》${chapter || ''}\n${quoted}\n\n${body || ''}`
+}
+
+/**
+ * 一条提问该显示成什么文本：能凑出 `[引用]《书名》章节` + `> "原文"` 的形态就凑出来，
+ * 再由 splitQuotedQuestion 拆成"上方横幅 + 正文"。
+ *
+ * 为什么要有这一层：**两种提问在数据里的长相不一样**——
+ *   · 侧栏提交：content 自带前缀（`[引用]…\n> "…"\n\n提问`，写入侧见 submit）；
+ *   · 共读弹窗提交：content 只有提问，引用另存 selectedText 字段（receiver 的 /chat 落库）。
+ * 后者若不在这里拼回来，同一条"带引用的提问"就会有两种下场：实时气泡靠 selectedText 画出
+ * 引用行、重开面板后从历史回放却**连引用一起不见了**（历史回放只喂 content）。
+ *
+ * ⚠️ 2026-11：`msg.translation` 有值时横幅显示**译文**（见 refDisplayText）。
+ * 历史消息落库的 content 里存的是当时的引用块（老消息里是原文），所以回放时用
+ * `/history` 带回来的 translation 把那一块**重建**一遍 —— 不重建的话，同一条提问
+ * "刚发出去显示译文、重开面板后变回原文"，又是一处"两种长相"。
+ * 认不出是哪条引用时原样返回，绝不猜。
+ */
+function quotedQuestionText(msg) {
+  const c = String((msg && msg.content) || '')
+  const display = String((msg && msg.translation) || '').trim()
+  if (/^\[引用\]/.test(c)) {
+    if (!display) return c
+    const q = splitQuotedQuestion(c)
+    if (!q) return c
+    return buildQuotedQuestion(q.book, q.chapter, display, q.body)
+  }
+  const sel = String((msg && msg.selectedText) || '')
+  if (!sel) return c
+  // PDF 那条路：selectedText 是原文（引用身份），translation 是用户读到的那半边
+  return buildQuotedQuestion((msg && msg.bookTitle) || '', (msg && msg.chapter) || '',
+    display || sel, c)
+}
+
+/** 带引用的提问气泡的 HTML：上方横幅（引用文本）+ 正文。
+ *  横幅**只是横幅**：不出回答气泡那根竖排书名条（2026-11 用户定调"竖着的不要"）；
+ *  书名与章节**也不显示在横幅上**（同日用户定调）——横幅就照回答气泡那条的样子，
+ *  只有引用文本。悬停提示同理只放引用全文（横幅截断时能看到全的）。
+ *  书名/章节仍在解析结果里（`q.book`/`q.chapter` 用于点击横幅时选回那条引用），
+ *  只是不上屏。
+ *
+ *  `q.quote` 走的是 refDisplayText：PDF 那条引用带译文时这里显示**译文**，
+ *  原文进 title —— 气泡是给人读的，而用户读得懂的是译文。 */
+function userQuoteBubbleHTML(q) {
+  const full = q.quote
+  const shown = full.length > QUOTE_BANNER_MAX ? full.slice(0, QUOTE_BANNER_MAX) + '…' : full
+  return (
+    '<div class="bubble">' +
+      // title 走 escAttr：原文里可能有半角引号（译文常见），esc 不转义 `"`，直接拼会把属性提前闭合
+      '<div class="uq-quote" title="' + escAttr(full) + '">' +
+        '<span class="uqq-text">"' + esc(shown) + '"</span>' +
+      '</div>' +
+      '<div class="uq-body">' + esc(q.body) + '</div>' +
+    '</div>'
+  )
+}
+
+/**
+ * 把一条提问的文本渲染进气泡：拆得出引用 → 上方横幅 + 正文；拆不出 → 整段纯文本。
+ * 横幅可点（与回答气泡的引用条同一个动作：把这条引用设回"当前引用"）。
+ * 侧栏提交的提问、共读弹窗来的提问、历史回放三条路都走它——三种入口一种长相。
+ */
+function renderQuoteBubble(el, content) {
+  const q = splitQuotedQuestion(content)
+  if (!q) {
+    el.innerHTML = `<div class="bubble">${esc(content)}</div>`
+    return false
+  }
+  el.innerHTML = userQuoteBubbleHTML(q)
+  const quoteEl = el.querySelector('.uq-quote')
+  if (quoteEl) {
+    quoteEl.addEventListener('click', () => selectRefByPending({
+      bookTitle: q.book, chapter: q.chapter, selectedText: q.quote,
+    }))
+  }
+  return true
 }
 
 function addRecentAnn(ann, opts = {}) {
@@ -627,13 +947,34 @@ function addRecentAnn(ann, opts = {}) {
   renderRefUI()
 }
 
+/**
+ * 书名比较（容错，2026-11）。
+ *
+ * 同一本书在数据里**可能有两种写法**：老数据把章节拼在书名里
+ *（「大国大城：当代中国的统一、发展与平衡 1 欧洲正经历大考」），
+ * 新数据从写入侧起只留干净书名（「大国大城：当代中国的统一、发展与平衡」）。
+ *
+ * 为什么必须容错：历史消息里的引用条、历史引用列表都还是老写法，而这两处
+ *（findRefNum 找序号、selectRefByPending 点引用条切当前引用）以前是 `===` 比较——
+ * 一旦一边干净一边带章节，就会**静默不匹配**：用户点引用条，界面上什么都不发生。
+ * 两种写法之间恰好是"前缀"关系，用前缀判定既认得出同一本，又不会张冠李戴
+ *（真正的身份另有 sameRef：bookId + 原文，这里只管显示与选中）。
+ */
+function titleMatches(a, b) {
+  const x = String(a || '').trim()
+  const y = String(b || '').trim()
+  if (x === y) return true
+  if (!x || !y) return false
+  return x.indexOf(y) === 0 || y.indexOf(x) === 0
+}
+
 // 根据引用文本查找序号
 function findRefNum(bookTitle, chapter, selectedText) {
   for (const a of RECENT_ANNS) {
-    if (a.bookTitle === bookTitle && a.selectedText === selectedText) return a.refNum
+    if (titleMatches(a.bookTitle, bookTitle) && a.selectedText === selectedText) return a.refNum
   }
   for (const a of RECENT_ANNS) {
-    if (a.bookTitle === bookTitle && selectedText && (a.selectedText || '').includes(selectedText.slice(0, 30))) return a.refNum
+    if (titleMatches(a.bookTitle, bookTitle) && selectedText && (a.selectedText || '').includes(selectedText.slice(0, 30))) return a.refNum
   }
   return ''
 }
@@ -641,7 +982,7 @@ function findRefNum(bookTitle, chapter, selectedText) {
 // 根据 pendingRef 信息选中对应的引用
 function selectRefByPending(ref) {
   for (const a of RECENT_ANNS) {
-    if (a.bookTitle === ref.bookTitle && sameRef(a, ref)) {
+    if (titleMatches(a.bookTitle, ref.bookTitle) && sameRef(a, ref)) {
       selectedAnn = a
       clearPendingSelect()  // 用户显式选择取代残留待办
       saveState()
@@ -650,7 +991,7 @@ function selectRefByPending(ref) {
     }
   }
   for (const a of RECENT_ANNS) {
-    if (a.bookTitle === ref.bookTitle && ref.selectedText &&
+    if (titleMatches(a.bookTitle, ref.bookTitle) && ref.selectedText &&
         (a.selectedText || '').includes(ref.selectedText.slice(0, 30))) {
       selectedAnn = a
       clearPendingSelect()  // 用户显式选择取代残留待办
@@ -662,15 +1003,21 @@ function selectRefByPending(ref) {
 }
 
 // ── 当前引用卡片 ──────────────────────────────────────────────────────────
-// AI-018：折叠态缩略概览 = 书名 + 划线前文。选中引用时填充，空态/无选中时清空，
+// 主体显示什么：refDisplayText —— 带译文的引用（PDF 翻译那条路）显示译文，
+// 其余照旧显示原文。原文**不藏起来**：卡片里有"原文"一栏可展开（见 renderCurrentRef），
+// 点「📍」跳回原文也永远按原文定位（引用身份始终是原文）。
+//
+// AI-018：折叠态缩略概览 = 书名 + 引用前文。选中引用时填充，空态/无选中时清空，
 // 折叠时（.collapsed 且非 .empty）CSS 显示它——切换引用后折叠态也能直接看清当前引用。
 function renderCollapsedPreview() {
   const pv = document.getElementById('rc-preview')
   if (!pv) return
   if (!selectedAnn) { pv.innerHTML = ''; return }
+  const hasTr = !!String(selectedAnn.translation || '').trim()
   pv.innerHTML =
     `<div class="rcp-book">《${esc(selectedAnn.bookTitle || '')}》</div>` +
-    `<div class="rcp-text">${esc(selectedAnn.selectedText || '')}</div>`
+    `<div class="rcp-text"${hasTr ? ` title="${escAttr('原文：' + (selectedAnn.selectedText || ''))}"` : ''}>` +
+    `${esc(refDisplayText(selectedAnn))}</div>`
 }
 
 function renderCurrentRef() {
@@ -719,13 +1066,54 @@ function renderCurrentRef() {
   renderJumpBack()  // AI-006：有跳转记录才显示「↩ 返回」
 
   renderCollapsedPreview()
-  document.getElementById('rc-text').textContent = selectedAnn.selectedText || ''
+  renderCurrentRefBody(selectedAnn)
   document.getElementById('rc-book').textContent = selectedAnn.bookTitle || ''
 
   const chapter = selectedAnn.chapter || ''
   const len = (selectedAnn.selectedText || '').length
   document.getElementById('rc-meta').innerHTML =
-    `${chapter ? `<span>${esc(chapter)}</span>` : ''}<span>${len} 字</span>`
+    `${chapter ? `<span>章节：${esc(chapter)}</span>` : ''}<span>${len} 字</span>`
+}
+
+/**
+ * 卡片正文：**主体是引用文本，译文优先**（见 refDisplayText）。
+ *
+ * 带译文时另起一栏「原文」——默认收起，点一下展开。
+ * 为什么要留这一栏（而不是把原文彻底藏掉）：原文是这条引用的身份，
+ * 用户核对"引的到底是哪一句"、以及把它跟书页对上时都要看它；
+ * 但它不该跟译文抢主角位置（PDF 场景下用户根本读不懂它）。
+ */
+function renderCurrentRefBody(a) {
+  const box = document.getElementById('rc-text')
+  if (!box) return
+  const original = String((a && a.selectedText) || '')
+  const translation = String((a && a.translation) || '').trim()
+
+  box.replaceChildren()
+  const main = document.createElement('div')
+  main.className = 'rc-main'
+  main.textContent = refDisplayText(a)
+  box.appendChild(main)
+
+  if (!translation || !original) return   // 没有译文：就是原来的单块原文，一个字都不变
+
+  const details = document.createElement('div')
+  details.className = 'rc-orig'
+  const btn = document.createElement('button')
+  btn.type = 'button'
+  btn.className = 'rc-orig-toggle'
+  btn.textContent = '原文 ▸'
+  btn.title = '显示这条引用的原文（引用按原文定位、按原文判重）'
+  const body = document.createElement('div')
+  body.className = 'rc-orig-text'
+  body.hidden = true
+  body.textContent = original
+  btn.addEventListener('click', () => {
+    body.hidden = !body.hidden
+    btn.textContent = body.hidden ? '原文 ▸' : '原文 ▾'
+  })
+  details.append(btn, body)
+  box.appendChild(details)
 }
 
 // ── 引用列表抽屉 ──────────────────────────────────────────────────────────
@@ -805,6 +1193,177 @@ function matchVisibleInPreview(text, q) {
   return false
 }
 
+/**
+ * 教程预置引用（2026-11 用户要求）。
+ *
+ * 数据在 `extension/tutorial/sample-refs.json`，**侧栏启动时 fetch 一次**。
+ *
+ * ── 为什么不是"用的时候再去模块里取" ─────────────────────────────────────────
+ * 用户的原话是"你直接给他添加些预设的例句有什么难的"。他是对的：上一版让它依赖了
+ * 三件不该依赖的事——侧栏认不认得出当前是教程书（`effectiveBookBase() !== TUTORIAL_BASE`
+ * 就返回空）、ES 模块加载完没有、抽屉什么时候渲染。任何一环不满足，用户看到的就是空列表，
+ * 而且**不报错**，他只能点"跳过"。
+ *
+ * 所以现在：**静态数据、启动即读、没有任何前置条件、不进用户的引用库**
+ * （不调 addRecentAnn——用户划的线是他自己的东西）。
+ */
+let SAMPLE_REFS = null
+async function loadSampleRefs() {
+  try {
+    const r = await fetch(chrome.runtime.getURL('tutorial/sample-refs.json'))
+    if (!r.ok) throw new Error('HTTP ' + r.status)
+    const j = await r.json()
+    SAMPLE_REFS = (j && Array.isArray(j.items)) ? j : null
+    postSidebarDebug({ stage: 'sample-refs-loaded', count: SAMPLE_REFS ? SAMPLE_REFS.items.length : 0 })
+  } catch (e) {
+    // 读不到就报出来——这类"静默空列表"正是上一版最难查的地方
+    postSidebarDebug({ stage: 'sample-refs-load-failed', error: String((e && e.message) || e) })
+    SAMPLE_REFS = null
+  }
+}
+
+let _lastSampleDiag = 0
+function tutorialSampleAnns() {
+  const mod = SAMPLE_REFS
+  if (!mod || !Array.isArray(mod.items) || !mod.items.length) {
+    diagOnce({ reason: '例句表没读到（见 sample-refs-load-failed）' })
+    return []
+  }
+  /**
+   * ⚠️⚠️ **只在《第一次共读》这本书里显示**（2026-11 用户实测："我在别的书打开「切换引用」，
+   * 还是能看到给教程准备的那几条例句"）。
+   *
+   * 这条检查**本来就有**，在某一轮重写里丢了。日志留着证据（更早的记录）：
+   *   {"stage":"sample-refs","bookBase":"","tutorialBase":"rd_e0c91cb6aa56dd005",
+   *    "hasMod":true,"count":6,"reason":"当前书不是教程书"}
+   * 丢了之后只剩下一条"自由模式"的判断（那是另一件事：自由模式里点了没反应），
+   * 于是**除了自由模式，随便哪本书打开抽屉都能看到这 6 条例句**。
+   *
+   * 判据用例句表**自己带的** `bookId`（= 教程书在共读侧的 ID），不再另引一个常量：
+   * "这些例句属于哪本书"和"什么时候显示它们"从此来自同一处，不会再分叉。
+   * 自由模式也在这一条里被挡掉——那时 effectiveBookBase() 是一段自由对话的 key，不是这本书。
+   */
+  const bookNow = effectiveBookBase()
+  if (bookNow !== mod.bookId) {
+    diagOnce({
+      reason: '当前书不是教程书',
+      bookBase: String(bookNow || '').slice(0, 24),
+      tutorialBase: String(mod.bookId || '').slice(0, 24),
+      hasMod: true,
+      freeMode: _freeMode,
+    })
+    return []
+  }
+  return mod.items.map((it, i) => ({
+    bookId: mod.bookId,
+    bookTitle: mod.bookTitle,
+    chapter: mod.chapter || '',
+    selectedText: it.text,
+    note: it.note || '',
+    __tutorialSample: true,
+    ts: 0 - i,   // 保证排序稳定（样例永远排在一起，不参与"最近"排序）
+  }))
+}
+
+/** 诊断节流：抽屉会被反复打开，别把日志刷爆 */
+function diagOnce(extra) {
+  const now = Date.now()
+  if (now - _lastSampleDiag < 1500) return
+  _lastSampleDiag = now
+  postSidebarDebug(Object.assign({ stage: 'sample-refs', count: (SAMPLE_REFS && SAMPLE_REFS.items || []).length }, extra))
+}
+
+/**
+ * 侧栏的真实状态（供教程与自检查询）。
+ *
+ * 这是"不要再猜"的落点：例句在不在、当前书认没认出来、教程走到第几步、
+ * 引用卡里现在是什么——全部一次性读出来。这些都是本页面内存里的东西，回答没有异步成分。
+ */
+function tutorialProbe() {
+  const script = window.__tutorialScript
+  const st = script && script.state ? script.state() : null
+  const items = tutorialSampleAnns()
+  const drawerList = document.getElementById('drawer-list')
+  const drawerSamples = drawerList ? drawerList.querySelectorAll('.drawer-tut-item').length : 0
+  return {
+    ok: true,
+    // 例句相关的三件事分开报：数据读到没、能造出几条、抽屉里真渲染出几条
+    sampleDataLoaded: !!(SAMPLE_REFS && SAMPLE_REFS.items && SAMPLE_REFS.items.length),
+    sampleCount: items.length,
+    drawerSampleItems: drawerSamples,
+    drawerHasSamples: drawerSamples > 0,
+    drawerOpen: !!(document.getElementById('ref-drawer') || {}).classList
+      && document.getElementById('ref-drawer').classList.contains('on'),
+    bookBase: effectiveBookBase(),
+    isTutorialBook: effectiveBookBase() === TUTORIAL_BASE,
+    refText: String(((document.getElementById('rc-text') || {}).textContent) || '').slice(0, 40),
+    tutorial: st ? { active: st.active, lesson: st.lesson, step: st.step, stepCount: st.stepCount, title: st.title } : null,
+    guide: (() => {
+      const tip = document.getElementById('tut-guide-tip')
+      if (!tip || tip.hidden) return null
+      return {
+        step: (tip.querySelector('.tg-step') || {}).textContent || '',
+        title: (tip.querySelector('.tg-title') || {}).textContent || '',
+        actions: [...tip.querySelectorAll('.tg-acts button')].map((b) => b.textContent),
+      }
+    })(),
+    // 引用卡上那两个按钮的实际位置——"用户到底点了哪个"这个问题以后不必再靠日志反推
+    refCardButtons: [...document.querySelectorAll('#ref-current button, .rc-head button')].map((b) => ({
+      id: b.id, text: String(b.textContent || '').trim().slice(0, 12), title: String(b.title || '').slice(0, 20),
+    })),
+  }
+}
+window.__coreadTutorialProbe = tutorialProbe
+
+/**
+ * 把一条引用设为当前引用（教程例句与"继续教程"都要用）。
+ *
+ * 为什么要把"选引用"抽出来：原来只有抽屉里那一条 DOM 处理器会这么干，
+ * 于是别的地方（教程引导卡片上的「用这句」按钮）想选一条只能**再写一遍**——
+ * 而"再写一遍"的代价是两边会分叉（一边清了待选标记、另一边忘了）。
+ */
+function pickReference(ann) {
+  if (!ann) return false
+  selectedAnn = ann
+  clearPendingSelect()   // 用户显式选择取代残留待办
+  saveState()
+  renderRefUI()
+  return true
+}
+
+/** 供教程引导卡片调用：按例句原文挑一条（参数是文本，不是对象——跨模块传引用不稳妥） */
+window.__coreadPickSampleRef = function (text) {
+  const want = String(text || '').trim()
+  if (!want) return false
+  const list = tutorialSampleAnns()
+  const hit = list.find((s) => s.selectedText === want)
+  if (!hit) {
+    postSidebarDebug({ stage: 'pick-sample-miss', want: want.slice(0, 24), count: list.length })
+    return false
+  }
+  pickReference(hit)
+  closeDrawer()
+  postSidebarDebug({ stage: 'pick-sample-ok', text: want.slice(0, 24) })
+  return true
+}
+
+/** 抽屉里一条教程例句（结构与真引用条目一致，所以"选中"走的是同一条路） */
+function buildTutorialSampleItem(s) {
+  const item = document.createElement('div')
+  item.className = 'drawer-item drawer-tut-item'
+  item.dataset.guidePin = ''      // 引导层不遮：教程那一步就是要点它
+  item.innerHTML = `<div class="di-text"></div>` + (s.note ? `<div class="di-note"></div>` : '')
+  item.querySelector('.di-text').textContent = s.selectedText
+  if (s.note) item.querySelector('.di-note').textContent = s.note
+  item.addEventListener('click', (e) => {
+    e.stopPropagation()
+    // 走与真引用**完全相同**的选中路径（pickReference）：这样"切换引用"学到的东西对真引用一样成立
+    pickReference(s)
+    closeDrawer()
+  })
+  return item
+}
+
 function renderDrawer() {
   const list = document.getElementById('drawer-list')
   list.innerHTML = ''
@@ -818,7 +1377,20 @@ function renderDrawer() {
 
   const anns = filterAnns()
 
+  // 教程预置引用（2026-11 用户要求："事先准备好一些引用"）。
+  // 只在《第一次共读》这本书里出现，且**只进这个抽屉**，不写进用户的引用库——
+  // 用户的划线是他的东西，不该被我们塞样例进去。
+  const tutSamples = tutorialSampleAnns()
+  if (tutSamples.length) {
+    const head = document.createElement('div')
+    head.className = 'drawer-tut-head'
+    head.textContent = '教程例句（这本手册自带的样例，不会进你的引用库）'
+    list.appendChild(head)
+    for (const s of tutSamples) list.appendChild(buildTutorialSampleItem(s))
+  }
+
   if (anns.length === 0) {
+    if (tutSamples.length) return   // 上面已经给了样例，不再显示"无匹配引用"
     const hint = !effBook
       ? '未在读书籍页：请打开一本书，或从已读书籍中选择'
       : '无匹配引用'
@@ -845,12 +1417,15 @@ function renderDrawer() {
     const toggleHtml = exceeded
       ? `<span class="di-toggle">${autoExpand ? '折叠 ▲' : '展开 ▼'}</span>`
       : ''  // 全文不足 50 字：概览即全文，无需展开按钮
+    // 「章节：」标签跟着值走（2026-11）：chapter 为空时这一行留空，
+    // **不留一句没下文的"章节："**。标签写在 hl() 外面，搜索命中只染章节名本身。
+    const chapterHtml = ann.chapter ? `章节：${hl(ann.chapter.slice(0, 40), q)}` : ''
     item.innerHTML = `
       <div class="di-head">
         <span class="di-num">#${ann.refNum || '?'}</span>
         <span class="di-book">${hl(ann.bookTitle || '未知书籍', q)}</span>
       </div>
-      <div class="di-chapter">${hl((ann.chapter || '').slice(0, 40), q)}</div>
+      <div class="di-chapter">${chapterHtml}</div>
       <div class="di-text">${hl(previewText, q)}</div>
       <div class="di-full">${hl(raw, q)}</div>
       ${toggleHtml}
@@ -927,6 +1502,9 @@ async function syncAnnsFromReceiver() {
           chapterUidInt: d.chapterUidInt || 0,
           bookmarkRange: d.bookmarkRange || '', bookmarkId: d.bookmarkId || '',
           selectedText: d.selectedText,
+          // 译文（2026-11）：SSE 断线后靠这趟全量补齐，漏了它就会出现
+          // "实时那条有译文、补齐出来的那条没有"
+          ...(d.translation ? { translation: d.translation } : {}),
         }, { select: false })
         added++
       }
@@ -960,6 +1538,8 @@ async function openDrawerWithSearch(query) {
 
 function closeDrawer() {
   document.getElementById('ref-drawer').classList.remove('on')
+  // 抽屉收掉之后高亮要挪回引用卡，否则它会悬在一个已经消失的面板上
+  try { guideBackFromDrawer() } catch (e) {}
 }
 
 function renderRefUI() {
@@ -1018,16 +1598,63 @@ function renderCurrentBook() {
 // 手动选书）时隐藏全部消息，消息区由「无书默认界面」接管——不再像旧逻辑那样
 // 残留显示上一本书/全部书的内容（2026-10 修复）。自由对话之间同样按 key 隔离
 //（2026-11 多对话）：切对话 = 切 key，天然只显示该场对话。
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// ⚠️ **消息区是"一个容器装所有会话"**：切书 / 切对话只把别的会话的气泡置成
+// `display:none`，**不从 DOM 移除**。所以 #msgs 里躺着所有会话的历史，几百个隐藏
+// 节点是常态。由此派生出一条铁律（2026-11 用一次真实故障换来）：
+//
+//   **任何想知道"这格有什么 / 有多少 / 是不是空的"的代码，都必须同时按
+//   上下文归属 + 可见性判断，一律走下面 nodesInContext()。**
+//
+// 只数"有没有子元素"的判据会永远为真——2026-11 开场卡整整两轮没露面，就是
+// hasRealMsg() 撞上别的书的隐藏气泡、认定"已有内容"（屏幕上什么都没有，日志却
+// 说 real=true）。裸写 `for (const el of msgs.children)` 属于同类错误，
+// test/selftest/check-msgs-walk.mjs 会在跑批时直接拦下。
+// ─────────────────────────────────────────────────────────────────────────────
 function applyBookFilter() {
   const book = effectiveBookBase()
   const msgs = document.getElementById('msgs')
-  for (const el of msgs.children) {
+  for (const el of msgs.children) {   // msgs-walk-ok: 规则的**源头**，它自己定义可见性
     const b = el.dataset.book || ''
     el.style.display = (book && b === book) ? '' : 'none'
   }
   // AI-005：切书后浮窗提问列表同步刷新（只列当前书可见的提问）
   renderJumpBars()
   if (jumpFab && jumpFab.classList.contains('open')) renderJumpList()
+}
+
+/**
+ * 一条消息是不是属于**当前**上下文的？—— 与 applyBookFilter 同一把尺子。
+ *
+ * 这是"当前会话可见内容"的唯一定义。别的判据（数数、判空、收集提问、清理节点）都不
+ * 该自己再写一遍：两边一旦分叉，就会出现"看得见的是空的、代码却认为有内容"这类
+ * 幽灵 bug（2026-11 实测）。
+ */
+function msgInCurrentContext(el) {
+  const book = effectiveBookBase()
+  if (!book || !el) return false
+  return String((el.dataset && el.dataset.book) || '') === book
+}
+
+/**
+ * 当前上下文的节点（顺序 = DOM 顺序）。**遍历消息区一律用它**，别裸写 msgs.children：
+ *   · 过滤掉别的书 / 别的对话的气泡（它们只是被隐藏，还在 DOM 里）
+ *   · 过滤掉开场卡的壳（id=intro，它不属于"内容"）
+ * 传 all=true 才返回不过滤的原始列表（只有 msgsDigest 这类诊断要用，见那边的 marker）。
+ *
+ * 返回的是**新数组**：调用方可以边遍历边 remove/append 而不受影响。
+ */
+function nodesInContext({ all = false } = {}) {
+  const msgs = document.getElementById('msgs')
+  if (!msgs) return []
+  const out = []
+  for (const el of msgs.children) {   // msgs-walk-ok: 唯一入口自身
+    if (all) { out.push(el); continue }
+    if (el.id === 'intro') continue
+    if (msgInCurrentContext(el)) out.push(el)
+  }
+  return out
 }
 
 // 滚到底部展示当前上下文最新内容。必须在 #msgs 可见后调用：无书状态下
@@ -1085,7 +1712,15 @@ function leaveManualBookIfRealRead(next) {
 // 刷新引用/消息过滤。手动选书期间，实时上下文不打断手动查看；一旦检测到真实
 // 阅读上下文（任何一本书），自动退出手动选书恢复跟随——手动选书是"无书时查看
 // 历史记录"的兜底入口（2026-10）。
-function applyBookContext(ctx) {
+//
+// ⚠️ 第三个参数 `opts.authoritative`（2026-11 二次改版）：
+//   含义是"**这个结论来自问不倒的事实**，不要去质疑它"（目前只有一种来源：
+//   活动标签页是哪一类页面 —— 只查 URL，不问消息，见 refreshCurrentBook）。
+//   它唯一的作用是绕过下面 `_readerReportsBook` 那道防线。为什么必须能绕过：
+//   那道防线是"阅读器开着书就不许清空"，而"阅读器开着"**不等于**"用户在看它" ——
+//   用户切到毫不相干的网页时，侧栏就该回到无书界面（与微信读书标签页一致），
+//   此时防线必须让路，否则又变回"只要那个标签页还在，侧栏就一直挂着它的会话"。
+function applyBookContext(ctx, why, opts) {
   const rawBase = baseBookId(ctx && ctx.bookId)
   // 防御：只认形如真实书 ID 的 bookId。书架/首页等非阅读页的历史广播可能带
   // "shelf"、空串等垃圾值，若写入 _currentBook 会让引用隔离失效（AI-001）。
@@ -1093,9 +1728,72 @@ function applyBookContext(ctx) {
   const bookTitle = String((ctx && ctx.bookTitle) || '').trim()
   const next = base ? { base, bookTitle } : null
   const prevEffBase = effectiveBookBase()
+  /**
+   * 诊断（2026-11）：**"当前书被清空"这件事必须留痕**。
+   *
+   * 快照显示：点开切换引用后的 0.4 秒内，侧栏的"当前书"从 `rd_e0c91c…` 变成空，
+   * 而阅读器**一直**好好地报着"第一次共读"。也就是说清空是侧栏自己干的，
+   * 但日志里看不出是**哪条路**（`refreshCurrentBook` 的清空分支、阅读器快照的清空分支、
+   * 退出自由模式、还是别的）——用户看到的"底层界面回到选书界面"就是它，而我没有证据只能猜。
+   * 所以这里把调用来源（堆栈）一起记下来。
+   */
+  if (!next && _currentBook) {
+    /**
+     * ⚠️ **防线**（2026-11）：如果阅读器此刻报着一本真书，就不许清空。
+     *
+     * 为什么加它：快照显示点开抽屉后的 0.4 秒内"当前书"被清空，而阅读器**一直**
+     * 好好地报着"第一次共读"。清空走的是哪条路我还没抓到（已加日志），
+     * 但无论哪条路，**"阅读器开着书"这个事实优先于任何清空意图**——
+     * 清了就是用户看到的"底层界面回到选书界面"（书单铺开 + 底部那格换成 PDF 入口条）。
+     *
+     * 这道防线不猜来源、不依赖时序，直接把最坏的结果挡住。
+     *
+     * ⚠️ 但它**只挡"猜出来的清空"**（2026-11 二次改版）：`authoritative` 的清空来自
+     * 活动标签页的身份（问不倒的事实），那类清空必须放行——否则用户切到别的标签页时，
+     * 侧栏会一直挂着阅读器里那本书的会话，正是本轮要修掉的现象。
+     */
+    if (_readerReportsBook && !(opts && opts.authoritative)) {
+      postSidebarDebug({
+        stage: 'book-context-clear-blocked',
+        was: String(_currentBook.base || '').slice(0, 20),
+        why: String(why || '(未标注)'),
+      })
+      return
+    }
+    const st = (new Error()).stack || ''
+    postSidebarDebug({
+      stage: 'book-context-cleared',
+      was: String(_currentBook.base || '').slice(0, 20),
+      rawBase: String(rawBase || '').slice(0, 20),
+      // `why` = **谁**要清空。调用栈只能告诉你"在 refreshCurrentBook 里"，
+      // 而那个函数里有几条路都会清（阅读器说没书 / 活动标签页不是在读书 / 微读书页说没有书）——
+      // 光看栈分不清是哪条，2026-11 就因此多猜了一轮。调用方现在必须自己报上来。
+      why: String(why || '(未标注)'),
+      readerReportsBook: _readerReportsBook,
+      caller: st.split('\n').slice(1, 5).map((s) => s.trim().replace(/^at\s+/, '').split(' ')[0]).join(' < '),
+    })
+  }
   _currentBook = next
   leaveManualBookIfRealRead(next)
-  const ctxChanged = !prevEffBase || prevEffBase !== effectiveBookBase()
+  const newEffBase = effectiveBookBase()
+  const ctxChanged = !prevEffBase || prevEffBase !== newEffBase
+  /**
+   * **"当前书换了一本"必须留痕**（2026-11 用户报"读《大国大城》时会话莫名跳到教程"）。
+   *
+   * 原先只有"清空"留痕（book-context-cleared），而"从 A 换到 B"一声不响——
+   * 于是用户说"莫名其妙跳了"时，日志里查不到任何东西，只能猜。
+   * 这里把 from / to / why / 调用来源一起记下来：谁把上下文换掉的，一眼可读。
+   */
+  if (newEffBase !== prevEffBase) {
+    const st = (new Error()).stack || ''
+    postSidebarDebug({
+      stage: 'book-context-changed',
+      from: String(prevEffBase || '(空)').slice(0, 20),
+      to: String(newEffBase || '(空)').slice(0, 20),
+      why: String(why || '(未标注)'),
+      caller: st.split('\n').slice(1, 5).map((s) => s.trim().replace(/^at\s+/, '').split(' ')[0]).join(' < '),
+    })
+  }
   if (ctxChanged) onEffectiveContextChange()
   renderCurrentBook()
   renderNoBookView()
@@ -1105,51 +1803,185 @@ function applyBookContext(ctx) {
   if (ctxChanged) scrollMsgsToBottom()
 }
 
-// 侧栏打开 / 切换 tab 时，向活动的微信读书 tab 查询当前阅读上下文。
-// 直接定向问活动 tab 的顶层 frame（不走 runtime 广播）：广播会被每个 content
-// script 帧抢答、可能绑到非活动 tab 的书，这里点名唯一的目标（AI-008）。
-// bookId 为空（如无活动阅读页）也走 applyBookContext：把当前书重置为无书状态。
-//
-// 2026-11：**先问 CoRead 自己是不是开着**。旧版只查 weread.qq.com 的 tab，于是
-// 用我们自己的阅读器看 PDF 时，侧栏显示"未检测到正在阅读的书籍"—— 引用/提问都没有
-// 归属，阅读器里点「设为引用」还会被判成"当前页面未关联任何书籍"。阅读器开着 PDF 时
-// 它就是当前阅读上下文，优先级与微信读书阅读页相同（谁在活动 tab 就算谁）。
+/**
+ * 侧栏打开 / 切换标签页时，问后台"我现在该认哪本书"。
+ *
+ * ── 规则一句话（2026-11 二次改版，用户定调：与微信读书标签页一致）────────────
+ *   **当前书 = 活动标签页所代表的那本书；活动标签页不是阅读源 → 无书（书单界面）。**
+ *
+ *     活动标签页 = 我们的阅读器   → 它开着的那本 PDF（它答不上来就保持原样，绝不清）
+ *     活动标签页 = 微读的**书页** → 那本书（书 ID 从 URL 就能读出来，书名问页面）
+ *     活动标签页 = 别的任何页面   → 无书：书单铺开，与微读那本书被切走时一模一样
+ *
+ * ── 为什么改（用户实测）─────────────────────────────────────────────────────
+ * 改之前，只要标签栏里还开着那个 PDF 标签页，侧栏就一直挂着它的会话——哪怕用户正在
+ * 看毫不相干的网页。两个原因叠加：
+ *   ① 后台会"按 URL 在整条标签栏里找一个开着的阅读器标签页"顶上来（旧 readerBookInfo）；
+ *   ② 这里还额外有一条"阅读器标签页还开着 → 绝不清空"的防线。
+ * 两条都是治"点切换引用跳回选书界面"时加的，**治过头**：把"阅读器开着"当成了"正在读"。
+ *
+ * ── 仍然保留的谨慎（都是真 bug 换来的，别删）─────────────────────────────────
+ *   · 后台答不上来 / 没带回 req（答话的不是后台） → **什么都不动**
+ *   · 阅读器说"正在打开书"或答非所问（unknown/loading） → 保持上一次已知的书
+ *   · 决定"有没有书"的只有**问不倒的事实**：活动标签页是哪一类页面（只查 URL，见
+ *     translate-background.js 的 activeTabKind）。"问页面"拿到的东西只用来补书名/章节，
+ *     问不到就退回 URL 里那个书 ID —— 绝不因为"问不到"而清空。
+ */
 async function refreshCurrentBook() {
   // 自由模式期间保持自由上下文：不被面板重开/活动 tab 变化刷新覆盖（退出时手动恢复）
   if (_freeMode) {
     applyBookContext({ bookId: _freeKey || FREE_KEY, bookTitle: freeConvTitle(_freeKey) })
     return
   }
-  // ① 我们自己的阅读器（是它 → 上下文就是它开着的那本 PDF；没开 PDF → 无书）
+  let r = null
+  /**
+   * ⚠️ 问的是 `readerContextQuery`（**只给后台的一条**），不是 `readerBookInfo`。
+   *
+   * `readerBookInfo` 是**广播**，打开着的阅读器页面也会收到并作答（它那条监听是给
+   * "后台点名问页面"用的），而广播**先答的赢**。页面只能说"我这儿开着哪本"，
+   * 它不知道自己是前台还是后台标签页——于是用户切回微信读书时，页面抢先答一句
+   * "我这儿开着教程书"，侧栏就永远回不到微读那本书（2026-11 用户实测）。
+   * 带 `req` 随机串是第二道锁：答复必须原样带回来，才算后台那条路的答复。
+   */
+  const req = 'rc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8)
   try {
-    const r = await chrome.runtime.sendMessage({ action: 'readerBookInfo' })
-    if (r && r.ok && r.notReader === false) {
-      const b = r.book
-      if (b && b.bookId) {
-        // 记进 _lastWereadContext？不：那个变量是"最近的微信读书上下文"，退出自由模式
-        // 时恢复用；把 PDF 塞进去会让退出自由模式后显示一本没在微读里打开的书。
-        leaveManualBookIfRealRead({ base: baseBookId(b.bookId), bookTitle: String(b.bookTitle || '').trim() })
-        applyBookContext({ bookId: b.bookId, bookTitle: b.bookTitle })
-      } else {
-        applyBookContext({ bookId: '' })
-      }
+    r = await chrome.runtime.sendMessage({ action: 'readerContextQuery', req })
+  } catch (e) {
+    // 抛错 ≠ 没有书（2026-11 实测：这里原先是个静默的 `catch {}`，
+    // 于是一条"问不到"的路会静悄悄地走到下面的兜底，把当前书清掉）。
+    postSidebarDebug({ stage: 'reader-info-threw', error: String((e && e.message) || e) })
+    return
+  }
+  /**
+   * ⚠️ 只认**后台**的答复：必须把 `req` 原样带回来（见 translate-background.js 里
+   * readerContextQuery 的注释）。一份没有 req 的答复说明答话的不是后台
+   *（阅读器页面 / 别的监听者），那种情况按"答不上来"处理——**什么都不动**。
+   */
+  if (!r || r.req !== req) {
+    postSidebarDebug({
+      stage: 'reader-info-shape-unknown',
+      kept: String(effectiveBookBase() || '(空)').slice(0, 20),
+      why: '答复里没有带回 req：答话的不是后台那条路，按"答不上来"处理',
+    })
+    return
+  }
+  /**
+   * ① 活动标签页**就是**我们的阅读器 → 它说哪本就是哪本。
+   *
+   * ⚠️ 判据是"**没明说不是**，就按是来处理"（2026-11 根因）：`notReader` 缺字段的答复
+   * 曾经被当成"后台说这不是阅读器"，于是掉进微读那条兜底、把当前书清空 ——
+   * 用户看到的"底层界面回到选择书界面"就是它。
+   */
+  if (r.notReader !== true) {
+    // 记住"阅读器此刻报着什么"——清空当前书之前会看它（见 applyBookContext 的防线）。
+    // 覆盖 `unknown` 的情况：只有**明确**报了一本真书才算数。
+    rememberReaderBook(r.book && r.book.bookId && !r.unknown)
+    /**
+     * `unknown` = 阅读器在，但**它现在答不上来**（页面正在加载/重载，内容脚本还没起来）。
+     * 这种情况**绝不能当成"没有书"**——那会把当前书清掉：书单铺开、底部那格换成
+     * PDF 入口条、引用变"暂未关联书籍"。正确做法：**保留上一次已知的书**。
+     */
+    if (r.unknown || r.loading) {
+      postSidebarDebug({
+        stage: 'reader-info-unknown',
+        kept: (_currentBook && _currentBook.base || '').slice(0, 20),
+        loading: !!r.loading,
+      })
       return
     }
-  } catch {}
-  // ② 微信读书阅读页（原逻辑）
+    const b = r.book
+    if (b && b.bookId) {
+      // 记进 _lastWereadContext？不：那个变量是"最近的微信读书上下文"，退出自由模式
+      // 时恢复用；把 PDF 塞进去会让退出自由模式后显示一本没在微读里打开的书。
+      leaveManualBookIfRealRead({ base: baseBookId(b.bookId), bookTitle: String(b.bookTitle || '').trim() })
+      applyBookContext({ bookId: b.bookId, bookTitle: b.bookTitle },
+        'reader-branch:活动标签页是阅读器，它报着这本书', { authoritative: true })
+    } else {
+      // 阅读器**明确**说"我这儿没开着书"（回到书库了）→ 无书。这话是它自己说的，照做。
+      applyBookContext({ bookId: '' }, 'reader-branch:活动标签页是阅读器，它说没开着书', { authoritative: true })
+    }
+    return
+  }
+  /**
+   * ② 活动标签页不是阅读器 → 它在不在"读书"由**它的身份**决定（后台的 `activeKind`）。
+   *
+   * 这一类结论只查 URL、不问消息，所以可以放心执行——包括清空：
+   *   'weread'（书架/详情/搜索）、'page'（文库网页）、'other'（任何别的网页） → 没有书
+   *   'unknown'（拿不到活动标签页：没有窗口 / 查询失败） → 什么都不知道，**别动侧栏**
+   */
+  const kind = String(r.activeKind || 'unknown')
+  if (kind === 'other' || kind === 'weread' || kind === 'page') {
+    postSidebarDebug({
+      stage: 'active-tab-not-reading',
+      kind,
+      was: String(effectiveBookBase() || '(空)').slice(0, 20),
+      why: '活动标签页不是在读书的页面 → 与微读那本书被切走时一样，回到无书界面',
+    })
+    applyBookContext({ bookId: '' }, 'active-tab:活动标签页是「' + kind + '」，不是在读书', { authoritative: true })
+    return
+  }
+  if (kind === 'unknown') {
+    postSidebarDebug({ stage: 'active-tab-unknown', kept: String(effectiveBookBase() || '(空)').slice(0, 20) })
+    return
+  }
+  // ③ 活动标签页是微读的**书页** → 问它要书名/章节（书 ID 从 URL 也能直接读出来）
   try {
     let ctx = null
-    const [tab] = await chrome.tabs.query({ url: 'https://weread.qq.com/*', active: true, lastFocusedWindow: true })
-    if (tab?.id) {
+    const tabId = Number(r.tabId)
+    if (Number.isFinite(tabId) && tabId > 0) {
+      // 定向问**活动标签页**的顶层 frame（不走广播：广播会被每个 content script 帧抢答，
+      // 可能绑到非活动 tab 的书，AI-008）。tabId 用后台给的那个，不再自己查一次——
+      // 两次查询之间用户切了 tab，两个答案就会打架。
       try {
-        ctx = await chrome.tabs.sendMessage(tab.id, { action: 'getReadingContext' }, { frameId: 0 }).catch(() => null)
-      } catch {}
+        ctx = await chrome.tabs.sendMessage(tabId, { action: 'getReadingContext' }, { frameId: 0 }).catch(() => null)
+      } catch (e) {}
+    }
+    if (ctx && typeof ctx.bookId === 'string' && ctx.bookId) {
+      _lastWereadContext = { base: baseBookId(ctx.bookId), bookTitle: String(ctx.bookTitle || '').trim() }
+      applyBookContext(ctx, 'weread-branch:活动标签页是微读书页，它报了这本书', { authoritative: true })
+      return
     }
     if (ctx && typeof ctx.bookId === 'string') {
-      _lastWereadContext = { base: baseBookId(ctx.bookId), bookTitle: String(ctx.bookTitle || '').trim() }
-      applyBookContext(ctx)
-    } else applyBookContext({ bookId: '' })  // 无活动阅读页 → 重置为无书状态
-  } catch {}
+      // 页面答了、但说"我不是书页"：**页面比 URL 权威**（URL 可能刚导航过去、页面还没跟上）
+      applyBookContext({ bookId: '' }, 'weread-branch:微读书页说自己没有书（页面更权威）', { authoritative: true })
+      return
+    }
+    /**
+     * 问不到（内容脚本还没起来 / 页面正在加载）→ 书 ID 直接**从 URL 读**：
+     * `/web/reader/<书 ID>`，与 content.js 的 getReadingContext 读的是同一段路径，所以不算猜。
+     * 书名尽力补（当前书同名 → 已读书单），补不到就空着：书对了、标题晚一拍，
+     * 好过把上一本书留在界面上。
+     */
+    const base = bookIdFromReaderUrl(r.url || '')
+    if (!base) {
+      postSidebarDebug({ stage: 'weread-branch-no-book-id', url: String(r.url || '').slice(0, 80) })
+      return
+    }
+    const known = (_currentBook && _currentBook.base === base ? _currentBook.bookTitle : '')
+      || ((_bookPickerList || []).find((x) => x && x.base === base) || {}).bookTitle
+      || ''
+    _lastWereadContext = { base, bookTitle: String(known).trim() }
+    applyBookContext({ bookId: base, bookTitle: known },
+      'weread-branch:微读书页（页面还没应声，书 ID 取自 URL）', { authoritative: true })
+  } catch (e) {
+    postSidebarDebug({ stage: 'weread-branch-threw', error: String((e && e.message) || e) })
+  }
+}
+
+/**
+ * 记下"我们自己的阅读器此刻有没有书"（清空当前书之前的最后一道防线，**只挡猜出来的清空**）。
+ *
+ * 为什么必须是**黏性**的、不能只在 refreshCurrentBook 里更新（2026-11 自检实测的教训）：
+ * 原先只有 refreshCurrentBook 的第 ① 条路会写这个变量，而那一条恰恰是**会被跳过的那条**——
+ * 一旦跳过，变量还是旧值 false，防线就等于不存在，兜底照样把当前书清掉。
+ * 现在改成两个来源：阅读器**自己推**上来的快照（最可靠）+ 第 ① 条路的回答。
+ *
+ * ⚠️ 2026-11 二次改版：这道防线**挡不住**来自"活动标签页身份"的清空 ——
+ * 用户切到别的标签页时侧栏就该回到无书界面（见 applyBookContext 的 authoritative）。
+ */
+function rememberReaderBook(has) {
+  _readerReportsBook = !!has
+  _readerReportsBookAt = Date.now()
 }
 
 /**
@@ -1165,8 +1997,13 @@ function applyReaderBookFromSnapshot(snapshot) {
   if (_freeMode) return                       // 自由模式优先，别被阅读器拽走
   const b = snapshot && snapshot.book
   const base = b ? baseBookId(b.bookId) : ''
+  // 阅读器**自己推**上来的这份快照是最可靠的事实来源，所以它同时更新那道防线
+  //（见 rememberReaderBook 的注释：原先只有会被跳过的那条路才写它，等于没有）。
+  rememberReaderBook(!!base)
   if (!base) {                                // 阅读器回到书库了 → 离开这本书
-    if (_currentBook && String(_currentBook.base).startsWith('rd_')) applyBookContext({ bookId: '' })
+    if (_currentBook && String(_currentBook.base).startsWith('rd_')) {
+      applyBookContext({ bookId: '' }, 'reader-push:阅读器回到书库了')
+    }
     return
   }
   const next = { base, bookTitle: String(b.name || '').trim() }
@@ -1175,10 +2012,66 @@ function applyReaderBookFromSnapshot(snapshot) {
     if (_manualBook.base !== base) { _currentBook = next; return }
     leaveManualBookIfRealRead(next)
   }
-  applyBookContext({ bookId: b.bookId, bookTitle: b.name })
+  applyBookContext({ bookId: b.bookId, bookTitle: b.name }, 'reader-push:阅读器推上来的这本书')
   // 兜底：侧栏刚打开时可能还没跑完历史回放（那之前消息区是空的），而 applyBookFilter
   // 只对**已在 DOM 里**的气泡生效。loadHistory 幂等（_histKeys 去重），重跑只补增量。
   loadHistory().catch(() => {})
+}
+
+/**
+ * 活动标签页的 id（判不出来 = null）。
+ *
+ * ⚠️ 它只用来**过滤推送**，所以失败时必须往"放行"那一侧倒：判不出来时调用方一律照旧
+ * 处理（见 applyWereadBroadcast）。取的是"最后聚焦的那个窗口"的活动标签页 ——
+ * 与本文件其它几处（网页绑定入口、绑定对话框）的取法一致。
+ */
+async function activeTabId() {
+  try {
+    const [t] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+    return t && typeof t.id === 'number' ? t.id : null
+  } catch (e) {
+    return null
+  }
+}
+
+/**
+ * 微读页面广播上来的"我现在读的是这本" —— **只有活动标签页的才算数**（2026-11 二次改版）。
+ *
+ * 为什么必须过滤（与阅读器那条推送同一个理由，见 readerUpdate 的处理）：
+ *   · content.js 在**每个微读页面加载时**都会广播一次（书架页也会，那时 bookId 是空串）；
+ *   · 中键点开一本书、浏览器恢复上次的会话、用户在后台刷新页面……都会触发广播；
+ *   · 采纳它们等于让"用户没在看的标签页"改掉侧栏的当前书 —— 用户实测报的正是这类现象：
+ *     "当前在毫不相关的标签页，侧栏还挂着另一个标签页那本书的会话"。
+ *
+ * ⚠️ 只认**顶层 frame**（`frameId === 0`）：content.js 跑在微读的每个 frame 里，而
+ * getReadingContext 读的是 `window.top` 的路径 —— 子 frame 读到的是它自己的路径，
+ * 于是会广播一个空 bookId（跨域 frame 必然如此），而空 bookId 会**把当前书清掉**。
+ * 那种广播是纯噪声，一条都不该采纳。
+ *
+ * ⚠️ 判不出来时**放行**（tabs.query 失败 / sender 没带 tab）：宁可放过一份可疑的广播，
+ * 也不要把"我问不出来"变成"侧栏不跟了"。
+ */
+async function applyWereadBroadcast(msg, sender) {
+  const tabId = sender && sender.tab ? sender.tab.id : undefined
+  const frameId = sender ? sender.frameId : undefined
+  if (typeof frameId === 'number' && frameId !== 0) {
+    postSidebarDebug({
+      stage: 'weread-broadcast-ignored', why: '不是顶层 frame 的广播',
+      frameId, bookId: String(msg.bookId || '').slice(0, 20),
+    })
+    return
+  }
+  if (typeof tabId === 'number') {
+    const active = await activeTabId()
+    if (active !== null && active !== tabId) {
+      postSidebarDebug({
+        stage: 'weread-broadcast-ignored', why: '广播来自非活动标签页',
+        from: tabId, active, bookId: String(msg.bookId || '').slice(0, 20),
+      })
+      return
+    }
+  }
+  applyBookContext(msg, 'weread-broadcast:微读页面广播的当前书')
 }
 
 // ── 无书默认界面 / 已读书籍（2026-10；2026-11 改版）────────────────────────
@@ -1198,14 +2091,132 @@ let _nbShown = false       // 无书界面上一轮是否可见：只在「隐�
 let _nbRenderKey = null    // 上次渲染的书单指纹：没变就不重建 DOM（见 renderNoBookList）
 const NB_SEARCH_MIN = 6    // 书多于这个数才显示搜索框（书少时它只是白占一行）
 
-// 无书默认界面：显示/隐藏 + 同步禁用聊天输入（无书时发消息没有归属书，历史
-// 回放无从展示，直接禁用输入让行为规范）
+// ── 教程的「引导模式」入口（2026-11）─────────────────────────────────────────
+// 用户对教程的要求是"像游戏那种教程"：在**真实界面**上高亮、让他自己动手。
+// 实现放在两个 ES 模块里（聚光灯层 + 脚本），而本文件是经典脚本、用不了 import 语句，
+// 所以这里按需动态 import 一次、缓存住。
+//
+// 教程书在共读侧的固定 ID（与 reader.js / receiver 里的那个常量逐字相同，
+// 静态闸门 test/selftest/check-tutorial.mjs 会比对）。
+const TUTORIAL_BASE = 'rd_e0c91cb6aa56dd0057235ba7374c03e599e1e37e09b3bc9f55f64e1a5b98a25e'
+
+let _tutorialMod = null
+async function loadTutorial() {
+  if (!_tutorialMod) {
+    _tutorialMod = Promise.all([
+      import('./tutorial-guide.js'),
+      import('./tutorial-script.js'),
+      // 课程表与样例引用都来自这一份（`lessons.js`），书与侧栏共读——
+      // 侧栏这边只用它的 SAMPLE_REFS（抽屉里那批例句）
+      import('./tutorial/lessons.js'),
+    ]).then(([guide, script, lessons]) => {
+      window.__coreadSampleRefs = lessons.SAMPLE_REFS || null
+      return { guide, script, lessons }
+    })
+  }
+  return await _tutorialMod
+}
+
+/** 「开始教程」按钮（只在当前这本书就是那本手册时显示）——按钮已去掉（2026-11 用户要求），
+ *  这个函数随之没有作用；保留一个空实现是为了让调用点不必再散落判断。 */
+function renderTutorialEntry() {}
+
+/**
+ * 侧栏顶部那条「继续教程」（2026-11）。
+ *
+ * 存在的理由：教程中途被关掉（用户去阅读器划词、或者关掉侧栏），状态留在存储里。
+ * 上一版的做法是"下次打开侧栏就自动接上"——结果扩展一更新、用户一开侧栏，
+ * 教程自己冒出来，看起来像插件坏了（用户实测报过）。
+ * 现在改成：**显示一个入口，点它才继续**。既没丢进度，也不会自己动。
+ */
+async function offerResumeTutorial() {
+  const bar = document.getElementById('tut-resume-bar')
+  if (!bar) return
+  const { script } = await loadTutorial()
+  const st = await (script.pausedState ? script.pausedState() : null)
+  if (!st || !st.paused || st.stale) { bar.hidden = true; return }
+  const label = bar.querySelector('.trb-text')
+  if (label) {
+    label.textContent = `教程停在第 ${st.lesson + 1} 课 · 第 ${st.step + 1}/${st.stepCount} 步（${st.title}）`
+  }
+  bar.hidden = false
+  const go = bar.querySelector('.trb-go')
+  if (go && !go.dataset.bound) {
+    go.dataset.bound = '1'
+    go.addEventListener('click', async () => {
+      const r = await script.resume()
+      bar.hidden = true
+      if (!r) showToast('这条教程记录已经失效，请重新开始', true)
+    })
+  }
+  const drop = bar.querySelector('.trb-drop')
+  if (drop && !drop.dataset.bound) {
+    drop.dataset.bound = '1'
+    drop.addEventListener('click', async () => {
+      await script.stop('用户放弃继续')
+      bar.hidden = true
+    })
+  }
+}
+
+/**
+ * 「开始教程」的入口（2026-11）。
+ *
+ * ⚠️ 顶部那个「教程」按钮**已按用户要求去掉**，所以这个函数目前**没有调用方**——
+ * 留着是因为"从侧栏起一课"这件事本身还要用（改成 PDF 之后书页上挂不了按钮，
+ * 很可能重新需要一个侧栏入口），而它里面有一条容易踩的坑值得留在原地：
+ * 参数是**课号**（lessons.js 里的下标），不是书 ID。传错不报错——`Number({})` 是 NaN，
+ * 被 `|| 0` 兜住，于是永远开第 1 课，属于静默走错。
+ *
+ * 现在课仍然能从**书页**上的「开始本课」启动（经后台广播 → coreadTutorialLesson）。
+ */
+async function startTutorial() {
+  const { script } = await loadTutorial()
+  const r = await script.start(0)
+  postSidebarDebug({ stage: 'tutorial-start-from-sidebar', lesson: r && r.lesson })
+  showToast('教程已开始：第 1 步在左边的阅读器里划词')
+}
+
+// ── 无书默认界面 ──────────────────────────────────────────────────────────────
+// 显示/隐藏 + 同步禁用聊天输入（无书时发消息没有归属书，历史回放无从展示，
+// 直接禁用输入让行为规范）
+/**
+ * 底部那一格二选一：`#footer`（输入区）还是 `#nb-reader-bar`（PDF 入口）（2026-11）。
+ *
+ * 为什么不是"两个都留着"：那一格只有 36px 高，无书时的输入框还是**禁用**状态、
+ * 只写着一句"未检测到书籍：请打开微信读书中的书"——它占着唯一的位置，
+ * 却回答不了"我手上就是一份 PDF"这个问题，所以让它让位。
+ *
+ * ⚠️ 但**本机服务没起来时不让位**（`_booksFailed`）：那时书单区显示的是
+ * "读不到已读书籍 + 重试"，PDF 入口这时候点下去只会拿到"打不开"——
+ * 该看见的是故障本身，不是一枚点了会报错的按钮。
+ * 判据是两件事同时成立才换：`noBook && !_booksFailed`。
+ *
+ * ⚠️ 调用点有两处，别只留一处：本函数由 renderNoBookView 调（它每次切上下文都跑），
+ * 而 `_booksFailed` 是**拉书单之后**才知道的——`refreshNoBookBooks` 拿到结果还要再调一次，
+ * 否则本机服务挂掉时底部会一直停着那枚没用的 PDF 按钮。
+ */
+function renderBottomSlot(noBook) {
+  const readerBar = document.getElementById('nb-reader-bar')
+  const footer = document.getElementById('footer')
+  const showReaderBar = !!noBook && !_booksFailed
+  if (readerBar) readerBar.hidden = !showReaderBar
+  if (footer) footer.hidden = showReaderBar
+}
+
 function renderNoBookView() {
   const view = document.getElementById('no-book-view')
   const msgs = document.getElementById('msgs')
   const noBook = !_freeMode && !effectiveBookBase()
   if (view) view.hidden = !noBook
   if (msgs) msgs.style.display = noBook ? 'none' : ''
+  // 开场卡归消息区：无书（读书模式下没检测到书）时整格由「无书默认界面」接管，
+  // 卡也跟着收起——否则它会在书单下面留着半张，看着像"上一本书的残影"。
+  // 只置 hidden、不清内容：切回有书时 syncIntro 会按新上下文整张重画。
+  if (noBook) {
+    const card = document.getElementById('intro')
+    if (card) card.hidden = true
+  }
   // 无书时把所有消息置为隐藏并刷新提问浮窗：applyBookFilter(book='') 全隐藏，
   // 提问浮窗（jump-fab）随之收起，不残留上一本书的跳转条
   if (noBook) applyBookFilter()
@@ -1214,17 +2225,46 @@ function renderNoBookView() {
   const attachBtn = document.getElementById('attach-btn')
   if (input) {
     input.disabled = noBook
+    /**
+     * 无书时输入框整条会被 PDF 入口条取代（见下面 renderBottomSlot），
+     * 所以这句占位文案**只有在本机服务没起来时**才真的看得见（那时输入框留着）。
+     * 还是照旧写上：万一将来又把输入框留下来了，它至少说的是实话。
+     */
     input.placeholder = noBook
       ? '未检测到书籍：请打开微信读书中的书'   // 输入框只有 ~18 个字宽，再长会被截断
       : '输入你的问题…'
   }
   if (sendBtn) sendBtn.disabled = noBook
   if (attachBtn) attachBtn.disabled = noBook
+  /**
+   * 底部那一格（输入框 / PDF 入口）**每次都要重算**，不能只在 noBook 变的时候算。
+   *
+   * 踩到过：原先写成 `if (noBook && !_nbShown) renderBottomSlot(...)`，于是本机服务挂着的时候
+   * ——启动时先画一次（那时 `_booksFailed` 还是假）→ 拉书单失败置真 → 重画时 `_nbShown`
+   * 已经是真、整段被跳过 → 底部永远停着那枚点了只会报错的 PDF 按钮。
+   * 这个函数很便宜（两次 getElementById + 两个 hidden 赋值），值得每次算。
+   */
+  renderBottomSlot(noBook)
   // 内联书单：进无书界面那一刻刷新一次（本函数被 applyBookContext 频繁调用——
   // 切 tab / 切上下文都会走——所以只在「隐藏 → 显示」时打请求，其余时候用缓存渲染）
   if (noBook && !_nbShown) refreshNoBookBooks()
   _nbShown = noBook
   renderNoBookList()
+  /**
+   * 开场卡就在这一格：**上下文定下来的那一刻**重画一次。
+   *
+   * 为什么放这里（2026-11 实测踩到）：这个函数是所有"上下文换了"的必经之路
+   * （切书 / 手动选书 / 检测到在读 / 进出自由模式 / 启动定上下文），而开场卡要讲的是
+   * "你现在在哪个场合、从哪句话起头"——没有比这里更合适的会合点。原先只把它挂在
+   * loadHistory 收尾和启动链末尾，于是**启动早期那两次调用 base 还是空的**（书还没认出来），
+   * 等 pickBook / refreshCurrentBook 真的把书认下来时，已经没有任何一处再叫它画了：
+   * 用户看到的就是"还是啥也没有"。
+   *
+   * 放在 renderNoBookList 之后：无书时本函数先把卡置 hidden，这里再算一次，
+   * 无书状态下 renderIntro 会走 base 为空那一支，不会把卡又画回来。
+   */
+  syncIntro()
+  renderTutorialEntry()  // 空实现（顶部「教程」按钮已去掉，2026-11 用户要求）
   refreshWebBindEntry()  // AI-021：无书状态时按活动 tab 显示/隐藏网页绑定入口
 }
 
@@ -1254,6 +2294,8 @@ async function refreshNoBookBooks() {
   renderNoBookList()
   await p
   renderNoBookList()
+  // 拉完才知道本机服务通不通 → 底部那一格跟着重算一次（见 renderBottomSlot）
+  renderBottomSlot(!_freeMode && !effectiveBookBase())
 }
 
 // 书单里的时间：越近说得越口语（今天 / 昨天 / 3 天前），远了才报日期。一排
@@ -1287,6 +2329,37 @@ function spineOf(b) {
   }
 }
 
+/**
+ * 这本是不是**我们自己阅读器里的书**（书 ID 形如 `rd_<内容哈希>`，见 reader.js 的 readerBookId）。
+ * 用于决定"点这一行"该干什么：阅读器里的书应该去读，微信读书的书只能看记录。
+ */
+function isReaderBook(b) {
+  return /^rd_[a-f0-9]{16,64}$/i.test(String((b && b.base) || ''))
+}
+
+/**
+ * 在阅读器里打开这本书（2026-11）。
+ *
+ * 为什么要有它：用户实测"我点击第一次共读对话的时候阅读器并没有自己弹出来"。
+ * 原因不是坏了，是**从来没有这条动作**——书单里"点一本"一直只做"手动选书 →
+ * 看它的讨论记录"，而 `rd_` 那几本（我们阅读器放进去的书）在侧栏里连一个"去读"的
+ * 入口都没有。所以这里补一条：交给后台开/切阅读器标签页，并带上 `?open=<hash>`。
+ */
+async function openInReader(b) {
+  const name = b.bookTitle || b.name || ''
+  try {
+    const r = await chrome.runtime.sendMessage({ action: 'openReaderBook', base: b.base, name })
+    if (r && r.ok) {
+      showToast(r.reused ? '已切到阅读器打开这本书' : '已打开阅读器')
+      return true
+    }
+    showToast((r && r.error && r.error.message) || '打不开阅读器页面')
+  } catch (e) {
+    showToast('打不开阅读器页面：' + String((e && e.message) || e))
+  }
+  return false
+}
+
 // 一条已读书籍（无书界面书单与弹窗共用同一套结构）：
 // 整行点击 = 手动查看它的历史记录（pickBook），右侧垃圾桶 = 删掉它的全部存档。
 // 版式是**单行**：色块 + 书名（占满）+ 最近更新的时间 —— 两行式在窄侧栏里一行只能
@@ -1297,14 +2370,24 @@ function buildBookItem(b) {
   const spine = spineOf(b)
   const time = fmtBookDate(b.updatedAt)
   const exact = b.updatedAt ? new Date(b.updatedAt).toLocaleDateString() : ''
+  const readerBook = isReaderBook(b)
   item.innerHTML =
     `<span class="book-spine" style="background:${spine.color}">${esc(spine.text)}</span>` +
     `<div class="bi-main">` +
       `<div class="bi-title">${esc(b.bookTitle || '（书名未知）')}</div>` +
     `</div>` +
     (time ? `<span class="bi-meta" title="最近更新 ${exact}">${time}</span>` : '') +
-    `<button class="bi-del" title="删除这本书的记录">${ICON_TRASH}</button>`
-  item.addEventListener('click', () => pickBook(b))
+    // 阅读器里的书多一枚「去读」：它是点得动的（有原件、能打开），
+    // 与微信读书那类"只能看记录"的书在这里分开
+    (readerBook ? `<button class="bi-open" title="用 CoRead 阅读器打开">读</button>` : '') +
+    // 垃圾桶删的是**记录**，不是那个 PDF 文件——这一点对所有书都成立，所以说明统一。
+    // 阅读器里的书要删原件得去阅读器「书库」（见 deleteBook 的注释：两个界面各代表一样东西）
+    `<button class="bi-del" title="删除这本书的讨论记录（PDF 原件留在阅读器书库里）">${ICON_TRASH}</button>`
+  // 阅读器里的书：整行点击 = 去读（那才是用户点它时想干的事）；
+  // 微信读书的书：整行点击仍然是看讨论记录（那些书在微读里打开，这里没有原文可读）
+  item.addEventListener('click', () => { readerBook ? openInReader(b) : pickBook(b) })
+  const openBtn = item.querySelector('.bi-open')
+  if (openBtn) openBtn.addEventListener('click', (e) => { e.stopPropagation(); openInReader(b) })
   item.querySelector('.bi-del').addEventListener('click', (e) => {
     e.stopPropagation()  // 不触发行点击的选书
     deleteBook(b)
@@ -1461,14 +2544,23 @@ function renderBookList() {
   for (const b of list) listEl.appendChild(buildBookItem(b))
 }
 
-// 删除一本书：确认后调 receiver /book-delete 清理该书全部存档（划线/章节缓存/聊天），
-// 并同步清理侧栏本地状态——引用列表（removeAnns 统一清选中态）、消息区残留气泡、
-// 手动选书/当前上下文（删的是当前上下文则重置为无书），最后刷新「已读过的书籍」列表。
+// 删除一本书的记录。**只清共读侧**：划线、章节缓存、聊天、「已读书籍」记录。
+//
+// ⚠️ 模型的边界（2026-11 用户定调，别再来回改）：
+//   侧栏这一栏里的每一项 = **这本书的讨论记录**，不是那个 PDF 文件；
+//   阅读器「书库」里的每一项 = **那个 PDF 原件**。
+//   两个界面各自只删自己那一样，**不做"二选一"弹窗**——那等于把两件东西塞进一次选择里，
+//   用户得先想清楚"我现在站的这个列表代表什么"，而这件事本来就该由界面替他定好。
+//   所以这里永远只打 /book-delete；原件在阅读器书库里删（见 reader.js 的 deleteReaderBook）。
+//   历史（别再走回去）：这里曾经会让阅读器的书二选一（记录 / 连原件一起删），
+//   用户当场否掉——"书库里的项应该只是指的原件，而会话里的项才对应这些记录"。
 async function deleteBook(b) {
   if (!b || !b.base) return
   const title = b.bookTitle || '这本书'
-  const ok = await showConfirm(`删除《${title}》？`,
-    '将删除该书的所有划线、章节缓存与聊天记录（含「已读书籍」列表），此操作不可恢复。')
+  const readerBook = isReaderBook(b)
+  const ok = await showConfirm(`删除《${title}》的讨论记录？`,
+    '将删除这本书的划线、章节缓存与聊天记录（含「已读书籍」列表），此操作不可恢复。'
+    + (readerBook ? '\nPDF 原件不在这里删：它留在阅读器「书库」里，要删那份文件请去那里。' : ''))
   if (!ok) return
   try {
     const resp = await fetch(`${RECEIVER}/book-delete`, {
@@ -1490,9 +2582,10 @@ async function deleteBook(b) {
   }
   // 本地引用列表清理（removeAnns 统一处理"移除的是当前选中引用 → 清空选中态"）
   removeAnns(a => baseBookId(a.bookId) === b.base)
-  // 移除消息区残留的该书气泡：loadHistory 回放出的 DOM 还在，书已删不可再展示
-  const msgs = document.getElementById('msgs')
-  for (const el of Array.from(msgs ? msgs.children : [])) {
+  // 移除消息区残留的该书气泡：loadHistory 回放出的 DOM 还在，书已删不可再展示。
+  // 用 all:true 拿全量——**要删的正是当前不可见的那批**（书已删、已不是当前上下文），
+  // 走默认过滤会一条都拿不到。
+  for (const el of nodesInContext({ all: true })) {
     if ((el.dataset.book || '') === b.base) el.remove()
   }
   saveState()
@@ -1583,7 +2676,39 @@ function bindMaskClose(overlay, close) {
 // 打开引用列表（卡片上的切换引用按钮）
 document.getElementById('rc-switch-btn').addEventListener('click', () => {
   openDrawer()
+  // ⚠️ 抽屉一打开，引导的高亮要**跟着挪到抽屉上**（2026-11 用户反馈：
+  // "点击了切换引用之后你的高亮也应该贴着切换引用栏"）。
+  // 原来的问题：目标一直钉在引用卡上，而抽屉是盖在界面上的另一层——
+  // 高亮框和一整片抽屉错位，用户看到的是"高亮框在讲一个你已经看不见的东西"。
+  guideFollowDrawer()
+  postSidebarDebug({ stage: 'drawer-open', tutorialActive: !!(window.__tutorialScript && window.__tutorialScript.state().active) })
 })
+
+/**
+ * 抽屉打开时，把引导的高亮挪到抽屉头部（只在本步确实和引用有关时才挪）。
+ *
+ * 只挪"引用类"的那几步：其他步骤（打字 / 等接话）打开抽屉属于用户自己乱点，
+ * 那时把高亮挪走反而让他找不着原来的目标。
+ */
+function guideFollowDrawer() {
+  const S = window.__tutorialScript
+  if (!S || !S.state().active) return
+  const st = S.state()
+  const step = S.currentStep ? S.currentStep() : null
+  const targetId = (step && step.target) || ''
+  if (targetId !== 'ref-current' && targetId !== 'rc-switch-btn') return
+  S.anchorTo && S.anchorTo(document.querySelector('#ref-drawer .drawer-panel') || document.getElementById('ref-drawer'), '.drawer-head')
+}
+
+/** 抽屉关掉之后，把高亮挪回引用卡（不然它会悬在已经消失的抽屉上） */
+function guideBackFromDrawer() {
+  const S = window.__tutorialScript
+  if (!S || !S.state().active) return
+  const step = S.currentStep ? S.currentStep() : null
+  const targetId = (step && step.target) || ''
+  if (targetId !== 'ref-current' && targetId !== 'rc-switch-btn') return
+  S.anchorTo && S.anchorTo(document.getElementById('ref-current'))
+}
 
 // 卡片折叠/展开
 document.getElementById('rc-collapse-btn').addEventListener('click', () => {
@@ -1603,6 +2728,56 @@ document.getElementById('rc-preview')?.addEventListener('click', () => {
 // 跳转到原文位置（微信读书原生章节 URL）
 document.getElementById('rc-jump-btn').addEventListener('click', () => {
   if (selectedAnn) jumpToAnnotation(selectedAnn)
+})
+
+/**
+ * 引用卡上「切换引用 ▸」被点到了。
+ *
+ * 除了记一笔，还要**采一串快照**（2026-11）：
+ * 用户报"点切换引用之后底层界面回到选书界面"，而日志里**没有任何导航记录**——
+ * 也就是说"跳"不是扩展发起的，或者发生在别的地方。分不清就不能再修。
+ * 从点开抽屉那一刻起，连续几秒记录**阅读器**（URL / 书 / 是否显示书库）与
+ * **侧栏**（抽屉开着没 / 书单开着没 / 当前书）的状态，最后一次性上报。
+ * 这样"哪一层、在第几秒跳的"直接可读。
+ */
+function snapshotAroundSwitch() {
+  const shots = []
+  const sideState = () => ({
+    drawer: !!(document.getElementById('ref-drawer') || {}).classList?.contains?.('on'),
+    picker: !!(document.getElementById('book-picker') || {}).classList?.contains?.('on'),
+    book: effectiveBookBase().slice(0, 14) || '(空)',
+    ref: String(((document.getElementById('rc-text') || {}).textContent) || '').slice(0, 16),
+  })
+  const tick = async (tag) => {
+    let reader = null
+    try {
+      // 与 refreshCurrentBook 用同一条**只给后台**的查询（带 req）：快照要反映的是
+      // "后台认为该认哪本"，不是"阅读器页面自己开着哪本"。
+      const req = 'snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6)
+      const r = await chrome.runtime.sendMessage({ action: 'readerContextQuery', req })
+      reader = r && r.req === req && r.ok
+        ? (r.book ? { book: String(r.book.bookTitle || '').slice(0, 12) } : { book: '(无书→书库)' })
+        : { error: 'r.failed' }
+      // `activeKind` 取代了原来的 `via`（2026-11 二次改版）：现在后台只报"活动标签页是
+      // 哪一类页面"，不再有"后台挂着的阅读器"那一路。快照里带着它，一眼可读
+      // "那一刻侧栏认的是哪本书、凭的是什么"。
+      if (r && r.req === req && r.ok) reader.activeKind = String(r.activeKind || '')
+    } catch (e) { reader = { error: '消息失败' } }
+    shots.push(Object.assign({ tag, t: Date.now() % 100000 }, sideState(), { reader: JSON.stringify(reader) }))
+  }
+  ;(async () => {
+    await tick('0s')
+    for (const [ms, tag] of [[400, '0.4s'], [1200, '1.2s'], [3000, '3s'], [6000, '6s']]) {
+      await new Promise((r) => setTimeout(r, ms === 400 ? 400 : 800))
+      await tick(tag)
+    }
+    postSidebarDebug({ stage: 'switch-snapshots', shots })
+  })().catch(() => {})
+}
+
+document.getElementById('rc-switch-btn')?.addEventListener('click', () => {
+  postSidebarDebug({ stage: 'btn-switch-ref', hasRef: !!selectedAnn, text: String((selectedAnn && selectedAnn.selectedText) || '').slice(0, 20) })
+  snapshotAroundSwitch()
 })
 
 // 返回跳转前的位置（AI-006）
@@ -1683,6 +2858,7 @@ function showThinking(bookId) {
   thinkingEl.dataset.book = _thinkingBook  // AI-001：跟随本次回复的书
   thinkingEl.innerHTML = `<div class="bubble"><span>${THINKING_COPY.init}</span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`
   msgs.appendChild(thinkingEl)
+  msgsRecord('thinking', thinkingEl)
   applyBookFilter()
   maybeAutoScroll(msgs)
   // 兜底文案：agent 状态未在预期时间内到达（排队/长思考）时逐步换文案
@@ -1712,13 +2888,272 @@ function renderSystemBubble(content, bookId) {
   const msgs = document.getElementById('msgs')
   if (!msgs) return
   const el = document.createElement('div')
-  el.className = 'msg-system'
+  // 含换行的回执（/相处 的清单、/归档 的产物说明）多带一个 multi：CSS 据此改左对齐，
+  // 单行短提示（/收口 等）仍居中。2026-10
+  el.className = /\n/.test(String(content || '')) ? 'msg-system multi' : 'msg-system'
   const book = bookId || effectiveBookBase()
   if (book) el.dataset.book = baseBookId(book)
   el.innerHTML = `<div class="bubble">${esc(content)}</div>`
   msgs.appendChild(el)
+  msgsRecord('system', el)
   applyBookFilter()
   maybeAutoScroll(msgs)
+}
+
+// ── 会话开场（2026-11）────────────────────────────────────────────────────────
+// 新建一场对话 / 刚要跟一本书开聊时，消息区是空的。"空"本身不难看，难的是用户
+// 站在那里不知道下一步点哪儿：原先自由模式只落一条灰字提示（讲的是现象），读书
+// 模式则**什么都没有**。
+//
+// 形态（2026-11 用户定调，第一版被否掉过，别再走回去）：
+//   第一版是**一张卡**——白底描边 + 标题行「这场共读还没开始」+ 引文块 + 两颗占满
+//   整宽的按钮 + 末行小字。用户的评价是"太重、太像说明书"：那一格的信息量是界面
+//   别处的三倍，读起来像一张表单，不像对话的开场。
+//   现在只剩两行，居中：
+//     · 一句话回答"我在哪"（引文走**行内引子**：一道绿竖线 + 原文，不再套第二个框）
+//     · 一行小胶囊回答"能做什么"（不占满整宽，所以读起来是"提议"不是"表单"）
+//
+// 三条设计规矩（后续改这里时别丢）：
+//   ① 胶囊必须真的能点出结果。凡是写"点上方某某"的文案都不算设计——用户刚进来，
+//      不该先去找控件；
+//   ② 引文必须来自用户自己的划线（RECENT_ANNS），不写"例如…"这种占位口水话。
+//      这条是这个产品的立身之本：它只聊你真正读到的地方；
+//   ③ 产品规则（"它知道你读到哪"这类）只挂在悬停提示上，**不占屏幕**——第一版把它
+//      做成末行小字，正是"说明书感"的来源之一。
+//
+// 归属：整块 data-book = 当前书 / 当前对话 key。
+// applyBookFilter 按 data-book 过滤消息区的子元素，所以切书 / 切对话 / 进出自由模式
+// 时这一块会跟着上下文一起走；loadHistory 末尾的 syncIntro 负责补内容。
+
+// 判定的判定留痕：结果**变了**才上报一次（见 renderIntro 里的说明）。
+// 为什么要细到 base / loaded / real：这几种原因在界面上长得一模一样——都是"什么都没有"
+// ——没有这条留痕就只能靠猜，2026-11 已经因此白跑了一轮。
+let _introTraceLast = ''
+function introTracePost(rec) {
+  const sig = `${rec.base}|${rec.real}|${rec.loaded}|${rec.free}`
+  if (sig === _introTraceLast) return
+  _introTraceLast = sig
+  if (window.__coreadIntroTrace) window.__coreadIntroTrace.push(rec)   // DOM 层自测读它
+  postSidebarDebug({
+    stage: 'intro',
+    base: String(rec.base || '').slice(0, 20),
+    real: rec.real,          // 消息区是否已有真实内容（气泡/思考中/系统通报）
+    loaded: rec.loaded,      // /history 是否已回放完（没跑完就不许画，避免闪一下）
+    free: rec.free,          // 自由模式 / 读书模式
+    before: rec.before,      // 本次判定前卡是不是藏着的
+    len: rec.contentLen,
+    msgs: msgsDigest(),      // 消息区里到底坐着谁 —— "real=true 却没有消息"那类问题全靠它
+    log: Array.isArray(_msgsLog) ? _msgsLog.slice(-12) : [],   // 最近 12 笔追加（只记类名/归属/长度）
+  })
+}
+
+/**
+ * 这一格对**当前上下文**来说，还有没有真实内容？
+ *
+ * 判据就一句：nodesInContext() 里有没有东西（它已经按归属 + 可见性过滤过了）。
+ * 这里不再自己遍历——2026-11 就是因为在这里裸写遍历、撞上别的书的隐藏气泡，
+ * 开场卡整整两轮没露面。
+ *
+ * 注意：**思考中气泡不算内容**（正在等回答，会话本身还是空的）。它本来带的是当前
+ * 书的标、会被 nodesInContext() 收进来，所以在这里单独剔除。
+ */
+function hasRealMsg() {
+  for (const el of nodesInContext()) {
+    if (el.classList && el.classList.contains('msg-thinking')) continue
+    return true
+  }
+  return false
+}
+
+// 真实消息落库 → 开场卡让位。只对**当前上下文**的消息生效（见 msgInCurrentContext）：
+// 别的书/别的对话来消息，不该把当前这场空对话的开场卡顺手摘了。
+function dropIntroIfReal(el) {
+  if (msgInCurrentContext(el)) dropIntro()
+}
+
+/**
+ * 黑匣子（2026-11）：消息区里每一次追加都记一笔，只记**结构**不记内容
+ *（id / class / data-book / 长度），滚动保留最近 30 笔。
+ *
+ * 为什么需要它：开场卡的判据是"消息区空不空"，而"消息区里到底有什么"这件事在
+ * 用户机器上一直是黑的——实测出现过 `real=true` 但库里一条消息都没有的情况
+ *（卡因此按设计不画，看起来就是"还是什么都没有"），光看日志分不出那个占位的是
+ * 思考气泡、系统通报还是别的书留下的残影。DOM 层自测里有 `document` 替身可以随便查，
+ * 真实侧栏里没有 DevTools 就只能靠这个。
+ */
+// ⚠️ 用 var 不用 const/let：introTracePost 可能在本文件后面那段声明执行之前就被调用
+//（函数声明提升、顶层链又跑得早），换成 const 会撞上暂时性死区、把整个侧栏脚本打断。
+var _msgsLog = []
+function msgsRecord(what, el, extra) {
+  try {
+    _msgsLog.push({
+      t: Date.now() % 100000,
+      what,
+      cls: (el && el.className) || '',
+      id: (el && el.id) || '',
+      // doc=归属哪本书/哪场对话：""=没打标的（历史/哨兵），"none"=元素上没有 dataset
+      doc: el && el.dataset ? String(el.dataset.book || '') : 'none',
+      len: el && el.innerHTML ? String(el.innerHTML).length : 0,
+      ...(extra || {}),
+    })
+    if (_msgsLog.length > 30) _msgsLog.shift()
+  } catch {}
+}
+
+// 消息区当前的"内容地图"（给上报用）：**只列可见的**，其余按归属归成一句统计。
+// 为什么要这么写：消息区是所有书共用一个容器，里面有几百条别的书的隐藏气泡是常态
+//（2026-11 实测：一次上报打出 400+ 个节点，日志直接没法看，真正有用的那句被淹了）。
+function msgsDigest() {
+  const vis = []
+  let hidden = 0
+  const byBook = {}
+  // msgs-walk-ok: 诊断专用——它要的恰恰是**全部**节点（含隐藏的），才能报出
+  // "隐藏了多少、分别是哪些会话"。走 nodesInContext({all:true}) 拿到原始列表。
+  for (const el of nodesInContext({ all: true })) {
+    const hiddenNow = el.style && el.style.display === 'none'
+    if (hiddenNow) {
+      hidden++
+      const b = (el.dataset && el.dataset.book) || '(无归属)'
+      byBook[b] = (byBook[b] || 0) + 1
+      continue
+    }
+    if (vis.length < 12) vis.push(`${el.id || el.className || el.tagName}${el.dataset && el.dataset.book ? '@' + String(el.dataset.book).slice(0, 8) : ''}`)
+  }
+  const tail = hidden ? `  [+隐藏 ${hidden} 条：${Object.entries(byBook).map(([b, n]) => `${b.slice(0, 8)}×${n}`).join(' ')}]` : ''
+  return (vis.join(',') || '(可见区为空)') + tail
+}
+
+// 摘掉开场。真实消息一到就调用（新会话开张那一刻，这几行就该消失）。
+// 留着节点的壳、只清内容并置 hidden：下次切到一场空对话时 syncIntro 直接复用。
+function dropIntro() {
+  const el = document.getElementById('intro')
+  if (!el) return
+  el.hidden = true
+  el.innerHTML = ''
+  // 居中是给"空态"用的：有内容了必须撤掉，否则消息会从中间开始排
+  const msgs = document.getElementById('msgs')
+  if (msgs) msgs.classList.remove('intro-on')
+}
+
+// 开场文案。刻意只有两行（第一版是"标题 + 副文案 + 末行小字"三层，用户嫌像说明书）：
+//   title = 一句话回答"我在哪"，ann = 可选的行内引子（你的划线）
+//   acts  = 可选的一行小胶囊
+// 产品规则那两句（原末行小字）没删，收进 PROD_RULES，渲染时挂到 title 的悬停提示上。
+//
+// ⚠️ **按钮资格**（2026-11 用户定调，别再往回加）：
+//   这是"新建会话、还没有任何气泡"的状态。此处**凡是用户自己打字就能做到的事，都不该有按钮**——
+//   「提个问题」只是把光标挪进输入框、输入框就在下面，属于多余；
+//   「选一条已有的划线」更糟：这场对话**还没有引用**，让空会话去"选引用"是自相矛盾。
+//   有资格留下的只有"光靠打字拿不到"的东西：
+//     · 先说我的看法   → 替你选中那条划线 + 填好话头（划线是现成的，替你挂上）
+//     · 接着「上一场」聊 → 切到指定那场对话（对话在别处，替你切过去）
+//     · 从会意图里选个知识点 → 打开图并选为引用（图在别处，替你打开）
+//   没有划线时这场共读本来就开不了张：**不出按钮**，把话说明白即可。
+//   （有划线时也只留「先说我的看法」一颗：另一颗"提个问题"同样只是把光标挪进输入框。）
+// ⚠️ **开场不出任何按钮**（2026-11 用户定调，这是最终版，别再往回加）：
+//   走到这一版之前挂过五颗，全被否掉，理由归成一句：**空会话里不该有能点的东西**。
+//     ·「提个问题」「说点什么」——只是把光标挪进输入框（输入框就在下面）
+//     ·「选一条已有的划线」——这场对话还没有引用，让空会话去选引用是自相矛盾
+//     ·「接着说某场对话」——用户是新建一场进来的，劝他聊别的等于说"你建的这个多余"
+//     ·「先说我的看法」/「从会意图里选个知识点」——**用户原话：多余的**
+//   产品在这一格要做的只有一件事：把状态说清楚 + 一句箴言填空。动作入口有两处已经够了——
+//   输入框（想说什么直接打）和下方引用卡/书里的划线（起点）。
+//   所以 introPlan 只返回 title（主句），不再有 acts。
+const INTRO_TITLE = '和这本书聊起来'
+const PROD_RULES = '它知道你读到哪，只聊你已经读到的地方；自由对话不会被自动写进会意图'
+
+/**
+ * 开场箴言（2026-11 用户定调）。
+ *
+ * 为什么要有它：空态真正的问题**不是排版，是内容**——中间什么都没有，怎么摆都显得空旷。
+ * 曾经把内容推到底部、"用位置去救空旷"，那是治错了病。这里放一句有分量的话，
+ * 让它站在中间当重心；"这本书还一句话没聊过"退到下面当一句状态说明。
+ *
+ * 选的是马克思《〈政治经济学批判〉序言》（1859）里那句：
+ *   在科学的入口处，正像在地狱的入口处一样，必须提出这样的要求：
+ *   **这里必须根绝一切犹豫；这里任何怯懦都无济于事。**
+ * 上句本身是马克思转引但丁《神曲·地狱篇》第三歌的铭文——他把"入口处"从地狱挪到了
+ * 科学上。只把下半句刻在开场是因为半句就够重，整句太长会压平重心。
+ *
+ * ⚠️ 出处别写错：《资本论》第一卷序言里**没有**这一句（那里是"在科学上没有平坦的大道"，
+ * 出自《资本论》法文版序与跋）。这里是《政治经济学批判》序言。
+ *
+ * 换箴言只改这一处（文案 + 出处一起改）。
+ */
+const MOTTO = {
+  text: '这里必须根绝一切犹豫',
+  // 署名只留人名（2026-11 用户定调）：空态里写"《〈政治经济学批判〉序言》"这种一串
+  // 书名号太重，也把一句用来填空的话抬成了学术引注。要查出处的人自己去查。
+  from: '卡尔·马克思',
+}
+
+function introPlan(base) {
+  if (_freeMode) {
+    return {
+      // 固定一句，**不写"第几场"**（2026-11 用户定调）：场次是个跟用户当下的意图
+      // 无关的计数器——他刚新建了一场，关心的是"这场能干什么"，不是编号。
+      title: '这是一场自由对话',
+      rules: '每场对话各自独立，归档时可以决定留下什么；自由对话不会被自动写进会意图',
+    }
+  }
+  // 读书模式：**固定一句**（2026-11 用户定调）。
+  // 不按"有没有划线"分两种文案——加那个判断是我自己多出来的复杂度，用户明确否掉：
+  // "不要再加这个 hasAnn 的判断了，都用'这本书还没有对话'"。
+  // 也**不再写书名**：顶栏已经写着《…》了（这就是当初"和《…》聊起来"那句话的问题之一，
+  // 另一个问题是搭配——书是被聊的对象，不是跟你聊天的对方）。
+  // 主句短还带来一个好处：不会再出现"长书名把这句话顶成两行"那种事故（实测过）。
+  return {
+    title: '这本书还没有对话',
+    rules: PROD_RULES,
+  }
+}
+
+// 重画开场。只有"当前上下文一条内容都没有、且历史已回放完"时才画——
+// 后者是为了避掉启动那一小段空窗：历史还没回来就先画，回来一看有消息再摘掉，
+// 用户看到的是闪一下（loadHistory 会把 _histLoaded 置真）。
+function renderIntro() {
+  const el = document.getElementById('intro')
+  if (!el) return
+  const base = effectiveBookBase()
+  const real = hasRealMsg()
+  // 留痕（2026-11 排查用）："该出现却没出现"时，唯一能区分"没轮到画 / 判据不满足 /
+  // 画了又被清掉"的证据就是这一条。判定结果变了才上报一次 —— 每次上下文变化都刷屏的话，
+  // 这份日志就没法读了；而"变了才报"恰好把用户看得见的每一次状态切换都记下来。
+  introTracePost({ base, real, loaded: _histLoaded, free: _freeMode, before: el.hidden, contentLen: el.innerHTML.length })
+  // 无有效上下文（书架/首页，读书模式）→ 由「无书默认界面」接管，这里不画
+  if (!base || real || !_histLoaded) { dropIntro(); return }
+  const plan = introPlan(base)
+  if (!plan || !plan.title) { dropIntro(); return }   // 兜底：连一句话都给不出就别占地方
+  // ── 结构：**永远三行**（2026-11 用户定调）────────────────────────────────
+  //   主句（我在哪）→ 箴言（填空、给分量）→ 署名
+  // 层次：主句 15px/最深（语用：先知道这是什么场合），箴言 13px/浅（审美），署名 11px/最浅。
+  // 划线**不在这里显示**（用户明确："开场里不该显示那行划线"）：它是内容，不是提示；
+  // 下方引用卡已经显示它了。所以这里不再拼任何引文块。
+  // 主句文案由 introPlan 按"有没有划线"给（有 → 聊起来；没有 → 还没开张），
+  // 但**显示的行数永远一样**——这一点很关键：开场不该因有没有划线而变形。
+  const capHtml = `<div class="it-cap" title="${escAttr(plan.rules || PROD_RULES)}">${esc(plan.title)}</div>`
+  el.dataset.book = base
+  el.hidden = false
+  // 也不绑任何点击事件：开场里没有按钮（见文件头的按钮说明）。
+  el.innerHTML =
+    capHtml +
+    `<div class="it-motto">${esc(MOTTO.text)}</div>` +
+    `<div class="it-from">${esc(MOTTO.from)}</div>`
+}
+
+/**
+ * 当前上下文该不该有开场——每次上下文变化 / 历史回放完 / 消息落库后调一次。
+ * 置 hidden 之后不 return：applyBookFilter 要照常跑（它决定这一块在当前书下显示与否）。
+ *
+ * `#msgs.intro-on` 是配套的：空态整块居中（上下留白），有消息时去掉这个类，
+ * 消息照旧从顶部往下排。两件事必须同生同灭，所以放在这一个函数里。
+ */
+function syncIntro() {
+  renderIntro()
+  const el = document.getElementById('intro')
+  const msgs = document.getElementById('msgs')
+  if (msgs) msgs.classList.toggle('intro-on', !!(el && !el.hidden))
+  if (el) applyBookFilter()
 }
 
 /**
@@ -1743,13 +3178,19 @@ function addBubble(role, content, extra, note, bookId) {
 
   if (role === 'user') {
     el.className = 'msg-user'
-    el.innerHTML = `<div class="bubble">${esc(content)}</div>`
+    // 带引用的提问 → 上方横幅（引用原文）+ 正文；普通提问照旧整段纯文本
+    renderQuoteBubble(el, content)
   } else if (role === 'user-popup') {
-    // 来自共读弹窗的用户消息：显示引用 + 用户问题，并启动思考动画
+    // 来自共读弹窗的用户消息：显示引用 + 用户问题，并启动思考动画。
+    // 引用同样走**上方横幅**（2026-11）：弹窗只给 selectedText 字段、正文里没有前缀，
+    // 由 quotedQuestionText 拼成库里那套形态再交给同一个渲染——不拼的话气泡里会是一行
+    // 生文本 `> "原文"`（绿底上多一个尖括号）。
     showThinking(bookId)
     el.className = 'msg-user'
-    const quoteText = note ? `> "${esc(note)}"\n\n` : ''
-    el.innerHTML = `<div class="bubble">${quoteText}${esc(content)}</div>`
+    const popupRef = extra || {}
+    renderQuoteBubble(el, quotedQuestionText({
+      content, selectedText: note, bookTitle: popupRef.bookTitle, chapter: popupRef.chapter,
+    }))
   } else {
     if (_pendingRefs.length || _streamEl) {
       if (_streamEl) {
@@ -1771,6 +3212,8 @@ function addBubble(role, content, extra, note, bookId) {
   }
 
   msgs.appendChild(el)
+  msgsRecord('bubble:' + role, el)
+  dropIntroIfReal(el)   // 会话开张了：这场对话的开场卡（若有）到此为止
   applyBookFilter()
   maybeAutoScroll(msgs)
   return el
@@ -1813,9 +3256,22 @@ function _isDuplicate(d) {
 //     会把之后实时到达的回复劫持成旧书的引用气泡，按书过滤后直接消失）；
 //  3) 挂轻量轮询（2s/趟）补渲染间隙里落库的回复，直到回复落库或超上限。
 //     实时流（SSE）照常推送，轮询只是兜底，二者都经 _histKeys / 指纹去重互斥。
+// ⚠️ 2) 要真的能触发，前提是 receiver 把**在途提问**（status=pending）也回放出来：
+// 2026-11 之前 /history 把它滤掉了，于是"思考中关掉面板、再打开"既没有提问气泡、
+// 也没有思考气泡（见 receiver/index.js 的 /history 分支）。
 const _histKeys = new Set()   // 已渲染的历史条目 key（role|ts|内容前40字）
+/**
+ * 历史回放过至少一趟（含失败那趟）。
+ *
+ * 为什么要有这个标志（2026-11）：开场卡不能抢在历史前面画。启动时 applyBookContext →
+ * renderNoBookView 会在 loadHistory 之前跑一遍，那时 _histKeys 还是空的，于是"这本书
+ * 早就聊过几百轮"也会被当成空会话：先画一张开场卡，历史回来再摘掉——用户看到的是闪一下。
+ * 置真之后开场卡才允许出现（见 renderIntro）。
+ */
+let _histLoaded = false
 let _recoverTimer = 0         // 未回复提问的恢复轮询定时器
 let _recoverTicks = 0         // 已轮询趟数（上限保护）
+let _recoverTs = 0            // 这 60 趟是在等哪一条提问（落库时间戳；换了新一轮就重置预算）
 const RECOVER_MAX_TICKS = 60  // ≈2 分钟；正常几趟内结束
 let _recoverAnswerSeen = false  // 本会话是否已有回复开始渲染（此后恢复逻辑不再重弹思考气泡）
 
@@ -1861,6 +3317,7 @@ function _handleStream(d) {
     _streamEl.dataset.book = baseBookId(d.bookKey) || _thinkingBook
     _streamEl.innerHTML = `<div class="bubble md"></div>`
     msgs.appendChild(_streamEl)
+    msgsRecord('stream', _streamEl)
     applyBookFilter()
   }
   // 流式分片的 content 是**累计全文**（agent 侧约定），所以每片都整段重渲染 markdown：
@@ -1873,7 +3330,9 @@ function _handleStream(d) {
 // 引用回复气泡的完整 HTML（引用条 + 引用原文预览 + 回复正文）
 function refReplyHTML(ref, content) {
   const book = esc(ref.bookTitle || '')
-  const chapter = esc((ref.chapter || '').slice(0, 12))
+  // 竖排条 .ref-bar 只有 30–40px 宽：章节名截到 2 字（完整章节名在「当前引用」卡与
+  // 引用抽屉里都是全的，这里只是个定位提示），配「章节」竖排标签 + 值横排，见 sidebar.html
+  const chapter = esc((ref.chapter || '').slice(0, 2))
   const num = findRefNum(ref.bookTitle, ref.chapter, ref.selectedText)
   const snippet = esc((ref.selectedText || '').slice(0, 80))
   // 注意：不要用带前导空白的模板字符串——生成 HTML 里的换行/缩进会进气泡排版；
@@ -1881,7 +3340,7 @@ function refReplyHTML(ref, content) {
   return (
     `<div class="ref-bar" data-ref-num="${num}">` +
       `<span class="ref-book">${book}</span>` +
-      (chapter ? `<span class="ref-chapter">${chapter}</span>` : '') +
+      (chapter ? `<span class="ref-chapter"><span class="rc-label">章节</span><span class="rc-val">${chapter}</span></span>` : '') +
       `<span class="ref-num">#${num || '?'}</span>` +
     `</div>` +
     `<div class="bubble md">` +
@@ -1916,6 +3375,7 @@ function _renderEntry(entry, content) {
     el.innerHTML = mdBubble(content)
   }
   msgs.appendChild(el)
+  msgsRecord('entry:' + (ref ? 'quoted' : 'plain'), el)
   applyBookFilter()
   maybeAutoScroll(msgs)
 }
@@ -2070,6 +3530,9 @@ function connect() {
       if (d.role === 'annotation-select') {
         applySetRef({ bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter,
           chapterUid: d.chapterUid, chapterUidInt: d.chapterUidInt || 0, selectedText: d.selectedText,
+          // 译文（2026-11）：PDF 阅读器「设为引用」那条路带它。丢了它就等于这条引用
+          // 没有译文可显示（引用卡与对话横幅双双回落原文）。
+          ...(d.translation ? { translation: d.translation } : {}),
           sourceUrl: d.sourceUrl || '' })
         return
       }
@@ -2081,6 +3544,8 @@ function connect() {
           applySetRef({ bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter || '',
             chapterUid: '', chapterUidInt: d.chapterUidInt || 0,
             bookmarkRange: d.bookmarkRange || '', bookmarkId: d.bookmarkId || '',
+            // 微读划线没有译文（这个字段恒缺失）——透传只为形状统一，不改变行为
+            ...(d.translation ? { translation: d.translation } : {}),
             selectedText: d.selectedText, sourceUrl: d.sourceUrl || '' })
         }
         return
@@ -2117,7 +3582,8 @@ function connect() {
       } else if (d.role === 'user-popup') {
         // 来自共读弹窗的用户消息（AI-001：引用回复绑定该书）
         _pendingRefs.push({ ref: { bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter, selectedText: d.selectedText } })
-        addBubble('user-popup', d.content, null, d.selectedText, d.bookId)
+        addBubble('user-popup', d.content,
+          { bookTitle: d.bookTitle, chapter: d.chapter }, d.selectedText, d.bookId)
         // 弹窗发送的标注要实时加入引用列表（标注走 annotation-select 事件，不产生消息气泡）
         if (d.bookId && d.selectedText) {
           addRecentAnn({ bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter,
@@ -2158,7 +3624,11 @@ async function refreshStackHits() {
   // 栈收口/清空后 hits 为空 → 锁定条目清空、图按 applyStackHits 的空结果规则清除。
   if (_freeMode && hits) setFreeStackCites(hits)
   if (!graphView || !hits) return
-  graphView.applyStackHits(hits)
+  // 「本轮还在进行」交给图视图判空结果（2026-11）：等在回答（_awaitingStop）或正在流式
+  // 渲染（_streamEl）时，本轮提问的 cites 还没由 agent 写进实时栈，/stack-hits 必然是空的
+  // ——那不是"命中结束"，不能据此清高亮（用户报："命中动画一结束就打开会意图，刚命中的
+  // 节点没被高亮，要等回答完成才补上"）。
+  graphView.applyStackHits(hits, { pending: _awaitingStop || !!_streamEl })
 }
 
 // ── 停止当前回答（2026-02 用户定调）─────────────────────────────────────────
@@ -2298,14 +3768,22 @@ function finishStoppedTurn({ content, bookKey, timestamp, force = false } = {}) 
   _awaitUserEl = null
   _awaitTs = 0
   _awaitContent = ''
+  // 停掉的若是这场对话的**第一条**提问，消息区此刻又空了（提问气泡与半截回答都被摘掉）。
+  // 这时把开场卡放回来，而不是留一块白板——用户按「停止」多半就是想换个问法再来一次，
+  // 卡上的按钮正好接住这一步。里面有内容时 hasRealMsg 会拦住，不会凭空多出一张卡。
+  syncIntro()
 }
 
 // ── 发送 ─────────────────────────────────────────────────────────────────────
 async function submit() {
   const input = document.getElementById('input')
-  const content = stripInvisibleBidi(input.value).trim()  // 双向控制字符不进正文（见 esc 注释）
+  const typed = stripInvisibleBidi(input.value).trim()  // 双向控制字符不进正文（见 esc 注释）
+  // 框里挂着命令块时，把它拼在正文前面（形如「/相处 以后别老用比喻」）；
+  // 用户自己手打了斜杠命令（正文以 / 开头）就忽略块——以他手打的为准
+  const useCmd = _pendingCmd && !typed.startsWith('/')
+  const content = useCmd ? (_pendingCmd + (typed ? ' ' + typed : '')) : typed
   const attach = _pendingAttachment
-  // 允许仅附件、无正文：附件正文即本次讨论内容（读取进讨论，不落盘保存原文件）
+  // 允许只有附件、没有正文；也允许只有命令块（「/相处」单独回车 = 只列清单）
   if (!content && !attach) return
   // /归档（2026-11）：自由模式下的斜杠命令，直接弹出归档确认窗（要勾选产物去向，
   // 不能像普通消息那样直接发出）。不发消息、不入队，输入框照常保留原文本。
@@ -2323,6 +3801,8 @@ async function submit() {
   }
   input.value = ''
   _inputPrevValue = ''
+  _pendingCmd = ''
+  renderCmdChip()
   _quoteParityFlipped = false  // 新消息重新判定输入法引号奇偶（下次第一下就错会立刻再纠正）
   input.style.height = 'auto'
   _pendingAttachment = null
@@ -2330,10 +3810,25 @@ async function submit() {
   // AI-001：消息归属有效上下文——有选中引用归引用书；否则归正在阅读的书 /
   // 手动选中的书（2026-10），自由消息也带上"在哪本书里聊起来的"标记，切书后不显示
   const msgBook = selectedAnn ? selectedAnn.bookId : effectiveBookBase()
+  // 斜杠命令（/收口 等，2026-09）不绑定引用——否则 [引用] 前缀会破坏命令匹配
+  const _isCmd = /^\//.test(content)
+  // 本次提问是否绑定引用：自由模式强制不带（测试对话不绑定引用），斜杠命令也不带
+  const isQuoted = !!(selectedAnn && !_freeMode && !_isCmd)
+  // 气泡文本与**落库文本同格式**（`[引用]《书名》章节` + `> "引用文本"` + 空行 + 正文）：addBubble
+  // 会把这段前缀渲染成上方横幅。以前气泡只喂正文，于是同一条提问"刚发出去"是干净提问、
+  // "重开面板后从历史回放"却多出一段 `[引用]…> "…"` 原文（2026-11 用户报的"气泡长出前缀"）。
+  //
+  // 2026-11：引用文本走 refDisplayText（**译文优先**）——PDF 那条引用带译文时，
+  // 横幅显示用户读到的那句；原文仍是引用的身份（body.selectedText 不动），
+  // 只是不上横幅（在引用卡里可查，那里点「原文」就看得到）。
+  const quoteHead = isQuoted
+    ? buildQuotedQuestion(selectedAnn.bookTitle, selectedAnn.chapter, refDisplayText(selectedAnn), '') + '\n'
+    : ''   // 末尾这个换行 = 引用块与正文之间那个空行（正文由 bubbleText 接在后面）
   // 气泡预览：附件用「📎 文件名」占位 + 正文（附件正文不整段贴进气泡，只进 agent 上下文）
-  const bubbleText = attach
+  const attachText = attach
     ? ('📎 ' + attach.fileName + (content ? '\n\n' + content : ''))
     : content
+  const bubbleText = quoteHead + attachText
   const userEl = addBubble('user', bubbleText, null, null, msgBook)
   showThinking(msgBook)
   // 发送成功即进入"等回答"态：按钮变「停止」，并记住这颗提问气泡（停止时连它一起删）
@@ -2345,9 +3840,8 @@ async function submit() {
 
   // 自由模式强制走自由消息路径（测试对话不绑定引用；进入自由模式时已清空选中引用，
   // 这里双保险：即使 selectedAnn 残留也不让消息带 [引用] 前缀/划线上下文）。
-  // 斜杠命令（/收口 等，2026-09）：同样不绑定引用——否则 [引用] 前缀会破坏命令匹配
-  const _isCmd = /^\//.test(content)
-  if (selectedAnn && !_freeMode && !_isCmd) {
+  // 判据与气泡文本共用 isQuoted，避免"气泡有横幅、落库没有前缀"这类不一致。
+  if (isQuoted) {
     // AI-001：引用回复气泡按 bookId 打书签隔离；入队等最终记录配对（AI-006）
     _pendingRefs.push({ ref: { bookId: selectedAnn.bookId, bookTitle: selectedAnn.bookTitle, chapter: selectedAnn.chapter, selectedText: selectedAnn.selectedText } })
     body.bookId = selectedAnn.bookId
@@ -2355,7 +3849,13 @@ async function submit() {
     body.chapter = selectedAnn.chapter || ''
     body.chapterUid = selectedAnn.chapterUid || ''
     body.selectedText = selectedAnn.selectedText
-    body.content = `[引用]《${selectedAnn.bookTitle}》${selectedAnn.chapter || ''}\n> "${selectedAnn.selectedText}"\n\n${content}`
+    // 为什么**不**把译文也塞进聊天库：那样要给 messages 表加一列，而它只服务一件事
+    // ——回放时把横幅重建成译文。而译文本来就躺在标注存档里（/annotation 落的那个
+    // `translation`），/history 会按消息的 bookId + selectedText 把它带回来，
+    // 见 quotedQuestionText。能不加列就不加列。
+    // 落库文本 = 前缀 + 正文；前缀与气泡文本（quoteHead）同源，不再各写一份（两处各写
+    // 一份字符串，改一处忘一处就会出现"气泡有横幅、重开后没了"这类不一致）
+    body.content = quoteHead + content
   } else {
     // AI-006：自由提问也入队一个 ref:null 条目，保证最终记录按提交顺序配对。
     // 之前自由消息不入队，若「自由回复流式中途又发引用」，自由回复的最终记录
@@ -2484,18 +3984,103 @@ function fixTypedQuoteDirection(el, prevValue) {
 }
 let _inputPrevValue = ''  // 输入框上一次的 value（打字纠正要判断"新增了哪个字符"）
 
+// 待提交的命令（点斜杠菜单里需要补内容的项后出现）。它**不是输入框里的文本**，而是贴在框内
+// 左侧的一个整体块：接着打的要求与它是一个整体，框里为空时按退格、或点块上的 ✕，一起移除；
+// 提交时由 submit() 拼成「/相处 你的要求」。
+let _pendingCmd = ''
+function renderCmdChip() {
+  const chip = document.getElementById('cmd-chip')
+  const input = document.getElementById('input')
+  if (!chip || !input) return
+  if (_pendingCmd) {
+    const name = document.getElementById('cmd-chip-name')
+    if (name) name.textContent = _pendingCmd
+    chip.hidden = false
+    // chip 是绝对定位（不占文档流），所以要把输入框左内距推到它右边，文字才不会被压住
+    input.style.paddingLeft = (chip.offsetWidth + 14) + 'px'
+  } else {
+    chip.hidden = true
+    input.style.paddingLeft = ''   // 回落到 CSS 默认值
+  }
+}
+document.getElementById('cmd-chip-remove').addEventListener('click', () => {
+  _pendingCmd = ''
+  renderCmdChip()
+  document.getElementById('input').focus()
+})
+
 document.getElementById('send-btn').addEventListener('click', () => {
   // 回答生成中 → 同一个按钮是「停止」（2026-02 用户定调：就地变，不并排加第二个）
   if (_awaitingStop) { requestStop(); return }
   submit()
 })
 document.getElementById('input').addEventListener('keydown', e => {
+  const menu = document.getElementById('cmd-menu')
+  const menuOpen = !!menu && !menu.hidden
+  // 菜单开着时这四个键归菜单（轮不到"发送"）：↑↓ 移动选中、Enter 确认、Esc 关掉
+  if (menuOpen && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+    e.preventDefault()
+    moveCmdHighlight(e.key === 'ArrowDown' ? 1 : -1)
+    return
+  }
+  if (menuOpen && e.key === 'Escape') {
+    e.preventDefault()
+    menu.hidden = true
+    clearCmdHighlight()
+    return
+  }
+  // Tab = 补全（不执行）：把当前选中项放进输入框，焦点留在输入框等用户接着打字。
+  // 与 Enter 的分工——Enter 是"确认执行"，Tab 是"先把它填进来，我还想补点别的"（类 shell 补全）。
+  // 菜单没开时不拦 Tab，浏览器默认的焦点移动照旧（2026-10）。
+  if (menuOpen && e.key === 'Tab') {
+    e.preventDefault()
+    const items = visibleCmdItems()
+    const cur = items.find((it) => it.classList.contains('on')) || items[0]
+    const el = document.getElementById('input')
+    if (cur) {
+      const cmd = cur.dataset.cmd || ''
+      menu.hidden = true
+      clearCmdHighlight()
+      clearTypedCommandStub(el)   // 清掉唤起菜单的那半截（Tab 路径原先漏了 → chip 旁边多一个 /）
+      if (cur.dataset.prefill) {
+        _pendingCmd = cmd      // 需要补内容的命令（/相处）→ 落成 chip，接着打要求
+        renderCmdChip()
+      } else {
+        el.value = cmd         // 无参命令（/收口）→ 补全成文本、不执行（想发再回车）
+        _inputPrevValue = cmd
+        el.style.height = 'auto'
+      }
+    }
+    el.focus()
+    return
+  }
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
-    const im = document.getElementById('cmd-menu')
-    if (im) im.hidden = true
+    if (menuOpen) {
+      const typed = document.getElementById('input').value.trim()
+      // 已经手打完整条命令（/收口、/相处…）→ 直接发它，不要替他选菜单第一项
+      const exact = visibleCmdItems().find((it) => (it.dataset.cmd || '') === typed)
+      if (exact) {
+        menu.hidden = true
+        clearCmdHighlight()
+        submit()
+        return
+      }
+      // 还只是半截（"/"、"/相"）→ Enter 确认当前选中项（复用点击处理：chip / 直接执行都在那）
+      const items = visibleCmdItems()
+      const cur = items.find((it) => it.classList.contains('on')) || items[0]
+      if (cur) cur.click()
+      return
+    }
     if (document.getElementById('input').value.trim() === '/') return  // 纯 "/" 不发送（斜杠菜单占位）
     submit()
+    return
+  }
+  // 框里已经空了还按退格 → 删掉待提交的命令块（要删就一起删，不留半个命令）
+  if (e.key === 'Backspace' && _pendingCmd && !document.getElementById('input').value) {
+    e.preventDefault()
+    _pendingCmd = ''
+    renderCmdChip()
   }
 })
 document.getElementById('input').addEventListener('input', function () {
@@ -2528,25 +4113,100 @@ function syncCmdMenuItems() {
   if (!cmdMenu) return
   for (const item of cmdMenu.querySelectorAll('.cmd-item')) {
     const when = item.dataset.when || 'reading'
-    item.hidden = (when === 'free') !== !!_freeMode
+    // 'both' = 两种模式都显示（相处规则与读书/自由模式无关，2026-10）
+    item.hidden = when === 'both' ? false : (when === 'free') !== !!_freeMode
   }
+}
+/**
+ * 菜单里**当前可见**的项。按模式隐藏的项（hidden）不参与上下键——
+ * 否则键盘会停在一个看不见的项上（2026-10）。
+ */
+function visibleCmdItems() {
+  if (!cmdMenu) return []
+  return [...cmdMenu.querySelectorAll('.cmd-item')].filter((it) => !it.hidden)
+}
+/** 选中第 idx 项（越界绕回，所以一直按 ↓ 会循环）。焦点仍在输入框，这是"高亮"不是 DOM focus */
+function setCmdHighlight(idx) {
+  const items = visibleCmdItems()
+  for (const it of items) it.classList.remove('on')
+  if (!items.length) return
+  const i = ((idx % items.length) + items.length) % items.length
+  items[i].classList.add('on')
+}
+/** ↑↓ 移动选中态；当前没有选中时，↓ 落第一项、↑ 落最后一项 */
+function moveCmdHighlight(delta) {
+  const items = visibleCmdItems()
+  if (!items.length) return
+  const cur = items.findIndex((it) => it.classList.contains('on'))
+  setCmdHighlight(cur < 0 ? (delta > 0 ? 0 : items.length - 1) : cur + delta)
+}
+function clearCmdHighlight() {
+  if (!cmdMenu) return
+  for (const it of cmdMenu.querySelectorAll('.cmd-item.on')) it.classList.remove('on')
+}
+/**
+ * 选完菜单项之后，清掉"唤起菜单时敲的那半截命令"（"/" 或 "/相"）——它不是内容，只是占位符；
+ * 留着会跟 chip（或补全/写回的文本）拼成「//相处」这种双斜杠。
+ * 只清"以 / 开头且不含空白"的半截：带空格的是用户已经写完的话，不动。
+ * 三条选择路径（鼠标点击、Enter、Tab）共用这一个函数——2026-10 修 Tab 路径漏清。
+ * @returns {boolean} 是否清掉了
+ */
+function clearTypedCommandStub(el) {
+  if (!el || !/^\/\S*$/.test(String(el.value || '').trim())) return false
+  el.value = ''
+  _inputPrevValue = ''
+  el.style.height = 'auto'
+  return true
 }
 if (cmdMenu) {
   document.getElementById('input').addEventListener('input', () => {
-    if ((document.getElementById('input').value || '').startsWith('/')) syncCmdMenuItems()
-    cmdMenu.hidden = !(document.getElementById('input').value || '').startsWith('/')
+    const v = document.getElementById('input').value || ''
+    // 只在"正在敲命令"时开菜单：以 / 开头**且还没出现空白**。
+    // 一旦打了空格（如「/相处 别老用比喻」），说明命令段结束、后面是正文——菜单必须让开，
+    // 否则按回车会被当成"选中菜单项"，而不是发送这条消息（2026-10 修）。
+    const show = /^\/\S*$/.test(v)
+    if (show) syncCmdMenuItems()
+    cmdMenu.hidden = !show
+    // 第一个字符是 / → 选中态自动落到第一项，接着就能 ↑↓ 选、Enter 确认
+    if (show) setCmdHighlight(0)
+    else clearCmdHighlight()
+  })
+  // 鼠标划过哪一项，选中态就跟到哪一项（键盘与鼠标共用同一个高亮，不会两处同时亮）
+  cmdMenu.addEventListener('mouseover', (e) => {
+    const item = e.target.closest('.cmd-item')
+    if (!item || item.hidden) return
+    const i = visibleCmdItems().indexOf(item)
+    if (i >= 0) setCmdHighlight(i)
   })
   cmdMenu.addEventListener('click', (e) => {
     const item = e.target.closest('.cmd-item')
-    if (!item) return
+    // 按模式隐藏的项：正常情况下它 display:none、根本点不到（见 .cmd-item[hidden]），这行是防御
+    if (!item || item.hidden) return
     const el = document.getElementById('input')
-    el.value = item.dataset.cmd || ''
-    _inputPrevValue = el.value
+    const cmd = item.dataset.cmd || ''
     cmdMenu.hidden = true
+    clearCmdHighlight()
+    clearTypedCommandStub(el)   // 清掉唤起菜单的那半截（见函数注释）
+    if (item.dataset.prefill) {
+      // 需要补内容的命令（/相处）：命令做成输入框内的一个整体块，用户接着打自己的要求，
+      // 提交时自动拼成「/相处 你的要求」。**不直接发**——点它的人本意是要接着说话。
+      _pendingCmd = cmd
+      renderCmdChip()
+      cmdMenu.hidden = true
+      el.focus()
+      return
+    }
+    // 无参命令（/收口、/归档）：直接执行；若框里还挂着上一个命令块，先摘掉（用户换意图了）
+    if (_pendingCmd) { _pendingCmd = ''; renderCmdChip() }
+    el.value = cmd
+    _inputPrevValue = el.value
     submit()
   })
   document.addEventListener('click', (e) => {
-    if (!cmdMenu.contains(e.target) && e.target !== document.getElementById('input')) cmdMenu.hidden = true
+    if (!cmdMenu.contains(e.target) && e.target !== document.getElementById('input')) {
+      cmdMenu.hidden = true
+      clearCmdHighlight()
+    }
   })
 }
 
@@ -2774,6 +4434,56 @@ async function jumpToAnnotation(ann) {
   try {
     const base = baseBookId(ann.bookId)
     if (!base) { console.warn('[CoRead] jump: missing bookId'); return }
+
+    // ---- 诊断（2026-11）：把"当时到底拿到了什么"写下来 ----------------------------
+    // 为什么要这一条：用户报"点切换引用回到选书界面"，而我加的那条 `rd_` 分支**没进**——
+    // 但我是靠"日志里没有 jump-rd"**推断**出来的，没有直接证据说明 `ann.bookId` 长什么样。
+    // 这类"分支为什么没进"的问题，唯一可靠的办法是把入参原样打出来。
+    postSidebarDebug({
+      stage: 'jump-begin',
+      annBookId: String(ann.bookId || '').slice(0, 32),
+      base: String(base || '').slice(0, 32),
+      isRd: base.indexOf('rd_') === 0,
+      text: String(ann.selectedText || '').slice(0, 24),
+      chapterNum: ann.chapterNum === undefined ? '(无)' : ann.chapterNum,
+    })
+
+    // 我们自己阅读器里的书（`rd_`，含扩展自带的教程书）——**必须在这里拦下来**。
+    // 2026-11 用户实测：在教程书里点「切换引用」，界面回到了**选书界面**。
+    // 原因是这条路漏了：下面全是"去微信读书跳转"的逻辑，`rd_` 书既不在 weread tab 里、
+    // 也没有章节槽位，于是被当成"找不到的书"处理，用户看到的就是选书界面。
+    //
+    // 修法要点（用户第二次反馈后定稿）：
+    //   ① 优先走**同页定位**：`readerCommand` 的 `locate(text)`——阅读器不重载、
+    //      直接在正文里找到这段原文并滚过去、加一圈高亮。用户点"跳到原文"要的是
+    //      "让我看见那句话在哪"，不是"把整本书重新打开一遍"。
+    //   ② 定位不到再退回"按章打开"（深链带 `&chapter=`）。
+    //   ③ **不要依赖引用里的章号**：教程书的引用是我们自己造的，它**没有** chapterNum，
+    //      于是 `Number(undefined) || 0` = 0，深链缺了 `&chapter=`，阅读器只能从头打开——
+    //      这正是用户看到的"回到主界面"。
+    if (base.indexOf('rd_') === 0) {
+      try {
+        const r = await chrome.runtime.sendMessage({
+          action: 'readerCommand', type: 'locate', text: String(ann.selectedText || ''),
+        }).catch(() => null)
+        postSidebarDebug({
+          stage: 'jump-rd', located: !!(r && r.ok && r.found), text: String(ann.selectedText || '').slice(0, 20),
+        })
+        if (r && r.ok && r.found) return
+      } catch (e) {}
+      // 同页定位没成（阅读器没开、或者这段不在这一本里）：退回按章打开
+      try {
+        await chrome.runtime.sendMessage({
+          action: 'openReaderBook',
+          base,
+          name: ann.bookTitle || '',
+          chapter: Number(ann.chapterNum) || 0,
+        })
+      } catch (e) {
+        showToast('打不开阅读器：' + String((e && e.message) || e), true)
+      }
+      return
+    }
 
     // 网页阅读源（AI-021，mia_* 书）：跳转 = 打开标注所在网页并滚动到原文。
     // 目标 URL 带 #coread=<encodeURIComponent(selectedText)>，source-mia.js 加载后定位滚动；
@@ -3062,6 +4772,14 @@ function renderJumpBack() {
 // 所以本地移除不依赖 receiver 结果（receiver 同步是 best-effort）。
 // 自绘确认弹窗：扩展页面不能用原生 confirm()（Chrome 压制并恒返回假），
 // 这里用侧栏内的 overlay + 确认/取消按钮替代，返回 Promise<boolean>。
+/**
+ * 自绘确认弹窗：扩展页面不能用原生 confirm()（Chrome 压制并恒返回假），
+ * 这里用侧栏内的 overlay + 确认/取消按钮替代，返回 Promise<boolean>。
+ *
+ * ⚠️ 只有"确定 / 取消"两个答案。曾经为"PDF 记录还是原件"加过第三个按钮，
+ * 用户否掉了那个模型（两个界面各自代表一样东西，不该让人在一次删除里选），
+ * 于是按钮与 altText 参数一并撤掉——少一个参数、少一种组合，别再加回来。
+ */
 function showConfirm(title, message, { okOnly = false, okText = '确认删除' } = {}) {
   return new Promise((resolve) => {
     const overlay = document.getElementById('confirm-overlay')
@@ -3173,9 +4891,9 @@ function showPrompt({ title, message = '', value = '', placeholder = '', maxLeng
 }
 
 async function deleteRef(ann) {
-  if (!ann?.bookId || !ann?.selectedText) return
+  if (!ann?.bookId || !ann?.selectedText) return false
   const ok = await showConfirm('删除这条引用？', '删除后书页中的共读标记也会移除。')
-  if (!ok) return
+  if (!ok) return false
 
   // 先从本地移除匹配项（AI-007：按 bookmarkId/章节位置精确匹配，避免同文本连坐删除）。
   // removeAnns 统一处理"移除的是当前选中引用 → 一并清空选中态"（AI-018）
@@ -3221,6 +4939,9 @@ async function deleteRef(ann) {
       }
     } catch {}
   }
+  // 返回"确实删了"：调用方（译文面板的动作条）据此决定要不要提示成功、
+  // 要不要把下划线抹掉。用户取消 / 参数不全都走上面的 false，不能当成删了。
+  return true
 }
 
 // ── 未回复提问的恢复轮询 ──────────────────────────────────────────────
@@ -3239,6 +4960,7 @@ function scheduleRecoverPoll() {
 function stopRecoverPoll() {
   clearTimeout(_recoverTimer)
   _recoverTicks = 0
+  _recoverTs = 0
 }
 
 // 完整 assistant 记录的直接渲染（历史增量 / 轮询补渲染专用）。与 addBubble 的
@@ -3263,6 +4985,8 @@ function renderCompleteAssistant(content, bookId, histRef) {
   if (bookId) el.dataset.book = baseBookId(bookId)
   el.innerHTML = mdBubble(content)
   msgs.appendChild(el)
+  msgsRecord('assistant:complete', el, { via: histRef ? 'hist' : 'direct' })
+  dropIntroIfReal(el)   // 历史/轮询补渲染出第一条回复 → 开场卡该摘了（限当前上下文）
   applyBookFilter()
   maybeAutoScroll(msgs)
 }
@@ -3271,6 +4995,8 @@ async function loadHistory() {
   // 遍历结束时若 pendingUser 仍非空 = 最新一条提问还没有回复落库（AI 仍在回复中，
   // 或回复恰在「loadHistory 抓取」与「SSE 注册」之间落库、本趟没抓到）——据此恢复
   // "思考中"状态并挂轮询补渲染（见函数尾部）。
+  // 标志先置：本趟（含失败那趟）跑完，开场卡才有资格出现（见 _histLoaded 的注释）。
+  _histLoaded = true
   let pendingUser = null
   let loadFailed = false  // /history 抓取失败（接收端暂不可用）：轮询不能停，等恢复
   try {
@@ -3295,28 +5021,47 @@ async function loadHistory() {
             chapterUid: d.chapterUid, chapterUidInt: d.chapterUidInt || 0,
             bookmarkRange: d.bookmarkRange || '', bookmarkId: d.bookmarkId || '',
             sourceUrl: d.sourceUrl || '',
+            // 译文（2026-11）：面板重开/本地引用被对账清理后靠这趟重建，
+            // 漏掉它就是"重开一次译文变回原文"
+            ...(d.translation ? { translation: d.translation } : {}),
             selectedText: d.selectedText }, { select: false })
         }
       }
       else if (d.role === 'user') {
         if (d.bookId) histBook = baseBookId(d.bookId)
-        pendingUser = { bookId: d.bookId || histBook, content: d.content }
-        // 幂等：已渲染过的提问（本会话发送/上一趟已渲染）直接跳过，不重复渲染
+        // 幂等：已渲染过的提问（本会话发送/上一趟已渲染）直接跳过，不重复渲染。
+        // 提问气泡元素要留着：等在回答的那条提问，恢复「停止」按钮时得知道删哪颗气泡。
+        let userEl = null
         const key = msgHistKey('user', d._ts, d.content)
-        if (_histKeys.has(key)) continue
-        _histKeys.add(key)
-        // 无 bookId 的旧自由消息：沿用当前书上下文做最佳归属（AI-001），
-        // 不切断书签链——它是在该书讨论期间发出的
-        addBubble('user', d.content, null, null, d.bookId || histBook)
+        if (!_histKeys.has(key)) {
+          _histKeys.add(key)
+          // 无 bookId 的旧自由消息：沿用当前书上下文做最佳归属（AI-001），
+          // 不切断书签链——它是在该书讨论期间发出的
+          // 文本走 quotedQuestionText：弹窗来的提问引用在 selectedText 字段里，
+          // 不拼回来气泡就只剩提问、横幅不见了（2026-11）
+          userEl = addBubble('user', quotedQuestionText(d), null, null, d.bookId || histBook)
+        }
+        // 在途提问（receiver 标了 pending = 回复还没落库，agent 还在回答）。
+        // 2026-11 用户报的 bug：这种提问原先被 receiver 整个滤掉，于是"思考中关掉面板、
+        // 再打开"时提问气泡与思考气泡双双不见。标记照旧记在 pendingUser 上，供本函数
+        // 尾部恢复思考气泡 + 「停止」按钮（见那里的注释）。
+        pendingUser = { bookId: d.bookId || histBook, content: d.content, el: userEl, ts: Number(d._ts) || 0, inFlight: !!d.pending }
+        // 在途提问 = **本轮回答还没开始渲染**：历史里排在它之前的那些回复属于更早的回合，
+        // 不能拿它们当"本轮答案已在屏上"（渲染历史回复会经 hideThinking 把这个标志置真，
+        // 不重置的话重开面板时思考气泡又被吞掉——正是这一条让本测试第一版红过）。
+        // 有实时流气泡时不重置：那才是真的"本轮答案正在打字"，此时不许再弹思考气泡。
+        if (d.pending && !_streamEl) _recoverAnswerSeen = false
         // 本趟局部配对（histPendingRef，单槽、仅 [引用] 提问）：它的回复在本趟
         // 遍历里到达时带引用条渲染。绝不入 _pendingRefs（实时提交队列）——
         // 历史里"永远没被回复"的旧提问（如被截断/agent 漏答）若占着实时队位，
         // 会劫持之后实时到达的回复（把新回复渲染成旧书的引用气泡，按书过滤后
         // 直接消失；自由模式提问的回复就是这么丢的）。
-        const ref = parseRefFromContent(d.content)
-        if (ref) {
-          histPendingRef = ref
-          if (d.bookId) histPendingRef.bookId = d.bookId
+        if (userEl) {
+          const ref = parseRefFromContent(d.content)
+          if (ref) {
+            histPendingRef = ref
+            if (d.bookId) histPendingRef.bookId = d.bookId
+          }
         }
       }
       else if (d.role === 'assistant') {
@@ -3374,17 +5119,68 @@ async function loadHistory() {
   // 补渲染间隙里落库的回复。该提问的实时回复到达时按既有流程渲染（流式分片
   // 直接建气泡、最终记录走收尾分支；无配对条目时渲染普通气泡，绝不会因本趟
   // 历史没有入队而丢回复）；回复落库 / 回复已实时渲染后轮询即停。
+  //
+  // 2026-11 补齐两件事（用户报"思考中关掉面板、再打开两颗气泡都不见了"）：
+  //   ① 在途提问现在由 receiver 回放（带 pending 标记），所以这里真的会走到
+  //      "有提问没回复"这一支——此前 receiver 把 pending 行滤掉了，这一支只在
+  //      "提问存在但回复永远不来"的罕见情况下才触发；
+  //   ② 除了思考气泡，把「停止」按钮一起恢复：重开后状态与关掉前一致，这条还在
+  //      生成的回答能直接停掉（原先只有一颗思考气泡、按钮却是「发送」，自相矛盾）。
   if (loadFailed) {
     // 抓取失败：接收端暂不可用，回答无法送达，保住轮询等它恢复
     scheduleRecoverPoll()
   } else if (pendingUser) {
-    // 只有当思考气泡已被清掉、且本会话还没有回复开始渲染时才恢复它——
-    // 回复已在流式渲染中（气泡正打字）时不再弹一个"思考中"在它后面
-    if (!thinkingEl && !_recoverAnswerSeen) showThinking(pendingUser.bookId)
-    scheduleRecoverPoll()
+    // 轮询预算按**这一条提问**算（用落库时间戳当身份证）：换了新一轮提问就把预算重置，
+    // 否则上一轮攒满的趟数会让新一轮刚开就"放弃"。
+    if (pendingUser.ts && pendingUser.ts !== _recoverTs) { _recoverTicks = 0; _recoverTs = pendingUser.ts }
+    if (_recoverTicks >= RECOVER_MAX_TICKS) {
+      // 轮询预算（≈2 分钟）用尽还是没等到回答：撤掉思考气泡并说清原因。
+      // 不撤的话这颗气泡会一直转下去——本机服务没跑、模型不可用、agent 被强杀
+      // 都会落在这一支（回复真到了仍会正常渲染，只是不再占着一颗转圈的球）。
+      // 提示只在"库说这条还在处理中"时给：那种情况"一直没等到"的判断才站得住。
+      if (thinkingEl) {
+        hideThinking()   // 内含 finishWaiting：按钮回「发送」
+        if (pendingUser.inFlight) {
+          showToast('这条提问一直没等到回答：CoRead 本机服务或模型可能没在运行。回答到达时会自动显示。', true)
+        }
+      }
+    } else {
+      // 只有当思考气泡已被清掉、且本会话还没有回复开始渲染时才恢复它——
+      // 回复已在流式渲染中（气泡正打字）时不再弹一个"思考中"在它后面
+      if (!thinkingEl && !_recoverAnswerSeen) {
+        showThinking(pendingUser.bookId)
+        // 提问正文（剥掉 [引用] 头与 > 原文行）做停止收尾的"原文回填"，
+        // 否则库里那串前缀会被灌进输入框
+        startWaiting(pendingUser.el || _awaitUserEl, pendingUser.bookId, questionTextFrom(pendingUser.content))
+        // startWaiting 会把 _awaitTs 清 0（实时那条要等 POST /chat 的响应才填），
+        // 但恢复的这条**现在就知道** ts：它是"哪一轮"的身份证，停止请求与
+        // message-stopped 事件的配对都用它，不补上的话停止会以 ts=0 收尾
+        //（气泡删了、历史 key 却登记错，面板重开时这条提问又会从历史里长回来）。
+        _awaitTs = pendingUser.ts || 0
+      }
+      scheduleRecoverPoll()
+    }
   } else {
     stopRecoverPoll()
   }
+  // 最后一步：这场对话一条内容都没有 → 落开场卡（有内容则它已经被 addBubble /
+  // renderCompleteAssistant 摘掉了，这里再兜一次）。放在函数尾部是因为卡上的引文
+  // 要等本趟回放把 RECENT_ANNS 补齐、把"最新一条划线"选出来才算得准。
+  syncIntro()
+}
+
+/**
+ * 一条历史提问的正文：剥掉 `[引用]《书名》章节` 头与 `> "原文"` 行。
+ *
+ * 为什么要它：库里 user 消息的 content 对引用提问是带前缀的（`[引用]…\n> "…"\n\n提问`），
+ * 而「停止」收尾会把 `_awaitContent` **覆盖**回输入框。直接拿 content 回填的话，
+ * 用户会看到 `[引用]《大国大城》\n> "划线原文"` 被灌进输入框里。
+ */
+function questionTextFrom(content) {
+  const body = String(content || '').split('\n')
+    .map((l) => l.trim())
+    .filter((t) => t && !t.startsWith('>') && !t.startsWith('[引用]'))
+  return body.join('\n').trim() || String(content || '').trim()
 }
 
 // ── 提问位置浮窗（AI-005）───────────────────────────────────────────────────
@@ -3399,6 +5195,16 @@ let _jumpBarWinStart = 0  // AI-015：折叠横杠窗口在 _jumpTargets 里的�
 function questionSnippet(el) {
   const bubble = el.querySelector('.bubble')
   if (!bubble) return ''
+  // 带引用的提问：正文在 .uq-body，横幅 .uq-quote 也在 textContent 里且不以 `>` 开头
+  //（渲染后前缀已变成横幅），不先把正文挑出来，浮窗列表会把引用原文当成提问摘要
+  const bodyEl = bubble.querySelector('.uq-body')
+  if (bodyEl) {
+    for (const l of String(bodyEl.textContent || '').split('\n')) {
+      const t = l.trim()
+      if (t) return t
+    }
+    return ''
+  }
   const lines = String(bubble.textContent || '').split('\n')
   for (const l of lines) {
     const t = l.trim()
@@ -3410,9 +5216,7 @@ function questionSnippet(el) {
 // 收集当前可见区（按书过滤后）的用户提问消息
 function collectQuestions() {
   const out = []
-  const msgs = document.getElementById('msgs')
-  for (const el of msgs.children) {
-    if (el.style.display === 'none') continue
+  for (const el of nodesInContext()) {   // 归属 + 可见性由入口统一处理（提问浮窗只列本会话）
     if (!el.classList.contains('msg-user')) continue
     out.push(el)
   }
@@ -3801,6 +5605,10 @@ function setFreeStackCites(hits) {
 function renderFreeRefs() {
   const box = document.getElementById('free-refs')
   if (!box) return
+  // 记住这一次渲染之前窗体是不是藏着的：**刚切进自由模式**那一下要特殊处理
+  //（显示时直接给到最新一条，见函数尾部）——藏着的元素量不出高度，那时算出来的
+  // 滚动位置是没有意义的。
+  const wasHidden = box.hidden
   box.hidden = !_freeMode
   const list = document.getElementById('fr-list')
   const empty = document.getElementById('fr-empty')
@@ -3811,6 +5619,33 @@ function renderFreeRefs() {
   const locked = _stackCiteIds.filter((id) => !pendIds.includes(id))
   const total = _freeRefs.length + locked.length
   if (label) label.textContent = '🔗 本次引用' + (total ? '（' + total + '）' : '')
+  // 折叠态同步（2026-11）：与读书模式「当前引用」卡片同款——折叠后表头下方留一行
+  // 缩略概览（条数 + 节点名），不用展开就能看清引用了什么。两条边界：
+  //   · 空清单没东西可折：按钮隐藏并强制展开，否则折叠态下只剩表头，
+  //     连"暂无引用"的提示都看不见；
+  //   · 清单被清空（取消/换对话/退出自由模式）时同样自动展开。
+  const cbtn = document.getElementById('fr-collapse-btn')
+  const cprev = document.getElementById('fr-preview')
+  if (!total) box.classList.remove('collapsed')
+  if (cbtn) {
+    cbtn.style.display = total ? '' : 'none'
+    cbtn.textContent = box.classList.contains('collapsed') ? '▸' : '▾'
+  }
+  if (cprev) {
+    // 编号与清单一致（待提交 #1..#n），锁定命中用 🔒 前缀区分
+    const names = _freeRefs.map((r, i) => `${i + 1}. ${r.point}`)
+      .concat(locked.map((id) => '🔒 ' + pointOf(id)))
+    const brief = names.join('　')
+    // 概览首行报**两组各几条**而不报总数：总数表头已经写了，重复没意义；
+    // 折叠时真正看不见的是"哪几条能取消、哪几条是锁定的"，顺带提示可点开
+    const split = []
+    if (_freeRefs.length) split.push('待提交 ' + _freeRefs.length)
+    if (locked.length) split.push('讨论命中 ' + locked.length)
+    cprev.innerHTML = names.length
+      ? `<div class="frp-count">${split.join(' · ')}（点此展开）</div>` +
+        `<div class="frp-items" title="${escAttr(brief)}">${esc(brief)}</div>`
+      : ''
+  }
   let html = ''
   if (locked.length) {
     html += '<div class="fr-locked-hd" title="实时讨论栈命中的节点（历史消息已提交的引用），随讨论自动更新，不可删除">' +
@@ -3837,6 +5672,16 @@ function renderFreeRefs() {
     })
   }
   empty.style.display = total ? 'none' : ''
+  // 新引用要能看见（2026-11 用户反馈）：限高之后清单自己会滚，而新加的条目是**追加在
+  // 末尾**的 —— 不跟随的话，用户刚在会意图里双击选的那条就落在可视区外，看起来像"没选上"。
+  // 规则直接用读书模式消息区那一套（AI-004 的 maybeAutoScroll）：接近底部才跟随，
+  // 手动往上翻看旧引用时不被强行拽下去。与消息区同一个函数、同一条规则，两处手感一致。
+  //
+  // 例外：**刚切进自由模式**（藏 → 显）时无条件给到最新一条。切换模式是用户明确的
+  // "我要看这个上下文"动作，与消息区切上下文就滚到底部同一条道理；而此刻清单本来就在
+  // 最上面（藏着的元素没有高度，之前那次渲染算不出位置），不强制的话每次进来都要手动滚。
+  if (wasHidden && !box.hidden) list.scrollTop = list.scrollHeight
+  else maybeAutoScroll(list)
 }
 // 打开拓扑图进入选取模式（手动选取引用）：正式图 + 单击看详情/双击选取
 function openPickMode() {
@@ -3858,12 +5703,6 @@ function freeConvTitle(key) {
 function freeConvMeta(key) {
   return _freeConvs.find((x) => x.key === (key || _freeKey)) || null
 }
-// 该对话是不是空对话（没有任何消息）——决定归档时给什么提示
-function freeConvIsEmpty(key) {
-  const c = freeConvMeta(key)
-  return !c || !c.messages
-}
-
 // 拉对话清单（活动 + 已归档），并刷新对话条/列表。
 // 会校正当前 key：不在活动清单里（被删/被归档/老数据对不上）就落到最近活跃的一场，
 // 并整链刷新上下文——否则面板重开后头部标题/消息区会停在已失效的那场对话上。
@@ -3909,28 +5748,14 @@ async function loadFreeConversations({ autoCreate = true } = {}) {
   return _freeConvs
 }
 
-// 首条指路（2026-11 用户定调）：切到自由模式 / 新建对话 / 切到一场空对话时，在消息区落
-// 一条系统提示，把"这是一场独立对话、怎么再开一场、归档能留什么"讲清楚——光有上方对话条，
-// 用户不一定意识到自由模式是多对话的。幂等：DOM 里已有本对话的提示就不重复落
-//（切走时该对话的气泡被摘掉，切回来会重新补上）；已经说过话的对话不再提示。
-function maybeFreeConvHint() {
-  if (!_freeMode) return
-  const key = _freeKey
-  if (!key) return
-  if (!freeConvIsEmpty(key)) return
-  const msgs = document.getElementById('msgs')
-  if (!msgs) return
-  for (const el of msgs.children) {
-    if (el.className === 'msg-system' && (el.dataset.book || '') === key) return   // 已有一条
-  }
-  const total = _freeConvs.length
-  renderSystemBubble(
-    total > 1
-      ? `自由模式下每场对话有独立上下文（共 ${total} 场）。直接提问即可，或点击上方「＋ 新对话」另开一场；归档时可选择保存记忆、收口进会意图。`
-      : '自由模式下每场对话有独立上下文。直接提问即可；需要另开话题时点击上方「＋ 新对话」。归档时可选择保存记忆、收口进会意图。',
-    key,
-  )
-}
+// 首条指路（2026-11 用户定调）：切到自由模式 / 新建对话 / 切到一场空对话时，消息区落
+// 一条提示，把"这是一场独立对话、怎么再开一场、归档能留什么"讲清楚——光有上方对话条，
+// 用户不一定意识到自由模式是多对话的。
+//
+// 2026-11 改版：原先这里落的是一条**灰字系统气泡**（只有文案、没有动作：讲的是现象，
+// 用户读完还得自己去找"＋ 新对话"在哪），现在整条被开场卡接管——文案、引文、动作按钮
+// 都在卡里，见 renderIntro。所以这几个调用点（新建 / 切换 / 进自由模式）直接调
+// syncIntro，**别在这里再补一颗系统气泡**：两颗提示叠在一起，用户会以为系统在复读。
 
 // 新建一场自由对话并切过去。reload=false 时不重拉清单（由调用方负责）——
 // loadFreeConversations 的补建分支要走这条，避免两条异步链互相递归。
@@ -3945,7 +5770,6 @@ async function createFreeConversation({ silent = false, reload = true } = {}) {
     if (!d || !d.key) throw new Error('no key')
     if (reload) await loadFreeConversations()
     switchFreeConversation(d.key, { toast: silent ? '' : '已新建对话' })
-    maybeFreeConvHint()
     return d.key
   } catch {
     if (!silent) showToast('新建对话失败：CoRead 本机服务未启动', true)
@@ -3976,7 +5800,7 @@ async function switchFreeConversation(key, { toast = '' } = {}) {
   renderFreeConvList()
   refreshStackHits()   // 新对话的实时栈命中（"讨论命中"锁定条目）
   loadHistory()        // 把新对话的历史消息渲染出来（幂等：已渲染的按 _histKeys 跳过）
-  maybeFreeConvHint()  // 切到一场还没说过话的对话 → 补回那条指路提示
+  syncIntro()      // 切到一场还没说过话的对话 → 补回开场卡（loadHistory 里也会兜一次）
   renderNoBookView()
   scrollMsgsToBottom()
   if (toast) showToast(toast)
@@ -3984,9 +5808,9 @@ async function switchFreeConversation(key, { toast = '' } = {}) {
 
 // 摘掉某场对话的消息气泡（切对话用）。只摘该 key 的，别的对话不动。
 function removeConversationBubbles(key) {
-  const msgs = document.getElementById('msgs')
-  if (!msgs) return
-  for (const el of [...msgs.children]) {
+  // all:true —— 摘的正是"已不是当前对话"的那批（当前 key 刚被切掉），
+  // 走默认过滤会一条都拿不到，气泡就永远留在 DOM 里跟着下一次切换串场。
+  for (const el of nodesInContext({ all: true })) {
     if ((el.dataset.book || '') === key) el.remove()
   }
 }
@@ -4283,10 +6107,22 @@ function toggleFreeMode() {
     onEffectiveContextChange()
     renderFreeRefs()
     renderFreeConvBar()   // 对话条在进入自由模式的那一刻就出现（含 ＋ 新对话）
+    // 开场卡立刻跟上：这一刻"场合"已经变了（读书 → 自由），不该等 loadFreeConversations
+    // 那一趟网络回来才换说法。清单回来后还会再刷一次（那时候"第 N 场"才准）。
+    syncIntro()
+    // 进入自由模式同样要滚到底部看最新消息（2026-11 用户反馈：切过来时滚动条停在最上面）。
+    // 为什么 applyBookContext 尾部那句没兜住它：_freeMode 在本函数开头就置位了，
+    // 进/出前后 effectiveBookBase() 都是 FREE_KEY → 那边 ctxChanged = false →
+    // scrollMsgsToBottom() 不执行（与上面显式补调 onEffectiveContextChange() 同一个原因，
+    // 2026-10 只补了不隐藏「当前引用」卡片那一半，滚动这一半漏了）。
+    // 位置放在 renderFreeConvBar() 之后：对话条会占掉消息区高度，等它就位再滚，
+    // 落的才是真正的底部。
+    scrollMsgsToBottom()
     loadFreeConversations().then(() => {
-      // 清单回来后再刷一次：标题/总数徽标/空对话提示都要等清单才准
+      // 清单回来后再刷一次：标题/总数徽标/开场卡都要等清单才准
+      //（卡上的「这是第 N 场」「接着上一场」都取自清单）
       renderFreeConvBar()
-      maybeFreeConvHint()
+      syncIntro()
     })
     showToast('已进入自由模式：各对话相互独立，归档时可选择保存记忆、收口进会意图')
   } else {
@@ -4320,6 +6156,9 @@ function toggleFreeMode() {
     renderFreeConvBar()
     showToast('已退出自由模式')
   }
+  // 进出自由模式都是"换了个场合"：开场卡跟着换一套说法（读书模式讲书、自由模式讲
+  // 这场对话怎么独立）。放在末尾、两个分支都走，避免只在一边补而另一边留着旧卡。
+  syncIntro()
   if (graphView) graphView.setMode(_freeMode ? 'free' : 'formal')
 }
 
@@ -4343,9 +6182,36 @@ const graphView = typeof CoReadGraphView !== 'undefined'
     })
   : null
 const graphBtn = document.getElementById('graph-btn')
-if (graphBtn && graphView) graphBtn.addEventListener('click', () => { graphView.open(); refreshStackHits() })
+if (graphBtn && graphView) {
+  graphBtn.addEventListener('click', () => {
+    // 教程模式（2026-11 用户要求）：在《第一次共读》里打开会意图时，只显示**教程自带的
+    // 样例节点**，不显示用户自己的图；反过来也绝不把样例写进用户的图。
+    // 判据放在这里（侧栏知道当前书 ID），图视图只管"这次拉哪一种"。
+    const onTutorial = effectiveBookBase() === TUTORIAL_BASE
+    graphView.setTutorialMode(onTutorial)
+    postSidebarDebug({ stage: 'graph-open', tutorial: onTutorial, book: effectiveBookBase().slice(0, 16) })
+    graphView.open()
+    refreshStackHits()
+  })
+}
 const pickBtn = document.getElementById('fr-pick-btn')
 if (pickBtn) pickBtn.addEventListener('click', openPickMode)
+// 本次引用窗体折叠/展开（2026-11）：表头 ▾ 切换；折叠态点概览直接展开（同 AI-018 的
+// rc-preview 手感）。折叠态只存在 DOM class 上，与读书模式卡片一样不落盘。
+document.getElementById('fr-collapse-btn')?.addEventListener('click', () => {
+  const box = document.getElementById('free-refs')
+  const btn = document.getElementById('fr-collapse-btn')
+  if (!box) return
+  box.classList.toggle('collapsed')
+  if (btn) btn.textContent = box.classList.contains('collapsed') ? '▸' : '▾'
+})
+document.getElementById('fr-preview')?.addEventListener('click', () => {
+  const box = document.getElementById('free-refs')
+  if (!box) return
+  box.classList.remove('collapsed')
+  const btn = document.getElementById('fr-collapse-btn')
+  if (btn) btn.textContent = '▾'
+})
 const freeSwitch = document.getElementById('free-switch')
 if (freeSwitch) {
   freeSwitch.addEventListener('click', toggleFreeMode)
@@ -4534,6 +6400,32 @@ for (const id of ['api-base', 'api-key', 'api-model']) {
 // 无书界面已无「从已读书籍中选择」按钮：书单直接列在那里（renderNoBookList），
 // 搜索框只在书多时出现，输入即过滤
 document.getElementById('nb-search')?.addEventListener('input', renderNoBookList)
+
+/**
+ * PDF 阅读器入口（2026-11 从工具箱提上来）。
+ *
+ * 两个入口共用它：
+ *   · 「⋯」菜单的 📕 PDF 阅读器（`#mm-reader`）
+ *   · 无书界面状态卡上的按钮（`#nb-reader-btn`）——给"手上只有一份 PDF、
+ *     微信读书里没有这本书"的人一条明确的出路
+ *
+ * 两个都传 `pick: true`（= 落地后自动拉起选文件框），因为从这两处点进来的人
+ * 手里**已经有文件了**，让他再自己找一次「打开 PDF」是白要一步。
+ * 走 `?pick=1` 而不是发消息：阅读器可能还没开，消息没有收件人（与 `?open=` 同一个理由）。
+ */
+function openReaderFrom(where) {
+  if (moreMenu) moreMenu.classList.remove('on')
+  try {
+    openReader({ pick: true })
+  } catch (e) {
+    showToast('打不开阅读器：' + String((e && e.message) || e))
+  }
+  postSidebarDebug({ stage: 'open-reader', where })
+}
+
+document.getElementById('mm-reader')?.addEventListener('click', () => openReaderFrom('menu'))
+document.getElementById('nb-reader-btn')?.addEventListener('click', () => openReaderFrom('no-book'))
+
 document.getElementById('mm-pick-book')?.addEventListener('click', () => {
   if (moreMenu) moreMenu.classList.remove('on')
   openBookPicker()
@@ -4542,17 +6434,71 @@ document.getElementById('mm-exit-manual')?.addEventListener('click', () => {
   if (moreMenu) moreMenu.classList.remove('on')
   exitManualBook()
 })
+// 自检（2026-11）：开一个新标签页跑自检。它要读写 chrome.* 与教程模块，
+// 只能在扩展自己的页面里跑，所以是"开页面"而不是"就地跑"。
+document.getElementById('mm-selfcheck')?.addEventListener('click', () => {
+  if (moreMenu) moreMenu.classList.remove('on')
+  chrome.tabs.create({ url: chrome.runtime.getURL('selfcheck.html') }).catch((e) => {
+    showToast('打不开自检页：' + String((e && e.message) || e))
+  })
+})
 document.getElementById('mb-switch-btn')?.addEventListener('click', openBookPicker)
 document.getElementById('mb-exit-btn')?.addEventListener('click', exitManualBook)
 document.getElementById('bp-close-btn')?.addEventListener('click', closeBookPicker)
 bindMaskClose(document.getElementById('book-picker'), closeBookPicker)  // 点击遮罩关闭（按+松都在遮罩上才算）
 document.getElementById('bp-search')?.addEventListener('input', renderBookList)
 
+// ── 「开始教程」按钮（2026-11）──────────────────────────────────────────────
+// 顶部那个按钮已按用户要求去掉，绑定一并删掉（留着会去绑一个不存在的元素——
+// 虽然 `?.` 不会报错，但那属于"看起来还接得上、其实没有入口"的假象）。
+// 侧栏被关掉/重载时，把引导层收掉并**标成暂停**——
+// 重开侧栏时**不会**自动弹出教程（2026-11 用户报的 bug：更新扩展后一打开就冒出教程），
+// 而是显示一个「继续教程」的入口，由用户点才接上。
+window.addEventListener('pagehide', () => {
+  if (!_tutorialMod) return
+  _tutorialMod.then(({ script }) => {
+    // 只收界面 + 标记暂停，**不删状态**：回来还能接着走，但不自动开始
+    script.state && script.state().active && import('./tutorial-guide.js').then((g) => g.hide())
+    script.pause && script.pause()
+  }).catch(() => {})
+})
+
+/**
+ * 侧栏每次打开就上报自己的**构建指纹**（2026-11）。
+ *
+ * ── 为什么必须有它 ────────────────────────────────────────────────────────────
+ * 这套教程改成现在这样之后，用户报了两次"还是不行"，而真相是**他机器上跑的还是旧代码**：
+ * 扩展要手动重新加载才生效，但没有任何地方能一眼看出"当前跑的是哪一版"。
+ * 于是每一轮都变成"我改 → 他试 → 呈现旧行为 → 我再猜"，白烧两轮。
+ *
+ * 修复办法不是让用户更小心，而是**让版本变成可观测的**：打开侧栏就往日志里写一串文件指纹，
+ * 与仓库里的源文件一比就知道差在哪几个文件上（算法与 extension/selfcheck.js 的
+ * fingerprint() 一致，都是 SHA-256 前 6 字节）。
+ */
+async function reportBuildStamp() {
+  const files = [
+    'sidebar.js', 'sidebar.html', 'translate-background.js', 'service_worker.js',
+    'reader.js', 'graph-view.js', 'tutorial-script.js', 'tutorial-guide.js',
+    'tutorial/lessons.js', 'tutorial/graph-seed.json',
+  ]
+  const out = {}
+  for (const f of files) {
+    try {
+      const buf = await (await fetch(chrome.runtime.getURL(f))).arrayBuffer()
+      const d = await crypto.subtle.digest('SHA-256', buf)
+      out[f] = [...new Uint8Array(d)].slice(0, 6).map((b) => b.toString(16).padStart(2, '0')).join('')
+    } catch (e) { out[f] = 'ERR' }
+  }
+  postSidebarDebug({ stage: 'build-stamp', files: out })
+}
+
 // 启动后查询当前阅读书籍（AI-001）：覆盖「切书后重开侧栏」的场景。
 // applyPendingRefSearch 放在 loadHistory 之后：引用列表就绪后再打开抽屉搜索，
 // 否则搜索框填了词但列表还是空的（AI-011）。
 checkApiConfigOnOpen()  // 打开插件即检查模型 API：确认未配置就自动弹出配置弹窗（用户定调）
 startPingLoop()         // 存活轮询：驱动连接指示灯 + 决定能不能发送（见 setDot 上方说明）
+reportBuildStamp()      // 上报构建指纹：一眼看出当前跑的是哪一版（见函数注释）
+loadSampleRefs()        // 读教程预设例句：**启动即读、无前置条件**（见函数注释）
 loadState()
   .then(loadHistory)
   .then(applyPendingRefSearch)
@@ -4567,15 +6513,70 @@ loadState()
     // 「打开对话」动作，直接滚到最新消息（横幅渲染后再滚，避免其高度挤压错位）。
     const msgs = document.getElementById('msgs')
     if (msgs) msgs.scrollTop = msgs.scrollHeight
+    // 启动链跑到这里，上下文（当前书 / 当前自由对话）终于定了，开场卡要按**定下来的**
+    // 上下文画。前面几处 renderNoBookView 可能跑在 /history 还没回来、refreshCurrentBook
+    // 还没答复的时候，那时 _histLoaded 还是假、书也还没认出来，卡被有意压着不发。
+    // loadHistory 里已经调过一次，这里是兜底（幂等）。
+    syncIntro()
   })
+  // 教程：侧栏刚打开时**不自动开始上课**（2026-11 用户报的 bug：更新扩展后一打开就冒出教程）。
+  // 只问一句"存储里有没有一条暂停中的教程"，有就在侧栏顶部显示一个「继续教程」入口——
+  // 由用户点才接上。这是"教程不该自己冒出来"与"中途关掉别丢进度"之间的取舍点。
+  .then(() => loadTutorial().catch((e) => {
+    /**
+     * 教程模块 import 失败必须**在这里吃掉**，不能让这条启动链断在半路（2026-11）。
+     *
+     * 为什么：这是启动链上唯一一处动态 import（教程引导那两个 ES module），而它失败的
+     * 形态有两种，都不是"用户该看见的错"：扩展更新后浏览器里还留着旧文件、或者沙箱/离线
+     * 环境根本没有那两个文件。原先 `loadTutorial()` 没有 catch，于是一次失败就把
+     * `offerResumeTutorial()` 也一起带走，并在控制台留一个没人看的 unhandled rejection
+     *（跑 DOM 层自测时，这个拒绝会被 node:test 算到**当时正在跑的测试**头上，
+     * 把与教程毫无关系的断言判红）。
+     * 教程是"点了才开始"的东西，加载失败唯一该做的就是留痕、别装死——其余功能照常。
+     */
+    postSidebarDebug({ stage: 'tutorial-load-failed', error: String((e && e.message) || e) })
+  }))     // 顺带把样例引用（SAMPLE_REFS）就位，抽屉里要用
+  .then(() => offerResumeTutorial().catch(() => {}))
 loadJumpBack()  // AI-006：面板重开后恢复「↩ 返回」能力（有未过期的跳转记录时）
 
 // 活动 tab 变化时刷新当前书（AI-001）：用户在多本书 / 多个微信读书 tab 间切换
 try {
   chrome.tabs.onActivated.addListener(function () { refreshCurrentBook(); refreshWebBindEntry() })
+  /**
+   * 阅读器标签页**被关掉**时，撤掉"阅读器报着书"那道防线（2026-11）。
+   *
+   * 为什么必须撤：那道防线是黏性的（见 rememberReaderBook），它挡住的是"误清空"；
+   * 但如果阅读器已经关了、它还原样留着，侧栏就会一直认着那本不在的书，
+   * 并且**拒绝**回到无书界面——把一种坏换成另一种坏。关掉标签页就是"这本书没了"
+   * 的确定信号，此时解除防线、重新算一次当前书。
+   */
+  chrome.tabs.onRemoved.addListener(function () {
+    setTimeout(function () {
+      chrome.tabs.query({ url: chrome.runtime.getURL('reader.html') + '*' })
+        .then(function (list) {
+          if (!list || !list.length) { rememberReaderBook(false); refreshCurrentBook() }
+        })
+        .catch(function () {})
+    }, 400)
+  })
   // 同一 tab 内导航（文库章节间跳转）也刷新网页绑定入口
   chrome.tabs.onUpdated.addListener(function (tabId, info) {
     if (info.url || info.status === 'complete') refreshWebBindEntry()
+    /**
+     * 活动标签页**加载完成**时重算一次当前书（2026-11 二次改版）。
+     *
+     * 为什么需要：切到一个还在加载（或刚被浏览器丢弃、正在恢复）的阅读器标签页时，
+     * 它一时答不上来 —— 侧栏按"保持上一次已知的书"处理（这条必须保留，见
+     * refreshCurrentBook 的注释），于是那几秒里显示的是**另一个标签页里**那本书的会话。
+     * 页面加载完就是"它答得上来了"的信号，这里补一次重算。
+     *
+     * 只看活动标签页：别的标签页加载完跟"用户在看什么"无关。
+     */
+    if (info.status === 'complete') {
+      activeTabId().then(function (id) {
+        if (id !== null && id === tabId) refreshCurrentBook()
+      }).catch(function () {})
+    }
   })
 } catch {}
 
@@ -4613,6 +6614,10 @@ try {
 // 模型配置默认全部用 CoRead 的（agent/api-config.json，经 receiver 读取）。工具箱里另有
 // 三个可选的按字段覆盖：填了就用填的，留空的仍用 CoRead 的。
 // 存储键与 translate-protocol.js 的 STORE_KEYS 保持一致。
+//
+// ⚠️ 2026-11：工具箱的「阅读器」页**已删除**，PDF 阅读器改挂「⋯」菜单顶层（#mm-reader，
+// 见下面 openReader / openReaderFrom）。所以这里只认 'translate' 一个 tab。
+// 原文案「工具箱就是 PDF 阅读器与翻译的入口」已随之下线——它现在只讲对了一半。
 const TR_KEYS = {
   enabled: 'stEnabled',
   apiBase: 'stApiBaseOverride',
@@ -4839,18 +6844,74 @@ document.getElementById('tb-tabs')?.addEventListener('click', function (e) {
   if (tab && tab.dataset.tab) selectToolboxTab(tab.dataset.tab)
 })
 
-// 阅读器：扩展自己的页面，不是注入到网站里的脚本，所以直接开一个标签页即可。
-// 侧栏太窄，长时间阅读还是在标签页里舒服。
-function openReader() {
-  chrome.tabs.create({ url: chrome.runtime.getURL('reader.html'), active: true })
+/**
+ * 阅读器：扩展自己的页面，不是注入到网站里的脚本，所以直接开一个标签页即可。
+ * 侧栏太窄，长时间阅读还是在标签页里舒服。
+ *
+ * @param {{pick?: boolean}} [opts] `pick` = 打开后自动拉起"选 PDF 文件"那个系统窗口。
+ *   只有**用户点了明确要读 PDF 的入口**（菜单 / 无书界面）才传它；从别处（比如
+ *   「去读」某一本）不传 —— 那里用户要的是"接着读上次那本"，弹选择框是打扰。
+ */
+function openReader(opts) {
+  const url = chrome.runtime.getURL('reader.html') + (opts && opts.pick ? '?pick=1' : '')
+  chrome.tabs.create({ url, active: true })
   closeToolbox()
 }
-document.getElementById('rd-open-btn')?.addEventListener('click', openReader)
+
+/**
+ * 译文面板里点了「删除引用」→ 走侧栏自己那条删除流程（deleteRef）。
+ *
+ * 面板传来的是**它画面上下划线对应的那条引用**（selectedText 是引用身份；
+ * bookId / bookmarkId / 章节位置用于精确匹配，见 refreshRefs 的映射）。
+ * 这里必须先在本地的 RECENT_ANNS 里找到同一条 —— deleteRef 要的是带 bookmarkId
+ * 等字段的完整记录，只拿一个 selectedText 无法区分"同一段文字的两次引用"。
+ *
+ * @param {{selectedText?:string, bookId?:string, bookmarkId?:string}} ref
+ * @returns {Promise<boolean>} 真的删掉了才 true（用户取消 → false，面板不会动下划线）
+ */
+async function deleteRefFromNotes(ref) {
+  const want = String((ref && ref.selectedText) || '').trim()
+  if (!want) return false
+
+  /**
+   * 三级匹配，从精确到宽松：
+   *   ① refMatches：bookmarkId 或 章节位置——能区分同文不同处
+   *   ② 书 + 原文（sameRef）：bookId 在两边都做过 baseBookId 归一化
+   *   ③ 只比原文：面板那份快照可能没带 bookId（老快照 / 接收端没给）
+   * 前两级都要求书对得上；只有第三级才退化成"全书范围找同文"。
+   */
+  const byId = ref && ref.bookmarkId
+    ? RECENT_ANNS.find((a) => refMatches(a, ref))
+    : null
+  const hit = byId
+    || RECENT_ANNS.find((a) => sameRef(a, { bookId: (ref && ref.bookId) || '', selectedText: want }))
+    || RECENT_ANNS.find((a) => String(a.selectedText || '').trim() === want)
+  if (!hit) {
+    // 常见成因：面板里那份清单比侧栏新/旧（刚删过、或接收端还没同步）。
+    // 如实说，不假装删成功——假装的话下划线会消失但引用还在。
+    showToast('侧栏里已没有这条引用（可能已被删除）', true)
+    return false
+  }
+
+  const gone = await deleteRef(hit)
+  if (!gone) return false
+
+  // 让阅读器把这一段从"已引用"清单里摘掉：它随即重推一份快照，下划线立刻消失。
+  // 不这么做就得等它下次按 TTL 拉取（REFS_TTL_MS = 2 秒），用户会看到"删了还留着"。
+  try {
+    chrome.runtime.sendMessage({ action: 'readerCommand', type: 'forgetRef', text: hit.selectedText })
+  } catch {}
+  return true
+}
 
 // ── 译文对照（阅读器翻过的段落）──────────────────────────────────────────────
 // 面板挂在本侧栏里（reader-notes.js 渲染），阅读器通过后台中继同步条目过来。
 let notesPanel = null
 
+// 译文对照面板：**菜单里的入口已删**（2026-11 用户定调）。它现在只有两个来源：
+//   ① 阅读器顶栏的「译文」→ 经后台广播 notesOpen 到这里（openNotes）
+//   ② 划词翻译完成时阅读器自己 requestNotesOpen
+// 所以下面不再有 mm-notes 的点击绑定——别再加回菜单项，两个入口两套说法只会让人猜。
 function openNotes() {
   const box = document.getElementById('reader-notes')
   if (!box) return
@@ -4859,6 +6920,8 @@ function openNotes() {
       send: (msg) => chrome.runtime.sendMessage(msg),
       onClose: closeNotes,
       toast: (t, err) => showToast(t, err),
+      // 点译文里那道"已引用"的下划线 → 动作条上的「删除引用」走这里（见 deleteRefFromNotes）
+      onDeleteRef: deleteRefFromNotes,
     })
     // 打开时先拉一次当前快照（阅读器可能已经翻过几段了）
     chrome.runtime.sendMessage({ action: 'readerGet' })
@@ -4872,21 +6935,32 @@ function closeNotes() {
   document.getElementById('reader-notes')?.classList.remove('on')
 }
 
-document.getElementById('mm-notes')?.addEventListener('click', function () {
-  if (moreMenu) moreMenu.classList.remove('on')
-  openNotes()
-})
-
 // 阅读器那边翻译完 / 双击空白处，都会经后台广播过来
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || !msg.action) return
   if (msg.action === 'readerUpdate') {
     if (notesPanel && msg.snapshot) notesPanel.update(msg.snapshot)
     // 2026-11：换书（打开/切换/关掉 PDF）时阅读器会把 notify 置真 —— 那是"把侧栏切到
-    // 这本书"的可靠信号，直接用，不再反过来问"哪个 tab 是活动的"（问法不可靠，
-    // 用户实测过"打开 PDF 但侧栏没跟过去"）。
+    // 这本书"的可靠信号，直接用，不再反过来问"哪个 tab 是活动的"。
     // 翻页 / 新译文这类同步不带 notify：不打扰用户当前翻看的书。
-    if (msg.snapshot && msg.snapshot.notify) applyReaderBookFromSnapshot(msg.snapshot)
+    //
+    // ⚠️ 2026-11 二次改版：**只认从活动标签页推上来的那一份**（后台随附 `fromActive`）。
+    // 为什么必须过滤：阅读器页面**加载时**会自己打开 URL 里指定的那本书并推一份 notify，
+    // 而扩展重载 / 浏览器恢复会话时，几个后台阅读器标签页会同时加载、各推一份 ——
+    // 采纳它们等于让"用户根本没在看的标签页"改掉侧栏的当前书，与"侧栏只跟随活动标签页"
+    // 直接冲突。`fromActive` 判不出来（null/undefined）时**照旧采纳**：
+    // 宁可放过一份可疑的快照，也不要把"我问不出来"变成"侧栏不跟了"。
+    if (msg.snapshot && msg.snapshot.notify) {
+      if (msg.fromActive === false) {
+        postSidebarDebug({
+          stage: 'reader-push-ignored',
+          book: String((msg.snapshot.book && msg.snapshot.book.bookId) || '(无书)').slice(0, 20),
+          why: '这份快照不是活动标签页推上来的（后台挂着的阅读器不许改当前书）',
+        })
+      } else {
+        applyReaderBookFromSnapshot(msg.snapshot)
+      }
+    }
     return
   }
   if (msg.action === 'notesOpen') { openNotes(); return }

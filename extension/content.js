@@ -128,6 +128,36 @@ function chapterUidIntFromUrl() {
   } catch { return 0 }
 }
 
+/**
+ * 把微信读书顶栏那一串拆成「书名」+「章节」（2026-11 治本）。
+ *
+ * 顶栏的 textContent 是**书名和章节拼在一起**，而且分隔符宽度不固定——同一个人的书库里两种都有：
+ *   「大国大城：当代中国的统一、发展与平衡 1 欧洲正经历大考」 ← 一个空格 + 章节号
+ *   「学做工  制度形式」「静静的顿河…  六」「…论纲  第1章」     ← 两个空格
+ * 以前整串当书名存下来，后果有两层：
+ *   ① 界面上天天看到《大国大城：…平衡 1 欧洲正经历大考》这种书名；
+ *   ② 会意图里"书"是按书名字符串认的 → 同一本书按章节碎成好几本 → **同一本书两种节点颜色**。
+ * ②在画图那一侧已经用 bookName() 兜住了（老数据也一起治），这里从**写入侧**把根去掉：
+ * 拆开之后书名干净、章节回到它该在的字段（侧栏引用卡/引用条显示章节本来就是单独一栏）。
+ *
+ * ⚠️ 三条规则必须与 extension/graph-view.js 的 bookName() 保持一致——两侧用同一批真实书名
+ * 做过一致性测试（agent/test/book-title-split.test.js），改一边测试就红。
+ */
+function splitBookTitle(rawTitle) {
+  const s = String(rawTitle || '').trim()
+  if (!s) return { bookTitle: '', chapter: '' }
+  const rules = [
+    /^([\s\S]*?)\s+(\d+(?:\.\d+)?\s+\S[\s\S]*)$/,      // 「…平衡 1 欧洲正经历大考」
+    /^([\s\S]*?)\s+(第\s*\d+\s*[章节回][\s\S]*)$/,       // 「…论纲  第1章」
+    /^([\s\S]*?)\s{2,}(\S[\s\S]*)$/,                    // 「学做工  制度形式」「…  六」
+  ]
+  for (const re of rules) {
+    const m = re.exec(s)
+    if (m && m[1].trim() && m[2].trim()) return { bookTitle: m[1].trim(), chapter: m[2].trim() }
+  }
+  return { bookTitle: s, chapter: '' }
+}
+
 function getReadingContext() {
   const topPath = (() => { try { return window.top.location.pathname } catch { return location.pathname } })()
   // AI-001 书籍隔离：只有阅读器页（/web/reader/…）的路径段才是书 ID。
@@ -136,15 +166,20 @@ function getReadingContext() {
   const readerMatch = /^\/web\/reader\/([^/]+)$/.exec(topPath)
   const bookId = readerMatch ? readerMatch[1] : ''
   const topDoc = (() => { try { return window.top.document } catch { return document } })()
-  const bookTitle =
+  // 顶栏整串先拆开：书名干净、章节单独拿（见 splitBookTitle 注释）
+  const topBarRaw =
     topDoc.querySelector('.readerTopBar_title')?.textContent?.trim() ||
     topDoc.querySelector('[class*="readerTop"] [class*="title"]')?.textContent?.trim() ||
     topDoc.title.replace('微信读书', '').trim()
-  const chapter =
+  const split = splitBookTitle(topBarRaw)
+  const bookTitle = split.bookTitle || topBarRaw
+  const chapterEl =
     topDoc.querySelector('.readerChapterTitleWrap_title')?.textContent?.trim() ||
     topDoc.querySelector('[class*="chapterTitle"]')?.textContent?.trim() ||
-    _chapterTitle ||
     ''
+  // 章节优先用页面上的章节元素；它为空时（微读很多书正是这样）用顶栏拆出来的那半——
+  // 于是"章节"这一栏从"经常是空的"变成"真的有内容"，而不是被塞进书名里。
+  const chapter = chapterEl || split.chapter || _chapterTitle || ''
   // URL hash 只在跳转/手动导航时出现，正常阅读为空；用跟踪的网络槽位兜底
   const hashSlot = (() => { try { return window.top.location.hash.replace('#', '') } catch { return '' } })()
   const chapterUid = (/^[te]_\d+$/.test(hashSlot) ? hashSlot : _chapterSlot) || ''
@@ -310,7 +345,11 @@ async function handleProgressContent(url, raw) {
 // 幂等：入库前先查 /annotations 已存在的 selectedText，避免重复堆积。
 // 触发源：1) bookmarklist 响应（打开书/刷新时的已有划线）；2) addBookmark 请求
 //（用户新画一条线的实时创建，立即成引用）。
-async function syncBookmarkRef(text, uidInt, range, bookmarkId) {
+//
+// opts.live = "用户刚刚画的这一条"（只有 addBookmark 那条路传），它比批量同步多做一件事：
+// 把这条划线落成**待选引用**（pendingSelectRef，见下方注释）。批量回放（打开书时把已有
+// 划线补进来）绝不能设，否则每次翻页都会把用户的当前引用抢走。
+async function syncBookmarkRef(text, uidInt, range, bookmarkId, opts = {}) {
   const t = String(text || '').trim()
   const u = Number(uidInt) || 0
   if (!t || !u) return false
@@ -339,6 +378,22 @@ async function syncBookmarkRef(text, uidInt, range, bookmarkId) {
       }),
     })
     postDebug({ source: 'bookmark-sync', stage: 'created', chapterUidInt: u, range: String(range || ''), bookmarkId: String(bookmarkId || ''), text: t.slice(0, 24) })
+    // 划线即"当前引用"（2026-11 修）：面板**关着**的时候，receiver 那条 annotation-sync
+    // 推向空气，而下次打开面板时 /history 只会把这条划线**加进列表**、不会选中它——
+    // 用户看到的就是"插件关着时划线，再打开引用没更新"。
+    // 所以这里落一份**待选标记**（与翻译工具「设为引用」用的同一个键，语义一致）：
+    // 面板下次打开时由 applyPendingSelect 在引用列表里认领并选中它。
+    // 同时发一条直接消息：面板**已开着**时立即生效，不必等 SSE（SSE 断开时也能更新）。
+    if (resp.ok && opts.live) {
+      const ref = {
+        bookId: ctx.bookId, bookTitle: ctx.bookTitle || '', chapter: ctx.chapter || '',
+        chapterUid: '', chapterUidInt: u,
+        bookmarkRange: String(range || ''), bookmarkId: String(bookmarkId || ''),
+        selectedText: t, sourceUrl: location.href,
+      }
+      try { await chrome.storage.local.set({ pendingSelectRef: ref }) } catch {}
+      try { chrome.runtime?.sendMessage({ action: 'coreadSetRefApply', ref }).catch(() => {}) } catch {}
+    }
     return resp.ok
   } catch { return false }
 }
@@ -468,9 +523,19 @@ async function handleAddBookmark(url, body) {
     }
   }
   postDebug({ source: 'bookmark-sync', stage: 'add-req', uid: data.chapterUid, range: data.range, hasMark: !!data.markText, markLen: String(text || '').length })
-  const created = await syncBookmarkRef(text, data.chapterUid, data.range)
+  const created = await syncBookmarkRef(text, data.chapterUid, data.range, '', { live: true })
   if (created) {
-    try { chrome.runtime.sendMessage({ action: 'openPanel' }).catch(() => {}) } catch {}
+    // 顺手请后台把面板打开。**这一步经常失败**：`chrome.sidePanel.open()` 必须由用户手势
+    // 触发，而手势不穿过消息传递（实测证据在 logs\debug.jsonl：open-side-panel-lesson
+    // 「may only be called in response to a user gesture」）。失败不是错——真正保证
+    // "引用更新了"的是上面那份 pendingSelectRef：面板下次打开时认领并选中这条划线。
+    // 只把结果记进日志，好让下次排查能一眼看出"是没打开，还是打开了没更新"。
+    try {
+      const r = await chrome.runtime.sendMessage({ action: 'openPanel' })
+      postDebug({ source: 'bookmark-sync', stage: 'panel-open', opened: !!(r && r.opened), alreadyOpen: !!(r && r.alreadyOpen), error: (r && r.error) || '' })
+    } catch (e) {
+      postDebug({ source: 'bookmark-sync', stage: 'panel-open-err', message: String((e && e.message) || e) })
+    }
   }
 }
 

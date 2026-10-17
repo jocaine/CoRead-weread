@@ -510,6 +510,13 @@
   /**
    * 只把原文设为侧栏的当前引用，**不直接发出提问**——用户在侧栏输入框里自己问。
    * 内容脚本不能跨域 POST，交给 service worker 发 /annotation（setRef: true）。
+   *
+   * ── 为什么不报译文（2026-11 明确决定，别顺手"补上"）─────────────────────────
+   * 这条路跑在**第三方网页**上（微读网页、文库网页），那里"引用"的语义与微读划线一致：
+   * 引的是书里的原文，侧栏显示原文才是对的（用户看的就是这本书的原文）。
+   * 译文只归 **CoRead 自己的 PDF 阅读器**——那里原文是外文、用户读的是译文，
+   * 所以只有 reader.js 那条路报 `translation`（见 translate-background.js 的说明）。
+   * 两条路的差别是有意的，不是漏了。
    */
   async function setAsReference(b) {
     if (!b.alive || b.refBusy) return
@@ -522,7 +529,6 @@
     const res = await send({
       action: 'setTranslationRef',
       original,
-      translation: b.refs.text.textContent || '',
       url: location.href,
       pageTitle: document.title || '',
     })

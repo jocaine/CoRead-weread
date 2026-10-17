@@ -1,0 +1,16 @@
+{
+  "bookId": "e0c91cb6aa56dd0057235ba7374c03e599e1e37e09b3bc9f55f64e1a5b98a25e",
+  "title": "第一次共读",
+  "subtitle": "CoRead 使用手册",
+  "author": "CoRead",
+  "version": 1,
+  "chapters": [
+    { "key": "c01", "title": "先说右边那一栏" },
+    { "key": "c02", "title": "划词共读：一场讨论的完整流程" },
+    { "key": "c03", "title": "一场讨论怎么变成一个知识点" },
+    { "key": "c04", "title": "换个说法找回来：节点命中" },
+    { "key": "c05", "title": "自由模式：随手记的地方" },
+    { "key": "c06", "title": "工具箱：PDF 阅读器与翻译" },
+    { "key": "c07", "title": "你的东西放在哪" }
+  ]
+}

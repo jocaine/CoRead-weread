@@ -261,6 +261,9 @@
     '.coread-mia-float .cm-btn{display:block;background:#b8860b;border:none;padding:6px 11px}.coread-mia-float .cm-btn:hover{background:#a07500}' +
     '.coread-mia-pill{position:fixed;right:14px;bottom:14px;background:#b8860b;color:#fff;border:none;border-radius:999px;padding:7px 13px;font-size:12.5px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.35);font-family:sans-serif;z-index:2147483645;max-width:46vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
     '.coread-mia-pill:hover{background:#a07500}' +
+    // 「适宽」胶囊（左下角，避开右下角的「📚 绑定到书」）：只在"页面比面板宽"或已开启时出现
+    '.coread-mia-fitpill{position:fixed;left:14px;bottom:14px;background:#2f6f8f;color:#fff;border:none;border-radius:999px;padding:7px 13px;font-size:12.5px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.35);font-family:sans-serif;z-index:2147483645;max-width:46vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+    '.coread-mia-fitpill:hover{background:#26596f}' +
     '.coread-mia-dlg{position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;font-family:sans-serif}' +
     '.coread-mia-dlg .box{background:#fff;color:#222;border-radius:10px;padding:12px 14px;width:min(92vw,440px);max-height:min(86vh,640px);overflow-y:auto;box-shadow:0 6px 24px rgba(0,0,0,.4);font-size:13.5px}' +
     '.coread-mia-dlg h3{margin:0 0 10px;font-size:15px}' +
@@ -562,6 +565,409 @@
     pill.style.display = bindingNow ? '' : 'none';
   }
 
+  // ── 适宽：面板拉宽后页面不重排、右边被切掉（2026-11 用户报）────────────────
+  // 用户原话：「在马克思中文网…有一个页面它貌似有自己的最小宽度，导致我拉大面板的时候，
+  // 左侧页面并没有自己适应，而是部分被遮盖」。
+  //
+  // 根因**不在这边**：老文库页是**固定宽度版心**（表格 + width 属性 / CSS 里的 min-width），
+  // 浏览器不能把页面压到它自己声明的最小宽度以下。侧栏只是"夺走"了网页区的宽度——
+  // 页面重不重排，是页面自己的 CSS 说了算（同一页在窄浏览器窗口里也一样不适配）。
+  // 所以这一节做的是**改页面**，而不是改面板：
+  //   ① 先量出到底哪些元素比可视区还宽（只压这几个，不做全局 CSS 覆盖，避免误伤正常元素）；
+  //      压的是 max-width/min-width/width 这几个行内属性，文字照原字号重排；
+  //   ② 还有东西撑住（<pre>、超长不可断字符串）→ 把它改成可折行；
+  //   ③ 仍然撑住 → 退一步整体缩放适配（zoom），并在探针里记明走了这一步。
+  // 全程只动**行内 style**，点一下「恢复原样」逐条还原；开关按站点记在 storage。
+  // 诊断：每次量完都往 /debug 写一条（谁比可视区宽、CSS 里哪些规则写了 min-width），
+  // 这样"到底是哪条规则撑着"不用再靠猜。
+  //
+  // 启用范围（2026-11）：**只在中文马克思主义文库**。用户报的是这个站；B 站同样跑这个
+  // 脚本，但没报过同类问题，就不擅自往那边加浮层——要让别的源也享受，把下面那行判断放开即可。
+  const FIT_ENABLED = SITE.name === 'marxists';
+  const FIT_PREF_KEY = 'miaFit:' + HOST;
+  const FIT_PILL_CLASS = 'coread-mia-fitpill';
+  const OUR_UI_SEL = '.coread-mia-ui,.coread-mia-dlg,.coread-mia-pill,.coread-mia-fitpill,.coread-mia-toast';
+  // 判定容差（px）。2026-11 从 4 收到 2：用户要的是"**一压到页面就出现**"，
+  // 4px 意味着"已经被切掉四五个像素"才认，观感上就是慢半拍。取 2 只为了避开亚像素抖动。
+  const FIT_SLOP = 2;
+  let fitOn = false;
+  let fitTouched = [];      // [{ el, style, widthAttr }] 还原用
+  const fitPressed = new Set();  // 已压过的元素（apply 幂等：不重复压、不重复登记）
+  let fitTimer = 0;         // 全页扫描的限频定时器
+  let fitLastProbe = 0;     // 探针限频（拖动时会连着来，别把日志刷满）
+  let fitCritW = 0;         // 这一页"装得下"的临界宽度（= 最宽元素的宽度，全页扫描时更新）
+
+  function fitWidths() {
+    const de = document.documentElement;
+    return { vw: de.clientWidth, docW: de.scrollWidth };
+  }
+
+  /**
+   * 一次把"装不下"的三种情形全量出来（2026-11 补齐：只量文档宽度会漏掉用户那种"被遮盖"）。
+   *
+   *   ① docOver：文档整体比可视区宽 —— 普通溢出，会出现横向滚动条；
+   *   ② worst  ：**某个元素**比可视区宽 —— 关键的一条：如果它的祖先写了 overflow:hidden，
+   *      溢出的部分被裁掉，文档宽度是"干净"的（①量不到），可屏幕上就是右边一截看不见。
+   *      用户说的"部分被遮盖"正是这种。所以判断要不要出手，两种信号都得看。
+   *   ③ scrollables：元素内部自己横向滚动（另有其事，只记进探针，不当压的目标）。
+   */
+  function fitDetect() {
+    const w = fitWidths();
+    let off = [];
+    try { off = fitOffenders(w.vw) } catch (e) {}
+    const scrollables = [];
+    try {
+      for (const el of qsa('body *')) {
+        if (el.closest && el.closest(OUR_UI_SEL)) continue;
+        let cw = 0, sw = 0;
+        try { cw = el.clientWidth; sw = el.scrollWidth } catch (e) { continue }
+        if (cw > 0 && sw > cw + 4) scrollables.push({ tag: String(el.tagName || '').toLowerCase(), cls: String(el.className || '').slice(0, 30), over: sw - cw });
+        if (scrollables.length >= 20) break;
+      }
+    } catch (e) {}
+    const worst = off.length ? Math.max.apply(null, off.map(function (o) { return o.w })) : 0;
+    // 右边缘伸出去多少（绝对定位/负边距那种，自身宽度可能并不大）
+    let edgeOver = 0;
+    try {
+      for (const o of off) {
+        const r = o.el.getBoundingClientRect();
+        const over = Math.round(r.right) - w.vw;
+        if (over > edgeOver) edgeOver = over;
+      }
+    } catch (e) {}
+    return { vw: w.vw, docW: w.docW, docOver: w.docW - w.vw, worst: worst, edgeOver: edgeOver, offenders: off, scrollables: scrollables };
+  }
+
+  /**
+   * "装不下"的判据（2026-11 三次修正后的**定稿**口径）：**页面一开始被切就算**。
+   *
+   * 回放用户三次实测（日志里都有），这一版的取舍是有据的、别再随手改：
+   *   · 第一版（只看整页宽度）：vw=991 就亮 —— 时机对，但那一刻 offenders 是空的，点了没反应；
+   *   · 第二版（只看元素宽度，且漏了 body）：晚到 vw=955 —— 用户原话
+   *     "压到文字的时候也没有立即出现，而是还要再多压一点"；
+   *   · 现在：整页宽度 / 元素宽度 / 右边缘 三个信号**取大者**，元素扫描**带上 body**
+   *     （实测那页 997 的固定宽度就挂在 body 上）。于是回到"一压到页面就出现"（vw≈994），
+   *     而且**点下去必定有元素可压**——那个撑住页面的元素本身就在名单里。
+   *
+   * 用户最后说"刚压到文字的时候会出现"，与"压到页面"在**这一页上是同一瞬**：
+   * 整页 997、版心 960，文字几乎顶到版心右边缘，面板边缘一进版心就已经切到字了。
+   * 想再往前只能做"预告"（面板离内容还有 N 像素就亮），代价是在"页面本来就还剩余地"时也会亮，
+   * 把"页面被切了"这个明确含义换成"面板挺宽了"——**明确不做**，除非用户另外要求。
+   */
+  function fitOverflowing() {
+    const d = fitDetect();
+    return Math.max(d.docOver, d.worst ? d.worst - d.vw : 0, d.edgeOver || 0);
+  }
+
+  /**
+   * 比可视区宽（或右边缘伸到可视区外）的元素，只留最外层。
+   *
+   * ⚠️ 三处 2026-11 的修正，都来自日志里的实测：
+   *   ① **必须带上 body 自己**。老页面的固定宽度经常挂在 `<body>` 上（实测那页：整页 997、
+   *      后代里最宽的是 960 的表格），只扫 `body *` 就会漏掉真正的那个，"装不下"要等到
+   *      表格也被压到才成立——比实际晚 36px（用户原话："压到文字也没立即出现，还要再多压一点"）。
+   *   ② 除了"比我宽"，**右边缘伸到可视区外**也算（绝对定位、负边距把内容顶出去那种，
+   *      它们的自身宽度可能并不大）。
+   *   ③ 过滤"子孙"时要**放过 body**：body 是 offender 不代表它的子孙也被治好了
+   *      （body 变流体了，里面那个固定宽度的表格照样溢出）。其余情况仍只留最外层，避免重复压。
+   */
+  function fitOffenders(vw) {
+    const out = [];
+    let all = [];
+    try {
+      all = (document.body ? [document.body] : []).concat(qsa('body *'));
+    } catch (e) { return out }
+    for (const el of all) {
+      if (el.closest && el.closest(OUR_UI_SEL)) continue;
+      let r = null;
+      try { r = el.getBoundingClientRect() } catch (e) { continue }
+      if (!r) continue;
+      const w = r.width;
+      if (w > vw + FIT_SLOP || r.right > vw + FIT_SLOP) out.push({ el: el, w: Math.round(w) });
+      if (out.length >= 60) break;
+    }
+    const body = document.body;
+    return out.filter(function (o) {
+      return !out.some(function (p) {
+        if (p === o || p.el === body) return false;   // 见 ③：body 不吞子孙
+        return p.el.contains(o.el);
+      });
+    });
+  }
+
+  /** CSS 里所有写了 min-width 的规则（跨域样式表读不到，跳过） */
+  function fitMinWidthRules(limit) {
+    const out = [];
+    let sheets = [];
+    try { sheets = Array.prototype.slice.call(document.styleSheets) } catch (e) { return out }
+    for (const sh of sheets) {
+      let rules = null;
+      try { rules = sh.cssRules } catch (e) { continue }
+      if (!rules) continue;
+      for (const r of rules) {
+        const t = r && r.cssText ? String(r.cssText) : '';
+        if (/min-width/i.test(t)) out.push(t.replace(/\s+/g, ' ').slice(0, 150));
+        if (out.length >= limit) return out;
+      }
+    }
+    return out;
+  }
+
+  // ── 「胶囊为什么慢」的可测量化（2026-11 用户第二次报"有点滞后"）───────────
+  // 滞后只有两种可能，现象一样、改法完全不同：
+  //   ① 我们自己的代码慢（比如等了一遍 storage、或者扫描太贵）；
+  //   ② 浏览器在**拖动期间压根不把新宽度交给网页**，松手才提交——那样页面在松手前
+  //      根本不知道你在拖，谁也快不了。
+  // 所以这里把 resize 的现场记下来：拖动期间页面到底收到几个 resize、宽度是连续变的
+  // 还是"跳"的、从判断出"装不下"到胶囊上屏隔了几毫秒。有这串数就能定案，不用再猜。
+  const FIT_RESIZE_KEEP = 24;
+  const fitResizeRing = [];
+  let fitOverflowLogged = false;   // 一次"装不下"的过程只留一条现场（免得把日志刷满）
+
+  function fitNow() {
+    try { return (typeof performance !== 'undefined' && performance.now) ? Math.round(performance.now()) : Date.now() } catch (e) { return Date.now() }
+  }
+  function fitNoteResize(vw, docW) {
+    const t = fitNow();
+    fitResizeRing.push({ t: t, vw: vw, docW: docW });
+    if (fitResizeRing.length > FIT_RESIZE_KEEP) fitResizeRing.shift();
+  }
+  /** 把这一串 resize 现场压成一行能读的东西：宽度@相对毫秒 */
+  function fitBurst() {
+    if (!fitResizeRing.length) return { events: 0 };
+    const t0 = fitResizeRing[0].t;
+    const last = fitResizeRing[fitResizeRing.length - 1];
+    let min = Infinity, max = -Infinity;
+    for (const r of fitResizeRing) { if (r.vw < min) min = r.vw; if (r.vw > max) max = r.vw }
+    return {
+      events: fitResizeRing.length,
+      spanMs: last.t - t0,
+      vwMin: min, vwMax: max, vwLast: last.vw, docWLast: last.docW,
+      series: fitResizeRing.slice(-12).map(function (r) { return r.vw + '@' + (r.t - t0) }),
+    };
+  }
+
+  /** 一条布局探针：多少宽、谁在撑、CSS 里谁声明了最小宽度（det 可复用上面那次量测，省一遍全页扫描） */
+  function fitProbe(stage, det, extra) {
+    try {
+      const d = det || fitDetect();
+      const w = { vw: d.vw, docW: d.docW };
+      const off = (d.offenders || []).slice(0, 6).map(function (o) {
+        const el = o.el;
+        let minW = '', cssW = '';
+        try { const cs = getComputedStyle(el); minW = cs.minWidth; cssW = cs.width } catch (e) {}
+        return {
+          tag: String(el.tagName || '').toLowerCase(),
+          id: el.id || '',
+          cls: String(el.className || '').slice(0, 36),
+          w: o.w,
+          attrW: (el.getAttribute && el.getAttribute('width')) || '',
+          minW: minW, cssW: cssW,
+          inline: String((el.getAttribute && el.getAttribute('style')) || '').slice(0, 60),
+        };
+      });
+      postJson('/debug', {
+        source: 'web-probe', site: SITE.name, stage: stage, url: pageUrl.slice(0, 200),
+        vw: w.vw, docW: w.docW, overflow: w.docW - w.vw, fitOn: fitOn,
+        // 2026-11 补齐：只报文档宽度会漏掉"被 overflow:hidden 裁掉"那种（见 fitDetect 注释）。
+        // 这两个数是判断"要不要出手"的真正依据，也让日志里能一眼分清两种情形。
+        worstEl: Math.max(0, (d.worst || 0) - w.vw),
+        scrollables: (d.scrollables || []).slice(0, 5),
+        zoom: document.documentElement.style.zoom || '',
+        touched: fitTouched.length,
+        offenders: off,
+        minWidthRules: fitMinWidthRules(6),
+        ...(extra || {}),
+      });
+    } catch (e) {}
+  }
+
+  /**
+   * 把"比可视区宽"的元素逐条压回来（只动行内 style，可逐条还原）。
+   *
+   * **幂等**（2026-11 补）：压过的元素记在 fitPressed 里，再压一次直接跳过。
+   * 为什么必须幂等：拉面板时会连着来一串 resize，每次都要补压"刚冒出来的宽元素"；
+   * 若同一个元素被压两次，fitTouched 里就会有两条（先存原样、再存"已压"的样子），
+   * 还原时按顺序恢复 → 最后留下的是"已压"的样子，等于**还原不回去**。
+   * 早先的写法是"每次 resize 先全量还原再重新压"——那也绕开了这个问题，但代价是
+   * 页面在每次拖动停顿处**先弹回原宽再压回去**，看着闪。
+   * @returns {number} 本次新压了几个（0 = 这一轮什么都没变）
+   */
+  function fitApply() {
+    const d = fitDetect();
+    let pressed = 0;
+    for (const o of d.offenders) {
+      const el = o.el;
+      if (fitPressed.has(el)) continue;
+      const tag = String(el.tagName || '').toUpperCase();
+      fitPressed.add(el);
+      fitTouched.push({ el: el, style: el.getAttribute('style') || '', widthAttr: el.getAttribute('width') });
+      pressed++;
+      try {
+        el.style.setProperty('max-width', '100%', 'important');
+        el.style.setProperty('min-width', '0', 'important');
+        if (tag === 'TABLE' || tag === 'TD' || tag === 'TR' || tag === 'DIV' || tag === 'CENTER' || tag === 'IMG') {
+          el.style.setProperty('width', 'auto', 'important');
+        }
+        // <table width="760"> 这类老式属性：CSS 里的 !important 压不过它，直接摘掉
+        if (el.hasAttribute && el.hasAttribute('width')) el.removeAttribute('width');
+      } catch (e) {}
+    }
+    // ② <pre> 撑住的话改成可折行
+    if (fitOverflowing() > 4) {
+      for (const pre of qsa('pre')) {
+        if (pre.closest && pre.closest(OUR_UI_SEL)) continue;
+        if (fitPressed.has(pre)) continue;
+        fitPressed.add(pre);
+        fitTouched.push({ el: pre, style: pre.getAttribute('style') || '', widthAttr: null });
+        pressed++;
+        try { pre.style.setProperty('white-space', 'pre-wrap', 'important') } catch (e) {}
+      }
+    }
+    // ③ 还撑住 → 整体缩放（记进探针，别让它悄悄发生）
+    const w1 = fitWidths();
+    if (w1.docW > w1.vw + 4) {
+      const z = Math.max(0.5, Math.min(1, (w1.vw - 2) / w1.docW));
+      try { document.documentElement.style.zoom = String(Math.round(z * 1000) / 1000) } catch (e) {}
+    }
+    return pressed;
+  }
+
+  /** 逐条还原（恢复行内 style / width 属性 / 去掉 zoom） */
+  function fitRevert() {
+    for (const t of fitTouched) {
+      try {
+        if (t.widthAttr != null) t.el.setAttribute('width', t.widthAttr);
+        if (t.style) t.el.setAttribute('style', t.style);
+        else if (t.el.hasAttribute && t.el.hasAttribute('style')) t.el.removeAttribute('style');
+      } catch (e) {}
+    }
+    fitTouched = [];
+    fitPressed.clear();   // 与 fitTouched 同生同灭：不清的话下次 apply 会漏压（以为已经压过）
+    try { document.documentElement.style.zoom = '' } catch (e) {}
+  }
+
+  let fitPill = null;
+  function fitPillShow() {
+    if (!fitPill) {
+      fitPill = makeEl('button', FIT_PILL_CLASS);
+      fitPill.type = 'button';
+      fitPill.addEventListener('click', function () {
+        fitOn = !fitOn;
+        if (fitOn) fitApply(); else fitRevert();
+        try { chrome.storage.local.set({ [FIT_PREF_KEY]: fitOn ? 'on' : 'off' }) } catch (e) {}
+        fitProbe(fitOn ? 'fit-on' : 'fit-off');
+        fitPillRender();
+        toast(fitOn ? ('已适宽（' + fitWidths().vw + 'px）') : '已恢复原样');
+      });
+      const host = document.body || document.documentElement;
+      if (!host) { fitPill = null; return; }
+      try { host.appendChild(fitPill) } catch (e) { fitPill = null; return; }
+    }
+    fitPill.style.display = '';
+    fitPillRender();
+  }
+  function fitPillRender() {
+    if (!fitPill) return;
+    fitPill.textContent = fitOn ? '↔ 原样' : '↔ 页面比面板宽 · 适宽';
+    fitPill.title = fitOn
+      ? '取消"适宽"，把这个页面恢复成它本来的样子'
+      : '这个页面是固定宽度版心，比面板还宽（右边一部分看不到）。点一下把它压回面板宽度，文字重新折行、字号不变';
+  }
+
+  /**
+   * 启动时做一次：按站点记住的开关自动应用；没记过就只在"真的装不下"时把胶囊亮出来。
+   *
+   * 2026-11 补两处（用户报"没看到蓝色胶囊"）：
+   *   ① 判据从"文档比可视区宽"改成 fitDetect 的两种信号取大者——被 overflow:hidden 裁掉的
+   *      那种文档宽度是干净的，只看文档宽度就会漏判，胶囊自然不出现；
+   *   ② 无论有没有溢出，都先写一条 `fit-init` 探针。这一条是为**可诊断**：日志里有它，
+   *      就说明新代码确实在这个页面跑过；没有它，就说明扩展没重载 / 页面没刷新，
+   *      两种"没看到胶囊"一眼可分（不然只能靠猜）。
+   */
+  function fitInit() {
+    if (!FIT_ENABLED) return;
+    /** 全页扫描（贵的那一趟）：找"被裁掉"那种、补压刚冒出来的宽元素、决定胶囊显隐 */
+    const scan = function (probeInit) {
+      const d = fitDetect();
+      // 与 fitOverflowing 同一口径：整页被切 / 元素装不下 / 右边缘伸出去，取大者
+      const over = Math.max(d.docOver, d.worst ? d.worst - d.vw : 0, d.edgeOver || 0);
+      // 记下这一页最宽元素的宽度：**只进探针**（日志里那个 critW），用来复盘"这一页的版心多宽"。
+      // 判据本身不用它——用的是 docW / 元素宽度 / 右边缘三者的最大超出量（见 fitOverflowing）。
+      // ⚠️ 曾经拿它当便宜路径的判据（vw < critW 才亮），后果是"压到文字也没立即出现、还要再多压一点"：
+      // 因为 critW 只在**扫描到 offender 时**才更新，等于要等到元素真的装不下才亮。别再改回去。
+      if (d.worst > 0) fitCritW = d.worst;
+      if (probeInit) { fitProbe('fit-init', d); fitLastProbe = Date.now(); }
+      if (fitOn) {
+        const n = fitApply();          // 幂等：只压"还没压过且现在超宽"的，不会先弹回再压（那是闪烁源）
+        if (n > 0) fitProbe('fit-applied');
+      }
+      if ((fitOn || over > 4) && Date.now() - fitLastProbe > 800) {
+        fitLastProbe = Date.now();
+        fitProbe(over > 4 ? 'overflow-detected' : 'fit-applied', d);
+      }
+      if (fitOn || over > 4) fitPillShow();
+      else if (fitPill) fitPill.style.display = 'none';
+      if (over <= FIT_SLOP) fitOverflowLogged = false;   // 页面又装得下了 → 下次"装不下"再留一条新现场
+    };
+    /**
+     * 便宜路径（2026-11 补：用户说"胶囊出现得有点慢"）。
+     *
+     * 原来 resize 上挂的是一个 260ms 的**防抖**：拖动分隔条会连着来一串 resize，
+     * 每一次都把定时器重置——于是胶囊只在**你松手之后**才出现，感觉就是"慢半拍"。
+     * 现在改成两条路：
+     *   ① 便宜路径（这里）：只读两个数（可视区宽 / 整页宽），**立刻**判断"整页装不下"，
+     *      胶囊当场就亮，不等任何定时器。这也是最常见的那种（这台机器上 <table width=960> 就是）。
+     *   ② 贵路径（scan）：要遍历全页才知道的"被 overflow:hidden 裁掉"那种，限频跑，
+     *      拖个不停时也不会把主线程拖卡。
+     */
+    /**
+     * 便宜路径：只读两个数（可视区宽 / 整页宽），**当帧**判断"页面被切了没有"。
+     *
+     * 口径与全页扫描一致（那里的 over 也含 docOver）——两条路不能各说各话，否则
+     * 会出现"便宜路径亮、扫描又把它藏了"的闪烁。
+     * 容差 FIT_SLOP=2：用户要的是"一压到页面就出现"，4px 就是"已经被切掉四五个像素"才认。
+     */
+    const fastCheck = function () {
+      let vw = 0, docW = 0;
+      try { const de = document.documentElement; vw = de.clientWidth; docW = de.scrollWidth } catch (e) { return }
+      fitNoteResize(vw, docW);      // 记现场：拖动期间页面到底看到了什么（诊断"滞后"用）
+      if (docW <= vw + FIT_SLOP) return;
+      const t0 = fitNow();
+      const wasHidden = !fitPill || fitPill.style.display === 'none';
+      fitPillShow();
+      // 一次"装不下"的过程只留一条：这条就是滞后现场——pillMs 是我自己花的时间，
+      // burst 是浏览器交给我的 resize 序列。两者一比就知道滞后出在谁身上。
+      if (!fitOverflowLogged) {
+        fitOverflowLogged = true;
+        fitProbe('resize-overflow', null, {
+          pillMs: fitNow() - t0,
+          pillWasHidden: wasHidden,
+          critW: fitCritW,
+          burst: fitBurst(),
+        });
+      }
+    };
+    // 先跑便宜路径：判断"装不下"跟用户偏好无关，没必要等一遍 storage 往返
+    //（这一条在加载路径上省掉一次异步往返，胶囊能早一帧是一帧）
+    fastCheck();
+    try {
+      chrome.storage.local.get([FIT_PREF_KEY], function (r) {
+        fitOn = !!(r && r[FIT_PREF_KEY] === 'on');
+        scan(true);
+      });
+    } catch (e) { scan(true); }
+    // 兜底：存储回调若因扩展上下文失效而没回来，也要量一次（否则整个功能静默失效）
+    setTimeout(function () { if (!fitPill && !fitTouched.length) scan(true) }, 1500);
+    // 图片/字体撑开版心的页面：load 之后再量一次
+    try { window.addEventListener('load', function () { setTimeout(function () { scan(false) }, 60) }) } catch (e) {}
+    window.addEventListener('resize', function () {
+      fastCheck();                                   // 先给反应：两个数一读，不等定时器
+      if (fitTimer) return;                          // 贵路径已在排队 → 不再重置（防抖的病根就在"重置"）
+      fitTimer = setTimeout(function () { fitTimer = 0; scan(false) }, 120);
+    });
+  }
+
   // ── 划线共读 ────────────────────────────────────────────────────────────
   let floatBtn = null;
   function hideFloat() {
@@ -816,6 +1222,7 @@
   function bootInner() {
     MAIN = extractMainText();
     refreshPill();
+    fitInit();          // 固定宽度版心的老页面：量一次，需要时亮出「适宽」（见 fitInit 注释）
     cacheChapter();
     renderMarks();
     // 懒加载兜底：命中候选容器的动态页（B 站等）正文可能晚于脚本到达，

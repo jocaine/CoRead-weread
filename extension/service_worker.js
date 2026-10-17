@@ -94,10 +94,44 @@ self.addEventListener('message', event => {
 // 点击扩展图标直接打开 side panel
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {})
 
+/**
+ * 尽力打开侧栏，并**如实回报结果**（2026-11）。
+ *
+ * 为什么不能只 `open().catch(()=>{})`：请我们开面板的有两条真实链路——书页画完一条
+ * 划线、工具栏「查引用」——它们都只想知道"到底开没开"。吞掉错误的话，用户看到的是
+ * "划线之后什么都没发生"，而我们这边连一行日志都没有。
+ *
+ * ⚠️ `chrome.sidePanel.open()` 必须由**用户手势**触发，且手势不穿过 sendMessage
+ * 从页面传到后台（实测证据：logs\debug.jsonl 的 open-side-panel-lesson，
+ * error=`sidePanel.open()` may only be called in response to a user gesture.）。
+ * 所以这里的 `open()` **必须同步发起**——在监听器里 await 过任何东西再调它，
+ * 连"理论上可能成功"的那点机会也没了。成功与否都返回，由调用方决定怎么兜底。
+ */
+function openSidePanelForTab(tabId) {
+  if (!tabId) return Promise.resolve({ opened: false, error: 'no-tab' })
+  // Chrome 114 之前没有 sidePanel API：老浏览器上如实回报，不要让监听器抛异常
+  // （抛出去的话消息通道直接断，调用方只会看到一句"Receiving end does not exist"）
+  if (!chrome.sidePanel || !chrome.sidePanel.open) return Promise.resolve({ opened: false, error: 'no-sidePanel-api' })
+  const p = chrome.sidePanel.open({ tabId })
+  return Promise.resolve(p).then(
+    () => ({ opened: true }),
+    async (e) => {
+      // 失败时要分清"已经被用户开着了"（无害）与"缺手势"（浏览器策略，我们改不了）
+      let alreadyOpen = false
+      try {
+        const ctxs = await chrome.runtime.getContexts({ contextTypes: ['SIDE_PANEL'] })
+        alreadyOpen = !!(ctxs && ctxs.length)
+      } catch {}
+      return { opened: false, alreadyOpen, error: String((e && e.message) || e) }
+    },
+  )
+}
+
 // 来自 content.js / sidebar 的消息
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === 'openPanel' && sender.tab?.id) {
-    chrome.sidePanel.open({ tabId: sender.tab.id }).catch(() => {})
+  if (msg.action === 'openPanel') {
+    openSidePanelForTab(sender.tab?.id).then(sendResponse)
+    return true   // 异步回报（调用方要把结果写进日志）
   }
 
   // 引用删除后 → 通知微信读书 tab 刷新共读标记
@@ -122,6 +156,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 reportExtensionToHost()
 chrome.runtime.onStartup.addListener(() => reportExtensionToHost())
 chrome.runtime.onInstalled.addListener(() => reportExtensionToHost())
+
+// ── 教程状态的作废（2026-11 用户报的 bug）────────────────────────────────────
+// 用户更新扩展后一打开侧栏，教程引导自己冒了出来。根因是教程状态存在 chrome.storage 里、
+// 跨会话有效，而上一版"侧栏每次打开都 restoreRun()"——于是任何一次打开都可能把
+// 一条旧记录接起来。现在侧栏那边改成"只显示「继续教程」入口、点了才continue"（见 sidebar.js），
+// 这里再加一道：**每次扩展启动都把那份状态作废**。
+//
+// 为什么用"启动即作废"而不是"够新就留"：教程是"你开始才存在"的东西，不该活过一次
+// 扩展的全生命周期。用户关掉浏览器、更新插件、禁用再启用，都该回到干净状态。
+// 代价是"浏览器重启后不能接着上次"——这个代价明确接受，因为"教程自己冒出来"更糟。
+async function clearTutorialStateOnBoot(reason) {
+  try {
+    const st = await chrome.storage.local.get('tutorialRun')
+    if (st && st.tutorialRun) {
+      await chrome.storage.local.remove('tutorialRun')
+      console.info('[教程] 已作废上一次的教程状态（' + reason + '）')
+    }
+  } catch (e) {}
+}
+clearTutorialStateOnBoot('service worker 启动')
+chrome.runtime.onStartup.addListener(() => clearTutorialStateOnBoot('浏览器启动'))
+chrome.runtime.onInstalled.addListener(() => clearTutorialStateOnBoot('扩展装上/更新/重载'))
 
 // ── 翻译能力（框选截图 / 划词）────────────────────────────────────────────────
 // 逻辑都在 translate-background.js 里，只在这里装配，避免和共读的 SW 逻辑混在一起。

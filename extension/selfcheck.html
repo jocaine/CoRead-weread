@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>CoRead 自检</title>
+<style>
+  body { margin: 0; padding: 20px 24px; font: 14px/1.7 "Microsoft YaHei", sans-serif; color: #23262b; background: #f4f6f8; }
+  h1 { font-size: 18px; margin: 0 0 6px; }
+  .sub { color: #6b7280; margin-bottom: 16px; }
+  #run { font: inherit; padding: 8px 18px; border-radius: 8px; border: 1px solid #a8dcc0; background: #eaf7f0; color: #0a7d43; font-weight: 600; cursor: pointer; }
+  #run:disabled { opacity: .5; cursor: default; }
+  #out { margin-top: 18px; }
+  .row { display: flex; gap: 8px; padding: 3px 0; border-bottom: 1px dotted #e3e7ec; }
+  .ok { color: #0a7d43; }
+  .no { color: #c0392b; font-weight: 600; }
+  .name { flex: 1; }
+  .detail { color: #6b7280; font-size: 12.5px; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #summary { position: sticky; top: 0; background: #f4f6f8; padding: 8px 0; font-weight: 600; }
+  #file { margin-top: 12px; color: #0a7d43; }
+  .warn { background: #fff8ec; border: 1px solid #f0dcb4; border-radius: 8px; padding: 10px 12px; margin: 14px 0; color: #8a6d3b; }
+</style>
+</head>
+<body>
+<h1>CoRead 自检</h1>
+<div class="sub">
+  在**这台机器的真实浏览器**里跑一遍关键流程，把结果写成一份报告。
+  这是给开发者（AI 助手）定位问题用的，不是给你看的说明书——看不懂没关系，点一下就行。
+</div>
+
+<div class="warn">
+  跑之前请确认：<b>CoRead 本机服务在运行</b>（托盘图标在）。否则报告只能下载，我读不到。<br>
+  另外它会短暂打开/切到 CoRead 阅读器标签页，跑完就还给你。
+</div>
+
+<button id="run">开始自检</button>
+<div id="summary"></div>
+<div id="out"></div>
+<div id="file"></div>
+
+<script type="module" src="selfcheck.js"></script>
+</body>
+</html>

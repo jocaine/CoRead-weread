@@ -362,6 +362,21 @@
   color: #6b7075;
   cursor: pointer;
   outline: none;
+  /* 先给一条透明边框：一是让下面 :focus-visible 的 border-color 改色一定生效
+     （不依赖浏览器是否给 summary 设了默认 border），二是边框宽度始终占位、
+     聚焦时不会挤动文字。 */
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+
+/* 键盘焦点：outline 被上面关掉了，必须自己给一个看得见的替代。
+   用 #07883f（本文件已有的深绿），对 #fafbfc 对比度 4.4，满足 WCAG 1.4.11 的 3.0。
+   不要用 #07c160——它太亮，对浅底只有 2.30，达不到。
+   用 :focus-visible 而非 :focus：鼠标点开“原文”时不该闪出一个框，键盘跳进来才给。 */
+.st-orig-wrap > summary:focus-visible {
+  border-color: #07883f;
+  box-shadow: 0 0 0 3px rgba(7, 136, 63, 0.18);
+  color: #056b32;
 }
 
 .st-orig {
@@ -379,9 +394,13 @@
   resize: vertical;
 }
 
-.st-orig:focus {
+/* 焦点样式：把原来的蓝边 #4c9ffe 换成 #07883f。
+   原因：蓝边对 #fafbfc 的对比度只有 2.63，达不到 WCAG 1.4.11 要求的 3.0；
+   #07883f 是 4.40（边框色随底色转白后为 4.56），且它本来就在本文件里用过。 */
+.st-orig:focus-visible {
   outline: none;
-  border-color: #4c9ffe;
+  border-color: #07883f;
+  box-shadow: 0 0 0 3px rgba(7, 136, 63, 0.18);
   background: #ffffff;
 }
 

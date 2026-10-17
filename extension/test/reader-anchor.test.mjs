@@ -9,10 +9,19 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  glyphTextFromOps,
   joinLines,
+  linesFromFixedItems,
+  linesFromItems,
   linesFromOffsets,
+  looksSpaceStarved,
   pageTextIndex,
+  planContextWindow,
+  restoreItemSpaces,
+  spacedPageFix,
+  spacedLinesFromOffsets,
   textFromOffsets,
+  textFromSpacedOffsets,
 } from '../reader-anchor.js'
 
 /** 假文字层：pdf.js 里一行就是一个 span，这里只需要 textContent */
@@ -92,4 +101,237 @@ test('同一对偏移在文字层重建后仍取到相同原文', () => {
   assert.equal(before, after)
   assert.match(before, /^Reading foreign literature/)
   assert.match(before, /sentences that do not survive/)   // 跨行处是空格，不是粘连
+})
+
+// ── 补回被 pdf.js 吞掉的词间空格 ───────────────────────────────────────────────
+// 真实案例（用户实报，2026-11）：item 文字是 "thegeneraleditorof"，
+// 而绘图指令里的字形序列是 "the general editor of"。
+const glyphItem = (unicode) => ({ unicode })
+
+test('glyphTextFromOps 从绘图指令里取回真字流（含空格）', () => {
+  const ops = { showText: 44, showSpacedText: 45, nextLineShowText: 46, nextLineSetSpacingShowText: 47 }
+  const fnArray = [31, 33, 44, 44, 47]                       // beginText / setFont / showText / showText / …
+  const argsArray = [
+    null, ['g_d0_f1', 14],
+    [[glyphItem('the'), glyphItem(' '), glyphItem('general')]],
+    [[glyphItem('editor')]],
+    [0, 0, [glyphItem(' of'), 20, [glyphItem(' Lacan')]]],    // TJ：数字是字距微调，不该当文字
+  ]
+  assert.equal(glyphTextFromOps(fnArray, argsArray, ops), 'the generaleditor of Lacan')
+  assert.equal(glyphTextFromOps(null, null, ops), '')
+})
+
+test('looksSpaceStarved 只对"长串字母中间没空格"报警', () => {
+  assert.equal(looksSpaceStarved('hoiswidelyrecognizedastheforemostinterpreter'), true)
+  assert.equal(looksSpaceStarved('the general editor of the book'), false)
+  assert.equal(looksSpaceStarved('这是一段中文正文，本来就没有词间空格。'), false)
+  assert.equal(looksSpaceStarved(''), false)
+  assert.equal(looksSpaceStarved('uncharacteristically'), true)   // 单个超长词也会命中 —— 只是白跑一次
+})
+
+test('restoreItemSpaces 只在真字流多出空格的地方插空格', () => {
+  const items = [{ str: 'thegeneraleditorof' }]
+  const truth = 'the general editor of'
+  const fix = restoreItemSpaces(items, truth)
+  assert.deepEqual(fix.lines, ['the general editor of'])
+  assert.deepEqual(fix.inserted, [[3, 10, 16]])              // 三个插入点（行内坐标）
+})
+
+test('restoreItemSpaces 绝不删改字符：item 自己带的空格原样留着', () => {
+  // pdf.js 猜出来的空格（真字流里没有）必须保留，否则我们反而把它抹掉了
+  const fix = restoreItemSpaces([{ str: 'thegeneral editorof' }], 'thegeneraleditorof')
+  assert.equal(fix.lines[0], 'thegeneral editorof')
+  assert.deepEqual(fix.inserted, [[]])
+})
+
+test('restoreItemSpaces 对不上就整页放弃（连字、隐形字符、ToUnicode 不一致）', () => {
+  assert.equal(restoreItemSpaces([{ str: 'abc' }], 'abd'), null)          // 字符本身不同
+  assert.equal(restoreItemSpaces([{ str: 'abc' }], ''), null)             // 没真字流
+  assert.equal(restoreItemSpaces([], 'abc'), null)
+})
+
+test('restoreItemSpaces 跨 item 的边界空格不补（交给 joinLines 的行间空格）', () => {
+  const items = [{ str: 'ab' }, { str: 'cd' }]               // 两行：ab / cd
+  const layer = fakeLayer(['ab', 'cd'])
+  const fix = restoreItemSpaces(items, 'ab cd')              // 真字流：ab·cd
+  assert.deepEqual(fix.lines, ['ab', 'cd'])                  // 两边都不用动
+  assert.deepEqual(fix.inserted, [[], []])
+  // 行边界那个空格由 joinLines 提供 —— 所以整段取出来仍然正确
+  assert.equal(textFromSpacedOffsets(layer, fix, 0, 999), 'ab cd')
+})
+
+test('spacedPageFix 在 item 与文字层对不上时拒绝出手（宁可缺空格，不可错位）', () => {
+  const items = [{ str: 'thegeneraleditorof' }]
+  const truth = 'the general editor of'
+  const same = spacedPageFix(fakeLayer(['thegeneraleditorof']), items, truth)
+  assert.equal(same.lines[0], 'the general editor of')
+  // 文字层里的文字与 item 不一致（页面重排过 / 换过节点）→ null
+  assert.equal(spacedPageFix(fakeLayer(['别的东西']), items, truth), null)
+})
+
+test('textFromSpacedOffsets 切片时把插入的空格算进偏移', () => {
+  const items = [{ str: 'freshair' }]
+  const layer = fakeLayer(['freshair'])
+  const fix = spacedPageFix(layer, items, 'fresh air')
+  assert.deepEqual(fix.inserted, [[5]])
+  // 原偏移 [5,8) = "air" → 补过空格后要切到 "air"，不能因为多了一个空格而串位
+  assert.equal(textFromSpacedOffsets(layer, fix, 5, 8), 'air')
+  assert.equal(textFromSpacedOffsets(layer, fix, 0, 5), 'fresh')
+  // 整段取出来：空格在里面
+  assert.equal(textFromSpacedOffsets(layer, fix, 0, 8), 'fresh air')
+  // 没有 fix 时与 textFromOffsets 完全一致（退回老路）
+  assert.equal(textFromSpacedOffsets(layer, null, 0, 8), textFromOffsets(layer, 0, 8))
+})
+
+test('textFromSpacedOffsets 仍按行拼接（跨行补空格、行尾断词照旧）', () => {
+  const items = [{ str: 'amanifesta-' }, { str: 'tionofdesire' }]
+  const layer = fakeLayer(['amanifesta-', 'tionofdesire'])
+  const fix = spacedPageFix(layer, items, 'a manifesta-tion of desire')
+  assert.deepEqual(fix.lines, ['a manifesta-', 'tion of desire'])
+  assert.equal(textFromSpacedOffsets(layer, fix, 0, 999), 'a manifestation of desire')
+})
+
+// ── 无 DOM 切片（页面还没渲染时用）─────────────────────────────────────────────
+// 场景：重开一本书，在译文对照里点一条旧条目的「设为引用」——那一页还没渲染，
+// 没有文字层可查，只能现问 pdf.js 要一份文字（items）。
+test('linesFromItems 与 linesFromOffsets 逐字一致（两份实现不许漂移）', () => {
+  const lines = ['Reading foreign literature', 'means meeting sentences', 'that do not survive']
+  const items = lines.map((str) => ({ str }))
+  const layer = fakeLayer(lines)
+  for (const [a, b] of [[0, 999], [8, 20], [20, 35], [26, 31], [5, 60]]) {
+    assert.deepEqual(linesFromItems(items, a, b), linesFromOffsets(layer, a, b))
+  }
+})
+
+test('linesFromItems 只取与区间有交集的行，并对坏输入不炸', () => {
+  const items = [{ str: 'abc' }, { str: '' }]
+  assert.deepEqual(linesFromItems([{ str: 'abc' }, { str: 'de' }], 2, 4), ['c', 'd'])
+  assert.deepEqual(linesFromItems([], 0, 10), [])
+  assert.deepEqual(linesFromItems(null, 0, 10), [])
+  assert.deepEqual(linesFromItems([{ str: 'abc' }], 10, 20), [])   // 整段在区间之外
+  assert.deepEqual(linesFromItems([{ str: 'abc' }], 2, 1), [])     // 倒过来的区间
+  assert.deepEqual(linesFromItems(items, 0, 3), ['abc'])           // 空 item 不产出空行
+})
+
+test('linesFromFixedItems 切补过空格那份，但偏移仍按原文字算', () => {
+  const items = [{ str: 'freshair' }, { str: 'andmore' }]   // 原长 8 + 7
+  const fix = restoreItemSpaces(items, 'fresh air and more')
+  assert.deepEqual(fix.lines, ['fresh air', 'and more'])
+  // 原偏移 [5,8) = "air" —— 补进来一个空格之后不能串位（与 textFromSpacedOffsets 同一把尺）
+  assert.deepEqual(linesFromFixedItems(fix, 5, 8), ['air'])
+  assert.deepEqual(linesFromFixedItems(fix, 8, 15), ['and more'])
+  // 边界上那个补进来的空格：joinLines 会 trim 掉 —— 与 textFromSpacedOffsets 的行为完全一致
+  assert.equal(joinLines(linesFromFixedItems(fix, 0, 5)), 'fresh')
+  assert.equal(joinLines(linesFromFixedItems(fix, 0, 15)), 'fresh air and more')
+  // 没有 fix（这页不需要补）时什么都不切，调用方会退回 linesFromItems
+  assert.deepEqual(linesFromFixedItems(null, 0, 15), [])
+  assert.deepEqual(linesFromFixedItems({ lines: null }, 0, 15), [])
+})
+
+test('linesFromFixedItems 与 spacedLinesFromOffsets 逐字一致（两份实现不许漂移）', () => {
+  const lines = ['Reading foreign literature', 'means meeting', 'sentences that do', 'not survive translation']
+  const items = lines.map((str) => ({ str }))
+  const layer = fakeLayer(lines)
+  const fix = spacedPageFix(layer, items, lines.join(' '))
+  for (const [a, b] of [[0, 999], [0, 20], [20, 45], [8, 20], [26, 31], [0, 5]]) {
+    assert.equal(joinLines(linesFromFixedItems(fix, a, b)), textFromSpacedOffsets(layer, fix, a, b),
+      '区间 [' + a + ',' + b + ')')
+  }
+})
+
+test('spacedPageFix 在没有文字层时也出手（页面还没渲染的页）', () => {
+  // 有文字层：逐字校验照旧
+  assert.equal(spacedPageFix(fakeLayer(['别的东西']), [{ str: 'thegeneraleditorof' }], 'the general editor of'), null)
+  // 没有文字层（null）：items 与真字流出自同一次 getTextContent，跳过校验直接用
+  const fix = spacedPageFix(null, [{ str: 'thegeneraleditorof' }], 'the general editor of')
+  assert.equal(fix.lines[0], 'the general editor of')
+  assert.equal(spacedPageFix(null, [], 'x'), null)
+})
+
+// ── 「划线附近原文」取哪几页、每页取哪一段（纯算术）──────────────────────────
+/** 假页长表：只列出存在的页，其余当"拿不到这一页的文字"（null） */
+const pageTotals = (map) => (n) => (n in map ? map[n] : null)
+
+test('planContextWindow：划线在页面中部 → 只取这一页，前后各扩 300 字', () => {
+  const plan = planContextWindow([{ page: 3, start: 400, end: 460 }], pageTotals({ 3: 1000 }))
+  assert.deepEqual(plan, [{ page: 3, from: 100, to: 760 }])
+})
+
+test('planContextWindow：划线在页首 → 往前一页的尾巴补足 300 字', () => {
+  const plan = planContextWindow([{ page: 3, start: 40, end: 100 }], pageTotals({ 2: 500, 3: 1000 }))
+  assert.deepEqual(plan, [
+    { page: 2, from: 240, to: 500 },     // 补 260 字（= 300 − 40）
+    { page: 3, from: 0, to: 400 },
+  ])
+})
+
+test('planContextWindow：划线在页尾 → 往后一页的开头补足 300 字', () => {
+  const plan = planContextWindow([{ page: 3, start: 900, end: 960 }], pageTotals({ 3: 1000, 4: 400 }))
+  assert.deepEqual(plan, [
+    { page: 3, from: 600, to: 1000 },
+    { page: 4, from: 0, to: 260 },       // 补 260 字（= 300 − 40）
+  ])
+})
+
+test('planContextWindow：跨页划线 → 首页留前文、末页留后文、中间页整页要', () => {
+  // 中间的页在真实数据里一定是"整页都被划线覆盖"（选区连续，offsetsAcrossPages 会把中间页夹成整页）
+  const plan = planContextWindow(
+    [{ page: 5, start: 200, end: 900 }, { page: 6, start: 0, end: 900 }, { page: 7, start: 0, end: 120 }],
+    pageTotals({ 5: 1000, 6: 900, 7: 800 }),
+  )
+  assert.deepEqual(plan, [
+    { page: 5, from: 0, to: 900 },
+    { page: 6, from: 0, to: 900 },
+    { page: 7, from: 0, to: 420 },
+  ])
+})
+
+test('planContextWindow：没有邻页时给多少算多少（不假装凑满）', () => {
+  const plan = planContextWindow([{ page: 1, start: 0, end: 50 }], pageTotals({ 1: 800 }))
+  assert.deepEqual(plan, [{ page: 1, from: 0, to: 350 }])
+})
+
+test('planContextWindow：拿不到某一页（null）就跳过它，其余照常', () => {
+  const plan = planContextWindow([{ page: 3, start: 10, end: 60 }], pageTotals({ 3: 900 }))
+  assert.deepEqual(plan, [{ page: 3, from: 0, to: 360 }])
+})
+
+test('planContextWindow：往前补页最多 span 页（不让长书一路往前翻）', () => {
+  const totals = pageTotals({ 1: 100, 2: 100, 3: 100, 4: 100, 5: 100 })
+  const plan = planContextWindow([{ page: 5, start: 0, end: 10 }], totals, { span: 2 })
+  assert.deepEqual(plan, [
+    { page: 3, from: 0, to: 100 },
+    { page: 4, from: 0, to: 100 },
+    { page: 5, from: 0, to: 100 },      // 这一页只有 100 字，后文要不满 300 → 夹到页尾
+  ])
+  // span=0：一页都不往前补，只给划线所在页
+  assert.deepEqual(planContextWindow([{ page: 5, start: 0, end: 10 }], totals, { span: 0 }),
+    [{ page: 5, from: 0, to: 100 }])
+})
+
+test('planContextWindow：坏锚点与空输入返回空计划（不产出、也不抛）', () => {
+  const totals = pageTotals({ 1: 500 })
+  assert.deepEqual(planContextWindow([], totals), [])
+  assert.deepEqual(planContextWindow(null, totals), [])
+  assert.deepEqual(planContextWindow([{ page: NaN, start: 0, end: 10 }], totals), [])
+  assert.deepEqual(planContextWindow([{ page: 1, start: undefined, end: 10 }], totals), [])
+  assert.deepEqual(planContextWindow([{ page: 9, start: 0, end: 10 }], totals), [])   // 那一页拿不到文字
+})
+
+test('planContextWindow：划线那页没有文字（扫描件）→ 空计划，不拿旁页凑数', () => {
+  // 这是无头自测抓到的真实缺陷：图片页没有文字层，如果不管这道闸，
+  // "往前补页"会把上一页的尾巴当成"划线附近的原文"报上去 —— 那段文字与划线毫无关系。
+  const totals = pageTotals({ 1: 500, 2: 400, 3: 0 })
+  assert.deepEqual(planContextWindow([{ page: 3, start: 0, end: 10 }], totals), [])
+  // 反过来：划线那页有文字时，邻页照样补
+  assert.deepEqual(planContextWindow([{ page: 3, start: 0, end: 10 }], pageTotals({ 2: 400, 3: 300 })),
+    [{ page: 2, from: 100, to: 400 }, { page: 3, from: 0, to: 300 }])
+})
+
+test('planContextWindow：before/after 可调，切片夹在页内不越界', () => {
+  const plan = planContextWindow([{ page: 2, start: 10, end: 20 }], pageTotals({ 1: 40, 2: 30 }), { before: 25, after: 25 })
+  assert.deepEqual(plan, [
+    { page: 1, from: 25, to: 40 },       // 补 15 字（= 25 − 10）
+    { page: 2, from: 0, to: 30 },        // 20 + 25 越出页尾 → 夹到 30
+  ])
 })

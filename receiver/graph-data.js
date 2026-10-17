@@ -170,3 +170,43 @@ export function buildDemoGraph() {
   const validEdges = edges.filter((e) => nodes.has(e.from) && nodes.has(e.to))
   return { nodes: [...nodes.values()], edges: validEdges }
 }
+
+/**
+ * 教程专用的会意图（2026-11 用户要求）。
+ *
+ * ── 为什么要它 ────────────────────────────────────────────────────────────────
+ * 用户原话："事先准备好一些引用和一些会意节点（注意这里的会意节点不要全局的，
+ * 只有在教程中才显示，同时教程中的会意图不要显示用户的会意节点）"。
+ * 教程要教"收口/命中"，可新用户的知识网是空的——图是空的就没法讲。
+ * 但直接往用户自己的图里塞假节点更糟：那是他的资产，会被污染。
+ *
+ * ── 所以走完全隔离的一条路 ────────────────────────────────────────────────────
+ *   · 数据来自**扩展自己的** `tutorial/graph-seed.json`（跟着扩展走，不进用户 data\）
+ *   · 接收端只在 `?tutorial=1` 时读它，**默认那个 /graph 一个字都不碰**
+ *   · 返回体带 `tutorial:true`，侧栏据此打标签、并且**不用它做命中动画**
+ * 于是"教程里看得见图"和"用户的图干净"两件事同时成立。
+ *
+ * @param {string} file 种子文件绝对路径
+ * @returns {{nodes:Array, edges:Array, tutorial:true}|null}
+ */
+export function readTutorialGraph(file) {
+  let raw
+  try { raw = JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null }
+  if (!raw || !Array.isArray(raw.nodes)) return null
+  const now = Date.now()
+  const nodes = raw.nodes
+    .filter((n) => n && n.id)
+    .map((n) => ({
+      id: n.id,
+      point: String(n.point || n.id),
+      aliases: Array.isArray(n.aliases) ? n.aliases : [],
+      discussions: Array.isArray(n.discussions) ? n.discussions : [],
+      createdAt: n.createdAt || now,
+      updatedAt: n.updatedAt || now,
+    }))
+  const ids = new Set(nodes.map((n) => n.id))
+  const edges = (Array.isArray(raw.edges) ? raw.edges : [])
+    .filter((e) => e && ids.has(e.from) && ids.has(e.to))
+    .map((e) => ({ from: e.from, to: e.to, kind: e.kind === 'derived' ? 'derived' : 'user' }))
+  return { nodes, edges, tutorial: true }
+}

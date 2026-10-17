@@ -1,0 +1,211 @@
+/* CoRead 教程书样式
+ *
+ * 两件事分开：
+ *  ① 书本身（.tut-page 那一套）—— 正文排版。它要能像一本书那样读：窄栏、够大的字号、
+ *     够松的行高。用户会在这段文字上划线共读，所以行距尤其不能挤。
+ *  ② 「开始本课」卡片 —— 这一章的动手入口。
+ *
+ * ⚠️ **这一版删掉了"演一个假界面"那一整套**（2026-11 用户定调：书的动画和侧栏的引导
+ *    是两张皮，应该合起来）。现在书里不再演戏：一章 = 一课，课在**真实侧栏**里跑，
+ *    样式由 sidebar.html 自己那份 CSS 负责（引导层见 tutorial-guide.js）。
+ *    所以这里只管"书页长什么样"，不再有舞台、坐标系、迷你界面那一堆。
+ */
+
+/* ── 书页 ─────────────────────────────────────────────────────────────────── */
+.tut-page {
+  background: #fff;
+  width: min(880px, 100%);
+  margin: 0 auto;
+  padding: 40px 52px 56px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .16);
+  font-size: 15.5px;
+  line-height: 1.95;
+  color: #23262b;
+}
+
+.tut-head { margin-bottom: 26px; }
+.tut-eyebrow {
+  font-size: 12px;
+  color: #8a8f98;
+  letter-spacing: .04em;
+  margin-bottom: 8px;
+}
+.tut-title {
+  font-size: 25px;
+  line-height: 1.4;
+  font-weight: 650;
+  margin: 0;
+  letter-spacing: .01em;
+}
+
+.tut-body > * + * { margin-top: 16px; }
+
+.tut-h2 {
+  font-size: 17.5px;
+  font-weight: 650;
+  margin: 34px 0 0;
+  padding-left: 11px;
+  border-left: 3px solid var(--rd-accent, #0a7d43);
+  line-height: 1.5;
+}
+.tut-h2 + * { margin-top: 12px; }
+
+.tut-p { margin: 0; }
+.tut-p strong { font-weight: 650; }
+.tut-p code, .tut-ul code {
+  background: #f2f4f6;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 13.5px;
+  font-family: ui-monospace, Consolas, "Courier New", monospace;
+}
+
+.tut-ul { margin: 0; padding-left: 22px; }
+.tut-ul li + li { margin-top: 8px; }
+
+.tut-note {
+  background: #f6f8f6;
+  border: 1px solid #e2e9e3;
+  border-radius: 10px;
+  padding: 14px 16px 15px;
+  font-size: 14.5px;
+  line-height: 1.8;
+  color: #37413a;
+}
+.tut-note-tag {
+  font-size: 11.5px;
+  font-weight: 650;
+  letter-spacing: .08em;
+  color: var(--rd-accent, #0a7d43);
+  margin-bottom: 6px;
+}
+
+.tut-quote {
+  margin: 22px 0;
+  padding: 4px 0 4px 18px;
+  border-left: 3px solid #d6dbe1;
+}
+.tut-quote-text {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.85;
+  color: #1e2126;
+}
+.tut-quote-cite {
+  display: block;
+  margin-top: 10px;
+  font-size: 13px;
+  font-style: normal;
+  color: #8a8f98;
+}
+
+/* ── 教程正文上划词后浮出来的「共读」浮标 ────────────────────────────────────
+   它是**页面级固定定位**（挂在 body 上，不在书页里），所以不受书页的 overflow 影响。
+   样子与阅读器自己的 .rd-tip 一致：黑底、白字、圆角、带一点阴影。 */
+.tut-sel-tip {
+  position: fixed;
+  z-index: 50;
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  background: #23262b;
+  border-radius: 8px;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, .25);
+}
+.tut-sel-tip button {
+  border: 0;
+  background: transparent;
+  color: #fff;
+  font: inherit;
+  font-size: 12.5px;
+  padding: 3px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.tut-sel-tip button:hover { background: rgba(255, 255, 255, .16); }
+.tut-sel-tip button.ghost { color: #b9bcc2; }
+
+/* 划词后浮出来的小浮标：与阅读器的 .rd-tip 同款（黑底、白字、圆角） */
+.tut-tip {
+  position: absolute;
+  left: 50%;
+  top: 58px;
+  transform: translateX(-50%);
+  display: flex;
+  padding: 4px;
+  background: #23262b;
+  border-radius: 8px;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, .25);
+  opacity: 0;
+  transition: opacity .25s ease;
+  pointer-events: none;
+}
+.tut-tip button {
+  border: 0;
+  background: transparent;
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 5px;
+}
+.tut-tip.is-hidden { opacity: 0; }
+.tut-tip:not(.is-hidden) { opacity: 1; }
+
+/* ── 「开始本课」：这一章的动手入口 ─────────────────────────────────────────────
+   书里不再自己演一遍（上一版是"书里演、侧栏做"两张皮，用户否掉了）。
+   一章 = 一课：正文讲清"为什么"，这张卡片把这课交给真实侧栏里的引导。 */
+.tut-lesson {
+  margin: 22px 0 26px;
+  padding: 16px 18px;
+  border: 1px solid #cfe6d8;
+  border-left: 4px solid #0a7d43;
+  border-radius: 6px;
+  background: linear-gradient(180deg, #f6fbf8 0%, #f1f8f4 100%);
+}
+.tut-lesson-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.tut-lesson-tag {
+  flex: none;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  color: #fff;
+  background: #0a7d43;
+  border-radius: 4px;
+  padding: 2px 7px;
+}
+.tut-lesson-title { font-size: 15px; font-weight: 650; color: #1f2a24; }
+.tut-lesson-intro { margin: 10px 0 8px; font-size: 13.5px; line-height: 1.85; color: #33403a; }
+.tut-lesson-meta { margin: 6px 0 14px; font-size: 12.5px; color: #6b7c73; }
+.tut-lesson-btn {
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #fff;
+  background: #0a7d43;
+  border: 0;
+  border-radius: 6px;
+  padding: 9px 20px;
+  cursor: pointer;
+}
+.tut-lesson-btn:hover { background: #096b3a; }
+.tut-lesson-btn:disabled { background: #9db8a9; cursor: default; }
+.tut-lesson-hint {
+  margin-top: 12px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  line-height: 1.8;
+  color: #4a5a52;
+  background: #fff;
+  border: 1px dashed #cfe6d8;
+  border-radius: 5px;
+}
+.tut-lesson-hint kbd {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 1px 5px;
+  border: 1px solid #c9d3cd;
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  background: #f4f6f5;
+}

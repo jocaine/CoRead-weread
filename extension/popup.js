@@ -5,7 +5,7 @@ async function checkReceiver() {
     document.getElementById('status').style.color = '#07c160'
   } catch {
     document.getElementById('status').textContent = 'CoRead 本机服务未启动，请运行 Start-CoRead.vbs'
-    document.getElementById('status').style.color = '#e74c3c'
+    document.getElementById('status').style.color = '#c0392b'
   }
 }
 checkReceiver()

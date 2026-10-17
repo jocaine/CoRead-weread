@@ -83,7 +83,19 @@ test('buildChatBody 只放 user 消息，图片不会落到 system', () => {
   assert.equal(body.messages[0].role, 'user')
   assert.equal(body.model, 'deepseek-flash')
   assert.equal(body.temperature, 0.2)
-  assert.equal(body.max_tokens, 2048)
+  assert.equal(body.max_tokens, 8192)
+})
+
+test('buildChatBody 默认开 JSON 模式、关思考（2026-11 那个"格式不正确"的两味药）', () => {
+  const body = buildChatBody({ model: 'm', content: [] })
+  assert.deepEqual(body.response_format, { type: 'json_object' })
+  assert.deepEqual(body.thinking, { type: 'disabled' })
+  // 关思考会把 max_tokens 全留给答案；额度也可按需指定
+  assert.equal(buildChatBody({ model: 'm', content: [], maxTokens: 32 }).max_tokens, 32)
+  // 连通性探测那种"不要 JSON"的调用要能单独关掉
+  const probe = buildChatBody({ model: 'm', content: [], jsonMode: false, noThinking: false })
+  assert.equal(probe.response_format, undefined)
+  assert.equal(probe.thinking, undefined)
 })
 
 test('buildImageContent 产出 text + image_url 两个块', () => {
@@ -116,6 +128,23 @@ test('extractReplyText 支持数组形态的 content', () => {
 test('extractReplyText 在 content 为空时回退 reasoning_content', () => {
   const payload = { choices: [{ message: { content: '', reasoning_content: '思考' } }] }
   assert.equal(extractReplyText(payload), '思考')
+})
+
+test('extractReplyText 回答被截断时不拿思考当正文（"格式不正确"的真凶）', () => {
+  // 现场：max_tokens 被思考吃满 → content 为空、finish_reason=length。
+  // 旧代码把 reasoning_content 当正文交给 JSON 解析，用户看到的就是
+  // 「重译结果格式不正确」—— 明明是"没答完"，却报成"格式错"。
+  const payload = {
+    choices: [{
+      finish_reason: 'length',
+      message: { content: '', reasoning_content: 'We need output JSON {"translation":"…"} but' },
+    }],
+    usage: { completion_tokens_details: { reasoning_tokens: 2048 } },
+  }
+  assert.equal(extractReplyText(payload), '')
+  // 回答完整（stop）时该回退还是要回退
+  const full = { choices: [{ finish_reason: 'stop', message: { content: '', reasoning_content: '思考' } }] }
+  assert.equal(extractReplyText(full), '思考')
 })
 
 test('extractReplyText 拿不到内容时返回空串', () => {

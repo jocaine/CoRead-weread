@@ -62,7 +62,7 @@ export const STORE_KEYS = {
 }
 
 /** prompt 版本号。prompt 或输出协议改动时加一，便于排查历史缓存差异。 */
-export const PROMPT_VERSION = 2
+export const PROMPT_VERSION = 3   // 3：请求体加了 JSON 模式与"关思考"（见 buildChatBody）
 
 export const IMAGE_PROMPT = [
   '你是屏幕截图翻译器。用户框选了屏幕的一块区域，图片就是这块区域。',
@@ -191,13 +191,35 @@ export function originPattern(apiBase) {
   return u.origin + '/*'
 }
 
-export function buildChatBody({ model, content, maxTokens = 2048, temperature = 0.2 }) {
-  return {
+/**
+ * 组一次 chat/completions 的请求体。
+ *
+ * 两个默认开着的开关，都是 2026-11 为「重译结果格式不正确」这个报错加的
+ * （实测模型 deepseek-v4-flash，同一段 136 字原文）：
+ *
+ *   jsonMode     response_format=json_object。上游会把输出约束成 JSON，思考也从
+ *                1068 token 降到 582。我们的每条 prompt 本来就只要 JSON，没有理由不开。
+ *   noThinking   thinking={"type":"disabled"}。翻译是机械活，思考对结果没帮助，代价却极大：
+ *                开思考 8.1 秒 / 输出 1099 token（其中思考占 1068），关掉 0.75 秒 / 29 token。
+ *                更要命的是 max_tokens 是**两者共用**的额度 —— 思考一旦吃满（实测见过
+ *                思考 token 正好 2048 = 额度上限），finish_reason 变成 length、
+ *                content 是空的，答案根本没生成。
+ *
+ * 不认 thinking 字段的上游会让请求 400，调用方（translate-background 的 chat）
+ * 会去掉这个字段重发一次，之后本会话都不再发。
+ */
+export function buildChatBody({
+  model, content, maxTokens = 8192, temperature = 0.2, jsonMode = true, noThinking = true,
+}) {
+  const body = {
     model,
     temperature,
     max_tokens: maxTokens,
     messages: [{ role: 'user', content }],
   }
+  if (jsonMode) body.response_format = { type: 'json_object' }
+  if (noThinking) body.thinking = { type: 'disabled' }
+  return body
 }
 
 /**
@@ -223,16 +245,20 @@ export function extractReplyText(payload) {
   const msg = choice?.message
   const content = msg?.content
   if (typeof content === 'string' && content.trim()) return content.trim()
-  // 部分推理模型把正文放在 reasoning_content；另有数组形态的多段 content
-  if (typeof msg?.reasoning_content === 'string' && msg.reasoning_content.trim()) {
-    return msg.reasoning_content.trim()
-  }
   if (Array.isArray(content)) {
     const joined = content
       .map((part) => (typeof part === 'string' ? part : (part?.text ?? '')))
       .join('')
       .trim()
     if (joined) return joined
+  }
+  // 回答被额度截断时**不**退回 reasoning_content：那段是"还没想完"的过程，
+  // 不是答案。把它当正文交给 JSON 解析，用户看到的就是一句误导人的
+  // 「格式不正确」（2026-11 实测：思考 token 正好等于 max_tokens 时就是这个现场）。
+  if (choice?.finish_reason === 'length') return ''
+  // 有些推理模型确实把正文放在 reasoning_content 里，回答完整时仍按正文处理。
+  if (typeof msg?.reasoning_content === 'string' && msg.reasoning_content.trim()) {
+    return msg.reasoning_content.trim()
   }
   return ''
 }

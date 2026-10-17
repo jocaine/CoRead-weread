@@ -47,6 +47,10 @@
   const DAMPING = 0.85        // 速度阻尼
   const MAX_SPEED = 13        // 速度上限
   const TICKS = 420           // 物理迭代上限（每帧 2 子步 → 约 3.5s 收敛）
+  // 「本轮回答已结束、cites 还没落栈」的宽限窗口（2026-11）：回答落库到 cites 进栈之间
+  // 隔着 agent 收口写盘 + receiver 的 3 秒轮询，这段时间 /stack-hits 仍是空的。
+  // 取 6s = 3s 轮询 + 3s 余量：窗口内空结果一律当"没有更新"，不清命中高亮（见 applyStackHits）。
+  const STACK_LAG_GRACE_MS = 6000
   const SETTLE_E = 0.004      // 收敛阈值（平均动能）
   const FRICTION_V = 3.0      // 静止摩擦速度阈值（世界单位/步）：低于此速度额外耗散
   const FRICTION_K = 0.45     // 静止摩擦系数：低速每步再乘 0.45，静止时安静不发飘
@@ -277,9 +281,20 @@
     }
   }
 
-  // 书名归一（AI-025）：冒烟数据里 book 字段形如「书名  章节」（章节号跟在书名后），  // 取色/展示时剥离章节后缀，让同一本书的节点同色；无后缀则原样返回。
+  // 书名归一（AI-025；2026-11 修「同一本书两种颜色」）。
+  // 图里的 book 字段就是**微信读书顶栏那一串**：书名后面直接跟着章节，而那个分隔
+  // **宽度不固定**——同一个人的书库里三种都有：
+  //   「静静的顿河…  六」「学做工  制度形式」「中国特色社会主义保障制度论纲  第1章」→ 两个空格
+  //   「大国大城：当代中国的统一、发展与平衡 1 欧洲正经历大考」        → **一个空格 + 章节号**
+  // 原先只按「两个及以上空格」切，于是《大国大城》按章节碎成好几本"书"，同一本书的节点
+  // 拿到两种调色板色（实测第 1 章 #3b82f6 / 第 4 章 #ec4899）——用户看到的就是"一本书两种颜色"。
+  // 三条规则从窄到宽依次切：能少切就少切（切错会误伤真书名里本来就有的空格）。
   function bookName(bookTitle) {
-    return String(bookTitle || '').trim().replace(/\s{2,}.+$/, '').trim()
+    return String(bookTitle || '').trim()
+      .replace(/\s+\d+(?:\.\d+)?\s+\S.*$/, '')   // 「 1 欧洲正经历大考」：空格+纯数字章节号+空格+章节名
+      .replace(/\s+第\s*\d+\s*[章节回].*$/, '')  // 「  第1章」
+      .replace(/\s{2,}.*$/, '')                  // 「  六」「  制度形式」：没有数字的章节名
+      .trim()
   }
   function bookColor(bookTitle) {
     const t = bookName(bookTitle)
@@ -395,6 +410,7 @@
       this._savedState = null   // 单击预览暂存：{ hl, focusChain, hidden }——manual 覆盖消息级高亮前保存，点空白取消时原样恢复（2026-09 修复）
       this._bannerBtnKind = 'hl' // 横幅按钮类型：'hl' 高亮显隐切换 | 'clear' 清除搜索（2026-09）
       this._pulseUntil = 0
+      this._stackLagUntil = 0   // 栈数据滞后宽限窗口的截止时刻（本轮回答期间/刚结束，见 applyStackHits）
       this._pendingChainFit = false   // 物理收敛时的一次性命中聚焦校准挂起标记（2026-10）
       this._dragging = null
       // 悬停过渡（AI-027）：压暗/放大/pill 淡入淡出按帧缓动，不再闪变
@@ -544,9 +560,14 @@
     async _doLoad(demo, free) {
       this._demo = !!demo
       if (free !== undefined) this._free = !!free
+      // 教程模式（2026-11）：用户要求"教程里的会意图只显示教程自带的样例节点，
+      // 不要显示他自己的、也不要反过来污染他自己的图"。所以这里走**独立的一个参数**，
+      // 接收端那边是独立一份数据（扩展自带的 tutorial/graph-seed.json）。
+      // 判据由 setTutorialMode 传进来，不在这个文件里判断"当前是不是教程书"——
+      // 那是侧栏（知道当前书 ID）的事，这里只管"这次拉哪一种图"。
       this._setLoading('加载中…')
       try {
-        const q = this._demo ? '?demo=1' : this._free ? '?free=1' : ''
+        const q = this._tutorial ? '?tutorial=1' : this._demo ? '?demo=1' : this._free ? '?free=1' : ''
         const res = await fetch(this.recv + '/graph' + q)
         if (!res.ok) throw new Error('HTTP ' + res.status)
         const g = await res.json()
@@ -555,17 +576,20 @@
           edges: Array.isArray(g.edges) ? g.edges : [],
           demo: !!g.demo,
           free: !!g.free,
+          tutorial: !!g.tutorial,
           updatedAt: g.updatedAt || 0,
         }
         this._demo = this.graph.demo
         this._free = this.graph.free
-        this._source = g.source || (this._demo ? 'demo' : this._free ? 'free' : 'file')
+        this._source = this._tutorial ? 'tutorial' : (g.source || (this._demo ? 'demo' : this._free ? 'free' : 'file'))
         this._updateSourceBadge()
         this.buildRun()
         this._renderBookLegend()
         this._setLoading('')
         if (this.run.nodes.length === 0) {
-          this._setEmpty(true, '会意图中暂无节点：尚无讨论收口固化。\n可先「载入演示拓扑」预览交互与命中高亮。')
+          this._setEmpty(true, this._tutorial
+            ? '教程样例图没读到：扩展里那份 tutorial/graph-seed.json 可能没进包。'
+            : '会意图中暂无节点：尚无讨论收口固化。\n可先「载入演示拓扑」预览交互与命中高亮。')
           this.closeDetail()   // 空态时收起可能残留的详情面板
         }
         else this._setEmpty(false)
@@ -620,15 +644,29 @@
     /** 当前讨论命中（2026-09 用户定调）：命中 = 当前实时栈 cites 的节点脉络。
      *  打开图 / 收到 stack-updated / 切书时由侧栏调用：hits 非空 → 恢复
      *  "当前讨论命中"高亮 + 横幅；hits 空（栈已收口结束）→ 清除 hit 态高亮
-     *  （不动 manual / search 高亮）。 */
-    applyStackHits(hits) {
-      console.log('[CoRead][gv] applyStackHits', Array.isArray(hits) ? hits.length : 'n/a', 'hl=', this.hl && this.hl.mode, 'at-ago=', this.hl ? Math.round((Date.now() - this.hl.at) / 1000) + 's' : '-')
+     *  （不动 manual / search 高亮）。
+     *  opts.pending = 本轮回答还没结束（侧栏给：正在等回答 / 正在流式渲染）。 */
+    applyStackHits(hits, opts) {
+      console.log('[CoRead][gv] applyStackHits', Array.isArray(hits) ? hits.length : 'n/a', 'pending=', !!(opts && opts.pending), 'hl=', this.hl && this.hl.mode, 'at-ago=', this.hl ? Math.round((Date.now() - this.hl.at) / 1000) + 's' : '-')
       this._stackIds = Array.isArray(hits) ? hits.slice() : []   // 本场实时栈累计命中的引用（种子之一）
+      if (opts && opts.pending) this._stackLagUntil = Date.now() + STACK_LAG_GRACE_MS
       if (!Array.isArray(hits) || !hits.length) {
-        // 命中动画保护（2026-10）：graph-hit 刚应用（4s 内）时，栈刷新的空结果
-        // 不得立刻清除命中横幅——receiver 3s 轮询/栈写入滞后都可能让 /stack-hits
-        // 暂时返回空（新消息尚未固化入栈），此时清横幅会把"消息命中"反馈吞掉；
-        // 动画播完、用户稳定浏览后，栈收口清空才正常清除（2026-09 用户定调）
+        // 空结果不清高亮（2026-11 用户报"命中动画一结束就打开图，刚命中的节点没被高亮，
+        // 要等回答完成才补上"）。成因：/stack-hits 读的是实时讨论栈的 cites，而本轮提问的
+        // cites 要等**回答收口**才由 agent 写进栈（agent/index.js 的 driveTopicStack），
+        // 回答期间它必然是空的。于是"空"有两种意思——"还没落栈"和"命中结束"——只能靠
+        // 轮次状态区分：本轮回答还在跑（pending），或刚跑完、cites 还在路上
+        //（receiver 3s 轮询 + 收口写盘的宽限窗口），都按"没有更新"处理，高亮与横幅留着。
+        // 命中动画保护（2026-10）：同理，graph-hit 刚应用 4s 内的空结果也不清——动画还在播。
+        const lagging = (opts && opts.pending) || Date.now() < this._stackLagUntil
+        if (lagging) {
+          // 高亮若已经丢了（切书回来 / 上一轮被清），就用**本轮命中**补回来：
+          // 用户打开图想看的就是刚刚命中的那条脉络。
+          if (this._open && !this.hl && this._turnHits && this._turnHits.length) {
+            this.applyHit(this._turnHits, '', 'hit')
+          }
+          return
+        }
         if (this.hl && this.hl.mode === 'hit' && Date.now() - this.hl.at > 4000) this.clearHighlight()
         return
       }
@@ -637,6 +675,7 @@
       // _pendingChainFit 一次性落位。图已加载的栈刷新/切书恢复保持动画聚焦。
       const needLoad = !this.graph
       if (needLoad) this._pendingChainFit = true   // 打开图场景：收敛后落位链聚焦
+      this._stackLagUntil = 0   // 栈已给到真数据：宽限窗口结束
       // 种子：本轮命中优先（栈数据可能滞后），没有则用栈命中——合并逻辑在 applyHit 里做。
       const seeds = (this._turnHits && this._turnHits.length) ? this._turnHits : hits
       return this.applyHit(seeds, '', 'hit', needLoad, hits)
@@ -830,6 +869,7 @@
       this._savedState = null
       this._pendingChainFit = false
       this._turnHits = null   // 本轮命中随命中态一起清（栈命中的恢复由 /stack-hits 重新喂）
+      this._stackLagUntil = 0   // 宽限窗口一并作废：清了高亮就没有"要保住的命中"了
       this._renderBanner()
       this._renderChainSwitch()
       this.render()
@@ -948,6 +988,7 @@
     startPhysics() {
       this._physics.running = true
       this._physics.tick = 0
+      this._settledOnce = false   // 新布局：先让图长完，再接受 hover/详情定格（见 _motionFrozen）
       this._ensureLoop()
     }
 
@@ -1488,13 +1529,33 @@
       // 收敛后节点基本静止，落位一次即准确稳定。
     }
 
+    /** 定格判定（2026-11 用户定调）：鼠标悬停某个节点、或详情面板开着的时候，整张图
+     *  **不许动**——布局物理与标签避让都停帧（连续帧位置一模一样）。
+     *
+     *  为什么：常驻弹性（AI-024）的本意是"拖任一节点整图跟着呼吸"，但用户盯着一个节点
+     *  读它的详情时，其余节点还在缓慢漂移 —— 刚看清的位置几秒后就不是那个位置了，
+     *  点起来也总在躲。定格把"看"和"动"分开：手一停、图就停。
+     *  例外两条：
+     *   · 正在**拖动**某个节点时不定格 —— 那是用户自己要看弹性联动（AI-037）；
+     *   · **布局还没收敛过**（_settledOnce）时不定格 —— 打开图/重载图后的头几秒本来就是
+     *     "图在长出来"，此刻定格会把半成品的环形布局冻在半路（一进图鼠标就落在某个节点上
+     *     是常事，详情面板一开更是能把它冻到收敛前），等收敛过一次再谈"不许动"。 */
+    _motionFrozen() {
+      if (!this._settledOnce) return false
+      if (this._dragging && this._dragging.kind === 'node' && this._dragging.moved) return false
+      return !!(this.hover || this.sel)
+    }
+
     _ensureLoop() {
       if (this._raf) return
       const frame = () => {
         this._raf = 0
         let busy = false
         let tMark = PERF_ON ? performance.now() : 0
-        if (this._physics.running) {
+        // 定格：跳过物理与标签避让（位置一动不动），但**循环照跑**——悬停压暗/放大的
+        // 缓动（_stepHoverFx）还要逐帧走完，停帧会让它卡在半明半暗上。
+        const frozen = this._motionFrozen()
+        if (this._physics.running && !frozen) {
           // 每帧 2 子步，加快收敛
           if (this.tickPhysics() | this.tickPhysics()) busy = true
           else {
@@ -1512,16 +1573,18 @@
                 this._fitToChain(true)
               }
             }
+            this._settledOnce = true   // 收敛过一次 → 此后 hover/详情才定格（见 _motionFrozen）
             busy = true
           }
-        }
+        } else if (frozen) busy = true   // 定格期保持渲染循环（缓动未走完）
         if (this._anim && Date.now() < this._anim.t0 + this._anim.dur) { this._stepAnim(); busy = true }
         else this._anim = null
         if (Date.now() < this._pulseUntil) busy = true
         if (this._dragging) busy = true
         if (PERF_ON) { perf.phys += performance.now() - tMark; tMark = performance.now() }
-        // 碰撞弹开（AI-023）：运动期自动推开重叠的节点圆/标签，收敛后不破坏已读布局
-        if (this._physics.running || this._anim || this._dragging) {
+        // 碰撞弹开（AI-023）：运动期自动推开重叠的节点圆/标签，收敛后不破坏已读布局。
+        // 定格期一并停掉——它也会挪节点，是"图不许动"的一部分。
+        if (!frozen && (this._physics.running || this._anim || this._dragging)) {
           if (this._separateLabels()) busy = true
         }
         if (PERF_ON) { perf.sep += performance.now() - tMark; tMark = performance.now() }
@@ -2062,10 +2125,27 @@
       const badge = this.container && this.container.querySelector('#gv-demo-badge')
       if (!badge) return
       const s = this._source
-      if (s === 'demo') { badge.hidden = false; badge.textContent = '演示数据'; badge.title = '演示图：由 knowledge-graph-demo.json 重建' }
+      if (s === 'tutorial') {
+        // 教程图必须**明说**它不是用户的图，否则用户会以为自己的知识网里凭空多了东西
+        badge.hidden = false
+        badge.textContent = '教程样例'
+        badge.title = '教程样例图：扩展自带（tutorial/graph-seed.json），只在教程里显示，不进你的会意图'
+      } else if (s === 'demo') { badge.hidden = false; badge.textContent = '演示数据'; badge.title = '演示图：由 knowledge-graph-demo.json 重建' }
       else if (s === 'results') { badge.hidden = false; badge.textContent = '测试数据'; badge.title = '测试图：由冒烟 / 派生脚本产出（knowledge-graph-results.json）' }
       else if (s === 'free') { badge.hidden = false; badge.textContent = '自由模式'; badge.title = '自由模式沙盒图：测试对话的固化产物，不写入正式会意图' }
       else { badge.hidden = true }
+    }
+    /**
+     * 切到/退出"教程模式"（2026-11）。
+     * 由侧栏在打开图之前调用——只有侧栏知道"当前这本书是不是那本手册"。
+     * 切换时**丢掉已加载的图**，否则会拿上一次那种图去渲染（教程图 ↔ 用户图 互串）。
+     */
+    setTutorialMode(on) {
+      const next = !!on
+      if (next === !!this._tutorial) return
+      this._tutorial = next
+      this.graph = null
+      this.run = null
     }
     _setLoading(text) {
       if (!text) {

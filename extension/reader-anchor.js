@@ -168,3 +168,313 @@ export function linesFromOffsets(layerEl, start, end) {
 export function textFromOffsets(layerEl, start, end) {
   return joinLines(linesFromOffsets(layerEl, start, end))
 }
+
+/** 一页文字层里所有 span 的文字接起来（= pageTextIndex 坐标下的完整正文）。 */
+export function pageText(layerEl) {
+  const { spans } = pageTextIndex(layerEl)
+  return spans.map((s) => s.textContent || '').join('')
+}
+
+/**
+ * `linesFromOffsets` 的**无 DOM 版**：直接对 `getTextContent()` 的 items 切片。
+ *
+ * 为什么需要它：页面**还没渲染**时没有文字层（没有 span 可查），而"划线附近的原文"
+ * 恰恰会在这种时候被要——重开一本书、在译文对照里点一条旧条目的「设为引用」。
+ * items 的顺序与文字层的 span 一一对应（pdf.js 就是一 item 一行span），
+ * 所以坐标系统与 `linesFromOffsets` 完全一致，只是文字不从 DOM 取。
+ *
+ * @param {Array<{str?: string}>} items getTextContent() 里 str 非空的项，顺序即页内顺序
+ */
+export function linesFromItems(items, start, end) {
+  const list = Array.isArray(items) ? items : []
+  const a = Math.max(0, Number(start) || 0)
+  const b = Math.max(0, Number(end) || 0)
+  const out = []
+  let off = 0
+  for (const it of list) {
+    const text = String((it && it.str) || '')
+    const s0 = off
+    const s1 = off + text.length
+    off = s1
+    if (s1 <= a || s0 >= b) continue
+    const from = Math.max(0, a - s0)
+    const to = Math.min(text.length, b - s0)
+    if (to <= from) continue
+    out.push(text.slice(from, to))
+  }
+  return out
+}
+
+/**
+ * 与 `linesFromItems` 同样的切片，但切的是**补过空格**的那份（fix 来自 restoreItemSpaces /
+ * spacedPageFix）。给"页面没渲染时也要正常词间空格"用 —— 否则送进模型的是
+ * `hoiswidelyrecognizedas…`（见本文件开头那段说明）。
+ *
+ * fix 里没有 item 的原始长度，由"补后长度 − 插入的空格数"倒推得来 —— 成立的前提是
+ * `restoreItemSpaces` 的第一条硬规矩：**只插空格，不删不改**。
+ */
+export function linesFromFixedItems(fix, start, end) {
+  if (!fix || !Array.isArray(fix.lines)) return []
+  const lines = fix.lines
+  const inserted = Array.isArray(fix.inserted) ? fix.inserted : []
+  const a = Math.max(0, Number(start) || 0)
+  const b = Math.max(0, Number(end) || 0)
+  const out = []
+  let off = 0
+  for (let i = 0; i < lines.length; i++) {
+    const line = String(lines[i] ?? '')
+    const ins = inserted[i] || []
+    const rawLen = Math.max(0, line.length - ins.length)
+    const s0 = off
+    const s1 = off + rawLen
+    off = s1
+    if (s1 <= a || s0 >= b) continue
+    const from = Math.max(0, a - s0)
+    const to = Math.min(rawLen, b - s0)
+    if (to <= from) continue
+    out.push(line.slice(shiftLocal(ins, from), shiftLocal(ins, to)))
+  }
+  return out
+}
+
+// ── 补回被 pdf.js 吞掉的词间空格（2026-11）────────────────────────────────────
+//
+// 现象：用户划词翻译时，对照栏里的原文是 "hoiswidelyrecognizedastheforemost
+// interpreterofLacan'swork…" —— 单词之间的空格全没了。
+//
+// 原因不在 PDF，也不在我们的锚点代码，而在 pdf.js 的**抽取文字**这一步：
+// 它不照抄 PDF 的内容流，而是拿"两个字之间的水平间隙像不像一个空格"去猜
+//（内部函数 addFakeSpaces，阈值由字体度量算出来）。猜不中就当成字间紧排，
+// 把空隙并进前一个字。实测同一页的绘图指令里，那些空格是**真实存在的字形**
+//（unicode === " "，见下面的 glyphTextFromOps），所以真值一直在，只是被丢了。
+//
+// 修法：拿绘图指令里的字形序列当"真字流"，与 pdf.js 给的 item 文字逐字对齐，
+// 只在真字流多出空格的地方把空格插回去。**不动 vendor 里的 pdf.js** —— 那是外部
+// 文件，改了下次升级就丢（见 extension/vendor/pdfjs/README.md 的升级步骤）。
+
+/** 连续多少个拉丁字母就算"词间空格被吞了"（见 looksSpaceStarved）。 */
+const STARVED_RUN = 20
+
+/**
+ * 这段文字像是"词间空格被 pdf.js 吞了"吗？
+ *
+ * 判据只有一条：**一长串拉丁字母中间一个空格都没有**。英文里 20 个字母的词已是
+ * 极端值（uncharacteristically 正好 20），中文根本不会命中（只认 A-Za-z）。
+ * 误判的代价只是白跑一次对齐，文字不会变 —— 所以宁可敏感一点。
+ */
+export function looksSpaceStarved(text, run = STARVED_RUN) {
+  return new RegExp('[A-Za-z]{' + run + ',}').test(String(text ?? ''))
+}
+
+/**
+ * 从绘图指令里取出"真字流"：所有文字指令里的字形字符，按出现顺序接起来。
+ *
+ * 它能当真值，是因为 pdf.js **画字与抽字用的是同一份字形数组**（每个字形带 unicode），
+ * 两条路唯一的差别就是抽取那条会把空格字形吃掉。所以绘图指令里的空格是可靠的。
+ *
+ * 不产出换行：抽取那边行尾也只是个 hasEOL 标记、不是字符，两边都不含换行才对得上。
+ *
+ * @param {ArrayLike<number>} fnArray opList.fnArray
+ * @param {ArrayLike<unknown>} argsArray opList.argsArray
+ * @param {Record<string, number>} ops pdfjsLib.OPS
+ */
+export function glyphTextFromOps(fnArray, argsArray, ops) {
+  if (!fnArray || !argsArray || !ops) return ''
+  const textOps = new Set([
+    ops.showText, ops.showSpacedText, ops.nextLineShowText, ops.nextLineSetSpacingShowText,
+  ])
+  const out = []
+  for (let i = 0; i < fnArray.length; i++) {
+    if (!textOps.has(fnArray[i])) continue
+    collectGlyphs(argsArray[i], out)
+  }
+  return out.join('')
+}
+
+/** 递归收一条指令参数里的字符：字形取 unicode；TJ 数组里的数字是字距微调，跳过。 */
+function collectGlyphs(x, out) {
+  if (typeof x === 'string') { out.push(x); return }
+  if (isGlyph(x)) { out.push(x.unicode); return }
+  if (!Array.isArray(x)) return
+  // 字形数组（最常见的形态）整批取走；混着别的（TJ 数组是 [字形…, 数字, 字形…]）就逐个下钻
+  if (x.length && x.every(isGlyph)) {
+    for (const g of x) out.push(g.unicode)
+    return
+  }
+  for (const y of x) collectGlyphs(y, out)
+}
+
+function isGlyph(x) {
+  return !!x && typeof x === 'object' && typeof x.unicode === 'string'
+}
+
+/**
+ * 用"真字流"给这一页每个 item 的文字补回被吞掉的空格。
+ *
+ * 三条硬规矩（宁可少补，不可乱补）：
+ *   ① 只往 item 文字里**插空格**，不删不改任何字符；
+ *   ② item 里已经有的空格一律原样留着 —— 它可能是 pdf.js 猜出来的（真字流里没有），
+ *      也可能是真字流里的那一个，两种情况都不该动；
+ *   ③ 碰到别的差异（连字、隐形字符、ToUnicode 不一致）→ 返回 null，整页放弃。
+ *
+ * @param {Array<{str?: string}>} items getTextContent() 里 str 非空的项（顺序 = 文字层 span 顺序）
+ * @param {string} glyphText 真字流，见 glyphTextFromOps
+ * @returns {{lines: string[], inserted: number[][]}|null}
+ *   lines[i]    = 第 i 个 item 补好空格后的文字
+ *   inserted[i] = 第 i 个 item 内的插入点（行内坐标，升序）
+ */
+export function restoreItemSpaces(items, glyphText) {
+  const list = Array.isArray(items) ? items : []
+  const truth = String(glyphText ?? '')
+  if (!list.length || !truth) return null
+  const lines = []
+  const inserted = []
+  let gi = 0
+  for (const it of list) {
+    const s = String((it && it.str) || '')
+    let r = ''
+    const ins = []
+    for (let k = 0; k < s.length; k++) {
+      const ch = s[k]
+      if (truth[gi] === ch) { r += ch; gi++; continue }
+      if (truth[gi] === ' ') {
+        // 真字流这里是空格、item 里没有 → 补上。
+        // 落在 item 开头的那个空格不补：那是行边界，joinLines 会按"行间补空格/行尾断词"
+        // 处理（补在这里反而多一个前导空格，还要再 trim 掉）。
+        while (truth[gi] === ' ') { if (k > 0) { ins.push(k); r += ' ' } gi++ }
+        if (truth[gi] === ch) { r += ch; gi++; continue }
+      }
+      if (ch === ' ') { r += ch; continue }    // item 自己带的空格：各走一步，谁也不吞谁
+      return null                              // 其它差异：不猜，整页放弃
+    }
+    lines.push(r)
+    inserted.push(ins)
+  }
+  return { lines, inserted }
+}
+
+/**
+ * 一页的"补空间"结果，带一道保险：item 文字必须与文字层里的 span 逐字一致。
+ *
+ * 不一致说明两次 getTextContent() 拿到的不是同一批文字（页面重排过、节点重建过），
+ * 那就不能用 —— 偏移对不上会切出错位的原文，比缺空格更糟。
+ *
+ * `layerEl` 传 null 表示**这一页还没渲染**（没有文字层可校验）：此时 items 与真字流
+ * 出自同一次 `getTextContent()`，不存在"两批文字"的可能，所以跳过校验直接用。
+ */
+export function spacedPageFix(layerEl, items, glyphText) {
+  const list = (items || []).filter((it) => it && typeof it.str === 'string' && it.str)
+  if (!list.length) return null
+  if (layerEl && list.map((it) => it.str).join('') !== pageText(layerEl)) return null
+  return restoreItemSpaces(list, glyphText)
+}
+
+/** 行内坐标 → 补过空格那份文字里的坐标（把插入的空格算进去）。 */
+function shiftLocal(ins, off) {
+  let n = 0
+  for (let i = 0; i < ins.length; i++) { if (ins[i] <= off) n++; else break }
+  return off + n
+}
+
+/**
+ * 取出一段偏移覆盖到的每一行文字 —— 改用**补过空格**的那份。
+ * 切片规则与 linesFromOffsets 完全一致，只是行文字换成 fix.lines[i]，
+ * 行内区间端点按"这一行插了几个空格"换算过去。
+ * @param {{lines: string[], inserted: number[][]}|null} fix
+ */
+export function spacedLinesFromOffsets(layerEl, fix, start, end) {
+  if (!fix || !Array.isArray(fix.lines)) return linesFromOffsets(layerEl, start, end)
+  const { spans, offsets, total } = pageTextIndex(layerEl)
+  const a = Math.max(0, Math.min(total, Number(start) || 0))
+  const b = Math.max(0, Math.min(total, Number(end) || 0))
+  const out = []
+  for (let i = 0; i < spans.length; i++) {
+    const text = spans[i].textContent || ''
+    const s0 = offsets[i]
+    const s1 = s0 + text.length
+    if (s1 <= a || s0 >= b) continue
+    const from = Math.max(0, a - s0)
+    const to = Math.min(text.length, b - s0)
+    if (to <= from) continue
+    const line = fix.lines[i]
+    if (typeof line !== 'string') { out.push(text.slice(from, to)); continue }
+    const ins = fix.inserted[i] || []
+    out.push(line.slice(shiftLocal(ins, from), shiftLocal(ins, to)))
+  }
+  return out
+}
+
+/** 取出一段偏移对应的可读原文，可能带着补回来的词间空格（没有 fix 时等于 textFromOffsets）。 */
+export function textFromSpacedOffsets(layerEl, fix, start, end) {
+  return joinLines(spacedLinesFromOffsets(layerEl, fix, start, end))
+}
+
+// ── 「划线附近原文」的取法（纯算术，与 DOM / pdf.js 无关）──────────────────────
+/**
+ * 以划线的起止为中心，**前后各取 before / after 字**，额度不够就向相邻页延伸。
+ *
+ * 为什么要抽成纯函数：这段"取哪几页、每页取哪一段"是这件事里唯一会算错的地方
+ * （页首、页尾、跨页、短页要往前多补一页），而它不需要 DOM、不需要 pdf.js ——
+ * 抽出来就能用单测把每种边界钉死（浏览器自测在受限环境里跑不起来，见 README 的说明）。
+ *
+ * @param {Array<{page:number,start:number,end:number}>} anchors 划线在各页的偏移（阅读顺序）
+ * @param {(page:number)=>number|null} pageTotal 问"这一页有多少字"；拿不到那页的文字返回 null
+ * @param {{before?:number, after?:number, span?:number}} [opts] span = 前后最多各看几页
+ * @returns {Array<{page:number, from:number, to:number}>} 按页序、可直接依次取文字拼接
+ */
+export function planContextWindow(anchors, pageTotal, opts = {}) {
+  const before = Number.isFinite(opts.before) ? opts.before : 300
+  const after = Number.isFinite(opts.after) ? opts.after : 300
+  const span = Number.isFinite(opts.span) ? opts.span : 2
+  const list = (Array.isArray(anchors) ? anchors : []).filter(
+    (a) => a && Number.isFinite(a.page) && Number.isFinite(a.start) && Number.isFinite(a.end),
+  )
+  if (!list.length) return []
+
+  const total = (page) => {
+    const t = typeof pageTotal === 'function' ? pageTotal(page) : null
+    return Number.isFinite(t) && t > 0 ? t : null
+  }
+  const slices = []
+  const add = (page, from, to) => {
+    const t = total(page)
+    if (t === null) return 0
+    const a = Math.max(0, Math.min(t, from))
+    const b = Math.max(a, Math.min(t, to))
+    if (b <= a) return 0
+    slices.push({ page, from: a, to: b })
+    return b - a
+  }
+
+  const first = list[0]
+  const last = list[list.length - 1]
+
+  // ① 划线自己覆盖到的那几页：首页往前留额度、末页往后留额度，中间页整页要
+  for (let i = 0; i < list.length; i++) {
+    const a = list[i]
+    add(a.page, a.start - (i === 0 ? before : 0), a.end + (i === list.length - 1 ? after : 0))
+  }
+
+  // 划线所在的那几页一个字都拿不到（典型：扫描件＝图片页，没有文字层）→ 空计划。
+  // 为什么要这道闸：没有它，下面的"往前补页"会拿**旁页**的文字凑出一段"附近原文"，
+  // 而那段文字与划线毫无关系 —— 宁可没有上下文，不可给错上下文。
+  if (!slices.length) return []
+
+  // ② 头一段在页首、前面不够 before 字 → 往前几页的**尾巴**补（最多 span 页）
+  let need = Math.max(0, before - Math.max(0, first.start))
+  for (let n = first.page - 1; need > 0 && n >= 1 && first.page - n <= span; n--) {
+    const t = total(n)
+    if (t === null) break
+    need -= add(n, Math.max(0, t - need), t)
+  }
+
+  // ③ 末一段在页尾、后面不够 after 字 → 往后几页的**开头**补（最多 span 页）
+  let needTail = Math.max(0, after - Math.max(0, (total(last.page) || 0) - last.end))
+  for (let n = last.page + 1; needTail > 0 && n - last.page <= span; n++) {
+    const t = total(n)
+    if (t === null) break
+    needTail -= add(n, 0, needTail)
+  }
+
+  return slices.sort((x, y) => x.page - y.page)
+}
