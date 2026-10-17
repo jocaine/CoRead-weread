@@ -257,6 +257,93 @@ export function isReachable(graph, fromId, toId, kinds) {
   return false
 }
 
+/**
+ * 热点节点：**被后来讨论反复引用**的节点，分三层取（2026-10 用户定调；供画像"他大致关心什么"做材料）。
+ *
+ * ⚠️ 口径（这里踩过一次坑，写清楚）：边的方向 = 引用方向，**from = 被引用的旧知识点，
+ * to = 当前讨论所在节点**。所以"被引用"数的是**出边**（从该节点出发的 user 边）；
+ * 入边是"它这场讨论引用了谁"，含义相反。只算 user 边——derived 是同一栈相邻段的机械产物，
+ * 不代表用户回头引用。
+ *
+ * 三层：**门槛管质量、名额管数量**，两者分开才能各自独立调（嫌材料长只动名额，
+ * 嫌选出来不够硬只动门槛）。
+ *   · 超级招 super：**跨到 ≥superBooks 本不同的书** → 全录，不占名额、不设上限。
+ *     依据是"多语境"，且**不依赖图的规模**（3 本就是 3 本，不会随节点变多而通胀）；
+ *     严格程度自带数量控制，所以空着也是正常状态，不为了"能看到它工作"而放宽。
+ *   · 统招 qualified：**跨书被引 ≥qualifierCross 次**，按排序取前 qualifierSlots。
+ *     门槛管质量（"反复"而非"偶发一次"，跨书排除了同书内自循环），名额防膨胀。
+ *   · 普招 general：其余按排序补 generalSlots 个。达线但没拿到统招名额的也在这里——
+ *     它们排序更高，会优先被补进来，强信号不浪费。
+ *
+ * 排序键：**跨到几本书 → 跨书被引次数 → 总被引次数**（多语境广度优先，再看反复程度）。
+ *
+ * "跨到几本书" = 引用它的那些讨论所在的书里，**不属于它自己**的书有几个（集合去重，
+ * 所以同一本外书里被引 3 次只算 1 本）。有一边没有 book 信息的边：计入总被引，
+ * 不计入跨书/跨书数（保持中立，不误判成同书）。
+ *
+ * 不用"讨论轮次"：2026-10 用户定调——聊得多不等于在意。
+ *
+ * @param {object} graph 会意图
+ * @param {object} [opts] { superBooks=3, qualifierCross=2, qualifierSlots=5, generalSlots=3 }
+ * @returns {{super: Array, qualified: Array, general: Array, overflow: number}}
+ *   条目为 { id, point, cited, crossEdge, crossBooks }；
+ *   overflow = 达线却没拿到统招名额的个数（>0 说明门槛该往上调了，调用方据此写日志）
+ */
+export function hotNodes(graph, opts = {}) {
+  const {
+    superBooks = 3,
+    qualifierCross = 2,
+    qualifierSlots = 5,
+    generalSlots = 3,
+  } = opts
+  const nodes = (graph && Array.isArray(graph.nodes)) ? graph.nodes : []
+  const edges = (graph && Array.isArray(graph.edges)) ? graph.edges : []
+  const byId = new Map(nodes.map((n) => [n.id, n]))
+  const booksOf = (n) => new Set(
+    ((n && n.discussions) || []).map((d) => String((d && d.book) || '').trim()).filter(Boolean),
+  )
+
+  const cited = new Map()      // 总被引
+  const cross = new Map()      // 其中来自"别的书"的次数
+  const foreign = new Map()    // 跨到的那些书（集合）
+  for (const e of edges) {
+    if (!e || e.kind === 'derived' || !e.from) continue
+    cited.set(e.from, (cited.get(e.from) || 0) + 1)
+    const fb = booksOf(byId.get(e.from))
+    const tb = booksOf(byId.get(e.to))
+    if (!fb.size || !tb.size) continue
+    const out = [...tb].filter((b) => !fb.has(b))
+    if (!out.length) continue
+    cross.set(e.from, (cross.get(e.from) || 0) + 1)
+    const s = foreign.get(e.from) || new Set()
+    for (const b of out) s.add(b)
+    foreign.set(e.from, s)
+  }
+
+  const rows = nodes
+    .map((n) => ({
+      id: n.id,
+      point: String(n.point || ''),
+      cited: cited.get(n.id) || 0,
+      crossEdge: cross.get(n.id) || 0,
+      crossBooks: (foreign.get(n.id) || new Set()).size,
+    }))
+    .filter((n) => n.cited > 0)
+    .sort((a, b) =>
+      b.crossBooks - a.crossBooks ||
+      b.crossEdge - a.crossEdge ||
+      b.cited - a.cited ||
+      String(a.id).localeCompare(String(b.id)))
+
+  const superSet = rows.filter((r) => r.crossBooks >= superBooks)
+  const atLine = rows.filter((r) => r.crossBooks < superBooks && r.crossEdge >= qualifierCross)
+  const qualified = atLine.slice(0, qualifierSlots)
+  const chosen = new Set([...superSet, ...qualified].map((r) => r.id))
+  const general = rows.filter((r) => !chosen.has(r.id)).slice(0, generalSlots)
+
+  return { super: superSet, qualified, general, overflow: Math.max(0, atLine.length - qualified.length) }
+}
+
 // ───────────────────────── 2. 路径上下文（root → recent） ─────────────────────────
 
 /**

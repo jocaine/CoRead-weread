@@ -148,11 +148,14 @@ export async function judgeSegmentSame(message, group, deps = {}) {
  * 对弹出的栈（思维连续的段）做固化后分段。
  * @param {Array} entries 弹出的栈轮次 [{role:'user'|'assistant', content, selected?, cites?}]
  * @param {object} deps { callLLM 必填, log?, attempts?, verdictOf? }
- * @returns {Promise<{segments: Array, ignored: number, noTopicized?: boolean}>}
+ * @returns {Promise<{segments: Array, ignored: number, noTopicized?: boolean, degraded: boolean, sameFailed: number}>}
  *   segments: [{ entries: [{role, content, selected?}], cites: string[] }]（不可分割的讨论组）
  *   ignored：恒 0（无内核轮次不做过滤处理——有当前组则跟随并入；无当前组则挂起，
  *     等后续专题化轮次开组时并入。2026-08-28 定调 + 2026-09：命中不替代专题化判断）
  *   noTopicized：整栈没有任何专题化轮次（全部挂起）→ 零产物，调用方不保留重试
+ *   degraded / sameFailed（2026-11）：判同一性失败的次数与是否有失败。失败按"切段"
+ *     处理（见下方 catch 处的原因），调用方**必须**把它写进日志/归档回执——
+ *     "判定失败被静默兜成合并"正是"22 轮收成 1 个节点"那类事故藏身的地方。
  */
 export async function segmentStack(entries, deps = {}) {
   const { callLLM, log = () => {}, attempts = MAX_ATTEMPTS, verdictOf } = deps
@@ -166,6 +169,7 @@ export async function segmentStack(entries, deps = {}) {
   }
   const segments = []
   let ignored = 0
+  let sameFailed = 0   // 判同一性重试耗尽（彻底失败）的次数——必须上报，不能静默降级
   let cur = []        // 当前组（user + assistant 轮次）
   let curCites = []   // 当前组内 user 轮次的引用（去重）
   let pending = []        // 无当前组时的非专题化挂起轮次（不独自成组，2026-09）
@@ -256,8 +260,17 @@ export async function segmentStack(entries, deps = {}) {
       )
       same = r.same
     } catch (err) {
-      log(`  ⚠️ 分段判同一性失败（不切断，按一致入组）: ${err.message}`)
-      same = true
+      // 2026-11 用户定调（"把自由会话收口成一个节点是错误的"）：判定失败**不再默认并入**。
+      // 失败的含义是"不知道这两个是不是同一个问题"，而两种猜法的代价不对等：
+      //   · 猜"并入"→ 几个独立知识点被一个节点吞掉，原文沉在 excerpts 里，用户看不出来
+      //     （实况：22 轮归档成一个节点，前半段完全没进图）；
+      //   · 猜"切段"→ 每段自洽，且相邻段之间无条件建 derived 边（见调用方），最坏是
+      //     多出几个细节点——看得见、可以再合。
+      // 归档场景尤其致命：对话马上要删，并错了就永远拆不开。所以失败按"切段"处理，
+      // 同时把次数记进 degraded 上报（调用方写日志与归档回执）。
+      sameFailed++
+      log(`  ⚠️ 分段判同一性失败（按切段处理，不并入）: ${err.message}`)
+      same = false
     }
     if (same) {
       cur.push(entry)
@@ -269,5 +282,5 @@ export async function segmentStack(entries, deps = {}) {
     }
   }
   flush()  // 结尾：开着的组收口
-  return { segments, ignored, noTopicized: !sawTopicized }
+  return { segments, ignored, noTopicized: !sawTopicized, degraded: sameFailed > 0, sameFailed }
 }

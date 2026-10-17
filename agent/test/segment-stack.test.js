@@ -69,19 +69,21 @@ test('分段：单轮栈 → 单组；空输入 → 空；缺 callLLM 抛 TypeEr
   await assert.rejects(() => segmentStack([u('Q')]), /callLLM/)
 })
 
-test('分段：verdictOf 复用已判专题化结论（不调 LLM）；未命中走 LLM', async () => {
-  // 全部轮次由 verdictOf 给结论（无内核轮次跟随并入，不滤掉）：假 LLM 队列为空也跑得动
+test('分段：verdictOf 复用已判专题化结论（不调 LLM 判专题化）；未命中走 LLM', async () => {
+  // 全部轮次由 verdictOf 给专题化结论（无内核轮次跟随并入，不滤掉）：
+  // 假 LLM 队列里**只剩判同一性那一次**的返回
   const r1 = await segmentStack([
     u('问题A', { _caseId: 'c1' }),
     a('回答A'),
     u('闲聊轮次', { _caseId: 'c2' }),  // verdictOf → false → 无内核，跟随并入
-    u('问题B', { _caseId: 'c3' }),     // verdictOf → true → 判同一性（无 LLM 时走失败兜底 same=true 并入）
+    u('问题B', { _caseId: 'c3' }),     // verdictOf → true → 判同一性（LLM 答"一致"→ 并入）
   ], {
-    callLLM: makeLLM([]),
+    callLLM: makeLLM(['{"same":true}']),
     verdictOf: (e) => (e._caseId === 'c2' ? false : e._caseId ? true : undefined),
   })
   assert.equal(r1.ignored, 0, 'verdictOf=false 的轮次不做过滤处理')
   assert.equal(r1.segments.length, 1, '问题A/闲聊/问题B 并入一组')
+  assert.equal(r1.degraded, false, '判定正常 → 不是降级结果')
   assert.deepEqual(r1.segments[0].entries.filter((e) => e.role === 'user').map((e) => e._caseId), ['c1', 'c2', 'c3'], '无内核轮次跟随并入')
   // verdictOf 未命中的轮次走 LLM（队列里有判专题化判定）
   const r2 = await segmentStack([u('问题C', { _caseId: 'cx' })], {
@@ -95,4 +97,22 @@ test('分段：verdictOf 复用已判专题化结论（不调 LLM）；未命中
     () => segmentStack([u('Q')], { callLLM: makeLLM([]), verdictOf: 'not-a-fn' }),
     /verdictOf/,
   )
+})
+
+test('分段：判同一性彻底失败 → 按"切段"处理 + degraded 上报（2026-11 起不再静默并入）', async () => {
+  // 假 LLM 队列为空 → judgeSegmentSame 三次尝试全抛 → segmentStack 兜底。
+  // 旧行为是 same=true（并入），实况后果：一场 22 轮的对话被判成一整段、只出一个节点，
+  // 而且没有任何地方能看出"这次判定其实是失败的"。新行为：切段 + degraded 上报。
+  const r = await segmentStack([
+    u('问题A', { _caseId: 'c1' }),
+    a('回答A'),
+    u('问题B', { _caseId: 'c2' }),
+  ], {
+    callLLM: makeLLM([]),
+    verdictOf: (e) => (e._caseId ? true : undefined),
+  })
+  assert.equal(r.segments.length, 2, '判定失败按切段处理（宁可细，不可把独立问题吞进一个节点）')
+  assert.equal(r.degraded, true, 'degraded 必须上报——归档回执据此提示用户')
+  assert.equal(r.sameFailed, 1, '失败次数')
+  assert.deepEqual(r.segments.map((s) => s.entries[0]._caseId), ['c1', 'c2'], '两段各含一个轮次')
 })

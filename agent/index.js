@@ -17,13 +17,15 @@ import net from 'net'
 import path from 'path'
 import readline from 'readline'
 import { fileURLToPath } from 'url'
-import { judgeSelfPortrait } from './lib/self-portrait.js'
 import { processStackMessage, makeStackEntry, collectStackCites } from './lib/topic-stack.js'
-import { createGraph, userAncestry, resolveReferences } from './lib/knowledge-graph.js'
+import { createGraph, userAncestry, resolveReferences, hotNodes } from './lib/knowledge-graph.js'
 import { consolidateThreadQuestion } from './lib/thread-question.js'
 import { consolidateDiscussion, addDerivedEdge, addCitationEdges, pruneRedundantCitationEdges, groupExcerpts } from './lib/graph-consolidate.js'
 import { segmentStack } from './lib/segment-stack.js'
 import { l3Block } from './lib/l3-context.js'  // L3 上下文渲染（2026-10 定调：来源见模块头）
+// 相处规则（2026-10 定调）：用户对 AI 的长期要求，唯一入口是侧栏 /相处 命令。
+// 增删改全是机械操作（不调 LLM），见 lib/agreement.js 头部——AI 自己**不写**这份文件。
+import { handleCommand as handleAgreement } from './lib/agreement.js'
 import { parseMessage } from './lib/chat-input.js'  // 引用解析输入剥离引文：只认用户自己的话（见 resolveCitations）
 import { resolveApiConfig, isConfigured } from './lib/api-config.js'  // 模型 API 配置：插件侧栏可写，.env 为回退
 // 聊天存储（2026-10-02 方案 B）：SQLite 取代 chat_input/chat_output.jsonl + 游标 + 指纹台账。
@@ -32,9 +34,16 @@ import { openChatStore } from './lib/chat-store.js'
 // 自由模式多对话（2026-11 用户定调）：每个自由对话 = 一个独立 bookKey（隔离链路复用
 // "按书隔离"），注册表管标题/活跃时间/归档状态；归档时可选择保存记忆、收编进正式拓扑图。
 import { isFreeKey, LEGACY_FREE_KEY, archiveConversation } from './lib/free-conversation.js'
+import { stashFreeClosedStack, closedStacksOf, dropFreeClosedStacks } from './lib/free-closed-stacks.js'  // 自由对话中途弹栈的旧讨论暂存（2026-11 修）
+// agent 身份应答（2026-11）：单实例管道兼职"问话"通道，托盘拨一次就知道"有没有 agent、
+// 是不是它那一份"。协议与托盘侧的 Get-AgentPipeInfo 是一份跨语言契约，见该模块头部。
+import { AGENT_PIPE_NAME, serveHello } from './lib/agent-identity.js'
 // 错误分类（2026-10）：网络层失败（fetch failed / ECONNRESET / 超时）此前一次都不重试，
 // 成因与机制见 lib/error-classify.js 头部注释
 import { canRetryError, isNetworkError, networkErrorMessage, isFatalConfigError, fatalErrorMessage } from './lib/error-classify.js'
+// 引用自带的「划线附近原文」（PDF 阅读器那条路）：微读的书靠 chapters\ 正文取上下文，
+// PDF 没有正文，上下文随标注一起来 —— 认领规则见该模块头部注释。
+import { annotationContextFor } from './lib/annotation-context.js'
 // 收件箱去重台账 + 游标语义（2026-09-30 机制级修复）已随 SQLite 存储层退役：
 // "这条处理过没有"现在是 messages.status 一列，"到哪了"是自增 id——游标文件、指纹台账、
 // decideCursor 判定全部不再需要。lib/inbox-dedupe.js 仍留着（迁移脚本用），运行时不再引用。
@@ -46,15 +55,23 @@ import { canRetryError, isNetworkError, networkErrorMessage, isFatalConfigError,
 import {
   AGENT_DIR, BOOKS_DIR, ANNOTATIONS_FILE, AGENT_CURSOR_FILE, CHAT_DB, STREAM_FILE,
   AGENT_STATE_FILE, STOP_FILE, JOURNAL_FILE, TOPIC_STACK_FILE, GRAPH_FILE,
-  BUILTIN_GRAPH_RESULTS_FILE, SELF_PORTRAIT_FILE, PROFILE_FILE, SOUL_FILE,
+  BUILTIN_GRAPH_RESULTS_FILE, PROFILE_FILE, AGREEMENT_FILE,
   HIST_CURSOR_FILE, SESSIONS_DIR, LOGS_DIR, LAYOUT_KIND, layoutSummary,
-  ensureDirs, detectUnmigrated, scriptCommand,
+  ensureDirs, migrateRenamedFiles, detectUnmigrated, scriptCommand,
   sessionStopFile, listSessionStopFiles,
+  PACKAGE_ROOT,
 } from './lib/paths.js'
 
 // 数据目录可能还不存在（全新安装、或用户直接跑 agent）：先建齐。
 // receiver 启动时也会调一次，幂等。
 ensureDirs()
+
+// 同目录内改过名的用户数据自动跟上（幂等）：老用户升级后不会"丢掉"相处规则。
+// 2026-10 起：values-portrait.md → agreement.md（角色从"AI 自画像"换成"相处契约"）。
+// 新名已存在就一个字都不动（规则见 lib/paths.js 的 migrateRenamedFiles）。
+const _renamed = migrateRenamedFiles()
+for (const d of _renamed.done) console.log(`  ✓ 数据文件已改名：${d}`)
+for (const f of _renamed.failed) console.log(`  ⚠️ 数据文件改名失败：${f}`)
 
 // ── 单实例保护（2026-10-07）──────────────────────────────────────────────
 // 为什么需要：托盘的自愈逻辑在"以为 agent 掉了"时会再拉一个（它的判据曾被 WMI 挡住，
@@ -71,9 +88,16 @@ ensureDirs()
 // 为什么用全局作用域（不带会话前缀）：data\ 是整机一份，跨用户跑两个 agent 会写同一个库。
 //
 // 拿不到锁就直接退出：宁可这个进程不启动，也不能两个一起回话。
-const AGENT_LOCK_PIPE = '\\\\.\\pipe\\CoReadAgent'
+//
+// 2026-11 追加：这把锁**兼职应答**。以前连接回调是 `(sock) => sock.destroy()`，谁拨进来都
+// 只说不上话，于是托盘只能靠"我记得我启动过"来猜 —— 上一班托盘留下的 agent、另一份 CoRead
+// 文件夹的 agent，它都看不见，状态就瞎报（用户报过"启动后托盘显示未运行/已停止"）。
+// 现在回一行 JSON：{role,v,pid,root}，托盘拨一次就知道"有没有 agent、是不是它那一份"。
+// 占线状态本身就是权威判据（名字全机唯一），协议与格式化在 lib/agent-identity.js，
+// 托盘那一侧是 installer/launcher/tray.ps1 的 Get-AgentPipeInfo，两边有测试盯着。
+const AGENT_LOCK_PIPE = AGENT_PIPE_NAME
 const lockResult = await new Promise((resolve) => {
-  const srv = net.createServer((sock) => sock.destroy())
+  const srv = net.createServer((sock) => serveHello(sock, PACKAGE_ROOT))
   srv.once('error', (err) => resolve({ srv: null, err }))
   srv.listen(AGENT_LOCK_PIPE, () => resolve({ srv, err: null }))
 })
@@ -131,7 +155,7 @@ function takeFatalError() {
 // 自由模式（2026-09 定调；2026-11 扩为多对话）：侧栏里的独立上下文，每个自由对话
 // 一个 bookKey（__coread_free_<8hex>__，默认对话沿用历史哨兵 __coread_free_mode__，
 // 见 lib/free-conversation.js），对话之间历史/讨论栈/命中全隔离。对话内容默认是
-// 临时的（不写 journal、不收口固化）——归档时由用户勾选：保存记忆（profile/soul）、
+// 临时的（不写 journal、不收口固化）——归档时由用户勾选：保存记忆（背景画像）、
 // 收编进正式拓扑图（完整固化）、或都不留（见 archiveFreeConversation）。
 const FREE_KEY = LEGACY_FREE_KEY
 
@@ -179,9 +203,9 @@ function userBookTitles() {
 }
 
 // ── 上下文加载（启动时一次性构建；system 只含静态内容，不再重建） ────────────
-// 2026-09 画像下沉：profile/soul/书籍足迹从 system 移到 personaBlock（本次消息头部）。
+// 2026-09 画像下沉：画像/相处规则/书籍足迹从 system 移到 personaBlock（本次消息头部）。
 // system 只剩【重要】头 + AGENT.md（静态）——MEMORIZE 合并、会话结束固化
-// （saveSessionMemory 重写 profile/soul）、新书足迹都不再触碰 system；
+// （saveSessionMemory 重写 profile）、新书足迹都不再触碰 system；
 // 前缀缓存因此稳定：跨会话恢复历史后，[静态S + 恢复历史] 前缀可跨会话命中。
 function buildSystemInstruction() {
   const rules = readIfExists(path.join(AGENT_DIR, 'AGENT.md'))   // 人格规则是程序文件，仍随代码走
@@ -198,33 +222,52 @@ function buildSystemInstruction() {
 // 答非所问并编造"你自己说过…"。档案内容禁止被转述/引用为用户原话（AGENT.md 同款规则）。
 function personaBlock() {
   const profile = readIfExists(PROFILE_FILE)
-  const soul = readIfExists(SOUL_FILE)
+  const agreement = readIfExists(AGREEMENT_FILE)
   const titles = userBookTitles()
   const bookSection = titles.length
     ? '\n\n【用户书籍足迹】（已添加引用/划线的书，用于跨书联想）\n' + titles.map((t) => `- 《${t}》`).join('\n')
     : ''
-  return '【背景档案】（profile.md / soul.md / 书籍足迹的内容——不是用户本轮发言，' +
+  return '【背景档案】（用户画像 / 相处规则 / 书籍足迹的内容——不是用户本轮发言，' +
     '只用于理解用户背景；即使出现"自述/自陈/你说过"式表述，也不得转述或引用为用户原话）\n\n' +
-    `【用户阅读画像】\n${profile}\n\n【你的自画像】\n${soul}${bookSection}`
+    // 相处规则（2026-10）：它是**对 AI 的行为要求**，不是背景资料——块内定性写明"请遵守"，
+    // 否则模型会把它当"用户的兴趣描述"读过去（老版块名「你的自画像」正是这个毛病）。
+    `【用户画像】\n${profile}\n\n【相处规则】（用户对你（AI）的长期要求，请遵守）\n${agreement || '（暂无）'}${bookSection}`
 }
 
 // ── 侧栏聊天 I/O（SQLite）────────────────────────────────────────────────────
 // 一条消息 = 库里一行。bookKey 就是 conversations.key（删除据此精确清理，不再靠 bookKey 过滤重写文件）。
 // opts: { status='ok'|'failed', error, replyTo, bookId/bookTitle/chapter/chapterUid/selectedText }
 function appendChatOutput(role, content, bookKey, opts = {}) {
+  const row = {
+    conv: String(bookKey || '_common'),
+    role,
+    content: stripCodeBlocks(content),
+    ts: Date.now(),
+    status: opts.status || 'ok',
+    error: opts.error,
+    replyTo: opts.replyTo,
+    bookId: opts.bookId, bookTitle: opts.bookTitle, chapter: opts.chapter,
+    chapterUid: opts.chapterUid, selectedText: opts.selectedText,
+  }
   try {
-    return chatStore().insertMessage({
-      conv: String(bookKey || '_common'),
-      role,
-      content: stripCodeBlocks(content),
-      ts: Date.now(),
-      status: opts.status || 'ok',
-      error: opts.error,
-      replyTo: opts.replyTo,
-      bookId: opts.bookId, bookTitle: opts.bookTitle, chapter: opts.chapter,
-      chapterUid: opts.chapterUid, selectedText: opts.selectedText,
-    })
+    return chatStore().insertMessage(row)
   } catch (e) {
+    // 外键兜底（2026-11 修）：reply_to 指向的那条消息可能在本条写库前就被删了——
+    // /归档 正是这条路径（archiveFreeConversation 第③步先删掉这场对话的全部消息，
+    // 调用方才把回执写回来，而回执的 reply_to 指的是刚被删掉的 /归档 指令行）。
+    // chat-store 开着 PRAGMA foreign_keys=ON，这种插入会整条失败 → 回执彻底丢失：
+    // 用户既没有 toast 也没有系统气泡，界面上"什么都没有发生"（实测踩到，
+    // data/sessions/chat.db 里连一行 system 都没留下）。
+    // reply_to 只是给侧栏做提问/回复配对用的显示字段，丢了不影响内容——回执必须送到。
+    if (row.replyTo && /FOREIGN KEY/i.test(String(e.message || ''))) {
+      console.log(`  ⚠️ 写库撞外键（reply_to=${row.replyTo} 已被删）——去掉配对重写一次，保住回执`)
+      try {
+        return chatStore().insertMessage({ ...row, replyTo: undefined })
+      } catch (e2) {
+        console.log(`  ⚠️ 写库失败：${e2.message}`)
+        return 0
+      }
+    }
     console.log(`  ⚠️ 写库失败：${e.message}`)
     return 0
   }
@@ -613,7 +656,7 @@ let currentBookKey = ''  // 后端跟踪的"正在读的书"（baseBookId），�
 // 时才从最老处整条切掉一批、切到裁剪目标（40 轮 ≈25.7K）——留 ~60 轮增长余量，
 // 避免"切完紧贴预算、追加一条又触发"（那样裁剪频率 = 滑动窗口，失配全废）。
 // 被切的是最老消息，长期价值已被会意图（L3 全量带回）/ 会意栈（跨会话持久化）/
-// profile·soul 兜底，不丢数据。
+// 背景画像兜底，不丢数据。
 // 参数（2026-09 用户拍板）：BUDGET 64K（1M 窗口下请求体量主开关，占 92% 是历史）；
 // TRIM 40 轮（承接下限仍充裕：单章讨论 3~10 轮）。裁剪间隔 ≈ (64K-25.7K)/643 ≈ 60 轮。
 const HIST_TOKEN_BUDGET = 64000            // 预算上限：超过才触发裁剪（≈99 轮）
@@ -965,7 +1008,7 @@ async function say(userText, options = {}) {
   hist.push({ role: 'user', content: storeText })
   trimHistoryByBudget(key, hist)  // 2026-09 惰性截尾：追加式保缓存前缀，超预算才从最老切
   // 自由模式（任意自由对话 key）不写 journal：对话内容默认是临时的，不进
-  // session_journal（从而不进 profile/soul 记忆固化）；归档时勾选「保存记忆」才
+  // session_journal（从而不进记忆固化）；归档时勾选「保存记忆」才
   // 单独把这场对话喂给记忆合并（见 archiveFreeConversation）。
   if (key !== '_meta' && !isFreeKey(key)) journalAppend({ kind: 'msg', bookKey: key, role: 'user', content: storeText })  // 同步落盘，强杀也不丢
   let fullContent = ''
@@ -980,7 +1023,7 @@ async function say(userText, options = {}) {
     // 含 uN）连续命中；不再用 slice(0,-1) 替换（那会让上一轮的 user 从请求里消失、
     // 且 persona+U_N 与下一轮历史的 uN(storeText) 分叉，每轮固定失配最近 2~3 轮，
     // 短会话/跨会话首轮命中率降到 50%~70%）。
-    // persona 独立块：profile/soul/足迹变化只失配当轮 persona 块，不碰历史前缀。
+    // persona 独立块：画像/相处规则/足迹变化只失配当轮 persona 块，不碰历史前缀。
     // 2026-09 防跑题（09-07 火星报段落教训）：persona 已带【背景档案】"非发言"标注；
     // 当轮输入前再加【本轮消息】锚定行，把"当前要回答什么"在语义上钉死——模型不得
     // 顺着旧主题代答、不得把档案/历史内容当成这轮的用户发言。_meta 记忆合并保持原状
@@ -1038,7 +1081,7 @@ async function say(userText, options = {}) {
     displayContent = stripMemorize(fullContent)
 
     if (key !== '_meta') {
-      // 会话中实时记忆：检测【MEMORIZE】标记 → 就地合并进 profile/soul → 追加确认反馈。
+      // 会话中实时记忆：检测【MEMORIZE】标记 → 就地合并进 profile.md → 追加确认反馈。
       // 自由模式跳过（对话内容默认不进长期记忆）：标记剥离照常（显示层），合并不执行；
       // 归档时勾选「保存记忆」由 archiveFreeConversation 统一合并。
       const memorize = !isFreeKey(key) ? extractMemorize(fullContent) : null
@@ -1280,6 +1323,11 @@ function saveTopicStacks(stacks) {
   }
 }
 
+// ── 自由对话中途弹栈的旧讨论（2026-11 修）────────────────────────────────────
+// 实现搬到 lib/free-closed-stacks.js（纯 IO + 可注入路径 → 有单测）。这里只留说明：
+// 读书模式弹栈 = 当场固化；自由模式的产物只在归档时生成，所以弹栈的旧讨论不能丢，
+// 先按 key 攒起来，归档勾了"收口进拓扑图"时逐段收口，有几段就出几个节点。
+
 // 从会话流水账恢复"上一轮 AI 回复"（按书隔离）：每本书各自最近一条 assistant 消息
 // （以及它针对的划线，如果有）——判专题化降级判定的同书上下文。
 function lastAssistantByBookFromJournal() {
@@ -1331,8 +1379,9 @@ let lastReplyByBook = {}  // 每本书最近一轮 AI 回复 { bookKey: { conten
 // 收口固化（实时收口 closed_and_pushed 与 /收口 手动收口共用，2026-09）：
 // 对被弹出的讨论做固化后分段 → 每段归纳问题 → 固化节点 → user 边 → 段间 derived
 // 边 → 冗余 user 边清理（上游命中被段间 derived 链覆盖则删，内容不变）→ 写图。
-// 返回 { keptClosed }：0 节点产出且非 noTopicized（LLM 故障）时保留
+// 返回 { keptClosed, sameFailed }：0 节点产出且非 noTopicized（LLM 故障）时保留
 // 被收口讨论，调用方压回栈顶下次重试；noTopicized（整栈无专题化）不保留。
+// sameFailed = 分段判同一性失败次数（>0 表示这次分段是降级结果，调用方要写进回执）。
 //
 // 目标图由 opts 决定（2026-11 自由模式多对话）：
 //   · 读书模式：（默认）正式图 graph —— 完整固化
@@ -1343,6 +1392,7 @@ let lastReplyByBook = {}  // 每本书最近一轮 AI 回复 { bookKey: { conten
 async function consolidateClosed(closed, opts = {}) {
   const { isFree = false, targetGraph = graph, logTag = '' } = opts
   let keptClosed = null
+  let sameFailed = 0   // 分段判同一性失败次数（isFree 分支恒 0；上报给调用方/归档回执）
       if (isFree) {
         // 自由对话且用户没勾"收口进拓扑图"：什么都不做。2026-11 用户定调——自由对话
         // 默认是临时的，只有归档时勾了才走正常收口程序；不勾就零产物。
@@ -1350,10 +1400,16 @@ async function consolidateClosed(closed, opts = {}) {
       } else {
       // ① 固化后分段：先判专题化（识别知识点轮次；无内核轮次**不做过滤处理**，跟随并入
       //    当前组，2026-08-28 定调），再判同一性（细切发散的具体问题）
-      const { segments, noTopicized } = await segmentStack(closed.entries, {
+      const { segments, noTopicized, degraded, sameFailed: segFailed } = await segmentStack(closed.entries, {
         callLLM: judgeLLM,
         log: (m) => console.log(`  [会意栈]${logTag} ${m}`),
       })
+      sameFailed = segFailed
+      if (degraded) {
+        // 判同一性失败 → 已按"切段"处理（见 lib/segment-stack.js 的 catch）。必须留痕：
+        // 以前这种失败被静默兜成"并入"，结果是一场长对话收成一个节点、还没人知道。
+        console.log(`  [会意栈]${logTag} ⚠️ 分段判定有 ${segFailed} 次失败（已按切段处理，结果可能偏细）`)
+      }
       console.log(`  [会意栈] 收口弹出 ${closed.entries.length} 轮 → 分段 ${segments.length} 个不可分割组`)
       // ② 每段：归纳问题（分段之后）→ 固化（派生 point/能指 → 新建节点，节点不可变）→ user 边
       const segResults = []  // {nodeId, question, excerpts}
@@ -1429,7 +1485,7 @@ async function consolidateClosed(closed, opts = {}) {
       // 正式图收口固化 → 写正式图文件（自由对话归档勾选"收编"时同样落正式图）
       saveGraph()
       }
-  return { keptClosed }
+  return { keptClosed, sameFailed }
 }
 
 // /收口：手动收口当前书（或指定书）的讨论栈（2026-09 用户定调——读完一本书时使用）。
@@ -1491,11 +1547,15 @@ async function driveTopicStack(bookKey, unit, reply, cites) {
     const savedStack = r.stack.map((e, i) => (i === lastUserIdx && citesList.length ? { ...e, cites: citesList } : e))
     let keptClosed = null  // 收口固化 0 节点产出时保留被收口讨论（压回栈顶，下次收口重试）
     if (r.action === 'closed_and_pushed' && r.closed) {
-      // 自由对话：弹栈旧讨论不固化（产物只在归档时生成）；读书模式：正式图实时固化
+      // 自由对话：弹栈旧讨论不**当场**固化（产物只在归档时生成），但也不能丢——
+      // 暂存起来，归档勾了"收口进拓扑图"时逐段收口（2026-11 修：此前只打日志就丢，
+      // 长对话里被判"换了问题"的前半段永远进不了图）。
+      // 读书模式：弹栈即固化进正式图（行为不变）。
       if (!isFree) {
         keptClosed = (await consolidateClosed(r.closed, { isFree: false, targetGraph: graph })).keptClosed
       } else {
-        console.log(`  [会意栈]${freeTag} 旧讨论弹栈（${r.closed.entries.length} 轮）：不固化——产物在归档时由用户勾选决定`)
+        const n = stashFreeClosedStack(bookKey, r.closed.entries)
+        console.log(`  [会意栈]${freeTag} 旧讨论弹栈（${r.closed.entries.length} 轮）：暂存待归档收口（该对话已攒 ${n} 段）`)
       }
     }
     topicStacks[bookKey] = [...(keptClosed || []), ...savedStack, { role: 'assistant', content: String(reply || '').trim(), ...(unit.selected ? { selected: unit.selected } : {}) }]
@@ -1507,7 +1567,7 @@ async function driveTopicStack(bookKey, unit, reply, cites) {
 
 // ── 自由对话归档（2026-11 用户定调）──────────────────────────────────────────
 // 侧栏归档弹窗两项**默认都勾上**（可取消，取消的选择会被记住），随归档请求一并送到：
-//   · 保存记忆 memory：把这场对话（histories[key] 的完整轮次）交给 profile/soul 合并
+//   · 保存记忆 memory：把这场对话（histories[key] 的完整轮次）交给 profile 合并
 //     ——走的就是 saveSessionMemory 的同一套 specs/校验/备份闭环，只是材料换成这场
 //     自由对话（自由对话不进 session_journal，所以不能复用 journal 那条路）。
 //   · 收口进拓扑图 graph：这场讨论跑**读书模式那套一模一样的正常程序**——判专题化 →
@@ -1537,7 +1597,7 @@ async function archiveFreeConversation(key, opts = {}) {
           { label: '这场自由对话' },
         )
         memoryOk = ok
-        lines.push(ok ? '已保存记忆（profile / soul）' : '记忆合并未通过校验，已保留原文件')
+        lines.push(ok ? '已保存记忆（背景画像）' : '记忆合并未通过校验，已保留原文件')
       } catch (e) {
         lines.push('记忆保存失败：' + e.message)
       }
@@ -1552,30 +1612,50 @@ async function archiveFreeConversation(key, opts = {}) {
   //    分段 → 逐段归纳问题 → 派生 point/能指 → 新建节点 → user 边 → 段间无条件 derived
   //    边 → 冗余 user 边清理），写正式图。这里不做任何"压成一个占位节点"的简化——
   //    自由对话的收口产物与读书模式收口出来的东西同构，用户看到的节点数就是分段的段数。
+  //
+  //    2026-11 修（"把自由会话收口成一个节点是错误的"）：要收的**不只是留在栈里的最后一段**。
+  //    对话过程中被判"换了问题"而弹栈的旧讨论原本被就地丢掉（只打一行日志），于是长对话
+  //    里前半段永远进不了图、用户只看到最后一段收出来的节点。现在那些弹栈讨论攒在
+  //    free-closed-stacks.json 里，这里按时间顺序逐段收口，最后再收当前栈——有几段就出几个
+  //    节点（每段内部仍按分段判定细切，段与段之间不建 derived 边：它们本来就是被判定为
+  //    不同问题的两场讨论）。
   const stack = topicStacks[key] || []
+  const stashed = closedStacksOf(key)
+  const workStacks = [...stashed.map((s) => s.entries), ...(stack.length ? [stack] : [])]
   const nodesBefore = graph.nodes.length
   const edgeKeysBefore = new Set(graph.edges.map((e) => `${e.from}|${e.to}|${e.kind || 'user'}`))
   if (wantGraph) {
-    if (!stack.length) {
+    if (!workStacks.length) {
       lines.push('无讨论内容可收口（对话太短：栈内没有轮到归纳）')
     } else {
       try {
-        const { keptClosed } = await consolidateClosed(
-          { ts: Date.now(), entries: stack },
-          { isFree: false, targetGraph: graph, logTag: '[自由·归档]' },
-        )
-        if (keptClosed && keptClosed.length) {
-          lines.push('收口未完成（固化 0 节点产出）—— 对话内容仍会随归档删除')
-        } else {
-          const newNodes = graph.nodes.slice(nodesBefore)
-          nodeCount = newNodes.length
-          newPoints = newNodes.map((n) => String(n.point || '')).filter(Boolean)
-          // 边没有 id，按 from|to|kind 记差集（同 pair 去重边不会重复计入）
-          edgeCount = graph.edges.filter((e) => !edgeKeysBefore.has(`${e.from}|${e.to}|${e.kind || 'user'}`)).length
+        let kept = 0
+        let segFailedTotal = 0
+        for (const entries of workStacks) {
+          const { keptClosed, sameFailed } = await consolidateClosed(
+            { ts: Date.now(), entries },
+            { isFree: false, targetGraph: graph, logTag: '[自由·归档]' },
+          )
+          if (keptClosed && keptClosed.length) kept++
+          segFailedTotal += sameFailed || 0
+        }
+        if (stashed.length) console.log(`  [自由模式] 归档含中途弹栈旧讨论 ${stashed.length} 段（已一并收口）`)
+        if (kept) {
+          lines.push(`收口未完成（${kept} 段固化 0 节点产出）—— 对话内容仍会随归档删除`)
+        }
+        const newNodes = graph.nodes.slice(nodesBefore)
+        nodeCount = newNodes.length
+        newPoints = newNodes.map((n) => String(n.point || '')).filter(Boolean)
+        // 边没有 id，按 from|to|kind 记差集（同 pair 去重边不会重复计入）
+        edgeCount = graph.edges.filter((e) => !edgeKeysBefore.has(`${e.from}|${e.to}|${e.kind || 'user'}`)).length
+        if (!kept) {
           lines.push(nodeCount
             ? `已收口进拓扑图（${nodeCount} 个知识点节点 / ${edgeCount} 条边）`
             : '已收口进拓扑图（整场无专题化轮次，未产出知识点节点）')
         }
+        // 降级要说出来（2026-11）：分段判定失败被按"切段"处理，产出可能偏细——
+        // 以前这种情况完全静默，用户只能看到"1 个节点"这个结果，无从判断对不对。
+        if (segFailedTotal) lines.push(`注意：分段判定有 ${segFailedTotal} 次失败，已按切分处理（节点可能偏细）`)
       } catch (e) {
         lines.push('收口失败：' + e.message)
       }
@@ -1584,9 +1664,11 @@ async function archiveFreeConversation(key, opts = {}) {
     skipped.push('未收口进拓扑图')
   }
 
-  // ③ 清理 + 墓碑：归档即删除
+  // ③ 清理 + 墓碑：归档即删除（含中途弹栈的暂存——已收口的清掉；没收口的也随之作废，
+  //    因为它们属于这场即将被删掉的对话）
   topicStacks[key] = []
   saveTopicStacks(topicStacks)
+  if (dropFreeClosedStacks(key)) console.log(`  [自由模式] 归档清掉中途弹栈暂存 ${key}`)
   histories.delete(key)
   lastReplyByBook && delete lastReplyByBook[key]
   if (histCutCursors && key in histCutCursors) { delete histCutCursors[key]; saveHistCursors() }
@@ -1611,145 +1693,61 @@ async function archiveFreeConversation(key, opts = {}) {
   return { reply: head + (lines.length ? lines.join('；') + '。' : '') + pointLine }
 }
 
-// ── 用户情况与观念画像（self-portrait） ─────────────────────────────────────
-// 用户谈到自己的情况、做过的事、对事件的思考，或表露观念 → 后台判画像 → **总结**为条目
-// （situation/events/thoughts/belief），维护 self-portrait.md。
-// 与 profile 分离：不进头部（buildSystemInstruction）、不是合并式重写（有新信息才追加条目）、
-// 内容是总结而非原文截取——维护不伤 LLM 前缀缓存。任何异常都不影响主回复（try/catch 隔离）；
-// 不 await——判定在后台跑，shutdown 时统一等待。
-const _pendingSelfPortrait = []
-
-// 读取现有画像条目（进程内缓存，更新后刷新）
-let _portraitCache = null  // { situation: [], events: [], thoughts: [], belief: [] }
-function readSelfPortrait() {
-  if (_portraitCache) return _portraitCache
-  const raw = readIfExists(SELF_PORTRAIT_FILE) || ''
-  const p = { situation: [], events: [], thoughts: [], belief: [] }
-  let section = null
-  for (const line of raw.split('\n')) {
-    if (line.startsWith('## 情况')) section = 'situation'
-    else if (line.startsWith('## 做过的事')) section = 'events'
-    else if (line.startsWith('## 对事件的思考')) section = 'thoughts'
-    else if (line.startsWith('## 观念')) section = 'belief'
-    else if (section && line.startsWith('- ')) p[section].push(line.slice(2).trim())
-  }
-  _portraitCache = p
-  return p
-}
-
-// 画像文本（去重参照，取最新一部分）
-function portraitText(p) {
-  const parts = []
-  if (p.situation.length) parts.push('情况：\n' + p.situation.map((s) => '- ' + s).join('\n'))
-  if (p.events.length) parts.push('做过的事：\n' + p.events.map((s) => '- ' + s).join('\n'))
-  if (p.thoughts.length) parts.push('对事件的思考：\n' + p.thoughts.map((s) => '- ' + s).join('\n'))
-  if (p.belief.length) parts.push('观念：\n' + p.belief.map((s) => '- ' + s).join('\n'))
-  return parts.join('\n\n')
-}
-
-// 合并新条目并重写 self-portrait.md（保留头部说明，条目按现有顺序追加）
-function saveSelfPortrait(p) {
-  const today = new Date().toISOString().slice(0, 10)
-  const md = [
-    '# 用户情况与观念画像（self-portrait）',
-    '',
-    '> 由会话内容维护：用户谈到自己的生活状况 → 记入「情况」；实际做过的事 → 记入「做过的事」；',
-    '> 对自己经历的想法/感受/心理活动 → 记入「对事件的思考」；表露立场/价值观/看问题的方式 → 记入「观念」。',
-    '> 与 profile.md 的区别：不进头部上下文（维护不伤 LLM 前缀缓存）、不是合并式重写（有新信息才追加条目）；',
-    '> 条目是**总结**（画像陈述），不是原文截取。',
-    '> 最近更新：' + today,
-    '',
-    '## 情况（situation）',
-    '',
-    ...(p.situation.length ? p.situation.map((s) => '- ' + s) : ['（暂无）']),
-    '',
-    '## 做过的事（events）',
-    '',
-    ...(p.events.length ? p.events.map((e) => '- ' + e) : ['（暂无）']),
-    '',
-    '## 对事件的思考（thoughts）',
-    '',
-    ...(p.thoughts.length ? p.thoughts.map((t) => '- ' + t) : ['（暂无）']),
-    '',
-    '## 观念（belief）',
-    '',
-    ...(p.belief.length ? p.belief.map((b) => '- ' + b) : ['（暂无）']),
-    '',
-  ].join('\n')
-  try { fs.writeFileSync(SELF_PORTRAIT_FILE, md + '\n') } catch (e) { console.log(`  ⚠️ 画像写入失败: ${e.message}`) }
-}
-
-let _lastReplyCtx = ''  // 最近一轮 AI 回复，作画像判定的对话脉络（归纳动机）
-function driveSelfPortrait(unit, ctx = {}) {
-  const p = (async () => {
-    try {
-      const cur = readSelfPortrait()
-      const r = await judgeSelfPortrait(unit, {
-        callLLM: judgeLLM,
-        existing: portraitText(cur), // 现有画像 → 去重参照
-        context: _lastReplyCtx, // 对话脉络（最近 AI 回复）→ 归纳动机/意义
-        maxTokens: 4096, // AI-012 同款教训：推理型模型先思考再输出，1024 常被思考耗尽
-        log: (m) => console.log(`  [画像] ${m}`),
-      })
-      if (!r.situation.length && !r.events.length && !r.thoughts.length && !r.belief.length) return
-      let changed = false
-      for (const s of r.situation) if (!cur.situation.includes(s)) { cur.situation.push(s); changed = true }
-      for (const e of r.events) if (!cur.events.includes(e)) { cur.events.push(e); changed = true }
-      for (const t of r.thoughts) if (!cur.thoughts.includes(t)) { cur.thoughts.push(t); changed = true }
-      for (const b of r.belief) if (!cur.belief.includes(b)) { cur.belief.push(b); changed = true }
-      if (changed) {
-        saveSelfPortrait(cur)
-        for (const s of r.situation) console.log(`  [画像] 📝 情况：${s}`)
-        for (const e of r.events) console.log(`  [画像] 🎬 事件：${e}`)
-        for (const t of r.thoughts) console.log(`  [画像] 💭 思考：${t}`)
-        for (const b of r.belief) console.log(`  [画像] ✦ 观念：${b}`)
-      }
-    } catch (e) {
-      console.log(`  [画像] 本轮跳过（不影响主回复）: ${e.message}`)
-    }
-  })()
-  _pendingSelfPortrait.push(p)
-  p.finally(() => {
-    const i = _pendingSelfPortrait.indexOf(p)
-    if (i >= 0) _pendingSelfPortrait.splice(i, 1)
-  })
-}
-
 // ── 会话中实时记忆（MEMORIZE 协议） ─────────────────────────────────────────
-// LLM 在回复末尾发 【MEMORIZE:profile|soul】标记（见 AGENT.md），
-// 这里解析它、剥离它（不让用户看到标记）、就地合并进对应的记忆文件。
+// LLM 在回复末尾发 【MEMORIZE:profile】标记（见 AGENT.md），
+// 这里解析它、剥离它（不让用户看到标记）、就地合并进画像文件。
 
-// profile 与 soul 的语义定义（AI-013）：合并时把"这个文件是什么、能写什么"喂给 LLM，
-// 防止模型把两者混为一谈——历史故障里 soul.md 曾被用户画像内容整段覆盖。
+// 记忆文件的语义定义（AI-013）：合并时把"这个文件是什么、能写什么"喂给 LLM。
+// 2026-10 起这张表**只剩 profile**（背景画像）：soul 已换角色为「相处规则」，
+// 唯一写入者是用户的 /相处 命令（见 lib/agreement.js），AI 不再有任何写它的路径。
+// 历史故障备忘：soul.md 曾被用户画像整段覆盖——根因是会话结束固化把同一份讨论材料
+// 分喂两个 prompt、视角只差一句，必然串味；2026-10-14 那次整份成了 portrait.md 的副本。
 const MEMORY_SPECS = {
   profile: {
     file: 'profile.md',
     filePath: PROFILE_FILE,          // 实际落点：data\profile\portrait.md（文件名与提示词里的名字分开，见 lib/paths.js）
     maxChars: 400,
-    purpose: '用户的长期阅读画像：品味、关注主题、思维习惯、知识背景',
-    scope: '只写用户的事实、品味、知识背景与思维习惯；不要写入你自己的立场、观点或相处方式。只能依据用户本人明确表达过的内容——AI 回复中对用户的转述、推断、脑补（含跑题回复）一律不得当作事实写入，具体方法/细节若在对话里查无实据就不要写',
-  },
-  soul: {
-    file: 'soul.md',
-    filePath: SOUL_FILE,             // 实际落点：data\profile\values-portrait.md
-    maxChars: 400,  // 250→400：旧规则易被压缩挤掉，放宽后模型更倾向保留原规则
-    purpose: '你自己的自画像：讨论中形成的立场、共识与分歧、与用户相处的方式、行为要求',
-    scope: '只写你自己的立场与行为规则，并完整保留原内容中已有的行为规则；绝不写入用户的画像类内容',
+    // 用途式定位（2026-10 用户定调）：**不罗列"应该装什么"**——罗列式会让模型凑内容。
+    // 实测代价：旧 purpose 写着"品味、关注主题、思维习惯、知识背景"，长出来的却是 500 字政治立场，
+    // 而"品味"一个字都没产出过。画像只负责一件事：让 AI 每轮知道它在跟谁说话。
+    purpose: '让 AI 知道它在跟谁说话：这个人的背景与处境、正在做的事、怎么看问题、哪些东西他熟哪些不熟（用来定回复详略）、大致关心哪些生活面、以及他反复回到哪些议题（议题那一块由程序从会意图直接填，不归你写）。只写能确认的；没有就少写或留空——不要求填满',
+    // 边界（2026-10 用户定调）：
+    // ① 材料只取"关于他自己"的：他的处境、他周围发生的事、他说自己怎么想。
+    // ② 问题域可写、结论不写：可以写他关心什么问题，不写他对这个问题下的结论
+    //    （结论在会意图里，有原文，用户引用时会自动带进上下文）。
+    // ③ 关心面用日常词，不用学科术语（"钱和产业往哪走""工人过得怎么样"，而不是
+    //    "国家与阶级的关系"）——多数用户不读理论书，学科语言对他们不成立。
+    // ④「他是谁」不点书名、不点话题（2026-10 用户指出：那一节塞进了一堆具体话题）。
+    // ⑤「他的知识结构」是**详略地图**，不是书目清单：以用户**自述**为主，不因他讨论得多就推断他熟。
+    // ⑥ **两块别混**（2026-10 用户点破的关键区分）：「他大致关心什么」= 宽泛的生活面向，**只看用户
+    //    在对话里提了什么问**来判断；「他长期关注的议题」= 具体议题，由程序从会意图直接填。
+    //    之前把 point 当材料去生成"关心什么"，方向就错了——一块从提问读，一块从图里取，互不生成。
+    scope: '分三块写（第四块「他长期关注的议题」由程序直接填，你不要写、不要碰）：' +
+      '「他是谁」（身份、处境、经历、正在做的事、怎么看问题）、' +
+      '「他的知识结构」（三档：直接说 / 拆开讲 / 半熟在补，外加一个**默认档**"其余一切按他能跟上"——AI 据此定回复详略）、' +
+      '「他大致关心什么」（注意力投向哪些生活面，1~3 个方向，日常语言）。' +
+      '「他是谁」里不点具体书名、不点具体话题：要提知识只用一句概括（"理论底子厚""历史知识有缺口"）；拿掉专有名词（列宁、辩证法、拉美史）后那句话还成立，才算写对。' +
+      '「他大致关心什么」**只看用户在对话里提了什么问、问的是哪一类事**来判断（他问钱、问制度、问工人的处境，就说明注意力在那一面）；不要拿他读了什么书、讨论了什么学问当依据。' +
+      '判断"知识结构"以他的**自述**为主（"我不懂金融""我对教育社会学比较熟"）；不要因为他讨论得多就推断他熟。' +
+      '材料只取用户消息里关于他自己的内容；AI 回复中对用户的转述、推断、脑补一律不得当作事实；细节若查无实据就不要写。' +
+      '用日常词，不用学科术语。',
   },
 }
 const MEMORY_SPEC_LIST = Object.keys(MEMORY_SPECS).map(type => ({ type, ...MEMORY_SPECS[type] }))
 
+// 只认 profile：soul 标记已从协议里撤掉（2026-10），AI 不该再发它。
 function extractMemorize(reply) {
-  const m = String(reply || '').match(/【MEMORIZE:(profile|soul)】\s*([\s\S]+?)\s*$/)
-  return m ? { target: m[1], content: m[2].trim() } : null
+  const m = String(reply || '').match(/【MEMORIZE:profile】\s*([\s\S]+?)\s*$/)
+  return m ? { target: 'profile', content: m[1].trim() } : null
 }
 
-// 从显示文本里剥掉 MEMORIZE 标记块（含未完成的部分，避免流式时闪出标记）
+// 从显示文本里剥掉 MEMORIZE 标记块（含未完成的部分，避免流式时闪出标记）。
+// 仍认 soul：历史消息与模型偶发的老写法都可能在流里带出它，用户不该看见标记本身。
 function stripMemorize(text) {
   return String(text || '').replace(/【MEMORIZE:(?:profile|soul)】[\s\S]*$/, '').trim()
 }
 
-// 把一条待记住的内容就地合并进 profile.md / soul.md（一次小 LLM 调用）
+// 把一条待记住的内容就地合并进 profile.md（一次小 LLM 调用）
 async function runMemoryMerge(target, memory) {
   const spec = MEMORY_SPECS[target] || MEMORY_SPECS.profile
   const { file, maxChars, filePath } = spec
@@ -1775,7 +1773,7 @@ async function runMemoryMerge(target, memory) {
 
 // ── 会话流水账（session_journal.jsonl） ────────────────────────────────────
 // 每条对话同步落盘（fs.appendFileSync 为同步写，硬杀/断电也不丢）。
-// checkpoint 标记"此处之前的对话已合并进 profile/soul"，之后的即"未合并"。
+// checkpoint 标记"此处之前的对话已合并进 profile"，之后的即"未合并"。
 function journalAppend(entry) {
   try { fs.appendFileSync(JOURNAL_FILE, JSON.stringify({ t: Date.now(), ...entry }) + '\n') } catch {}
 }
@@ -1792,7 +1790,7 @@ function readJournalLines() {
  * 把某场对话里"用户说了什么"的流水行标成作废（2026-02 用户停止一轮时调用）。
  *
  * 为什么需要：journal 那行是**用户按下发送的瞬间就同步落盘**的（防强杀丢话），
- * 中止时必须把它作废，否则用户的原话照样会被会话结束时的记忆固化写进 profile/soul。
+ * 中止时必须把它作废，否则用户的原话照样会被会话结束时的记忆固化写进 profile。
  *
  * 为什么就地改写而不删行：流水账保持"只追加、可整文件重写（checkpoint 就是这么干的）"
  * 这个性质更好核对；作废行留着也便于事后排查"这轮为什么没进记忆"。
@@ -1826,7 +1824,7 @@ function voidJournalUserMsg(bookKey, content) {
   return false
 }
 
-// 上一次 checkpoint 之后的全部对话消息（尚未固化进 profile/soul 的部分）。
+// 上一次 checkpoint 之后的全部对话消息（尚未固化进 profile 的部分）。
 // **跳过作废行**：被用户停止的那一轮不该进画像（2026-02 用户定调）。
 function unmergedJournalMsgs() {
   const lines = readJournalLines()
@@ -1844,14 +1842,14 @@ function transcriptText(msgs) {
   }).join('\n\n')
 }
 
-// 合并成功后打 checkpoint，并顺带把 journal 轮转成一行（旧对话已蒸馏进 profile/soul，可弃）
+// 合并成功后打 checkpoint，并顺带把 journal 轮转成一行（旧对话已蒸馏进 profile，可弃）
 function journalCheckpoint() {
   try {
     fs.writeFileSync(JOURNAL_FILE, JSON.stringify({ t: Date.now(), kind: 'checkpoint' }) + '\n')
   } catch {}
 }
 
-// 会话结束 / 启动恢复时，把"尚未固化"的对话合并重写进 profile / soul。
+// 会话结束 / 启动恢复时，把"尚未固化"的对话合并重写进 profile。
 // 对话来源是 session_journal.jsonl（比内存 history 更稳：强杀后启动也能恢复，
 // 也顺带修复了 AI-001 把记忆重写隔离进空 _meta 历史、导致模型看不到本次讨论的问题）。
 async function saveSessionMemory({ minMsgs = 2 } = {}) {
@@ -1873,8 +1871,38 @@ async function saveSessionMemory({ minMsgs = 2 } = {}) {
   }
 }
 
+/** 剥掉模型可能自己写的「他长期关注的议题」那一节——它不归模型写（见 renderTopicsSection） */
+function stripTopicsSection(text) {
+  return String(text || '').replace(/\n*##\s*他长期关注的议题[\s\S]*$/, '').trimEnd()
+}
+
+/**
+ * 「他长期关注的议题」：**程序直接从会意图填，不经模型**（2026-10 用户定调）。
+ *
+ * 它跟「他大致关心什么」是**两块**，别混：那一块是宽泛的生活面向、只看用户提了什么问；
+ * 这一块是具体议题，直接取会意图热点节点（hotNodes 三层：超级招 → 统招 → 普招）的 point 原文。
+ * 图空 / 还没有被引用过的节点 → 写一行"暂无"，让用户知道这一块存在，而不是悄悄没有。
+ */
+function renderTopicsSection(graph) {
+  let list = []
+  try {
+    const hot = hotNodes(graph)
+    list = [...hot.super, ...hot.qualified, ...hot.general]
+    // 达线却没拿到统招名额 → 留一行痕。将来翻日志看到它，就知道门槛该往上调了，
+    // 而不是一直以为写进画像的议题是完整的。
+    if (hot.overflow > 0) {
+      console.log(`  · 热点：达线 ${hot.qualified.length + hot.overflow} 个，统招只取了前 ${hot.qualified.length} 个（门槛该往上调了？）`)
+    }
+  } catch (e) {
+    console.log(`  ⚠️ 热点计算失败，本次不填议题块：${e.message}`)
+    return ''
+  }
+  if (!list.length) return '## 他长期关注的议题\n（暂无——还没有被反复引用的议题）'
+  return '## 他长期关注的议题\n' + list.map((h) => `- ${h.point}`).join('\n')
+}
+
 // 记忆合并本体：把 msgs（[{ role:'user'|'assistant', bookKey?, content }]）压成记录文本，
-// 逐个人格文件（profile / soul）提炼 + 合并重写。返回是否有文件被成功写入。
+// 逐个人格文件（目前只有 profile）提炼 + 合并重写。返回是否有文件被成功写入。
 // 注意：本函数**不打 journal checkpoint**——checkpoint 只对 session_journal 有意义
 //（调用方 saveSessionMemory 负责）；自由对话归档借用本函数时不碰流水账游标。
 async function saveMemoryFromTranscript(msgs, { label = '本次讨论' } = {}) {
@@ -1895,13 +1923,19 @@ async function saveMemoryFromTranscript(msgs, { label = '本次讨论' } = {}) {
       `请从上面的讨论中提炼出属于 ${file}（${purpose}）的新内容，与以下原内容合并，` +
       `输出完整的重写版本（删去被覆盖的旧条目，保持精简）。\n\n` +
       `要求：${scope}。\n\n` +
-      `重要：${file} 若为 profile.md——只能把【用户】消息中用户明确表达过的事实、偏好、知识背景记为画像内容；【AI】消息中对用户的转述、推断、脑补（尤其是跑题回复）一律不是用户事实，不得写入。\n\n` +
+      `重要：① 只能把【用户】消息里**关于他自己**的内容记为画像（他的处境、他周围发生的事、他说自己怎么想）；【AI】消息中对用户的转述、推断、脑补（尤其是跑题回复）一律不是用户事实。② 若原内容里混着"他对某个问题的结论或立场"，这次一并清出画像、不要保留——那属于会意图，不属于画像。\n\n` +
       `只输出合并后的完整 ${file} 内容（≤${maxChars}字），不要输出任何其他文字、标记或说明。\n` +
       `本次讨论若没有属于 ${file} 的新内容，则原样输出原内容。\n\n原内容：\n${oldContent || '（尚无记录）'}`
 
     let content = await rewriteWithRetry(type, prompt, maxChars)
     if (content) {
-      fs.writeFileSync(filePath, content + '\n')
+      // 「他长期关注的议题」由**程序直接从会意图填**（2026-10 用户定调）：那是具体议题，
+      // 跟「他大致关心什么」那块宽泛方向是**两块**——一块从用户的提问读、一块从图里取，
+      // 互不生成。所以模型只写前三块，这一块在这里拼上去；它若自己写了一个，剥掉、用程序填的。
+      const body = type === 'profile'
+        ? stripTopicsSection(content) + '\n\n' + renderTopicsSection(graph)
+        : content
+      fs.writeFileSync(filePath, body.trimEnd() + '\n')
       anyWritten = true
       console.log(`  ✓ ${file} 已合并重写`)
     } else {
@@ -1921,7 +1955,7 @@ async function recoverUnmergedMemory() {
 }
 
 // AI-012：推理型模型偶尔把思考草稿当成最终输出返回（明显长于目标上限，或复述了任务指令）。
-// 此类内容绝不能写进 profile/soul（会覆盖长期记忆），判为"垃圾输出"并触发重试。
+// 此类内容绝不能写进 profile（会覆盖长期记忆），判为"垃圾输出"并触发重试。
 function isMergeOutputGarbage(text, maxChars) {
   const t = String(text || '')
   if (t.replace(/\s/g, '').length > maxChars * 3) return true  // 远超目标上限 → 是思考草稿而非精简产物
@@ -1942,7 +1976,7 @@ async function rewriteWithRetry(type, prompt, maxChars) {
     // 下面是 LLM 对单任务的回复，整段即是目标内容，无需正则切割。
 
     const content = resp.trim()
-    // LLM 调用失败：错误串绝不能写进 profile/soul（会覆盖长期记忆），只重试不写入
+    // LLM 调用失败：错误串绝不能写进 profile（会覆盖长期记忆），只重试不写入
     if (/^⚠️/.test(content)) {
       console.log(`  ⚠️ ${type} 第 ${attempt + 1} 次 LLM 调用失败（${content.slice(0, 40)}），重试...`)
       continue  // META 历史已被 say() 平衡，无需清理
@@ -1976,7 +2010,15 @@ function assembleBookContext(bookId, bookTitle, chapter, chapterUid, selectedTex
   if (win) {
     ctx += `\n${win}\n`
   } else {
-    ctx += `\n（暂无这本书的原文足迹。如果作者在后文对这个问题有新的回应，我们到时再一起讨论。）\n`
+    // 没有章节正文（PDF 阅读器那条路）→ 用**随引用一起报上来的**划线附近原文
+    // （阅读器算的前后各 300 字，见 extension/reader.js 的 contextAround）。
+    // 认不到才说"暂无足迹"——这句话本身没错，只是以前把 PDF 也算进去了。
+    const near = annotationContextFor(bookId, selectedText, { normalizeBookId: baseBookId })
+    if (near) {
+      ctx += `\n[划线附近的原文]\n${near}\n`
+    } else {
+      ctx += `\n（暂无这本书的原文足迹。如果作者在后文对这个问题有新的回应，我们到时再一起讨论。）\n`
+    }
   }
   return ctx
 }
@@ -2159,6 +2201,19 @@ async function main() {
   const RETRY_PAUSE_MS = 60 * 1000   // 非致命失败（网络/截断/空流）也歇一会儿，避免热循环
   let queuePausedUntil = 0
 
+  // 清掉上次残留的停机哨兵（2026-10 修）。哨兵是"请求**正在跑的** agent 停机"的信号；
+  // 若上一次停机时 agent 已经死了，写下的哨兵就没人消费，留在磁盘上——新 agent 启动后
+  // 轮询第一轮（≤3 秒）读到它就会**立刻自杀**。实测：18:04 启动 → 秒退，用户看到的是
+  // "CoRead 打不开"（侧栏发消息没人应答），托盘要等自愈间隔才重新拉起（那次等了 34 分钟）。
+  // 判据用 mtime：只清**早于本进程启动时刻**的哨兵——启动之后写的照常生效（用户此刻正要点退出）。
+  const START_TS = Date.now() - Math.round(process.uptime() * 1000)   // 本进程真实启动时刻
+  try {
+    if (fs.statSync(STOP_FILE).mtimeMs < START_TS) {
+      fs.unlinkSync(STOP_FILE)
+      console.log('  🧹 清掉一个上次残留的停机哨兵（否则本进程会在 3 秒内退出）')
+    }
+  } catch {}   // 文件不存在 = 正常情况（绝大多数启动都是这样）
+
   // 每 3 秒轮询新标注 + 侧栏用户消息
   const poller = setInterval(async () => {
     if (busy) return
@@ -2235,9 +2290,27 @@ async function main() {
           const reply = isFreeKey(target)
             ? (await archiveFreeConversation(target, ar)).reply
             : '只能归档自由模式的对话（读书模式的讨论用 /收口）。'
-          appendChatOutput('system', reply, target, { replyTo: msg.id })
+          // 不带 replyTo（2026-11 修）：archiveFreeConversation 已经把这场对话的消息
+          // 连这条 /归档 指令一起删了，再引用它就会撞外键、回执整条丢失。
+          appendChatOutput('system', reply, target)
           markMessage(msg.id, { status: 'ok' })
           console.log('\n[侧栏] ' + reply + '\n')
+          continue
+        }
+        // /相处：相处规则（agreement.md）的**唯一入口**（2026-10 定调）。指令消息不进栈、
+        // 不进会话历史。用户说人话，AI 负责整理（见 lib/agreement.js）：
+        //   · 无参数 → 只列清单（不调模型）
+        //   · 有参数 → 一次判定调用（judgeLLM，temperature 0）：总结要求 / 合并重复 / 报告冲突
+        // 回执用系统消息写回侧栏（侧栏按系统气泡渲染）。
+        if (/^\/相处(?:\s|$)/.test(String(msg.content || '').trim())) {
+          const arg = String(msg.content || '').trim().replace(/^\/相处\s*/, '')
+          const sr = await handleAgreement(arg, AGREEMENT_FILE, {
+            callLLM: judgeLLM,
+            log: (m) => console.log(`  [相处] ${m}`),
+          })
+          appendChatOutput('system', sr.reply, key, { replyTo: msg.id })
+          markMessage(msg.id, { status: 'ok' })
+          console.log('\n[侧栏] ' + sr.reply + '\n')
           continue
         }
         // 自由对话（任意自由 key）不改变"正在读的书"：对话结束后，后续无 bookId 的
@@ -2279,7 +2352,6 @@ async function main() {
         appendAgentState('answer', key)
         // replyTo = 这条提问的 id：回答入库时直接挂上引用（配对从"时间序推断"变成"外键"）
         const reply = await say(userMsg, { bookKey: key, storeText, assistantSelected: selectionFromMsg(msg), l3: citesR.l3, replyTo: msg.id })
-        _lastReplyCtx = stripCodeBlocks(reply)
         // 用户停止（2026-02 用户定调"当没问过"）：say() 已经把历史与流水账收干净了，
         // 这里再弃掉库里的提问行与命中事件，然后**直接进入下一条**——
         // 不标 ok、不标 failed、不入栈判同一、不记账。判同一根本轮不到被踩。
@@ -2306,14 +2378,6 @@ async function main() {
           break
         }
         markMessage(msg.id, { status: 'ok' })
-        // 画像维护（self-portrait）已停用（2026-10 用户定调：画像只写不读、无消费方，展示不需要）。
-        // 调用入口注释保留——恢复时取消注释即可；历史条目可用 scripts/backfill-self-portrait.mjs 重建。
-        // if (key !== FREE_KEY) {
-        //   driveSelfPortrait(
-        //     { userNote: msg.content, ...(selectionFromMsg(msg) ? { selected: selectionFromMsg(msg) } : {}) },
-        //     { book: msg.bookTitle || '', chapter: msg.chapter || '' }
-        //   )
-        // }
         console.log('\n[侧栏] ' + stripCodeBlocks(reply) + '\n')
         // 会意栈（按书隔离）：喂该消息所属书的栈；以上一轮**同书** AI 回复为降级上下文；
         // 入栈消息的引用暂存，**收口固化**（新专题化弹栈旧讨论）时建 user 边 + 段间无条件 derived 边。
@@ -2351,13 +2415,6 @@ async function main() {
         // 命中事件带书归属（key），侧栏按当前上下文过滤显示
         const citesR = await resolveCitations(line, key)
         const reply = await say(line, { bookKey: key, l3: citesR.l3 })
-        _lastReplyCtx = stripCodeBlocks(reply)
-        // 画像维护已停用（2026-10 用户定调）：self-portrait 无消费方，调用入口注释保留。
-        // driveSelfPortrait(
-        //   { userNote: line },
-        //   { book: currentAnn?.bookTitle || '', chapter: currentAnn?.chapter || '' }
-        // )
-
         console.log('\n' + stripCodeBlocks(reply) + '\n')
         // 会意栈（按书隔离）：REPL 输入也是用户追问，喂进该书（key）的栈；REPL 无划线，selected 恒缺省
         const lastR = lastReplyByBook[key]
@@ -2374,10 +2431,9 @@ async function main() {
 
   async function shutdown() {
     clearInterval(poller)
-    // 若正在调 LLM，等它收尾再固化，避免并发写 profile/soul
+    // 若正在调 LLM，等它收尾再固化，避免并发写 profile
     let waited = 0
     while (busy && waited < 15000) { await sleep(100); waited += 100 }
-    try { await Promise.allSettled(_pendingSelfPortrait) } catch (e) { console.log(`⚠️ 画像收尾失败: ${e.message}`) }
     try { await saveSessionMemory({ minMsgs: 2 }) } catch (e) { console.log(`⚠️ 记忆固化失败: ${e.message}`) }
     // 关闭不做收口固化：进行中的讨论留在栈里（已实时保存），下次恢复
     closeChatStore()

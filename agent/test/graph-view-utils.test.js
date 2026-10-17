@@ -311,3 +311,39 @@ test('回归守卫：recent 环满不透明（不许把脉冲的淡出套到常�
     '常驻环不许再乘 0.45 之类的淡出系数——图上那圈会发灰，与图例实心色对不上')
   assert.ok(block.includes('COLORS.recentMark'), 'recent 环必须用 recentMark')
 })
+
+// ── 书名归一：微读顶栏把章节拼在书名后，而且分隔宽度不固定（2026-11 修「同书两色」）──
+// 症状（用户报）：会意图里《大国大城》的节点出现两种颜色。根因不是取色算法，是**书名没归成一本**：
+// 顶栏那一串对多数书是「书名  章节」（两个空格），对这本是「书名 1 欧洲正经历大考」（一个空格+章节号），
+// 旧规则只切两个空格的，于是同一本书按章节碎成几本"书"，各自分到一个调色板色。
+test('bookName：顶栏「书名＋章节」后缀要切掉——宽窄两种分隔写法都认', () => {
+  // 两个空格（用户书库里的多数书）
+  assert.equal(U.bookName('学做工  制度形式'), '学做工')
+  assert.equal(U.bookName('静静的顿河：全三册（…改变）  六十五'), '静静的顿河：全三册（…改变）')
+  assert.equal(U.bookName('中国特色社会主义保障制度论纲  第1章'), '中国特色社会主义保障制度论纲')
+  // 一个空格 + 章节号（《大国大城》这一种；旧规则切不掉）
+  assert.equal(U.bookName('大国大城：当代中国的统一、发展与平衡 1 欧洲正经历大考'), '大国大城：当代中国的统一、发展与平衡')
+  assert.equal(U.bookName('大国大城：当代中国的统一、发展与平衡 3 大国的难题'), '大国大城：当代中国的统一、发展与平衡')
+  // 真书名原样保留：含空格、含数字、书名号、英文长标题
+  assert.equal(U.bookName('列宁：怎么办？'), '列宁：怎么办？')
+  assert.equal(U.bookName('国家与革命'), '国家与革命')
+  assert.equal(U.bookName('1984'), '1984')
+  assert.equal(
+    U.bookName('Theories of German Fascism: On the Collection of Essays War and Warrior, edited by Ernst Junger.  第1章'),
+    'Theories of German Fascism: On the Collection of Essays War and Warrior, edited by Ernst Junger.')
+})
+
+test('回归守卫：同一本书的多种章节写法只拿一种颜色（《大国大城》两色）', () => {
+  const raw = [
+    '大国大城：当代中国的统一、发展与平衡 1 欧洲正经历大考',
+    '大国大城：当代中国的统一、发展与平衡 3 大国的难题',
+    '大国大城：当代中国的统一、发展与平衡 4 发展中大国的困境与机遇',
+    '大国大城：当代中国的统一、发展与平衡 5 统一市场符合公共利益',
+    '学做工  制度形式',
+  ]
+  const colors = U.assignBookColors(raw.map((r) => U.bookName(r)))
+  const cities = raw.slice(0, 4).map((r) => colors.get(U.bookName(r)))
+  assert.equal(new Set(cities).size, 1, '《大国大城》四个章节写法必须同色（就是这条曾拿到两种颜色）')
+  assert.equal(colors.size, 2, '整张图只有两本书：大国大城 + 学做工')
+  assert.notEqual(cities[0], colors.get('学做工'), '两本书必须拿到不同颜色')
+})

@@ -54,7 +54,7 @@ function makeOldInstall(dir) {
   // ── 用户自己的东西：一个字节都不许动 ──
   w(path.join(dir, 'data', 'sessions', 'chat.db'), 'USER-CHAT-DB-BYTES')
   w(path.join(dir, 'data', 'config', 'api-config.json'), '{"apiKey":"sk-user-secret"}')
-  w(path.join(dir, 'data', 'profile', 'self-portrait.md'), '# 用户的画像')
+  w(path.join(dir, 'data', 'profile', 'portrait.md'), '# 用户的画像')
   w(path.join(dir, 'logs', 'tray.log'), 'user log line\n')
   w(path.join(dir, '我的笔记.txt'), '放在程序目录里的私人笔记')
 }
@@ -115,7 +115,7 @@ test('升级脚本：清掉旧版本残留、不碰用户数据、落成新版�
       '聊天库必须原样')
     assert.equal(fs.readFileSync(path.join(install, 'data', 'config', 'api-config.json'), 'utf8'), '{"apiKey":"sk-user-secret"}',
       'API 配置（含密钥）必须原样')
-    assert.equal(fs.readFileSync(path.join(install, 'data', 'profile', 'self-portrait.md'), 'utf8'), '# 用户的画像',
+    assert.equal(fs.readFileSync(path.join(install, 'data', 'profile', 'portrait.md'), 'utf8'), '# 用户的画像',
       '画像必须原样')
     assert.equal(fs.readFileSync(path.join(install, 'logs', 'tray.log'), 'utf8'), 'user log line\n',
       '日志必须原样（只追加我们自己的 update.log）')

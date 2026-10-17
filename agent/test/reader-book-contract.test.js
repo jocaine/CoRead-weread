@@ -105,14 +105,51 @@ test('阅读器的书与书库共用同一个目录名（rd_<hash>），不裂�
     'normalizeReaderHash 不再剥前缀 → 带前缀的入参会校验失败（老接口按裸哈希传）')
 })
 
+const BACKGROUND_JS = path.join(__dirname, '..', '..', 'extension', 'translate-background.js')
+
 test('侧栏认得"阅读器里正在看的那本 PDF"', () => {
-  assert.ok(/action:\s*'readerBookInfo'/.test(SIDEBAR_SRC),
-    '侧栏不再问后台"阅读器里开着哪本" → 用阅读器时侧栏又变回"未检测到正在阅读的书籍"')
+  assert.ok(/action:\s*'readerContextQuery'/.test(SIDEBAR_SRC),
+    '侧栏不再问后台"我该认哪本书" → 用阅读器时侧栏又变回"未检测到正在阅读的书籍"')
+  // 必须带 `req` 随机串：这条查询是**只给后台**的，答复必须原样带回来才算数
+  // （2026-11 踩过：打开着的阅读器页面也会答，**先答的赢**，于是侧栏认的书时灵时不灵）
+  assert.ok(/action:\s*'readerContextQuery',\s*req/.test(SIDEBAR_SRC),
+    '这条查询没带 req → 又分不清那句答复是后台说的还是阅读器页面抢答的')
   // 阅读器侧是**监听**这个消息（不是发送），所以断言监听分支存在
   assert.ok(/msg\.action === 'readerBookInfo'/.test(READER_SRC),
     '阅读器不再回答 readerBookInfo → 侧栏问不到书')
-  const bg = fs.readFileSync(path.join(__dirname, '..', '..', 'extension', 'translate-background.js'), 'utf8')
+  const bg = fs.readFileSync(BACKGROUND_JS, 'utf8')
   assert.ok(/^\s*readerBookInfo,\s*$/m.test(bg), '后台没有注册 readerBookInfo 处理器')
-  assert.ok(/isReaderUrl\(url\)[\s\S]{0,400}bookId/.test(bg),
-    '后台解析书籍上下文时不再单独认阅读器页面 → 「设为引用」会又报"未加入一本书籍"')
+  assert.ok(/isReaderUrl\(url\)[\s\S]{0,200}readerBookInfo/.test(bg),
+    '后台不再单独认阅读器页面（活动标签页是它时才去问它开着哪本）→ 「设为引用」会又报"未加入一本书籍"')
+})
+
+/**
+ * 侧栏只跟随**活动标签页**（2026-11 用户定调：与微信读书打开的那本书表现一致）。
+ *
+ * 用户实测的现象：当前停在毫不相干的标签页上，只要 PDF 那个标签页还开在标签栏里，
+ * 侧栏就一直挂着它的会话。根因是两条治过头的机制——后台"按 URL 找一个后台开着的
+ * 阅读器"、侧栏"阅读器标签页还开着就绝不清空"。这个测试把它们钉死：
+ * 谁要是哪天又加回来，这里当场红，而不是等用户过两周再报一次。
+ */
+test('侧栏只跟随活动标签页：不许再拿"后台挂着的阅读器"顶替，也不许"开着就不清"', () => {
+  const bg = fs.readFileSync(BACKGROUND_JS, 'utf8')
+  const start = bg.indexOf('async function readerBookInfo')
+  const end = bg.indexOf('export function activeTabKind', start)
+  assert.ok(start > 0 && end > start, '找不到 readerBookInfo / activeTabKind（改名了就要同步改这里）')
+  const fn = bg.slice(start, end)
+  // ① 后台不再"按 URL 在整条标签栏里找一个开着的阅读器"
+  assert.ok(!/via\s*=\s*'background'/.test(fn), '后台又在拿"后台挂着的阅读器"顶替当前书了')
+  assert.ok(!/lastAccessed/.test(fn), '后台又在挑"最近用过的那个阅读器标签页"了')
+  // ② 活动标签页属于哪一类页面必须报给侧栏（侧栏据此决定认书还是清空）
+  assert.ok(/activeKind/.test(fn), '后台不再报 activeKind → 侧栏没法判断"活动标签页算不算在读书"')
+  assert.ok(/activeTabKind\(url\)/.test(fn), '后台不再按 URL 给活动标签页分类')
+  // ③ 侧栏据此清空，而且清得动（要能绕过"阅读器报着书就不许清"那道防线）
+  assert.ok(/active-tab:活动标签页是/.test(SIDEBAR_SRC), '侧栏没有"活动标签页不是在读书就清空"那条路')
+  assert.ok(/opts\s*&&\s*opts\.authoritative/.test(SIDEBAR_SRC),
+    'applyBookContext 没有 authoritative 通道 → 那道防线会把"用户切走了"当成误清空挡住')
+  // ④ "阅读器标签页还开着"不再等于"正在读"
+  assert.ok(!/readerStillOpen/.test(SIDEBAR_SRC), '那条"阅读器标签页还开着就绝不清空"的防线又回来了')
+  // ⑤ 阅读器推上来的换书通知必须带"是不是活动标签页"这个前提
+  assert.ok(/fromActive/.test(bg) && /msg\.fromActive === false/.test(SIDEBAR_SRC),
+    '阅读器推送不再区分"是不是活动标签页推的" → 后台挂着的阅读器会改掉侧栏的当前书')
 })

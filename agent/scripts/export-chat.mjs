@@ -2,7 +2,7 @@
 /**
  * 导出：SQLite → 旧 JSONL 形态（兼容层，2026-10-02）。
  *
- * 用途：老脚本（measure-tokens / group-discussions / backfill-self-portrait / verify-* 等）
+ * 用途：老脚本（measure-tokens / group-discussions / verify-* 等）
  * 与人工 grep 仍然想要"两个 jsonl 文件"时，用这个命令现导一份**只读副本**。
  * 导出的文件带 .export 后缀，不会被任何在线路径读写。
  *

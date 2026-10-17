@@ -187,7 +187,7 @@ function loadSidebar({ convList = [], archiveOk = true, pingOk = true } = {}) {
   ctx.self = ctx
 
   const src = fs.readFileSync(JS, 'utf8')
-  const expose = '\n;globalThis.__X = { toggleFreeMode, renderFreeConvBar, renderFreeConvList, openFreeConvList, closeFreeConvList, openFreeArchive, closeFreeArchive, submitFreeArchive, switchFreeConversation, submit, createFreeConversation, loadFreeConversations, freeConvTitle, freeConvMeta, freeConvIsEmpty, maybeFreeConvHint, effectiveBookBase, effectiveBook, isFreeConvKey, deleteFreeConversation, removeConversationBubbles, renderCurrentBook, applyBookFilter, getState: () => ({ freeMode: _freeMode, freeKey: _freeKey, freeConvs: _freeConvs, archived: _freeArchived }) };'
+  const expose = '\n;globalThis.__X = { toggleFreeMode, renderFreeConvBar, renderFreeConvList, openFreeConvList, closeFreeConvList, openFreeArchive, closeFreeArchive, submitFreeArchive, switchFreeConversation, submit, createFreeConversation, loadFreeConversations, freeConvTitle, freeConvMeta, syncIntro, effectiveBookBase, effectiveBook, isFreeConvKey, deleteFreeConversation, removeConversationBubbles, renderCurrentBook, applyBookFilter, getState: () => ({ freeMode: _freeMode, freeKey: _freeKey, freeConvs: _freeConvs, archived: _freeArchived }) };'
   vm.createContext(ctx)
   vm.runInContext(src + expose, ctx, { filename: 'sidebar.js' })
 
@@ -208,12 +208,29 @@ test('侧栏脚本可在扩展页 DOM 上装载（顶层代码不抛错，无未
   assert.equal(X.getState().freeKey, '__coread_free_mode__', '默认落在历史哨兵对话上')
 })
 
+/**
+ * 由**其它模块运行时注入**的 id：它们本来就不在 sidebar.html 里。
+ *
+ * 登记规则（别放宽这条）：只有"注入方文件里确实创建了这个 id"才准登记在这里 ——
+ * 下面那条测试会反查。否则这张表会慢慢变成"缺失一律放过"，真删掉一个静态 id 也没人发现。
+ */
+const INJECTED_IDS = new Map([
+  // 教程引导浮标：tutorial-guide.js 自己建 DOM（该文件的 TIP_ID）；
+  // sidebar.js 只在探针里读它，且对"没显示 / 还不存在"有兜底。
+  ['tut-guide-tip', 'tutorial-guide.js'],
+])
+
 test('sidebar.js 引用的 DOM id 全部存在于 sidebar.html', () => {
   const { ids } = loadSidebar({ convList: [] })
   const js = fs.readFileSync(JS, 'utf8')
   const refs = new Set([...js.matchAll(/getElementById\('([A-Za-z0-9_-]+)'\)/g)].map((m) => m[1]))
-  const missing = [...refs].filter((r) => !ids.has(r))
+  const missing = [...refs].filter((r) => !ids.has(r) && !INJECTED_IDS.has(r))
   assert.deepEqual(missing, [], '缺失的 id: ' + missing.join(', '))
+  // 豁免表要对得上：登记成"别处注入"的 id，那个文件里必须找得到
+  for (const [id, file] of INJECTED_IDS) {
+    const src = fs.readFileSync(path.join(__dirname, '..', '..', 'extension', file), 'utf8')
+    assert.ok(src.includes(id), `${id} 登记为 ${file} 注入，但那个文件里没有它 —— 豁免表过期了`)
+  }
 })
 
 // ── 进入自由模式：拉清单、建对话条 ──────────────────────────────────────────
@@ -276,26 +293,42 @@ test('对话条显示对话总数徽标；空对话给出指路提示行', async
   assert.match(getById('fc-hint').textContent, /互不影响/)
 })
 
-test('指路气泡每场对话最多一条，且只归属当前对话（不串场）', async () => {
+test('会话开场：空对话显示、归属当前对话、有消息的对话不显示（2026-11 取代原来的指路气泡）', async () => {
   const { X, getById } = loadSidebar({ convList: [CONV_A, CONV_B] })
   X.toggleFreeMode()
   await flush()
   await X.switchFreeConversation(CONV_B.key)
-  X.maybeFreeConvHint()
+  // 2026-11 改版两次：① 原先落的是灰字系统气泡（maybeFreeConvHint），改由"会话开场"接管
+  //（文案 + 引文 + 动作都在里面，见 sidebar.js 的 renderIntro）；② 同月又按用户定调把
+  // "卡片"形态去掉（嫌像说明书），所以断言的是"一句话 + 一行小胶囊"。
+  // ⚠️ 断言走 getElementById('intro')（与脚本同一条路）：它在 sidebar.html 里是一个
+  // **固定节点**，不是每次 createElement 新建的元素——本替身的 createElement 每次都造
+  // 新对象，跟着 msgs.children 断言会走岔（真实 DOM 里两者是同一个节点）。
+  X.syncIntro()
+  const el = getById('intro')
+  assert.equal(el.hidden, false, '空对话显示会话开场')
+  assert.equal(el.dataset.book, CONV_B.key, '归属当前对话（切走时按 data-book 过滤）')
+  assert.match(el.innerHTML, /自由对话/, '自由模式的说法（不是读书模式那句）')
+  // 2026-11 用户定调（最终版）：**开场里一个按钮都不许有**。曾经挂过五颗，全被否掉：
+  //   「说点什么」= 只是把光标挪进输入框；「接着上一场」= 新建一场却劝人聊别的，莫名其妙；
+  //   「从会意图里选个知识点」= 用户原话"多余的"。
+  // 动作入口有两处已经够：输入框（想说什么直接打）+ 引用卡/书里的划线（起点）。
+  assert.equal(/<button/.test(el.innerHTML), false, '开场里不许有按钮')
+  assert.equal(/data-act=/.test(el.innerHTML), false, '连动作标记都不该有')
+  assert.equal(/第 \d+ 场/.test(el.innerHTML), false, '不写场次编号（固定一句"这是一场自由对话"）')
+  const first = el.innerHTML
+  X.syncIntro()   // 同一场再调（幂等）
+  assert.equal(el.innerHTML, first, '重复调用不会叠出第二份 / 不会改写文案')
+  // 切到有 6 条消息的对话（替身里把那 6 条的 DOM 也摆上）：开场收起
   const msgs = getById('msgs')
-  // 数"每场对话各落了几条"，不按可见性过滤
-  const hintsFor = (key) => msgs.children.filter((el) => el.className === 'msg-system' && el.dataset.book === key)
-  assert.equal(hintsFor(CONV_B.key).length, 1, '空对话落一条提示')
-  X.maybeFreeConvHint()   // 同一场再调（幂等）
-  assert.equal(hintsFor(CONV_B.key).length, 1, '同一场对话不重复落')
-  // 切到有 6 条消息的对话：不落提示，且 B 的提示随切走被摘下
+  const a1 = makeEl(); a1.dataset.book = CONV_A.key; msgs.appendChild(a1)
   await X.switchFreeConversation(CONV_A.key)
-  X.maybeFreeConvHint()
-  assert.equal(hintsFor(CONV_A.key).length, 0, '已有 6 条消息的对话不落提示')
-  assert.equal(hintsFor(CONV_B.key).length, 0, 'B 的提示随切走被摘掉（气泡按对话隔离）')
-  // 切回空对话：把那条提示补回来（不是又落一条）
+  X.syncIntro()
+  assert.equal(el.hidden, true, '已经有消息的对话不显示会话开场')
+  // 切回空对话：它回来（此刻归属已换成 B）
   await X.switchFreeConversation(CONV_B.key)
-  assert.equal(hintsFor(CONV_B.key).length, 1, '切回空对话补回提示，仍只有一条')
+  assert.equal(el.hidden, false, '切回空对话补回会话开场')
+  assert.equal(el.dataset.book, CONV_B.key, '归属跟着上下文换')
 })
 
 test('切换对话：上下文 key 换掉、标题跟着换', async () => {

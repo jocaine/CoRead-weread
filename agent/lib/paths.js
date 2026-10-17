@@ -148,9 +148,24 @@ export const ENV_FILE = path.join(CONFIG_DIR, 'env')
 
 // profile\：对用户的长期理解
 export const GRAPH_FILE = path.join(PROFILE_DIR, 'knowledge-graph.json')
-export const SELF_PORTRAIT_FILE = path.join(PROFILE_DIR, 'self-portrait.md')
+// 2026-11：原 SELF_PORTRAIT_FILE（profile\self-portrait.md）随「用户情况与观念画像」功能一起删除
+// ——模块 lib/self-portrait.js、单测、回填脚本、运行时接线（agent/index.js）全删。
+// **数据文件仍在原处，且已无任何代码读写它**：那份记录是唯一一份"用户生活史"素材
+// （家里的情况、做过的事、对事件的思考），留作备查；确认不需要时可直接删 data\profile\self-portrait.md。
 export const PROFILE_FILE = path.join(PROFILE_DIR, 'portrait.md')
-export const SOUL_FILE = path.join(PROFILE_DIR, 'values-portrait.md')
+/** 相处规则：**用户对 AI 的长期要求**（一份编号清单），不是 AI 自画像（2026-10 换的角色）。
+ *  唯一写入者是用户的侧栏 `/相处` 命令（lib/agreement.js）——AI 不写它，也不参与会话结束固化
+ *  （老机制会把它整份重写成画像副本，2026-10-14 实况）。判据：AI 该怎么做→这里；
+ *  用户是谁→portrait.md；我们讨论出了什么→会意图。
+ *  2026-10 改名：values-portrait.md → agreement.md。旧名的 "portrait/画像" 已经名不副实
+ *  （它不是画像，是约定）；老用户由 migrateRenamedFiles() 在启动时自动跟上，规则不丢。 */
+export const AGREEMENT_FILE = path.join(PROFILE_DIR, 'agreement.md')
+/** 同目录内改过名的用户数据文件（旧名 → 新名）。启动时由 migrateRenamedFiles() 自动跟上。
+ *  为什么需要：升级只换程序文件、data\ 归用户，所以新版本读新名会读空——用户看到的是
+ *  "我的相处规则没了"，而他并不知道文件改了名。 */
+const RENAMED_FILES = [
+  { from: 'values-portrait.md', to: 'agreement.md', note: '相处规则（2026-10 换角色并改名）' },
+]
 export const UNANSWERED_QUESTIONS_FILE = path.join(PROFILE_DIR, 'unanswered-questions.json')
 // 2026-10-06 删掉了 COLDSTART_MARKER_FILE（profile\coldstart-done）：
 // 它只是用来记住"别再问是否加载微信读书历史"，而那句提问连同它背后的
@@ -167,6 +182,11 @@ export const JOURNAL_FILE = path.join(SESSIONS_DIR, 'journal.jsonl')
 export const HIST_CURSOR_FILE = path.join(SESSIONS_DIR, 'hist-cursors.json')
 export const LAST_ANSWERED_FILE = path.join(SESSIONS_DIR, 'last-answered.json')
 export const TOPIC_STACK_FILE = path.join(SESSIONS_DIR, 'topic-stack.json')
+/** 自由对话**中途弹栈**的旧讨论（2026-11 修）：读书模式弹栈即固化，自由模式的产物
+ *  只在归档时生成——所以弹栈的那几段不能就地丢掉，先按 bookKey 攒在这里，归档勾了
+ *  "收口进拓扑图"时逐段收口。丢掉的话：一场长对话里被判"换了问题"的前半段会永远
+ *  不进图（用户看到的只是最后一段收出来的节点）。 */
+export const FREE_CLOSED_STACKS_FILE = path.join(SESSIONS_DIR, 'free-closed-stacks.json')
 export const FREE_CONVERSATIONS_FILE = path.join(SESSIONS_DIR, 'free-conversations.json')
 /** 优雅停机哨兵：托盘 / stop.bat 写，agent 轮询到就保存记忆退出。
  *  ⚠️ 历史上这处路径写歪过（2026-10 修）：tray.ps1 曾写 <包根>\data\agent\.stop，
@@ -275,9 +295,8 @@ export function legacyLocations() {
     // 它仍在 migrate-data-layout.mjs 的残渣清单里，--clean-legacy 会顺手删掉。
     { from: path.join(legacyAgent, 'data', 'knowledge-graph.json'), to: GRAPH_FILE, kind: 'file', note: '会意图谱' },
     { from: path.join(legacyAgent, 'data', 'knowledge-graph.free.json'), to: path.join(PROFILE_DIR, 'knowledge-graph.free.json'), kind: 'file', note: '自由模式沙盒图（测试产物）' },
-    { from: path.join(legacyAgent, 'self-portrait.md'), to: SELF_PORTRAIT_FILE, kind: 'file', note: '观念画像' },
-    { from: path.join(legacyAgent, 'profile.md'), to: PROFILE_FILE, kind: 'file', note: '阅读画像' },
-    { from: path.join(legacyAgent, 'soul.md'), to: SOUL_FILE, kind: 'file', note: '价值观侧写' },
+    { from: path.join(legacyAgent, 'profile.md'), to: PROFILE_FILE, kind: 'file', note: '用户画像' },
+    { from: path.join(legacyAgent, 'soul.md'), to: AGREEMENT_FILE, kind: 'file', note: '相处规则（旧称"价值观侧写"）' },
     { from: path.join(legacyAgent, 'data', 'unanswered-messages.json'), to: UNANSWERED_QUESTIONS_FILE, kind: 'file', note: '未答提问清单' },
     { from: path.join(legacyInbox, 'chat.db'), to: CHAT_DB, kind: 'file', note: '聊天记录（唯一真源）' },
     { from: path.join(legacyAgent, 'session_journal.jsonl'), to: JOURNAL_FILE, kind: 'file', note: '会话流水账' },
@@ -315,6 +334,37 @@ export function ensureDirs() {
 }
 
 /**
+ * 同目录内改过名的用户数据自动跟上（幂等）。
+ *
+ * 为什么要有它：升级只覆盖程序文件、`data\` 归用户，所以程序改读新文件名之后，老用户那边
+ * 新名不存在 → 读到空 → 他看到的只是"我的相处规则没了"，并不知道文件改了名。
+ *
+ * 规则（宁可不搬，也不覆盖）：
+ * - **新名已存在 → 一个字都不动**（用户可能已在新文件里写过东西）；
+ * - 旧名也不存在 → 什么都不做（全新用户）；
+ * - 只搬主文件，`.bak` 不跟（历史备份，留着旧名无害）。
+ *
+ * @returns {{done: string[], failed: string[]}} 实际做过的动作与失败项（供启动日志打印）
+ * @param {string} [dir] 数据目录（默认 profile\）；只为可测性留的口子
+ */
+export function migrateRenamedFiles(dir = PROFILE_DIR) {
+  const done = []
+  const failed = []
+  for (const r of RENAMED_FILES) {
+    const from = path.join(dir, r.from)
+    const to = path.join(dir, r.to)
+    try {
+      if (fs.existsSync(to) || !fs.existsSync(from)) continue
+      fs.renameSync(from, to)
+      done.push(`${r.from} → ${r.to}（${r.note}）`)
+    } catch (e) {
+      failed.push(`${r.from} → ${r.to}：${(e && e.message) || e}`)
+    }
+  }
+  return { done, failed }
+}
+
+/**
  * 老数据体检：新位置还没有数据，但旧位置有 —— 说明是"升级上来的老用户，还没迁移"。
  * 这个判断存在的理由：如果没有它，升级后聊天记录会是**静默的空**（新库自动建表、0 条消息），
  * 用户只会觉得"我的记录没了"，而不知道要跑一次迁移。启动时据此打一条显眼告警。
@@ -349,9 +399,8 @@ export const DATA_FILES = {  'knowledge-graph': GRAPH_FILE,
   'knowledge-graph-fallback': BUILTIN_GRAPH_RESULTS_FILE,
   'knowledge-graph-demo': BUILTIN_GRAPH_DEMO_FILE,
   'knowledge-graph-free': path.join(PROFILE_DIR, 'knowledge-graph.free.json'),
-  'self-portrait': SELF_PORTRAIT_FILE,
   portrait: PROFILE_FILE,
-  'values-portrait': SOUL_FILE,
+  agreement: AGREEMENT_FILE,
   'unanswered-questions': UNANSWERED_QUESTIONS_FILE,
   'chat-db': CHAT_DB,
   journal: JOURNAL_FILE,
