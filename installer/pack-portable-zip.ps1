@@ -252,6 +252,18 @@ Copy-Item (Join-Path $repo 'agent\package.json') $agentOut
 Copy-Item (Join-Path $repo 'agent\lib')          $agentOut -Recurse
 if (Test-Path (Join-Path $repo 'agent\.env.example')) { Copy-Item (Join-Path $repo 'agent\.env.example') $agentOut }
 
+# ⚠️ agent\AGENT.md 必须进包（2026-11 补漏）。它是共读 agent 的**人格与对话规则**，
+# agent\index.js 的 buildSystemInstruction() 直接读 <agent 目录>\AGENT.md 拼进 system。
+# 漏掉它**不会报错**：readIfExists() 读不到就当空字符串，于是用户那边的 agent 人格规则
+# 整段是空的 —— 同一个版本号，开发机与用户机器上行为不一样，而且没有任何日志能看出来
+# （这是最坏的一类缺口：静默）。实测：2026-10 之前构建的 4 个包
+# （pkg032 / pkg100 / oldpkg / migfix）里都没有这个文件，$need 清单里也没有它，
+# 所以打包闸门全程放行。这里补上拷贝，并在下面的 $need 里补一条校验。
+$agentMd = Join-Path $repo 'agent\AGENT.md'
+if (-not (Test-Path $agentMd)) { Fail '缺少 agent\AGENT.md —— 它是 agent 的人格规则文件，不能少' }
+Copy-Item $agentMd $agentOut
+Write-Step 'internal\agent\AGENT.md'
+
 # ── builtin\：2026-10 起**不再随包分发任何图谱文件** ────────────────────
 #
 # 这一段以前会把 agent\scripts\data\ 下的两个图谱拷进 builtin\，注释还写着它们是
@@ -324,6 +336,17 @@ foreach ($f in @('index.js', 'package.json', 'graph-data.js')) {
 # 藏进"不要动"的文件夹里说不通。它本身也是纯前端资源，没有可动的风险。
 Copy-Item (Join-Path $repo 'extension') $StageDir -Recurse
 Remove-Item (Join-Path $StageDir 'extension\test') -Recurse -Force -EA SilentlyContinue
+
+# extension\tutorial\（2026-11）：**内置教程书**的正文，必须进包。
+# 它是《第一次共读》那本书的 7 章内容 + 动画脚本，由 reader.html 打开、由接收端
+# 导出成 chapters\*.txt 给共读 agent 读（否则用户在教程里划线提问会找不到正文）。
+# 为什么不去动 builtin\：那一格被本脚本下面的闸门强制要求"完全为空"（2026-10 为
+# "作者的私人图谱曾被本地打包带出去"而立）。这份内容是程序自带的只读素材，
+# 跟扩展一起走才对——用户装插件时已经把它装进去了，包根不必再放一份。
+$tutBook = Join-Path $StageDir 'extension\tutorial\book\book.json'
+if (-not (Test-Path $tutBook)) { Fail '内置教程书没进包：extension\tutorial\book\book.json 不在暂存目录里' }
+$tutChapters = @(Get-ChildItem (Join-Path $StageDir 'extension\tutorial\book') -Directory -EA SilentlyContinue).Count
+Write-Step ("extension\tutorial\ 内置教程书（{0} 章）" -f $tutChapters)
 
 # 图标：托盘用的 coread.ico 放包根 assets\icons\（托盘就按这个相对路径找它）；
 # 浏览器插件图标在 extension\icons\ 里，随 extension 一起走。
@@ -430,7 +453,7 @@ Write-Host "`n--- 文件夹显示名 ---"
 $labels = @(
   @{ dir = $dataRoot;                       name = '你的数据（备份就复制这个文件夹）';        tip = 'CoRead 的全部个人数据：配置、画像、聊天记录、书与标注、翻译记录。删掉等于清空所有记录。'; files = $null }
   @{ dir = (Join-Path $dataRoot 'config');  name = '设置（含密钥，别外发）';                  tip = '模型 API 地址与密钥。把数据发给别人排查问题前，先删掉这一格。'; files = $null }
-  @{ dir = (Join-Path $dataRoot 'profile'); name = '画像与知识图谱';                          tip = 'AI 对你的长期理解：阅读画像、价值观侧写、会意图谱。'; files = $null }
+  @{ dir = (Join-Path $dataRoot 'profile'); name = '画像与知识图谱';                          tip = 'AI 对你的长期理解：用户画像、相处规则、会意图谱。'; files = $null }
   @{ dir = (Join-Path $dataRoot 'sessions'); name = '聊天记录与讨论';                          tip = '聊天库、会话流水账、正在进行的讨论栈。'; files = $null }
   @{ dir = (Join-Path $dataRoot 'reading'); name = '书与标注';                                tip = '划线标注、书库缓存（读过的章节原文）。'; files = $null }
   @{ dir = (Join-Path $dataRoot 'runtime'); name = '运行状态（可删）';                        tip = '处理进度之类的临时状态。删掉只会让程序重新扫一遍，不丢记录。'; files = $null }
@@ -513,7 +536,7 @@ foreach ($ps1 in Get-ChildItem $StageDir -Recurse -File -Filter '*.ps1' -EA Sile
 # ── 7. 敏感数据闸门 ─────────────────────────────────────────────────
 Write-Host "`n--- 敏感数据检查 ---"
 $bad = @()
-foreach ($pat in @('*.db', '*.db-wal', '*.db-shm', '*.jsonl', 'topic_stack.json', 'hist_cursors.json', '*.bak', '*.out', 'profile.md', 'soul.md')) {
+foreach ($pat in @('*.db', '*.db-wal', '*.db-shm', '*.jsonl', 'topic_stack.json', 'hist_cursors.json', '*.bak', '*.out', 'profile.md', 'soul.md', 'portrait.md', 'values-portrait.md', 'agreement.md')) {
   Get-ChildItem $StageDir -Recurse -File -Force -Filter $pat -EA SilentlyContinue | ForEach-Object { $bad += $_.FullName }
 }
 Get-ChildItem $StageDir -Recurse -File -Force -Filter '*.env' -EA SilentlyContinue |
@@ -615,6 +638,7 @@ $need = @(
   'internal\update.ps1',
   'internal\instructions-zh.txt',
   'internal\agent\index.js',
+  'internal\agent\AGENT.md',
   'internal\agent\lib\paths.js',
   # 面向用户的维护脚本：说明书写着让用户跑迁移，缺一个用户就卡死在那一步。
   # 写进校验清单是为了让"脚本没进包"这种静默缺失在打包时就炸出来，而不是等用户撞上。
@@ -641,7 +665,31 @@ $need = @(
   # 图标（托盘用）
   'assets\icons\coread.ico',
   # 插件图标
-  'extension\icons\icon128.png'
+  'extension\icons\icon128.png',
+  # 内置教程书（2026-11）：阅读器打开它、接收端导出它的章节给 agent。
+  # 写进校验清单是为了让"教程没进包"这种静默缺失在打包时就炸出来——
+  # 少了它用户看到的不是报错，而是书单里没有那本书（最难查的那种缺）。
+  'extension\tutorial\book\book.json',
+  'extension\tutorial\book\c01\chapter.json',
+  'extension\tutorial\index.js',
+  'extension\tutorial\render.js',
+  # 课程表（2026-11）：书与侧栏共读的一份，一章 = 一课。
+  # 少了它书里就没有「开始本课」按钮、侧栏也没有课可上，而且是**静默**的（不报错）。
+  'extension\tutorial\lessons.js',
+  # 教程专用的会意图种子（2026-11）：只在 `?tutorial=1` 时被接收端读取，
+  # 绝不进用户的 knowledge-graph.json。少了它，教程里打开会意图是空的。
+  'extension\tutorial\graph-seed.json',
+  # 预设例句（2026-11）：静态数据，侧栏启动直接读。少了它，抽屉里那批「教程例句」
+  # 是空的（静默），用户在第 2 步就无路可走。
+  'extension\tutorial\sample-refs.json',
+  'extension\tutorial\tutorial.css',
+  # 自检页（2026-11）：Chrome 137 起自动化浏览器装不进未打包扩展，AI 助手没法自己验，
+  # 于是让扩展在用户真实环境里自己跑一遍、把报告写给助手读。**它必须进包**——
+  # 少了它，出问题时又回到"用户口述现象、助手猜"的老路（上一轮就是这么踩的）。
+  'extension\selfcheck.html',
+  'extension\selfcheck.js',
+  'extension\tutorial-guide.js',
+  'extension\tutorial-script.js'
 )
 $missing = 0
 foreach ($n in $need) {

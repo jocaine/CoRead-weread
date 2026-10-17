@@ -143,7 +143,19 @@ function Start-Child($name, $scriptRelPath) {
   $errLog = Join-Path $LogDir "$name.err.log"
   Write-Log $name "启动: $scriptRelPath"
   try {
-    $p = Start-Process -FilePath $Node -ArgumentList @($script) `
+    # ⚠️ 参数必须**自带引号**（2026-11 实测）。为什么：Windows 给程序传参数不是给一张清单，
+    # 而是给**一整行文字**，程序只能自己按**半角空格**切。而 -ArgumentList 的语义只是
+    # "我把数组用空格拼成一行交出去"，它不会替你加引号。于是路径里有半角空格时
+    # （D:\CoRead 1.0.1\...、C:\Users\Zhang San\... 这种），下面这行交给 node 的是
+    #     "...\node.exe" D:\CoRead 1.0.1\internal\agent\index.js
+    # node 按空格切完，把第一个词当成要运行的脚本 → 打开 D:\CoRead → 没有 → 打印
+    # "Error: Cannot find module 'D:\CoRead'" 后**立刻退出**（实测退出码 1）。
+    # 接收端与 agent 是同一行代码、同一个拼法，所以**两个一起死** → 托盘状态"已停止"，
+    # 而托盘自己的日志（tray.log / agent.log：有"启动:"、有 PID）看不出任何异常 ——
+    # 2026-11 用户报的"启动后托盘显示未运行"就是这个，真凶只在 logs\*.err.log 里。
+    # 加引号后 node 收到的是完整路径（同一台机器实测：err 文件为空、脚本正常运行）。
+    # 全项目只有这一处要改：另一处 -ArgumentList 传的是浏览器 URL，URL 里不会有空格。
+    $p = Start-Process -FilePath $Node -ArgumentList @("`"$script`"") `
       -WorkingDirectory $PackageRoot -WindowStyle Hidden -PassThru `
       -RedirectStandardOutput $outLog -RedirectStandardError $errLog
     Write-Log $name "PID $($p.Id)"
@@ -191,15 +203,155 @@ function Get-CoreadProcesses {
   }
 }
 
-# 某个孩子还活着吗？（2026-10-07）
+# ── agent 身份探测（2026-11）：直接问那把锁，而不是猜 ────────────────────
+# 为什么要有它：agent 用一个**全机唯一**的命名管道（\\.\pipe\CoReadAgent）做单实例锁，
+# 而"占线"这件事本身就是权威事实 —— 拨得通就一定有 agent 占着它。托盘以前只能靠
+# ① 自己启动时留下的进程手柄 ② 扫全机找"长得像的"进程，两者都有盲区：上一班托盘留下的
+# agent、另一份 CoRead 文件夹（或旧版本）的 agent，它都看不见 → 状态瞎报"未运行"，
+# 还每 30 秒白拉一个（新 agent 撞锁即退，只刷日志）。
+# 现在改成拨一次号，对方（agent/lib/agent-identity.js）回一行 JSON：
+#     {"role":"coread-agent","v":1,"pid":1234,"root":"D:\\CoRead"}
+# root 用来分辨"我们这一份"还是"另一份安装"。协议两边必须逐字对齐，有测试盯着：
+# agent/test/agent-pipe-protocol.test.js
+$script:agentPipeName = 'CoReadAgent'      # 不带 \\.\pipe\ 前缀（.NET 的 API 只要短名）
+$script:myRootKey = ''                     # 本包根（规范化后），下面立刻填
+$script:agentOtherRoot = ''                # 最近一次探测到"另一份"的包根，供菜单点名
+$script:agentProbe = @{ at = [datetime]::MinValue; state = '' }   # 2 秒缓存（见 Get-AgentState）
+
+function Get-NormalizedRoot([string]$p) {
+  # 与 agent 侧 normalizeRoot() 同一个规则：去掉结尾的分隔符
+  if (-not $p) { return '' }
+  return $p.TrimEnd('\', '/')
+}
+
+function Test-SamePath([string]$a, [string]$b) {
+  # Windows 路径大小写不敏感，结尾斜杠也要忽略
+  if (-not $a -or -not $b) { return $false }
+  return [string]::Equals((Get-NormalizedRoot $a), (Get-NormalizedRoot $b), [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-AgentPipeInfo {
+  # 拨一次号，把对方说的一行 JSON 读回来。
+  #   kind='none'   —— 这个名字不存在：这台机器上没有 agent（最干脆的一档）
+  #   kind='hello'  —— 拨通并读到一行合法 JSON（info 里是 role/v/pid/root）
+  #   kind='silent' —— 名字在，但对方一个字都不说：旧版本的 agent 就是这样（它对连接直接
+  #                    destroy()），也可能是别的程序占了这个名字
+  #   kind='error'  —— 拨号这件事本身出错，判不了（调用方回退到旧判据）
+  $result = @{ kind = 'error'; info = $null }
+  try {
+    if (-not (Test-Path ('\\.\pipe\' + $script:agentPipeName))) {
+      $result.kind = 'none'
+      return $result
+    }
+  } catch { return $result }
+  try {
+    $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', $script:agentPipeName, [System.IO.Pipes.PipeDirection]::InOut)
+    try {
+      $c.Connect(500)          # 正常是毫秒级；对方卡住时不把托盘的 UI 线程无限挂住
+      # 读也要有超时：对方接下连接却不写也不关时，不能一直等。
+      # ⚠️ 不能用 $c.ReadTimeout —— .NET Framework 的管道流设这个属性会抛
+      #    InvalidOperationException（实测：SetValueInvocationException），然后被下面的兜底
+      #    吞成 'silent'，症状是**永远认不出自己的 agent**。这条 bug 是测试当场抓到的
+      #    （agent/test/agent-pipe-protocol.test.js，见那次 3 红 3 绿）。改用
+      #    BeginRead + WaitOne：纯 .NET API，不需要在别的线程上跑 PowerShell 脚本块。
+      $buf = New-Object byte[] 1024
+      $sb = New-Object System.Text.StringBuilder
+      $deadline = (Get-Date).AddMilliseconds(500)
+      while ($true) {
+        $ar = $c.BeginRead($buf, 0, $buf.Length, $null, $null)
+        $left = [int][Math]::Max(1, ($deadline - (Get-Date)).TotalMilliseconds)
+        if (-not $ar.AsyncWaitHandle.WaitOne($left)) { break }   # 超时：读到多少算多少
+        $n = $c.EndRead($ar)
+        if ($n -le 0) { break }                                  # 对端关了
+        [void]$sb.Append([Text.Encoding]::UTF8.GetString($buf, 0, $n))
+        if ($sb.ToString().Contains("`n")) { break }              # 一行读完了
+      }
+      $line = $sb.ToString().Trim()
+      if (-not $line) {
+        $result.kind = 'silent'      # 连上了但一个字没说（旧版 agent 就是这样）
+      } else {
+        $obj = $line | ConvertFrom-Json
+        if ($obj -and $obj.role -eq 'coread-agent') { $result.kind = 'hello'; $result.info = $obj }
+        else { $result.kind = 'silent' }      # 能读到东西但不认这个协议 = 号被别的程序占了
+      }
+    } finally {
+      try { $c.Dispose() } catch {}
+    }
+  } catch {
+    # 名字既然存在（上面 Test-Path 过了），连不上/读超时就都归到 silent：
+    # 有东西占着号，只是问不出话。**绝不能**归成 none —— 那会让看门狗去拉一个
+    # 必然被锁挡回的进程。
+    $result.kind = 'silent'
+  }
+  return $result
+}
+
+function Get-AgentState {
+  # agent 现在是什么状况？
+  #   'mine'   —— 我们这一份的引擎在跑（手柄活着，或回话里的 root 就是本包根）
+  #   'other'  —— 另一份 CoRead 的引擎在跑（回话的 root 不是本包根，路径记在 $script:agentOtherRoot）
+  #   'silent' —— 号被占着，但对方不答话（多半是旧版本的 agent）
+  #   'none'   —— 号是空的：真没有 agent
+  # 顺序讲究：**先问手柄**（最快，健康时一次系统调用就够），手柄说"没了"才拨号 ——
+  # 所以正常情况下一个 tick 都不拨号，不会因为拨号超时把托盘菜单卡住。
+  $now = Get-Date
+  if ($script:agentProbe.state -and ($now - $script:agentProbe.at).TotalSeconds -lt 2) {
+    # 2 秒内复用：一个 tick 里会被问两次（状态显示 + 看门狗），没必要拨两回号
+    return $script:agentProbe.state
+  }
+  $state = 'none'
+  $p = $script:children['agent']
+  if ($p) {
+    try { if (-not $p.HasExited) { $state = 'mine' } } catch {}
+  }
+  if ($state -eq 'none') {
+    $probe = Get-AgentPipeInfo
+    switch ($probe.kind) {
+      'hello' {
+        if (Test-SamePath $probe.info.root $script:myRootKey) { $state = 'mine' }
+        else { $script:agentOtherRoot = [string]$probe.info.root; $state = 'other' }
+      }
+      'silent' { $state = 'silent' }
+      default {
+        # 号是空的 / 拨号判不了 → 用旧的整机扫描兜底（同一文件夹里的旧进程还能扫到）
+        if (@(Get-CoreadProcesses | Where-Object { $_.CommandLine -like '*agent*' }).Count -gt 0) { $state = 'mine' }
+      }
+    }
+  }
+  $script:agentProbe = @{ at = $now; state = $state }
+  return $state
+}
+
+function Test-AgentRunning {
+  # 看门狗用：现在**该不该**去拉一个 agent？只有"号是空的"才该拉 —— 号被占着时拉了也进不来
+  # （撞锁即退），只会白刷日志、还让状态继续说不清。
+  return ((Get-AgentState) -ne 'none')
+}
+
+# 本包根的规范形式：与 agent 回话里的 root 比对用。放在函数定义之后（脚本从上往下跑，
+# 这里已经能调用 Get-NormalizedRoot 了）。
+# 尽量取"文件系统认得的那种写法"（解析掉相对路径、..、盘符大小写）—— 对面 agent 报的是它
+# 自己 __dirname 推出来的绝对路径，两边写法不一致会被判成"另一份安装"，而那一档是要弹提示
+# 让用户去关另一份的，误报很扰民。三层兜底：Resolve-Path → GetFullPath → 原样。
+$script:myRootKey = ''
+if ($PackageRoot) {
+  try { $script:myRootKey = Get-NormalizedRoot (Resolve-Path -LiteralPath $PackageRoot -EA Stop).Path }
+  catch {
+    try { $script:myRootKey = Get-NormalizedRoot ([IO.Path]::GetFullPath($PackageRoot)) }
+    catch { $script:myRootKey = Get-NormalizedRoot $PackageRoot }
+  }
+}
+
+# 某个角色（agent / receiver）还活着吗？（2026-10-07 起，2026-11 改判据）
 # 优先问我们自己的句柄 —— 可靠、不需要任何权限、不受安全软件影响。
-# 只有拿不到句柄时（脚本缺失、启动失败等）才回退到扫 WMI，并**宁可不动作**：
-# 那条路看不见时会把活着的进程当成死的，而看门狗"以为死了"的后果是多拉一个 agent。
+# ⚠️ 但手柄说"已退出"**不等于**这个角色没人干：上一班托盘留下的进程、另一份安装的进程，
+#    都不在我们的抽屉里。所以 2026-11 去掉了这里原来那句"手柄说退了就 return $false"，
+#    让它落到下面扫一眼整机 —— 扫到就算活着（看门狗因此不会去拉一个必然被锁挡回的进程）。
+#    agent 那一半另有更权威的判据（管道拨号，见 Get-AgentState）。
 function Test-ChildAlive([string]$name) {
   $p = $script:children[$name]
   if ($p) {
     try { if (-not $p.HasExited) { return $true } } catch {}
-    return $false      # 句柄有效且已退出 = 确定死了，不必再问 WMI
   }
   return (@(Get-CoreadProcesses | Where-Object { $_.CommandLine -like "*$name*" }).Count -gt 0)
 }
@@ -262,7 +414,12 @@ function Stop-All {
 function Get-Status {
   if (Test-PortConflict) { return 'port-conflict' }
   $hasReceiver = Test-ChildAlive 'receiver'
-  $hasAgent = Test-ChildAlive 'agent'
+  $agentState = Get-AgentState
+  # "引擎被别人占着"优先于接收端那一半：那是用户唯一能采取行动的信息（去关掉那一份）。
+  # 接收端要是也掉了，看门狗会在同一个 tick 里把它补起来，不用在这儿抢着报。
+  if ($agentState -eq 'other') { return 'agent-other' }
+  if ($agentState -eq 'silent') { return 'agent-silent' }
+  $hasAgent = ($agentState -ne 'none')
   if ($hasReceiver -and $hasAgent) { return 'running' }
   if ($hasReceiver) { return 'receiver-only' }
   if ($hasAgent) { return 'partial' }
@@ -1201,6 +1358,8 @@ $notify.add_DoubleClick({ Open-Reader })
 # ── 状态刷新 + 崩溃自愈 ─────────────────────────────────────────────
 $script:lastRestart = @{}
 $script:quitting = $false
+# 首次状态刷新还没发生（气泡要等**看过事实**再说话，见 tick 末尾那段注释）
+$script:firstTick = $true
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 5000
 $timer.add_Tick({
@@ -1210,7 +1369,43 @@ $timer.add_Tick({
     'receiver-only' { $notify.Text = 'CoRead 部分运行（引擎未起）';  $itemStatus.Text = '状态：引擎未运行 ⚠️' }
     'partial'       { $notify.Text = 'CoRead 部分运行';             $itemStatus.Text = '状态：部分运行 ⚠️' }
     'port-conflict' { $notify.Text = 'CoRead：端口 7239 被占用';    $itemStatus.Text = '状态：端口被占用 ❌（另一个实例在跑？）' }
+    # 2026-11 新增两档：引擎被**别人**占着。以前这两种情况都显示"已停止"（因为托盘
+    # 只认自己启动的进程），用户看到的是"没运行"却又能用，谁也查不出为什么。
+    # 图标名有 63 字上限，所以路径只放在菜单那一行里（菜单项没有长度限制）。
+    'agent-other'   { $notify.Text = 'CoRead：引擎被另一份占用'
+                      $itemStatus.Text = '状态：引擎被另一份 CoRead 占用 ❌' +
+                        $(if ($script:agentOtherRoot) { "（$($script:agentOtherRoot)）" } else { '' }) }
+    'agent-silent'  { $notify.Text = 'CoRead：引擎占着但不答话'
+                      $itemStatus.Text = '状态：引擎被旧版本/其它程序占用 ⚠️（建议用那个文件夹里的 stop.bat 收工）' }
     default         { $notify.Text = 'CoRead 已停止';               $itemStatus.Text = '状态：已停止' }
+  }
+
+  # ── 首启气泡：等**第一次看完成事实**再说"已启动" ─────────────────────
+  # 2026-11 改。以前这里没有判断，托盘一起来就无条件弹"CoRead 已启动"；而那时两个子进程
+  # 可能早就死了（最常见：程序目录路径带半角空格 → 见 Start-Child 的注释）。于是用户看到的
+  # 是"已启动"→ 5 秒后"已停止"，**托盘自己把唯一的线索说反了**，用户能报出来的只剩
+  # "启动后显示未运行"，排查信息为零。现在改成：状态确实 running 才报已启动；
+  # 否则直接告诉用户去看哪两个文件。气泡正文有 250 字左右的上限，两句都要压着写。
+  if ($script:firstTick) {
+    $script:firstTick = $false
+    if ($st -eq 'running') {
+      $notify.BalloonTipTitle = 'CoRead 已启动'
+      $notify.BalloonTipText = '双击这个图标打开 CoRead 阅读器（推荐）。想读微信读书就右键图标选它。右键可退出。'
+      $notify.ShowBalloonTip(6000)
+      Write-Log 'tray' '首次状态检查：运行中'
+    } elseif ($st -eq 'agent-other' -or $st -eq 'agent-silent') {
+      # 引擎在跑，但不是我们这一份 —— 这条比"没能启动"更准确，也直接给了用户下一步。
+      $notify.BalloonTipTitle = 'CoRead 引擎被占用'
+      $notify.BalloonTipText = '引擎被另一份 CoRead（或旧版本）占着，这一份暂时收不到回复。右键图标 → 第一行能看到是哪一份。'
+      $notify.ShowBalloonTip(10000)
+      Write-Log 'tray' "首次状态检查：$st（占着的是 $($script:agentOtherRoot)）—— 已用气泡告知用户"
+    } elseif ($st -ne 'port-conflict') {
+      # 端口被占用那条路，启动时已经弹过模态框说明过了，不再重复打扰。
+      $notify.BalloonTipTitle = 'CoRead 没能启动'
+      $notify.BalloonTipText = '引擎没有起来。右键这个图标 →「查看日志（出错时看这里）」，把 agent.err.log 与 receiver.err.log 一起发给我。'
+      $notify.ShowBalloonTip(10000)
+      Write-Log 'tray' "首次状态检查：$st —— 已用气泡提示用户看日志"
+    }
   }
   # 崩溃自愈：不在退出流程里、且某一半掉了，就补起来（最多每 30 秒一次）
   # 端口被占用时不自愈——重启多少次都没用，只会在日志里刷屏
@@ -1220,8 +1415,11 @@ $timer.add_Tick({
   #      看门狗会把活着的 agent 当成死的，于是**多拉一个**，两个 agent 同时回话。
   #   ② 节流键合并：以前 'agent' 与 'all' 各算各的，所以 30 秒拦不住连着拉
   #      （实测 15:19:30 与 15:19:50 两次，间隔 20 秒）。
+  # 2026-11 改动：agent 那一半改问 **Test-AgentRunning**（= 管道拨号的结论）。手柄说"退了"
+  #   不再等于"没人干"——上一班/另一份安装的 agent 都算数。只有"号是空的"才去拉，
+  #   免得每 30 秒拉一个必然撞锁退出的进程、把 agent-instances.log 刷满。
   if (-not $script:quitting -and $st -ne 'port-conflict') {
-    if (-not (Test-ChildAlive 'receiver') -or -not (Test-ChildAlive 'agent')) {
+    if (-not (Test-ChildAlive 'receiver') -or -not (Test-AgentRunning)) {
       $now = Get-Date
       $last = $script:lastRestart['any']
       if (-not $last -or ($now - $last).TotalSeconds -gt 30) {
@@ -1230,8 +1428,8 @@ $timer.add_Tick({
           Start-Child 'receiver' $ReceiverScript | Out-Null
           Start-Sleep -Milliseconds 1200     # 让接收端先占好端口
         }
-        if (-not (Test-ChildAlive 'agent')) {
-          Write-Log 'tray' '检测到 agent 未运行，尝试重启'
+        if (-not (Test-AgentRunning)) {
+          Write-Log 'tray' '检测到管道是空的（没有 agent 在跑），尝试拉起'
           Start-Child 'agent' $AgentScript | Out-Null
         }
         $script:lastRestart['any'] = $now
@@ -1241,13 +1439,10 @@ $timer.add_Tick({
 })
 $timer.Start()
 
-# 首次启动时给个气泡提示。
-# 气泡是"该去哪儿读书"这句话唯一的落点（菜单要右键才看见），所以两个入口都点名，
-# 并把 CoRead 自己的阅读器放在前面 —— 用户没读说明书时，这里就是他看到的全部指引。
-# NotifyIcon 的气泡正文有长度上限（超过 ~250 字会被截断），这一句要压着写。
-$notify.BalloonTipTitle = 'CoRead 已启动'
-$notify.BalloonTipText = '双击这个图标打开 CoRead 阅读器（推荐）。想读微信读书就右键图标选它。右键可退出。'
-$notify.ShowBalloonTip(4000)
+# 首启气泡已经挪进状态轮询的**第一次**刷新里（2026-11 改，理由见 tick 里那段注释）。
+# 这里刻意不留无条件的气泡：启动那一刻就说"已启动"，等于在事实之前替用户下结论 ——
+# 那正是"启动后托盘显示未运行"这条报告里最误导人的一环。
+# 气泡仍是"该去哪儿读书"这句话唯一的落点（菜单要右键才看见），内容没丢，只是等到看清楚了再说。
 
 # ── 主循环 ──────────────────────────────────────────────────────────
 [System.Windows.Forms.Application]::Run()
