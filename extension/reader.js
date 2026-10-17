@@ -31,7 +31,7 @@ import { RECEIVER_URL } from './translate-protocol.js'   // 后台地址的真�
 import * as Tutorial from './tutorial/index.js'          // 内置教程书（2026-11）
 // 「读到哪儿」的算术（第几页 + 页内比例）：纯函数，单测在 extension/test/reader-position.test.mjs
 // ⚠️ 只取这两个：`clamp01` 本文件里已经有一个（:1920，别处也在用），不要再导一个同名的进来
-import { positionFromBoxes, deltaToPosition } from './reader-position.js'
+import { fracInBox, positionFromBoxes, deltaToPosition } from './reader-position.js'
 
 /**
  * 内置教程书的固定 ID（64 位十六进制）。
@@ -80,6 +80,8 @@ const SCROLL_REF_PAD = 8
  */
 const RESTORE_SETTLE_MS = 2500
 const RESTORE_MAX_TRIES = 12
+/** 纠偏隔多久补一次（120ms ≈ 一帧多，用户看不出"在纠"，又能赶上渲染造成的漂移） */
+const RESTORE_TICK_MS = 120
 /**
  * 这一次**页面加载**的随机指纹（2026-11）。
  *
@@ -916,48 +918,71 @@ async function openBytes(bytes, name, opts = {}) {
 
 // ── 阅读位置：读到哪儿（量参考线）、回到哪儿（落位 + 纠偏）────────────────────
 //
-// 位置的**唯一定义**是"第几页 + 页内比例 frac"，算术全在 reader-position.js（有单测），
+// 位置的**唯一定义**是"第几页/章 + 页内比例 frac"，算术全在 reader-position.js（有单测），
 // 这里只做两件事：把 DOM 的矩形喂进去、把算出来的滚动量落下来。
-// 参考线 = 滚动区顶端 + SCROLL_REF_PAD（那 8px 是给顶栏留的，见常量注释）。
+//
+// ⚠️ 两条不许分叉的规矩（agent/test/reader-position-wiring.test.js 盯着）：
+//   ① currentPage() **就是** currentPosition().page —— 保存用一个、显示用另一个，
+//      两把尺子迟早对不上（表现是"存的时候在第 5 页，打开却回到第 4 页"）。
+//   ② 参考线只能有一个来源 scrollRefLine()：存与恢复必须量同一条线，
+//      否则位置会差那 8px，而且没人看得出来。
+
+/** 参考线：滚动区顶端 + SCROLL_REF_PAD（"读到哪儿"的唯一基准） */
+function scrollRefLine() {
+  return els.scroll.getBoundingClientRect().top + SCROLL_REF_PAD
+}
 
 /** 每一页的盒子（按页序），喂给 reader-position.js 的纯函数 */
 function pageBoxes() {
   const c = els.scroll.getBoundingClientRect()
+  /**
+   * 教程书一次只渲染**一章**（tutorial/render.js 会 replaceChildren 再放一个 .tut-page），
+   * 所以它的"页"就是那一个元素，章号来自 Tutorial。不这么兜的话 state.pages 为空，
+   * 位置算术对教程书永远返回 {page:1, frac:0} —— 每次打开都回到第一章。
+   */
+  if (state.tutorialOpen) {
+    const el = els.pages.querySelector('.tut-page')
+    if (!el) return []
+    const r = el.getBoundingClientRect()
+    return [{ page: currentPage(), top: r.top - c.top, height: r.height }]
+  }
   return state.pages.map((p) => {
     const r = p.wrap.getBoundingClientRect()
     return { page: p.num, top: r.top - c.top, height: r.height }
   })
 }
 
-/** 参考线的视口纵坐标（"读到哪儿"的唯一基准） */
-function refLineY() {
-  return els.scroll.getBoundingClientRect().top + SCROLL_REF_PAD
-}
-
-/** 当前在第几页（教程书用它的章号，见 syncTocPosition） */
+/** 当前在第几页 / 第几章 */
 function currentPage() {
-  if (state.tutorialOpen) return state.tutorialPage || 1
+  if (state.tutorialOpen) {
+    // 教程书的"第几章"只有 Tutorial 知道：state.pages 在教程书下是空的，
+    // 拿它量**永远是第 1 章**（教程书每次打开都回到第一章，就是这么来的）
+    const i = Tutorial.currentIndex()
+    return i >= 0 ? i + 1 : 1
+  }
   return currentPosition().page
 }
 
 /** 当前位置：{page, frac}（frac 0=页顶 1=页底） */
 function currentPosition() {
   if (state.tutorialOpen) {
-    // 教程书一章就是一个滚动单位，章内位置同样用比例记
+    const i = Tutorial.currentIndex()
+    const ch = i >= 0 ? i + 1 : 1
     const boxes = pageBoxes()
-    const b = boxes[state.tutorialPage - 1] || boxes[0]
-    if (!b) return { page: state.tutorialPage || 1, frac: 0 }
-    return { page: state.tutorialPage || 1, frac: fracOf(b) }
+    const b = boxes[ch - 1] || boxes[0]
+    // 一章就是一个滚动单位，章内位置同样按比例记
+    return { page: ch, frac: b ? fracInBox(scrollRefLine(), b.top, b.height) : 0 }
   }
-  return positionFromBoxes(refLineY(), pageBoxes())
+  return positionFromBoxes(scrollRefLine(), pageBoxes())
 }
 
-/** 参考线落在某个盒子里的比例（单独抽出来，教程书那条路要用） */
-function fracOf(b) {
-  const h = Number(b.height) || 0
-  if (!h) return 0
-  const x = (refLineY() - b.top) / h
-  return x < 0 ? 0 : x > 1 ? 1 : x
+/** 状态栏的"第几页 / 第几章"（滚动时要跟着走；教程书的章号来自 Tutorial） */
+function updatePageInfo() {
+  if (!els.pageinfo || !hasBook()) return
+  const text = state.tutorialOpen
+    ? '第 ' + currentPage() + ' / ' + bookTotal() + ' 章'
+    : '第 ' + currentPage() + ' / ' + bookTotal() + ' 页'
+  if (els.pageinfo.textContent !== text) els.pageinfo.textContent = text
 }
 
 /**
@@ -973,7 +998,41 @@ function gotoPage(num, smooth = true) {
   const delta = p.wrap.getBoundingClientRect().top - c.top - SCROLL_REF_PAD
   cancelRestore('用户主动跳页')
   els.scroll.scrollBy({ top: delta, behavior: smooth ? 'smooth' : 'auto' })
+  updatePageInfo()
   syncTocPosition()
+}
+
+/**
+ * 把"读到 pos"落到滚动条上。
+ *
+ * 返回四种结果，**必须分开**（混成一个会把纠偏搞坏）：
+ *   'moved'    动了
+ *   'in-place' 已经正好在位 —— 这不是失败：漂移是**之后**才发生的（上面的页渲染完），
+ *              所以纠偏不能因为它就收手
+ *   'blocked'  想动却动不了（到顶/到底/被别的东西卡住）—— 这才是"落不动"
+ *   'no-box'   这一页的盒子还不存在（还没建出来）
+ */
+function applyPosition(target) {
+  const pos = target || (state.restore && state.restore.pos)
+  if (!pos || !pos.page) return 'no-box'
+  let el = null
+  if (state.tutorialOpen) {
+    // 教程书只渲染了"当前那一章"：要落的章不是它，就没有盒子（调用方负责先翻章）
+    if (Number(pos.page) !== currentPage()) return 'no-box'
+    el = els.pages.querySelector('.tut-page')
+    if (!el) return 'no-box'
+  } else {
+    const p = state.pages[pos.page - 1]
+    if (!p) return 'no-box'
+    el = p.wrap
+  }
+  const c = els.scroll.getBoundingClientRect()
+  const r = el.getBoundingClientRect()
+  const delta = deltaToPosition(SCROLL_REF_PAD, r.top - c.top, r.height, pos.frac)
+  if (Math.abs(delta) < 1) return 'in-place'
+  const before = els.scroll.scrollTop
+  els.scroll.scrollBy({ top: delta, behavior: 'auto' })
+  return Math.abs(els.scroll.scrollTop - before) < 1 ? 'blocked' : 'moved'
 }
 
 /**
@@ -981,44 +1040,60 @@ function gotoPage(num, smooth = true) {
  *
  * 为什么要纠偏：打开书的那一刻，后面几页的高度还是按第 1 页估的**占位值**，
  * 等它们各自渲染完，页序上方的几何就变了 —— 落好的位置会漂。所以落位之后
- * 在 RESTORE_SETTLE_MS 内被"叫醒"几次（渲染完成会调 restoreOnLayoutChange），
- * 每次按新几何补落一次，稳定了就不再动。
+ * 在 RESTORE_SETTLE_MS 内反复补落，稳定了就不再动。
  *
  * ⚠️ 用户一动手就停（见下面那几处 cancelRestore）：纠偏的意义是"把布局漂移抵掉"，
  * 用户自己滚走之后再把他拽回来，表现就是"滚不动 / 自己往回跳"。
  */
 function restorePosition(target, why) {
   if (!target || !target.page) { state.restore = null; return }
-  const until = Date.now() + RESTORE_SETTLE_MS
-  state.restore = { pos: { page: target.page, frac: Number(target.frac) || 0 }, tries: 0, until, stuck: false }
-  postDebug({ stage: 'restore-start', why: why || '', page: state.restore.pos.page, frac: Number(state.restore.pos.frac.toFixed(3)) })
-  applyRestore()
+  const pos = { page: Number(target.page) || 1, frac: clamp01(target.frac) }
+  state.restore = { pos, tries: 0, until: Date.now() + RESTORE_SETTLE_MS, stuck: 0, timer: null }
+  postDebug({ stage: 'restore-start', why: why || '', page: pos.page, frac: Number(pos.frac.toFixed(3)) })
+  // 立刻落一次：只排队等定时器的话，用户会先看到第 1 页再被"拽"过去
+  applyPosition(target)
+  scheduleRestoreTick()
 }
 
-/** 按当前几何把"该滚到哪"落下去（restorePosition 与 restoreOnLayoutChange 共用） */
-function applyRestore() {
+/** 排下一次纠偏 */
+function scheduleRestoreTick() {
   const r = state.restore
   if (!r) return
-  if (Date.now() > r.until || r.tries >= RESTORE_MAX_TRIES) { finishRestore('settled'); return }
-  const p = state.pages[r.pos.page - 1]
-  if (!p) { finishRestore('no-page'); return }
-  const c = els.scroll.getBoundingClientRect()
-  const top = p.wrap.getBoundingClientRect().top - c.top
-  const delta = deltaToPosition(SCROLL_REF_PAD, top, p.wrap.getBoundingClientRect().height, r.pos.frac)
+  clearTimeout(r.timer)
+  r.timer = setTimeout(restoreTick, RESTORE_TICK_MS)
+}
+
+/**
+ * 纠偏一拍：按**当前**几何再落一次，并决定要不要继续。
+ *
+ * 刹车有两道：连续两次"落不动"就收手（到底/到顶时再补一万次也不会动，
+ * 只会跟用户抢滚动条）；以及最多补 RESTORE_MAX_TRIES 次。
+ */
+function restoreTick() {
+  const r = state.restore
+  if (!r) return
+  r.timer = null
   r.tries++
-  els.scroll.scrollBy({ top: delta, behavior: 'auto' })
+  const res = applyPosition(r.pos)
+  if (res === 'blocked' || res === 'no-box') r.stuck++
+  else r.stuck = 0
+  if (r.stuck >= 2) return finishRestore('stuck')
+  if (r.tries >= RESTORE_MAX_TRIES) return finishRestore('tries')
+  if (Date.now() > r.until) return finishRestore('settled')
+  scheduleRestoreTick()
 }
 
 /** 布局变了（某页刚渲染完、缩放变了）→ 正在恢复的话按新几何补落一次 */
 function restoreOnLayoutChange() {
   if (!state.restore) return
-  applyRestore()
+  applyPosition(state.restore.pos)
 }
 
 /** 结束这次恢复（自己停下、或用户接管） */
 function finishRestore(reason) {
   if (!state.restore) return
   const r = state.restore
+  clearTimeout(r.timer)
   state.restore = null
   postDebug({
     stage: 'restore-' + reason, tries: r.tries,
@@ -1035,14 +1110,23 @@ function cancelRestore(why) {
 }
 
 /**
- * 滚动时做的事：目录里的当前位置标记跟着走；正在恢复的话顺便把"还没落定"记下来。
+ * 滚动时做的事：把"当前在第几章/页"跟真实滚动位置对齐。
  *
- * ⚠️ 不在滚动里直接写 storage：滚动一秒能触发几十次，而写 storage 是每本书一整条
- * 记录（几百 KB 量级），越写越卡。落定之后由 finishRestore / scheduleSave 存一次。
+ * 教程书那条分支**必须**问 Tutorial：它的当前章只在 Tutorial.openChapter() 里更新，
+ * 而状态栏/目录/保存都读 state.tutorialPage。不对齐的表现是"滚过去了，状态栏还写着第 1 章"。
+ *
+ * ⚠️ 不在滚动里直接写 storage：滚动一秒能触发几十次，而写 storage 是每本书一整条记录。
+ * 落定之后由 finishRestore / scheduleSave 存一次。
  */
 function onScroll() {
+  if (state.tutorialOpen) {
+    const i = Tutorial.currentIndex()
+    const ch = i >= 0 ? i + 1 : 1
+    if (ch !== state.tutorialPage) state.tutorialPage = ch
+  }
+  updatePageInfo()
   syncTocPosition()
-  if (state.restore) applyRestore()
+  if (state.restore) applyPosition(state.restore.pos)
 }
 
 async function loadDocument(bytes, name) {
@@ -1192,6 +1276,28 @@ async function setSelectionAsRef(text) {
     bookId: readerBookId(TUTORIAL_HEX),
     bookTitle: state.name || '',
   })
+}
+
+/**
+ * 把当前选中的正文设为侧栏的当前引用（教程书的划词、自检的 submitSelection 都走它）。
+ * 与 PDF 那条路的区别：PDF 走 setTranslationRef 时还带原文锚点与上下文，
+ * 教程书没有锚点，只把文字交上去。
+ */
+async function submitSelectionAsRef(hit) {
+  const text = String((hit && hit.text) || '').trim()
+  if (!text) {
+    toast('请先划选一段正文', true)
+    return { ok: false, error: { message: '没有选中文字' } }
+  }
+  const res = await setSelectionAsRef(text)
+  if (res && res.ok) {
+    toast('已设为引用')
+    hideTip()
+    clearSelection()
+  } else {
+    toast('设为引用失败：' + ((res && res.error && res.error.message) || '原因未知'), true)
+  }
+  return res || { ok: false }
 }
 
 function closeDoc() {
@@ -1746,6 +1852,18 @@ function selectionAnchors() {
   const sel = window.getSelection()
   if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null
   const range = sel.getRangeAt(0)
+  /**
+   * 教程书：正文是 HTML，**没有 PDF 文字层** —— 下面那套"落没落在 layer 里"的判断
+   * 对它永远不成立，于是浮标不出现、划词设为引用这一步根本走不到。
+   * 所以这一支单独处理：只要选区在书页容器里就算数，锚点为空（教程书用不上页内偏移，
+   * 引用直接拿选中的字符串，见 textOfSelection）。
+   */
+  if (state.tutorialOpen) {
+    if (!els.pages.contains(range.commonAncestorContainer)) return null
+    const text = String(sel.toString() || '').trim()
+    if (!text) return null
+    return { anchors: [], text, range }
+  }
   // 只认落在文字层里的选区：页面上其它地方（对照栏）的选区不该触发翻译
   const startLayer = state.pages.find((p) => p.layer && p.layer.contains(range.startContainer))
   if (!startLayer) return null
@@ -1819,6 +1937,19 @@ async function sourceText(anchors) {
     if (t) parts.push(t)
   }
   return parts.join('\n') || raw
+}
+
+/**
+ * 这次选区对应的原文。
+ *
+ * 教程书没有文字层（anchors 为空），直接用选中的字符串；PDF 走 sourceText ——
+ * 它会顺带把"词间空格被 pdf.js 吞了"的那类 PDF 补回空格。两条路的差别就在这里，
+ * 所以统一从这一个入口取，别在调用点各判一次。
+ */
+async function textOfSelection(hit) {
+  if (!hit) return ''
+  if (hit.text) return String(hit.text)
+  return await sourceText(hit.anchors || [])
 }
 
 // ── 划线附近的原文（随引用交给共读侧）─────────────────────────────────────────
@@ -1957,6 +2088,10 @@ function onSelectionSettled() {
 function showTipAt(range) {
   const rect = range.getBoundingClientRect()
   if (!rect || (!rect.width && !rect.height)) { hideTip(); return }
+  // 教程书里这一步是"把这段交给共读"（不是翻译）：按钮上就得这么写，
+  // 否则用户在教程里看到的提示与实际动作对不上
+  els.tipTranslate.textContent = state.tutorialOpen ? '共读' : '翻译'
+  els.tipTranslate.title = state.tutorialOpen ? '把选中的这段设为当前引用' : '翻译选中的这段'
   els.tip.hidden = false
   const w = els.tip.offsetWidth || 120
   const h = els.tip.offsetHeight || 32
@@ -1993,7 +2128,10 @@ async function translateSelection() {
   const dup = findDuplicate({ kind: 'text', anchors: hit.anchors })
   if (dup && reuseDuplicate(dup)) { hideTip(); return }
 
-  const source = await sourceText(hit.anchors)
+  // 教程书没有外语正文可翻：这一步的动作是**把这段设为引用**（共读的第一步）
+  if (state.tutorialOpen || !(hit.anchors || []).length) return await submitSelectionAsRef(hit)
+
+  const source = await textOfSelection(hit)
   if (!source.trim()) { toast('未获取到可翻译的文字', true); return }
   hideTip()
   requestNotesOpen()
@@ -2851,11 +2989,216 @@ function readerBookInfo() {
   }
 }
 
+/**
+ * 自检页（extension/selfcheck.js）能对阅读器执行的**预定义操作**。
+ *
+ * 为什么是一张表而不是"执行一段代码"：自检页是**扩展页面**，但让页面能给阅读器下任意
+ * 指令等于开了一个后门。这里只允许表里这些操作，参数与返回值都固定。
+ *
+ * 协议：selfcheck.js 发 {action:'selfcheckEval', op, arg}，这里回
+ *   {ok:true, value} 或 {ok:false, error}
+ * —— 回执**必须**有 ok 字段：自检那边把"空对象"当成"消息通道提前关了"（踩过）。
+ */
+const SELFCHECK_OPS = {
+  /** 活着吗（自检第一句就问它：模块没报错才有后面那些） */
+  alive: async () => 'object',
+
+  /** 教程书开着没、在第几章 */
+  tutorialSnapshot: async () => ({
+    open: !!state.tutorialOpen,
+    chapters: state.tutorialOpen ? Tutorial.chapterCount() : 0,
+    index: state.tutorialOpen ? Tutorial.currentIndex() : -1,
+    page: state.tutorialPage,
+  }),
+
+  bookName: async () => state.name || '',
+  bookId: async () => currentBookId(),
+  hasBook: async () => hasBook(),
+
+  /** 状态栏那行字（"第 x / y 章"就在这里） */
+  pageInfo: async () => String(els.pageinfo.textContent || ''),
+
+  /** 打开目录并数一下条目 */
+  tocOpen: async () => {
+    if (els.toc.hidden) toggleToc()
+    return { open: !els.toc.hidden, items: els.tocList ? els.tocList.children.length : 0 }
+  },
+
+  /** 跳到第 index 条（0 起）——教程书走"真开章"，PDF 走滚动 */
+  tocJump: async (index) => {
+    const i = Math.max(0, Number(index) || 0)
+    if (state.tutorialOpen) await gotoChapter(i + 1)
+    else gotoPage(i + 1, false)
+    return {
+      jumped: true,
+      index: state.tutorialOpen ? Tutorial.currentIndex() : i,
+      info: String(els.pageinfo.textContent || ''),
+    }
+  },
+
+  /** 当前这一章的「开始本课」卡片（有没有、第几章、标题） */
+  lessonCard: async () => {
+    const box = els.pages.querySelector('.tut-lesson')
+    if (!box) return { exists: false, chapter: 0, title: '' }
+    const title = box.querySelector('.tut-lesson-title')
+    return {
+      exists: true,
+      chapter: Number(box.dataset.lesson) || 0,
+      title: String((title && title.textContent) || ''),
+    }
+  },
+
+  /**
+   * 点一下「开始本课」，再**把状态读回来**。
+   * 只回报"我调过了"是不够的：这一环断了不报错，只是点了没反应。
+   */
+  startLesson: async () => {
+    const btn = els.pages.querySelector('.tut-lesson-btn')
+    if (!btn) return { wrote: false, reason: '这一章没有课' }
+    btn.click()
+    let run = null
+    for (let i = 0; i < 20; i++) {
+      run = await readTutorialRun()
+      if (run && run.active) break
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    return { wrote: !!(run && run.active), run }
+  },
+
+  /** 快捷键绑上了什么（写错的表现是静默失效，所以要把真相读出来） */
+  commands: async () => {
+    try { return await chrome.commands.getAll() } catch (e) { return [] }
+  },
+
+  /** 侧栏此刻开着几个上下文（决定"要不要调 open()"、广播有没有听众） */
+  sidePanelContexts: async () => {
+    try {
+      const api = chrome.sidePanel
+      if (!api || typeof api.getContexts !== 'function') return { supported: false }
+      const list = await api.getContexts({})
+      return { supported: true, count: Array.isArray(list) ? list.length : 0 }
+    } catch (e) {
+      return { supported: false, error: String((e && e.message) || e) }
+    }
+  },
+
+  /** 「跳到原文」那条路（按原文在正文里找，不重载） */
+  locateProbe: async (text) => {
+    const r = locateText(String(text || ''))
+    return { found: !!(r && r.found), page: (r && r.page) || 0 }
+  },
+
+  /**
+   * 当场量的位置 + 记录里存的位置。
+   * 两个都要给：只给一个的话，分不清"存错了"还是"恢复错了"——而用户看到的现象一模一样。
+   */
+  position: async () => {
+    const pos = currentPosition()
+    const rec = await readOwnRecord()
+    return {
+      session: PAGE_SESSION,          // 这一次加载的指纹：重载后必须换一个（防旧页面回音）
+      page: pos.page,
+      frac: Number(Number(pos.frac).toFixed(4)),
+      restoring: !!state.restore,
+      tutorial: !!state.tutorialOpen,
+      storedPage: rec ? Number(rec.page) || 0 : 0,
+      storedFrac: rec ? Number(rec.frac) || 0 : 0,
+    }
+  },
+
+  /** 把位置摆到"第 page 章/页的 frac 处"，persist 时顺手落盘 */
+  setPosition: async (arg) => {
+    const page = Math.max(1, Number((arg && arg.page) || 1))
+    const frac = clamp01((arg && arg.frac) || 0)
+    if (state.tutorialOpen) await gotoChapter(page)
+    else gotoPage(page, false)
+    // 跳章会把滚动条归零，所以页内比例必须在**跳完之后**再落一次
+    applyPosition({ page, frac })
+    updatePageInfo()
+    syncTocPosition()
+    const pos = currentPosition()
+    if (arg && arg.persist) await saveRecord()
+    const rec = await readOwnRecord()
+    return {
+      page: pos.page,
+      frac: Number(Number(pos.frac).toFixed(4)),
+      storedPage: rec ? Number(rec.page) || 0 : 0,
+      storedFrac: rec ? Number(rec.frac) || 0 : 0,
+    }
+  },
+
+  /** 在教程正文上划出一段（自检要验"划词 → 浮标 → 共读"这条真实链路） */
+  selectParagraph: async () => {
+    if (!state.tutorialOpen) return { ok: false, reason: '没有打开教程书' }
+    const paras = [...els.pages.querySelectorAll('p, li')]
+      .filter((el) => String(el.textContent || '').trim().length > 12)
+    const p = paras[0]
+    if (!p) return { ok: false, reason: '这一章没有可划的正文' }
+    const walk = document.createTreeWalker(p, NodeFilter.SHOW_TEXT)
+    const node = walk.nextNode()
+    if (!node) return { ok: false, reason: '段落里没有文字节点' }
+    const len = Math.min(24, (node.nodeValue || '').length)
+    const range = document.createRange()
+    range.setStart(node, 0)
+    range.setEnd(node, len)
+    const sel = window.getSelection()
+    sel.removeAllRanges()
+    sel.addRange(range)
+    onSelectionSettled()
+    return {
+      ok: true,
+      chars: String(sel.toString() || '').length,
+      tipVisible: !els.tip.hidden,
+      tipLabel: String(els.tipTranslate.textContent || ''),
+      text: String(sel.toString() || '').slice(0, 40),
+    }
+  },
+
+  /** 点一下浮标（教程书里那一下就是"设为引用"） */
+  submitSelection: async () => {
+    const res = await translateSelection()
+    return { ok: !!(res && res.ok !== false), raw: res || null }
+  },
+}
+
+/** 跑一个自检操作（找不到就如实说，不假装成功） */
+async function runSelfcheckOp(op, arg) {
+  const fn = SELFCHECK_OPS[op]
+  if (!fn) return { ok: false, error: '未知的自检操作：' + String(op) }
+  try {
+    return { ok: true, value: await fn(arg) }
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) }
+  }
+}
+
+/** 读侧栏引导的状态（「开始本课」写的就是它，见 startTutorialLesson） */
+async function readTutorialRun() {
+  try {
+    const got = await chrome.storage.local.get('tutorialRun')
+    return (got && got.tutorialRun) || null
+  } catch (e) {
+    return null
+  }
+}
+
+/** 读**当前这本**书的进度记录（没有书 / 没存过 → null） */
+async function readOwnRecord() {
+  if (state.tutorialOpen) return await loadRecord(Tutorial.TUTORIAL_STORE_KEY)
+  if (!state.hash) return null
+  return await loadRecord(state.hash)
+}
+
 /** 后台/侧栏发来的消息（动作名与 translate-background.js 里发给页面的一致） */
 if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.action) return
   if (msg.action === 'readerBookInfo') { sendResponse(readerBookInfo()); return }
+  // 自检页（extension/selfcheck.js）专用的预定义操作通道，见 SELFCHECK_OPS
+  if (msg.action === 'selfcheckEval') {
+    runSelfcheckOp(msg.op, msg.arg).then(sendResponse, (e) => sendResponse({ ok: false, error: String((e && e.message) || e) }))
+    return true
+  }
   if (msg.action === 'readerCommand') {
     // ⚠️ 必须带 catch：onReaderCommand 里一旦抛错（不是 return ok:false），
     // Promise 会静默 reject，sendResponse 永不执行 —— 后台的 await 只能超时，
