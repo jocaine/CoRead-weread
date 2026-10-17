@@ -52,10 +52,39 @@
   font: inherit; font-size: 12px; padding: 2px 8px; border-radius: 6px; cursor: pointer; }
 .rn-acts button:hover { background: #f2f4f7; }
 .rn-acts button.rn-ref { border-color: #a8dcc0; color: #07883f; background: #f2fbf6; }
-.rn-edit { margin-top: 8px; }
-.rn-edit textarea { width: 100%; min-height: 72px; font: inherit; line-height: 1.5;
-  border: 1px solid var(--line, #dfe3e8); border-radius: 6px; padding: 6px 8px; resize: vertical; }
-.rn-edit-acts { display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; }
+/* 改原文（2026-11 重做）：编辑器**就地**替换原文预览那一块。
+   旧版是往卡片底部再追加一个文本框，于是同一段文字出现两次、卡片还会往上长。
+   层次按视觉规格来：主操作实心、取消描边、键盘提示最弱（11px 灰）。 */
+.rn-item.is-editing { border-color: #bfe3cc; background: #fbfefc; }
+/* 编辑态里，操作行下面紧跟的是**当前译文**（还没被替换掉的那一版）：
+   加一道很轻的分隔线，让人看出"上面是在改的原文、下面是将被替换的译文"。 */
+.rn-item.is-editing .rn-dst { margin-top: 8px; padding-top: 8px; border-top: 1px solid #eef1f4; }
+.rn-edit { border-left: 2px solid #a8dcc0; padding-left: 8px; }
+.rn-edit-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.rn-edit-label { font-size: 12px; font-weight: 600; color: #0a7d43; }
+.rn-edit-hint { font-size: 11px; color: #888; }
+.rn-edit textarea {
+  display: block; width: 100%; box-sizing: border-box;
+  min-height: 64px; max-height: 40vh;
+  font: inherit; font-size: 13px; line-height: 1.7; color: #222;
+  border: 1px solid #d0d0d0; border-radius: 8px; padding: 6px 8px;
+  background: #fff; resize: vertical;
+}
+.rn-edit textarea:focus { outline: none; border-color: #0a7d43; box-shadow: 0 0 0 3px rgba(10, 125, 67, .18); }
+.rn-edit-acts { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.rn-edit-keys { margin-right: auto; font-size: 11px; color: #aaa; }
+.rn-edit-acts button {
+  font: inherit; font-size: 12px; line-height: 1.2; padding: 4px 12px;
+  border-radius: 8px; cursor: pointer; border: 1px solid transparent;
+  background: transparent; color: #555;
+  transition: background 120ms cubic-bezier(.4, 0, .2, 1), border-color 120ms, color 120ms;
+}
+.rn-edit-acts button.rn-primary { background: #07c160; border-color: #07c160; color: #fff; font-weight: 600; }
+.rn-edit-acts button.rn-primary:hover { background: #06ad56; border-color: #06ad56; }
+.rn-edit-acts button.rn-ghost { border-color: #e5e5e5; background: #fff; }
+.rn-edit-acts button.rn-ghost:hover { background: #f2f4f7; }
+.rn-edit-acts button[disabled] { opacity: .55; cursor: default; }
+@media (prefers-reduced-motion: reduce) { .rn-edit-acts button { transition: none; } }
 .rn-empty { padding: 16px; color: var(--muted, #6b7280); line-height: 1.8; }
 .rn-empty kbd { border: 1px solid var(--line, #dfe3e8); border-bottom-width: 2px; border-radius: 4px;
   padding: 0 4px; background: #fafbfc; font-family: inherit; }
@@ -609,6 +638,85 @@
       toast(ok ? '已复制这一句' : '复制失败', !ok)
     })
 
+    /**
+     * 「改原文」编辑器（2026-11 重做，见文件里那段说明）。
+     * 返回的元素会被放在**原文预览原来的位置**，所以卡片不会因为进入编辑态而跳动。
+     */
+    function buildEditor(e) {
+      const box = el('div', 'rn-edit')
+      const head = el('div', 'rn-edit-head')
+      head.append(
+        el('span', 'rn-edit-label', '改原文'),
+        el('span', 'rn-edit-hint', '改完会按新的原文重译这一段'),
+      )
+
+      const ta = document.createElement('textarea')
+      ta.value = e.source || ''
+      ta.spellcheck = false
+      ta.rows = 3
+      ta.setAttribute('aria-label', '原文')
+      // 随内容长高：先归零再按 scrollHeight 设 —— 不归零的话删字之后框不会缩回去
+      const grow = () => {
+        ta.style.height = 'auto'
+        ta.style.height = Math.min(ta.scrollHeight, Math.round(window.innerHeight * 0.4)) + 'px'
+      }
+      ta.addEventListener('input', grow)
+
+      const acts = el('div', 'rn-edit-acts')
+      const keys = el('span', 'rn-edit-keys', 'Ctrl/⌘+Enter 重译 · Esc 取消')
+      const cancelBtn = el('button', 'rn-ghost', '取消')
+      cancelBtn.type = 'button'
+      const okBtn = el('button', 'rn-primary', '重译')
+      okBtn.type = 'button'
+
+      const cancel = () => { editingId = ''; render() }
+      /**
+       * 提交：等后台的**真实回执**再决定关不关编辑器。
+       * 不能像旧版那样"发出去就关" —— 重译失败时用户刚改的那段就白费了，
+       * 而失败原因只在校角弹一下（很容易没看见）。
+       */
+      const submit = async () => {
+        const text = ta.value.trim()
+        if (!text) { toast('原文不能为空', true); ta.focus(); return }
+        // 一个字都没改就别白跑一趟（那会白白重翻一次、还多花一次模型调用）
+        if (text === String(e.source || '').trim()) { cancel(); return }
+        okBtn.textContent = '重译中…'
+        okBtn.disabled = true
+        cancelBtn.disabled = true
+        let res = null
+        try { res = await send({ action: 'readerCommand', type: 'retranslate', id: e.id, text }) } catch (err) {
+          res = { ok: false, error: { message: String((err && err.message) || err) } }
+        }
+        if (res && res.ok === false) {
+          // 失败：把编辑器留着、按钮恢复，用户可以直接改完重试
+          toast('重译失败：' + ((res.error && res.error.message) || '原因未知'), true)
+          okBtn.textContent = '重译'
+          okBtn.disabled = false
+          cancelBtn.disabled = false
+          ta.focus()
+          return
+        }
+        editingId = ''
+        render()
+      }
+      cancelBtn.addEventListener('click', cancel)
+      okBtn.addEventListener('click', submit)
+      ta.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Escape') { ev.stopPropagation(); cancel() }
+        else if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); submit() }
+      })
+
+      acts.append(keys, cancelBtn, okBtn)
+      box.append(head, ta, acts)
+      // 聚焦并把光标放到**末尾**：用户多半是想补/改最后几个字，全选会让人一敲就全删了
+      setTimeout(() => {
+        ta.focus()
+        try { ta.setSelectionRange(ta.value.length, ta.value.length) } catch (err) {}
+        grow()
+      }, 0)
+      return box
+    }
+
     function render() {
       const entries = snapshot.entries || []
       count.textContent = entries.length + ' 条'
@@ -623,43 +731,26 @@
         item.dataset.id = e.id
         item.__entry = e      // 下划线按它判断"这条是文字还是图片、原文是什么"
 
-        const src = el('div', 'rn-src', e.source || (e.kind === 'image' ? '（图片区域）' : ''))
-        src.title = '点击跳到原文'
-        src.addEventListener('click', () => {
-          src.classList.toggle('is-open')
-          send({ action: 'readerCommand', type: 'reveal', id: e.id })
-        })
+        const editing = editingId === e.id
+        if (editing) item.classList.add('is-editing')
 
         const dst = el('div', 'rn-dst')
         if (e.pending) dst.append(el('span', 'rn-pending', '翻译中…'))
         else if (e.error) dst.append(el('span', 'rn-err', '失败：' + e.error))
         else dst.textContent = e.translation || ''
 
-        item.append(src, dst)
-
-        if (editingId === e.id) {
-          const box = el('div', 'rn-edit')
-          const ta = document.createElement('textarea')
-          ta.value = e.source || ''
-          ta.spellcheck = false
-          const acts = el('div', 'rn-edit-acts')
-          const okBtn = el('button', null, '重译')
-          okBtn.type = 'button'
-          okBtn.addEventListener('click', () => {
-            const text = ta.value.trim()
-            if (!text) return
-            send({ action: 'readerCommand', type: 'retranslate', id: e.id, text })
-            editingId = ''
-            render()
-          })
-          const cancelBtn = el('button', null, '取消')
-          cancelBtn.type = 'button'
-          cancelBtn.addEventListener('click', () => { editingId = ''; render() })
-          acts.append(cancelBtn, okBtn)
-          box.append(ta, acts)
-          item.append(box)
-          setTimeout(() => ta.focus(), 0)
+        if (editing) {
+          // 编辑器**就地**替换原文预览：卡片不跳，同一段文字也只出现一次
+          item.append(buildEditor(e), dst)
         } else {
+          const src = el('div', 'rn-src', e.source || (e.kind === 'image' ? '（图片区域）' : ''))
+          src.title = '点击跳到原文'
+          src.addEventListener('click', () => {
+            src.classList.toggle('is-open')
+            send({ action: 'readerCommand', type: 'reveal', id: e.id })
+          })
+          item.append(src, dst)
+
           const acts = el('div', 'rn-acts')
           const mk = (label, fn, cls) => {
             const b = el('button', cls || null, label)
@@ -667,9 +758,13 @@
             b.addEventListener('click', fn)
             return b
           }
-          acts.append(
-            mk('跳到原文', () => send({ action: 'readerCommand', type: 'reveal', id: e.id })),
-            mk('修改原文重译', () => { editingId = e.id; render() }),
+          const btns = [mk('跳到原文', () => send({ action: 'readerCommand', type: 'reveal', id: e.id }))]
+          // 没有原文的条目（扫描件的图片区域）不给「改原文」：文本框会是空的，
+          // 提交必然被拦，等于摆了个按钮让人白点。
+          if (String(e.source || '').trim()) {
+            btns.push(mk('改原文', () => { editingId = e.id; render() }))
+          }
+          btns.push(
             mk('复制译文', async () => {
               const ok = await copyText(e.translation || '')
               toast(ok ? '已复制' : '复制失败', !ok)
@@ -677,6 +772,7 @@
             mk('设为引用', () => makeReference(e.id), 'rn-ref'),
             mk('删除', () => send({ action: 'readerCommand', type: 'remove', id: e.id })),
           )
+          acts.append(...btns)
           item.append(acts)
         }
 
