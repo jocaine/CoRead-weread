@@ -22,6 +22,8 @@ import {
   textFromSpacedOffsets,
   // 附近原文取哪几页/哪一段（纯算术，见 reader-anchor.js 的 planContextWindow）
   planContextWindow,
+  // 「设为引用」带什么上下文（扫描件退回整卡译文，见 reader-anchor.js 的 contextForRef）
+  contextForRef,
   // 页面还没渲染时（没有文字层）的切片：见 contextAround
   joinLines,
   linesFromItems,
@@ -2816,10 +2818,12 @@ async function revealEntry(id) {
 async function setAsReference(entry, quote) {
   if (!entry || !entry.translation) return { ok: false, error: { message: '该条目暂无译文' } }
   const picked = String(quote || '').trim()
-  // 划线**附近各 300 字**随引用一起报上去（见 contextAround）。为什么要带：PDF 没有章节正文
-  // 可查，agent 那边只有这一份上下文；不带的话它只看到划线那一句，prompt 里落成
-  // "（暂无这本书的原文足迹…）"。取不到就是空串（扫描件、图片页），不影响设引用本身。
-  const context = await contextAround(entry.anchors)
+  // 上下文随引用一起报上去（PDF 没有章节正文可查，agent 那边只有这一份）。
+  // 两条路（见 reader-anchor.js 的 contextForRef）：
+  //   · 文字条目 → 划线**附近各 300 字**（contextAround）
+  //   · 扫描件（截图/框选翻译）→ 没有原文也没有文字层，退回**整张卡片的译文**：
+  //     用户划的那一句的前后文就在这张卡上，不送出去 agent 只剩孤零零一句。
+  const context = contextForRef(await contextAround(entry.anchors), entry)
   const res = await callBackground({
     action: 'setTranslationRef',
     original: entry.source,

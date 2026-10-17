@@ -1204,15 +1204,27 @@ async function fillBookTitle(ctx) {
  * 这个回落顺序是这次改动的关键：以前只写了 `original || translation`，扫描件整页
  * 译文进引用卡，用户想讨论的那一句被埋在里面。
  */
-/** 附近原文的长度上限（阅读器给的是前后各 300 字，这里只防上游塞进来一个超大字段）。 */
-const MAX_CONTEXT_CHARS = 2000
+/**
+ * 上下文的长度上限。
+ *
+ * 原来写 2000，因为当时上下文只有"划线前后各 300 字"（≤600 字）。
+ * 2026-11 起扫描件的引用会把**整张译文卡片**当上下文（见 reader-anchor.js 的
+ * contextForRef），一张整页译文卡可以有两三千字，2000 会把尾巴切掉 ——
+ * 所以放到与译文上限一致（4000），一张卡能完整装下。
+ */
+const MAX_CONTEXT_CHARS = 4000
 /** 译文的长度上限（receiver 侧还有一道同样的闸；这里防的是把一个超大字段发出去）。 */
 const MAX_TRANSLATION_CHARS = 4000
 
 /**
- * 扫描件（图片页）那条路**没有**"附近原文"可给：图片页没有文字层，contextAround
- * 必然返回空串。以前这就等于什么都不给，agent 那边只能落成"（暂无这本书的原文足迹…）"，
- * 而它其实连"为什么没有"都不知道。这里换成一句**说清缺什么**的话。
+ * 扫描件（图片页）**连整卡译文都没带上**时的一句说明。
+ *
+ * 历史：图片页没有文字层，`contextAround` 必然返回空串，所以以前扫描件的引用
+ * 一点上下文都没有 —— agent 那边只能落成"（暂无这本书的原文足迹…）"，而它连
+ * "为什么没有"都不知道。
+ * 现状（2026-11）：阅读器改为把**整张卡片的译文**当上下文报上来（见 reader-anchor.js
+ * 的 contextForRef），所以这段说明只是**兜底** —— 只有调用方什么上下文都没给时才用到
+ *（老客户端、或上游取不到译文）。它现在的价值是"说清缺什么"，而不是常态。
  *
  * 为什么不做 OCR 补一段真原文：那是又一次模型调用，要等、要花钱，而用户此刻正在
  * 等着设引用；而且 OCR 出来的文字与用户框选的那块未必对得上，"给错上下文"比
@@ -1221,16 +1233,33 @@ const MAX_TRANSLATION_CHARS = 4000
 const IMAGE_CONTEXT_NOTE = '（本段来自扫描件的框选翻译：这一页没有可提取的文字层，'
   + '因此没有原文可查，也没有划线附近的原文。判断依据只有下面这段译文本身。）'
 
+/**
+ * 这次引用该带什么上下文（纯函数，单测在 extension/test/reader-context.test.mjs）。
+ *
+ * 三级：
+ *   ① 调用方给了 → 用它（阅读器已经算好：文字条目是附近原文、扫描件是整卡译文）
+ *   ② 没给，而且是"没有原文的扫描件引用" → 一句说明缺什么的 IMAGE_CONTEXT_NOTE
+ *   ③ 其它情况 → 空串（不给上下文，比给错的强）
+ *
+ * 为什么 ② 不能一律补：文字条目的原文是引用身份（selectedText），agent 拿它去查章节正文；
+ * 再塞一段"附近原文"反而是重复。而扫描件没有身份可查，只能靠这段说明 + 译文本身。
+ */
+export function refContextOf(msg) {
+  const own = String(msg?.context || '').trim().slice(0, MAX_CONTEXT_CHARS)
+  if (own) return own
+  const original = String(msg?.original || '').trim()
+  if (msg?.image === true && !original) return IMAGE_CONTEXT_NOTE
+  return ''
+}
+
 async function setTranslationRef(msg) {
   const original = String(msg?.original || '').trim()
   const quote = String(msg?.quote || '').trim().slice(0, MAX_TRANSLATION_CHARS)
-  const isImage = msg?.image === true
+  const isImage = msg?.image === true   // 供 resolveBookContext 判"扫描件那条路"用
   // 引用的内容：原文优先（那是引用身份），扫描件才落到摘录/整段译文上
   const selected = original || quote || String(msg?.translation || '').trim()
   if (!selected) return fail('BAD_REQUEST', '没有可设为引用的内容')
-  // 图片条目缺原文时，用那句话替代空上下文（见 IMAGE_CONTEXT_NOTE）
-  const context = String(msg?.context || '').trim().slice(0, MAX_CONTEXT_CHARS)
-    || (isImage && !original ? IMAGE_CONTEXT_NOTE : '')
+  const context = refContextOf(msg)
   // 显示用的那半边：划选了就是那一段，否则整段译文
   const translation = (quote || String(msg?.translation || '').trim()).slice(0, MAX_TRANSLATION_CHARS)
 

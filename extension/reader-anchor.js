@@ -478,3 +478,29 @@ export function planContextWindow(anchors, pageTotal, opts = {}) {
 
   return slices.sort((x, y) => x.page - y.page)
 }
+
+/**
+ * 「设为引用」要带上的上下文：优先用从锚点附近抽出来的原文，没有就退回**整张卡片的译文**。
+ *
+ * 为什么需要退回：扫描件（截图/框选翻译）的条目没有原文、也没有文字层，从锚点抽上下文
+ * 必然是空。而用户划的那一句的前后文，其实**就在这张译文卡片上** —— 不送出去，
+ * agent 手里就只有孤零零一句，判断依据严重不足。
+ *
+ * 边界：只对"没有原文来源"的条目退回译文（扫描件的特征）。普通文字条目要么已经取到
+ * 附近原文，要么取不到是因为别的原因（页还没渲染等）—— 那时把**译文**当"附近原文"
+ * 会给出跨语言、错位的上下文，比没有更坏（同 contextAround 的既有原则）。
+ *
+ * @param {string} near 从锚点附近抽出来的原文（扫描件为空串）
+ * @param {{kind?:string, source?:string, translation?:string}} entry 译文条目
+ * @returns {string} 上下文（可能为空串）
+ */
+export function contextForRef(near, entry) {
+  const own = String(near || '').trim()
+  if (own) return own
+  const kind = String((entry && entry.kind) || '')
+  const source = String((entry && entry.source) || '').trim()
+  // 扫描件：没有原文（source 为空）或明确标成图片条目
+  if (kind !== 'image' && source) return ''
+  return String((entry && entry.translation) || '').trim()
+}
+

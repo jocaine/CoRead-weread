@@ -13,7 +13,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { activeTabKind, installTranslateBackground } from '../translate-background.js'
+import { activeTabKind, installTranslateBackground, refContextOf } from '../translate-background.js'
 
 const WEREAD_BOOK_URL = 'https://weread.qq.com/web/reader/ce0321c0722b4a5d9f7b0c1e2d3f4a5b'
 const WEREAD_BOOK_K_URL = WEREAD_BOOK_URL + 'k06432b4029e064096632ab8'   // 带章节目录后缀（真实形态）
@@ -120,4 +120,28 @@ test('不是从标签页来的快照（扩展页面自己发的）→ fromActive
   const s = setupBackground()
   await tell(s, snapshotMsg, {})
   assert.equal(s.broadcast.find((m) => m.action === 'readerUpdate').fromActive, null)
+})
+
+// ── refContextOf：这次引用该带什么上下文（2026-11 扫描件带整卡译文）────────────
+
+test('refContextOf：调用方给了上下文就用它（并去掉首尾空白）', () => {
+  assert.equal(refContextOf({ context: '  整页译文  ' }), '整页译文')
+})
+
+test('refContextOf：扫描件没给上下文 → 退成"说清缺什么"的说明', () => {
+  const out = refContextOf({ image: true, original: '' })
+  assert.match(out, /扫描件/)
+  assert.match(out, /没有可提取的文字层/)
+})
+
+test('refContextOf：文字引用没给上下文 → 空串（不塞一句多余说明）', () => {
+  assert.equal(refContextOf({ original: '原句' }), '')
+})
+
+test('refContextOf：上限放宽到 4000，一张整页译文卡不被切掉', () => {
+  // 2500 字（旧上限 2000 会切掉尾巴）：这张卡必须完整通过
+  const card = '译'.repeat(2500)
+  assert.equal(refContextOf({ context: card, image: true }).length, 2500)
+  // 超过 4000 才切
+  assert.equal(refContextOf({ context: 'x'.repeat(5000) }).length, 4000)
 })

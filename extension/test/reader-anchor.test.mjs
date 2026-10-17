@@ -9,6 +9,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  contextForRef,
   glyphTextFromOps,
   joinLines,
   linesFromFixedItems,
@@ -334,4 +335,30 @@ test('planContextWindow：before/after 可调，切片夹在页内不越界', ()
     { page: 1, from: 25, to: 40 },       // 补 15 字（= 25 − 10）
     { page: 2, from: 0, to: 30 },        // 20 + 25 越出页尾 → 夹到 30
   ])
+})
+
+// ── contextForRef：设为引用时带什么上下文（2026-11 扫描件那条路）───────────────
+
+test('contextForRef：文字条目有附近原文时，就用附近原文（不拿译文顶）', () => {
+  const near = '前文……划线的那一句……后文'
+  const entry = { kind: 'text', source: '划线的那一句', translation: '【译】划线的那一句' }
+  assert.equal(contextForRef(near, entry), near)
+})
+
+test('contextForRef：扫描件没有附近原文 → 退回**整张卡片的译文**', () => {
+  // 图片条目：kind=image、source 为空、translation 是整页译文
+  const entry = { kind: 'image', source: '', translation: '第一句。第二句。第三句。' }
+  assert.equal(contextForRef('', entry), '第一句。第二句。第三句。')
+  // 没有 kind 但 source 为空（老快照）也按扫描件处理
+  assert.equal(contextForRef('   ', { source: '', translation: '整页译文' }), '整页译文')
+})
+
+test('contextForRef：文字条目取不到附近原文时**不**拿译文顶（跨语言上下文比没有更坏）', () => {
+  const entry = { kind: 'text', source: 'the original sentence', translation: '【译】原句' }
+  assert.equal(contextForRef('', entry), '')
+})
+
+test('contextForRef：什么都没有时返回空串（不假装有上下文）', () => {
+  assert.equal(contextForRef('', null), '')
+  assert.equal(contextForRef('', { kind: 'image', translation: '' }), '')
 })
