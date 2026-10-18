@@ -267,6 +267,8 @@
     const toast = opts.toast || (() => {})
     let snapshot = { book: null, entries: [], activeId: '', page: 0, total: 0 }
     let editingId = ''
+    /** 面板刚挂上（侧栏重启 / 第一次打开）：第一次渲染要**滚到最新那条**，见 render */
+    let firstRender = true
 
     root.classList.add('rn-wrap')
     root.replaceChildren()
@@ -724,6 +726,14 @@
         ? snapshot.book.name + (snapshot.total ? '　第 ' + (snapshot.page || 1) + ' / ' + snapshot.total + ' 页' : '')
         : '未打开 PDF'
       empty.hidden = entries.length > 0
+      /**
+       * 重排会清空列表，滚动位置必然回到顶部。所以先看用户停在哪：
+       * 贴着底 → 重排后继续贴底（新译文不该把人从最新一条上推走）；
+       * 已经往上翻了 → 别把他拽回来（他在看旧的那几条）。
+       * 面板**刚打开**（侧栏重启）时一律滚到底：用户打开译文栏要看的是刚翻的那条，
+       * 不是最早那一条（这是用户明确要求的行为）。
+       */
+      const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 16
       list.replaceChildren()
 
       for (const e of entries) {
@@ -786,6 +796,8 @@
       // ⚠️ 顺序不能反：restoreSelection 会改选区（不动 DOM），markQuotes 只读 DOM。
       restoreSelection()
       markRefs()
+      if (firstRender || atBottom) list.scrollTop = list.scrollHeight
+      firstRender = false
     }
 
     render()

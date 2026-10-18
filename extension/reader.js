@@ -158,6 +158,8 @@ const state = {
   entries: [],          // {id, anchors:[{page,start,end}], source, translation, at}
   refsSeen: [],         // 已设成引用的段落 {selectedText, translation, at}（给译文面板画下划线）
   refsAt: 0,            // 上一次从接收端拉这份清单的时刻（TTL 用，见 refreshRefs）
+  refsFail: 0,          // 连续失败次数（退避重试用，见 scheduleRefsRetry）
+  refsRetryTimer: null, // 排队中的那次重试
   activeId: '',
   pendingAnchorFlash: '',
   boxMode: false,
@@ -1184,8 +1186,15 @@ async function loadDocument(bytes, name) {
   if (saved) {
     if (saved.scale) state.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, saved.scale))
     state.entries = Array.isArray(saved.entries) ? saved.entries : []
-    // 已设成引用的段落：真值在接收端存档里，这里只是缓存（见 refreshRefs）
-    state.refsSeen = []
+    /**
+     * 已设成引用的段落（画下划线用）。
+     *
+     * **先读回上次落盘的那份**，再去接收端刷新（下面的 refreshRefs）：
+     * 只靠刷新的话，重启时接收端还没起来就永远空了 —— 那正是"重启后划线全丢、
+     * 但引用还在"的成因（引用在侧栏是本地/历史恢复的，不依赖接收端）。
+     * 这份是缓存，拉取成功会被覆盖成真值。
+     */
+    state.refsSeen = Array.isArray(saved.refs) ? saved.refs : []
     state.refsAt = 0
     els.pages.style.setProperty('--total-scale-factor', String(state.scale))
     applyScaleToPlaceholders()
@@ -2438,17 +2447,17 @@ const REFS_TTL_MS = 2000
  * 时点选在哪：打开书（loadDocument）、面板要快照（readerGet）、页面重新可见。
  * 就是"用户会去看一眼"的那几个瞬间，不额外轮询。
  */
-async function refreshRefs(reason) {
+async function refreshRefs(reason, opts = {}) {
   if (!hasBook()) return false
   const now = Date.now()
-  if (reason !== 'open' && state.refsAt && now - state.refsAt < REFS_TTL_MS) return false
+  if (!opts.force && reason !== 'open' && state.refsAt && now - state.refsAt < REFS_TTL_MS) return false
   state.refsAt = now
   try {
     const bookId = currentBookId()
-    const r = await fetch(RECEIVER + '/annotations?bookId=' + encodeURIComponent(bookId), { cache: 'no-store' })
-    if (!r.ok) return false
+    const r = await fetch(RECEIVER_URL + '/annotations?bookId=' + encodeURIComponent(bookId), { cache: 'no-store' })
+    if (!r.ok) throw new Error('HTTP ' + r.status)
     const list = await r.json()
-    if (!Array.isArray(list)) return false
+    if (!Array.isArray(list)) throw new Error('返回的不是数组')
     state.refsSeen = list
       .filter((d) => d && d.selectedText)
       .map((d) => ({
@@ -2463,10 +2472,15 @@ async function refreshRefs(reason) {
         at: d.timestamp || 0,
       }))
       .slice(0, REFS_SEEN_MAX)
+    state.refsFail = 0
     scheduleSync()   // 清单变了，推一份新快照给面板重画下划线
     return true
   } catch (e) {
-    return false   // 接收端没起来：保留上一次的清单（宁可用旧的，也别把下划线全抹掉）
+    // 接收端没起来 / 还没起完：**保留**上一次的清单（宁可用旧的，也别把下划线全抹掉），
+    // 并把 TTL 让开 + 排队重试 —— 重启时它常常要过几秒才起来，只试一次等于永远拉不到。
+    state.refsAt = 0
+    scheduleRefsRetry(reason)
+    return false
   }
 }
 
@@ -2474,6 +2488,28 @@ async function refreshRefs(reason) {
  * 本地记一笔"刚设过引用"——**只是乐观更新**，真值仍以 refreshRefs 拉回来的为准。
  * 为什么还要它：设完引用面板马上会重画下划线，等一次网络往返会闪一下。
  */
+/** 拉引用清单最多重试几次（≈ 0.8s / 1.6s / 3.2s / 6.4s 之后各一次，共约 12 秒） */
+const REFS_RETRY_MAX = 4
+
+/**
+ * 拉清单失败后的退避重试。
+ *
+ * 为什么要它：重启机器/浏览器时，阅读器页面往往比接收端（CoRead 托盘 + agent）先就绪，
+ * 那一次 fetch 必然失败。旧实现只试一次 —— 于是**每次重启都得赌**那一次网络，
+ * 赌输的表现就是"译文卡片的划线全没了，但引用还在"。
+ */
+function scheduleRefsRetry(reason) {
+  const n = (state.refsFail = (state.refsFail || 0) + 1)
+  if (n > REFS_RETRY_MAX) return
+  const delay = Math.min(8000, 800 * Math.pow(2, n - 1))
+  clearTimeout(state.refsRetryTimer)
+  state.refsRetryTimer = setTimeout(() => {
+    state.refsRetryTimer = null
+    if (!hasBook()) return
+    refreshRefs('retry:' + (reason || '') + '#' + n, { force: true })
+  }, delay)
+}
+
 /**
  * 这本书"已设成引用的那些段落"（下划线的事实来源，见 refreshRefs）。
  * 只是一个缓存 —— 真值在接收端的 annotations.jsonl 里。
@@ -3197,6 +3233,14 @@ async function readOwnRecord() {
 if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.action) return
+  /**
+   * 面板被打开（侧栏的译文对照）→ 立刻把"这本书引过哪些段落"刷新一遍。
+   *
+   * 为什么要这一个触发点：用户点开译文对照，就是为了看译文与划线；
+   * 而打开书那一刻的拉取可能失败（重启时接收端还没起来）或者还没返回。
+   * 这里 force 一次，等于是"你打开面板我就再对一次账"。
+   */
+  if (msg.action === 'notesOpen') { refreshRefs('panel', { force: true }); return }
   if (msg.action === 'readerBookInfo') { sendResponse(readerBookInfo()); return }
   // 自检页（extension/selfcheck.js）专用的预定义操作通道，见 SELFCHECK_OPS
   if (msg.action === 'selfcheckEval') {
@@ -3252,6 +3296,9 @@ async function saveRecord() {
       translation: e.translation,
       at: e.at,
     })),
+    // 已设成引用的段落：落盘是为了"重启后立刻能画下划线"（见 loadDocument 里那段说明）。
+    // 它是缓存，接收端拉回来之后会被覆盖；条数上限与内存那份一致。
+    refs: refsSeen().slice(0, REFS_SEEN_MAX),
     updatedAt: Date.now(),
   }
   try {
@@ -3353,6 +3400,10 @@ for (const evName of ['wheel', 'touchstart', 'pointerdown']) {
 }
 document.addEventListener('keydown', () => cancelRestore('用户按键'))
 document.addEventListener('mouseup', () => setTimeout(onSelectionSettled, 0))
+// 页面重新可见（切回这个标签页）→ 对一次账：别的路径可能刚删/刚加过引用
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) refreshRefs('visible')
+})
 document.addEventListener('click', onReaderClick)
 // 双击空白处（既不在译文高亮上，也没选中文字）→ 收起侧栏里的译文对照
 document.addEventListener('dblclick', (ev) => {
@@ -3535,6 +3586,10 @@ window.__readerTest = {
   renderImageMarks,
   notesSnapshot,
   syncNotes,
+  // 「已引用段落」这条链（重启后划线的持久化 / 拉取重试）——自测要直接驱动它
+  refreshRefs,
+  saveRecord,
+  refsSeen,
   onReaderCommand,
   loadLibrary,
   openFromLibrary,
