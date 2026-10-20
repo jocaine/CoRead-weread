@@ -1893,8 +1893,16 @@ async function refreshCurrentBook() {
     if (b && b.bookId) {
       // 记进 _lastWereadContext？不：那个变量是"最近的微信读书上下文"，退出自由模式
       // 时恢复用；把 PDF 塞进去会让退出自由模式后显示一本没在微读里打开的书。
-      leaveManualBookIfRealRead({ base: baseBookId(b.bookId), bookTitle: String(b.bookTitle || '').trim() })
-      applyBookContext({ bookId: b.bookId, bookTitle: b.bookTitle },
+      //
+      // ⚠️ 书名取 `b.name`，不是 `b.bookTitle`（2026-11 修"灰节点"根因）：
+      // 阅读器回的 bookInfo 是 { bookId, hash, name, page, total }（见 reader.js 的
+      // readerBookInfo），**根本没有 bookTitle 这个字段**。原先读 b.bookTitle 恒为
+      // undefined → 当前书变成"书 ID 对、书名空"：头部退回格言，且此后**纯打字提问**
+      // 落库只有 bookId、没有书名（带划线的消息不受影响：它的书名来自标注记录）。
+      // 收口那边又只从划线取书名 → 节点没有书 → 图上涂成默认灰（未归属书籍）。
+      const bTitle = String(b.name || b.bookTitle || '').trim()
+      leaveManualBookIfRealRead({ base: baseBookId(b.bookId), bookTitle: bTitle })
+      applyBookContext({ bookId: b.bookId, bookTitle: bTitle },
         'reader-branch:活动标签页是阅读器，它报着这本书', { authoritative: true })
     } else {
       // 阅读器**明确**说"我这儿没开着书"（回到书库了）→ 无书。这话是它自己说的，照做。
@@ -2873,9 +2881,10 @@ function hideThinking() {
   _recoverAnswerSeen = true
   clearThinkingFallbacks()
   if (thinkingEl) { thinkingEl.remove(); thinkingEl = null }
-  // 思考气泡一撤，就说明本地不再"卡在等回答"了（回答到了 / 用户点了停止）→ 按钮回「发送」。
-  // 放在这里而不是各处调用点：思考气泡与「停止」态是同一个状态的两种表现，必须同生同灭。
-  finishWaiting()
+  // 2026-11 拆开：**撤思考气泡 ≠ 这一轮结束**。流式第一片到达时也会撤它，而那一刻回答才
+  // 刚开始打字 —— 按钮必须继续是「停止」（用户定调：整条回答写完之前都能停）。
+  // 所以这里只负责气泡，"按钮该是什么"交给 syncSendBtn() 按实际进度算；
+  // "本轮结束"由各处显式调 finishWaiting()（答案落库 / 停止 / 失败 / 放弃等待）。
 }
 
 // 去重：跟踪已显示的 assistant 消息（前 200 字指纹）
@@ -3200,6 +3209,7 @@ function addBubble(role, content, extra, note, bookId) {
         if (entry && entry.ref) upgradeStreamToRefReply(_streamEl, entry.ref, content)
         else patchStreamedComplete(_streamEl, content)
         _streamEl = null
+        finishWaiting()   // 答案补齐进已显示的气泡 = 这一轮结束，按钮回「发送」
         return null
       }
       // 非流式的完整渲染（历史回放 / 兜底）：直接渲染
@@ -3296,11 +3306,18 @@ let _streamEl = null
 let _streamDone = false
 
 function _handleStream(d) {
+  // 已弃那一轮的残片（2026-11）：整条丢掉——不画气泡、不置 _streamDone。
+  // 认领依据是分片自带的 replyToTs（= 那一轮提问落库的 timestamp），与「停止」收尾登记的
+  // _discardedTurnTs 同一个口径。没有它就只能靠"此刻在不在等回答"猜，而实测最糟的情形
+  // 恰恰是"用户已经改口问了下一题、旧那轮的分片此刻才到"——猜不出，就画出一颗无主小气泡。
+  // 注意 _discardedTurnTs **不随新提问清空**：清空的时机就是旧分片可能到达的时机（见上）。
+  if (_discardedTurnTs && Number(d.replyToTs || 0) === _discardedTurnTs) return
   if (d._stream === -1) {
     // 流结束标记：置完成标志等最终完整记录。_streamEl 不置空——最终记录要
     // 用它就地升级出引用条（引用回复）或补齐完整文本（普通回复缺尾）。
     _streamDone = true
     _thinkingBook = ''  // AI-001：本条回复的书签使命结束
+    syncSendBtn()       // 字吐完了、但答案还没落库 → 仍算进行中（按钮继续「停止」）
     return
   }
   // 上一条流已 -1 但最终记录缺失（异常断开/回放跳变）：放弃旧气泡，新流开新气泡
@@ -3323,6 +3340,7 @@ function _handleStream(d) {
   // 流式分片的 content 是**累计全文**（agent 侧约定），所以每片都整段重渲染 markdown：
   // 加粗/列表在标记闭合的那一刻成形，用户看到的就是边流边排版的效果
   _streamEl.querySelector('.bubble').innerHTML = mdToHtml(d.content || '')
+  syncSendBtn()   // 回答开始打字 → 按钮必须是「停止」（这一轮还没走完）
   // AI-004：流式时不强制拉滚动条到底部，仅用户接近底部时跟随
   maybeAutoScroll(_streamEl.parentElement)
 }
@@ -3479,11 +3497,15 @@ function connect() {
         const ctxBook = effectiveBookBase()
         console.log('[CoRead] graph-hit', d.hits.length, 'hitBook=', hitBook, 'ctxBook=', ctxBook, 'open=', !!graphView && graphView.isOpen())
         if (hitBook !== ctxBook) return
+        // 已弃那一轮的命中（2026-11）：命中是在**生成回答之前**写出来的，用户完全可能在
+        // "引用判定"那几秒里点停止 —— 事件这时才到，一来就把图点亮，而那一轮已经没有提问、
+        // 也不在栈里（收口不会碰到它）。认出来源就整条丢掉，与流式分片同一套身份证。
+        if (_discardedTurnTs && Number(d.replyToTs || 0) === _discardedTurnTs) return
         graphView?.onHit(d.hits, d.reason || '')
         _hitBook = hitBook
         // 自由模式：语义命中自动并入引用窗体（可悬浮取消），随消息提交为 cites
         if (_freeMode) {
-          for (const id of d.hits) addFreeRef(id, '')
+          for (const id of d.hits) addFreeRef(id, '', true)   // auto：停止时要收回去
         }
         return
       }
@@ -3508,6 +3530,7 @@ function connect() {
         rememberAssistant(d.content)
         if (dupAlreadyRendered) {
           if (_streamEl) { _streamEl.remove(); _streamEl = null }
+          finishWaiting()   // 答案已由恢复轮询渲染过：这一轮同样结束了
           return
         }
         const entry = _pendingRefs.shift()  // 队列非空才渲染引用气泡，内部按序 shift
@@ -3522,6 +3545,7 @@ function connect() {
           addBubble('assistant', d.content)
         }
         _streamEl = null
+        finishWaiting()   // 最终完整记录到齐 = 这一轮结束，按钮回「发送」
         return
       }
 
@@ -3573,12 +3597,14 @@ function connect() {
       if (d.role === 'system') {
         _pendingRefs.shift()
         hideThinking()
+        finishWaiting()   // 指令的回执到了 = 这一轮结束
         showToast(d.content, false)
         renderSystemBubble(d.content)
         return
       }
       if (d.role === 'assistant') {
         addBubble('assistant', d.content)
+        finishWaiting()   // 没有流式气泡可补、答案直接落库到了 = 这一轮结束
       } else if (d.role === 'user-popup') {
         // 来自共读弹窗的用户消息（AI-001：引用回复绑定该书）
         _pendingRefs.push({ ref: { bookId: d.bookId, bookTitle: d.bookTitle, chapter: d.chapter, selectedText: d.selectedText } })
@@ -3624,11 +3650,11 @@ async function refreshStackHits() {
   // 栈收口/清空后 hits 为空 → 锁定条目清空、图按 applyStackHits 的空结果规则清除。
   if (_freeMode && hits) setFreeStackCites(hits)
   if (!graphView || !hits) return
-  // 「本轮还在进行」交给图视图判空结果（2026-11）：等在回答（_awaitingStop）或正在流式
-  // 渲染（_streamEl）时，本轮提问的 cites 还没由 agent 写进实时栈，/stack-hits 必然是空的
-  // ——那不是"命中结束"，不能据此清高亮（用户报："命中动画一结束就打开会意图，刚命中的
-  // 节点没被高亮，要等回答完成才补上"）。
-  graphView.applyStackHits(hits, { pending: _awaitingStop || !!_streamEl })
+  // 「本轮还在进行」交给图视图判空结果（2026-11）：这一轮还没走完（在等回答 / 正在流式
+  // 渲染 / 等答案落库，见 isAnswerInFlight）时，本轮提问的 cites 还没由 agent 写进实时栈，
+  // /stack-hits 必然是空的 —— 那不是"命中结束"，不能据此清高亮（用户报："命中动画一结束就
+  // 打开会意图，刚命中的节点没被高亮，要等回答完成才补上"）。
+  graphView.applyStackHits(hits, { pending: isAnswerInFlight() })
 }
 
 // ── 停止当前回答（2026-02 用户定调）─────────────────────────────────────────
@@ -3638,10 +3664,22 @@ async function refreshStackHits() {
 //
 // 为什么按钮态以"本地是否在等回答"为准、不等 agent 回执：agent 被强杀时回执永不到达，
 // 按钮会永远卡在「停止」，用户既停不了也发不出。
-let _awaitingStop = false    // 本地是否正在等这一条的回答（= 按钮是否处于「停止」态）
+let _awaitingStop = false    // 本轮提问还没走完：从发送起，到答案落库 / 被停掉 / 失败为止
 let _awaitUserEl = null      // 本轮提问的气泡（停止时要连它一起删）
 let _awaitBook = ''          // 本轮提问归属的对话（命中按对话隔离，防串场）
 let _awaitTs = 0             // 本轮提问的落库 timestamp（停止请求要带上它做目标标识）
+// 已经被「停止」弃掉那一轮的身份证（= 提问落库 timestamp，2026-11）。
+// 为什么留着它：停止是**本地先收尾**的（提问与半截回答两颗气泡当场删掉），而 agent 那一头
+// 可能还在生成 —— 实测模型第一个 token 能晚到 8.6 秒（点停止 19:58:08.982，第一片
+// 19:58:17.611）。那片分片带着 `replyToTs` 回来时，侧栏手里已经没有"本轮"了（气泡删了、
+// 也不在等回答），只能新建一颗气泡把那半句画上；而被弃那一轮**永远不会再落一条完整回答**
+// 来补它 → 屏幕上就留下一颗没有提问的小气泡（用户报的「小气泡里写着'这句话'」）。
+// 所以这里记下身份证，_handleStream 认出来源的残片一律不画。
+let _discardedTurnTs = 0
+// "停止比 /chat 的回执先到"（2026-11 的窄缝）：连点两下按钮就可能发生 —— 发送的请求还在飞，
+// 停止已经点了，这时还不知道这条提问的 timestamp（身份证没到手）。先记一笔，等回执到了再补
+// 认领；否则那一轮的迟到分片会因为"认不出来源"又画出一颗无主气泡。
+let _stopBeforeTs = false
 const STOP_LABEL = '停止'
 const SEND_LABEL = '发送'
 
@@ -3652,6 +3690,22 @@ function setSendBtnMode(stopping) {
   btn.classList.toggle('stopping', !!stopping)
 }
 
+/**
+ * 还有一条回答没走完吗？下面三种情形都算「进行中」，按钮都该是「停止」：
+ *   · 在等回答（模型还没吐第一个字，`_awaitingStop`）
+ *   · 屏幕上正有流式气泡在长（`_streamEl`）
+ *   · 流吐完了、最终完整记录还没到（`_streamDone`）
+ *
+ * 2026-11 修（用户定调复盘）：**整条回答写完之前都能停**。原先按钮态只跟着「思考气泡」走，
+ * 而流式第一片到达时正好会撤思考气泡（见 _handleStream）→「停止」活不过回答的第一个字：
+ * 回答一开始打字，按钮就变回「发送」，那条长回答再也停不掉（想停只能等它写完）。
+ */
+function isAnswerInFlight() {
+  return !!_awaitingStop || !!_streamEl || !!_streamDone
+}
+/** 把上面那个事实投影到按钮上。**凡是改动这三个状态的地方都要调它一次**，否则按钮卡在旧样子。 */
+function syncSendBtn() { setSendBtnMode(isAnswerInFlight()) }
+
 /** 开始等这一条的回答：按钮变「停止」。userEl = 这条提问的气泡 */
 function startWaiting(userEl, book, content) {
   _awaitingStop = true
@@ -3659,22 +3713,28 @@ function startWaiting(userEl, book, content) {
   _awaitBook = book || ''
   _awaitTs = 0
   _awaitContent = content || ''
-  setSendBtnMode(true)
+  _stopBeforeTs = false   // 新的一轮：上一轮的"停止赶在回执前"作废
+  syncSendBtn()
 }
-/** 回答到达 / 已停止：按钮回「发送」。不清 _awaitTs 与 _awaitUserEl——
- *  停止收尾（SSE 可能比 POST 响应先到）还要用它们。 */
+/** 这一轮结束了（答案落库 / 已停止 / 失败 / 放弃等待）：清等待标记，按钮按实际状态回落。
+ *  不清 _awaitTs 与 _awaitUserEl——停止收尾（SSE 可能比 POST 响应先到）还要用它们。 */
 function finishWaiting() {
   _awaitingStop = false
-  setSendBtnMode(false)
+  syncSendBtn()
 }
 let _awaitContent = ''   // 本轮提问原文（停止后回填输入框）
 
 /** 点「停止」：告知接收端 + 本地收尾（不等回执）。 */
 async function requestStop() {
-  if (!_awaitingStop) return          // 没在等（回答已到、按钮已复位）→ 忽略
+  // 只认事实：没有在飞的一轮（此刻按钮是「发送」）就忽略。
+  // 回答已经开始打字时 _awaitingStop 仍是 true（见 isAnswerInFlight），所以这一条也放过。
+  if (!isAnswerInFlight()) return
   const content = _awaitContent
   const ts = _awaitTs
   const book = _awaitBook
+  // 回执还没回来（ts=0）就点了停止：先记一笔，等 POST 回执到了再把身份证补登记
+  // （见 submit 里处理 /chat 响应的那一段），否则这一轮的迟到分片认不出来源、又会画成气泡。
+  _stopBeforeTs = !ts
   // 本地先收尾：用户点下去就该看到反应，不等 agent。SSE message-stopped 到达时会再走一次
   // 同一个收尾函数（幂等），那时 _awaitTs 已填好，可登记历史 key。
   // force：本地这一次是"确认要停"，此刻 ts 可能还没从 POST 响应回来，不能拿它当门槛。
@@ -3724,14 +3784,18 @@ function finishStoppedTurn({ content, bookKey, timestamp, force = false } = {}) 
     awaitTs: _awaitTs, hasUserEl: !!_awaitUserEl, hasStreamEl: !!_streamEl,
   })
   if (!isCurrentTurn({ bookKey, timestamp, force })) return    // 过期事件 / 别的对话：不动屏幕
+  // 记下这一轮的身份证（提问落库 timestamp），供 _handleStream 认领"之后才到的残片"。
+  // 只在这一轮真的被收尾时登记：上面那道闸挡掉的过期重放事件不该被记成"已弃"。
+  _discardedTurnTs = Number(timestamp || _awaitTs || 0)
 
   hideThinking()
   // 半截回答气泡（流式那条）
   if (_streamEl) {
     try { _streamEl.remove() } catch {}
     _streamEl = null
-    _streamDone = false
   }
+  _streamDone = false
+  finishWaiting()   // 这一轮已被弃掉：清等待标记，按钮回「发送」
   // 提问气泡
   if (_awaitUserEl) {
     try { _awaitUserEl.remove() } catch {}
@@ -3747,8 +3811,13 @@ function finishStoppedTurn({ content, bookKey, timestamp, force = false } = {}) 
       gv._autoOpened = false
     }
   } catch {}
-  // 引用配对队列：本次请求那个占位条目出队，否则下一条真实回复的配对会挤偏一格
-  try { if (_pendingRefs.length) _pendingRefs.pop() } catch {}
+  // 引用配对队列：本次请求那个占位条目出队，否则下一条真实回复的配对会挤偏一格。
+  // 2026-11 修：出队要按**提交顺序**（shift）而不是弹末尾（pop）—— 用户可以在一条回答
+  // 还没写完时再按回车问下一题，那时队列里排着两条，pop 会把**下一条**的占位挤掉，
+  // 于是后一条的引用回复配对整体偏一格（引用条挂错消息）。正在生成的就是队首那一条。
+  try { if (_pendingRefs.length) _pendingRefs.shift() } catch {}
+  // 自由模式：把"这一轮语义命中自动并入"的待提交引用收回（人工选的与已进栈的锁定组不动）
+  try { dropAutoFreeRefs() } catch {}
   // 登记历史 key：面板重开时的增量历史不会把这条提问再渲染一遍
   try { if (timestamp) _histKeys.add(msgHistKey('user', timestamp, content || '')) } catch {}
   // 原文回填（覆盖框内内容），光标置末尾并保持聚焦——改题目重发是本功能的主要用途。
@@ -3897,6 +3966,8 @@ async function submit() {
           _histKeys.add(msgHistKey('user', j.timestamp, body.content))
           // 停止请求需要它做"目标是哪一条"的标识（agent 侧据此配对提问行）
           if (_awaitingStop) _awaitTs = j.timestamp
+          // 停止比回执先到：此刻才拿到这条提问的身份证，补登记给 _handleStream 认领残片
+          else if (_stopBeforeTs) { _discardedTurnTs = j.timestamp; _stopBeforeTs = false }
         }
       } catch {}
     }
@@ -3916,7 +3987,8 @@ async function submit() {
     // 仍在流式的回复还需要自己的队项配对。
     _pendingRefs.pop()
     _awaitUserEl = null   // 这条没发出去，没有"本轮提问气泡"可留
-    hideThinking()        // 内含 finishWaiting：按钮回「发送」
+    hideThinking()
+    finishWaiting()       // 没发出去 = 没有这一轮，按钮回「发送」
   }
 }
 
@@ -4010,8 +4082,9 @@ document.getElementById('cmd-chip-remove').addEventListener('click', () => {
 })
 
 document.getElementById('send-btn').addEventListener('click', () => {
-  // 回答生成中 → 同一个按钮是「停止」（2026-02 用户定调：就地变，不并排加第二个）
-  if (_awaitingStop) { requestStop(); return }
+  // 回答生成中（含已经开始打字）→ 同一个按钮是「停止」（2026-02 用户定调：就地变，不并排加第二个）
+  // 判据必须与按钮文案同源（isAnswerInFlight），否则会出现"显示停止、点下去却变成发送"
+  if (isAnswerInFlight()) { requestStop(); return }
   submit()
 })
 document.getElementById('input').addEventListener('keydown', e => {
@@ -5139,7 +5212,8 @@ async function loadHistory() {
       // 都会落在这一支（回复真到了仍会正常渲染，只是不再占着一颗转圈的球）。
       // 提示只在"库说这条还在处理中"时给：那种情况"一直没等到"的判断才站得住。
       if (thinkingEl) {
-        hideThinking()   // 内含 finishWaiting：按钮回「发送」
+        hideThinking()
+        finishWaiting()   // 放弃等待 = 这一轮到此为止，按钮回「发送」（答案真到了仍会渲染）
         if (pendingUser.inFlight) {
           showToast('这条提问一直没等到回答：CoRead 本机服务或模型可能没在运行。回答到达时会自动显示。', true)
         }
@@ -5162,6 +5236,10 @@ async function loadHistory() {
     }
   } else {
     stopRecoverPoll()
+    // 没有"在途提问"了 = 这一轮结束了（答案已落库并被本趟历史渲染，或提问已被停掉）。
+    // 面板在回答期间关掉再打开时，答案是从历史补渲染的、不走 SSE 的最终记录分支，
+    // 所以按钮要靠这里复位——不然「停止」会一直挂着（2026-11 与按钮态解耦一起补的）。
+    finishWaiting()
   }
   // 最后一步：这场对话一条内容都没有 → 落开场卡（有内容则它已经被 addBubble /
   // renderCompleteAssistant 摘掉了，这里再兜一次）。放在函数尾部是因为卡上的引文
@@ -5566,13 +5644,27 @@ function syncPickHighlight() {
   graphView.applyHit(ids, '', 'picked', needLoad)
 }
 // 加入引用（语义命中 / 手动选取共用；id 去重）
-async function addFreeRef(id, point) {
+// auto=true = 语义命中自动并入（用户没点过），停止时要收回（见 dropAutoFreeRefs）
+async function addFreeRef(id, point, auto = false) {
   if (!id) return
   if (_freeRefs.some((r) => r.id === id)) return
-  _freeRefs.push({ id, point: point || pointOf(id) })
+  _freeRefs.push({ id, point: point || pointOf(id), auto: !!auto })
   await ensureGraphPointCache()   // 补 point（命中并入时可能只有 id）
   const r = _freeRefs.find((x) => x.id === id)
   if (r) r.point = point || pointOf(id)
+  renderFreeRefs()
+}
+/**
+ * 收回"语义命中自动并入"的待提交引用（2026-11）。
+ *
+ * 为什么停止时要收：自动并入是替**这一轮提问**找的讨论线索，随消息一起作为 cites 提交。
+ * 而这一轮被用户停掉了——它从没进过讨论栈，也不会被收口。那些线索留着的话，下一条提问
+ * 会把它们一起提交上去（`body.refs`），等于把"被弃那一轮"的命中挂到新提问名下，
+ * 收口时还会变成图的 user 边。已提交进栈的（锁定组，`_stackCiteIds`）不动。
+ */
+function dropAutoFreeRefs() {
+  if (!_freeRefs.some((r) => r.auto)) return
+  _freeRefs = _freeRefs.filter((r) => !r.auto)
   renderFreeRefs()
 }
 function removeFreeRef(id) {
@@ -5792,6 +5884,7 @@ async function switchFreeConversation(key, { toast = '' } = {}) {
   // 分片会新建气泡；已落库的内容由 loadHistory 补齐），这里一并复位
   _streamEl = null
   _streamDone = false
+  finishWaiting()   // 上一场对话的"进行中"不该带到新对话上（按钮回「发送」）
   clearFreeRefs()   // 引用窗体属于上一场对话：待提交 + 锁定栈命中一并清空
   hideThinking()    // 上一场对话的"思考中"不该挂在新对话上
   onEffectiveContextChange()   // 消息过滤 / 引用卡片 / 命中高亮整链刷新

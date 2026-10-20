@@ -156,6 +156,9 @@ setInterval(() => {
         pushSSE('message', {
           role: 'graph-hit', hits: (e.payload && e.payload.hits) || [],
           reason: (e.payload && e.payload.reason) || '', timestamp: e.ts, bookKey: e.conv,
+          // 这一轮提问的身份证（2026-11）：侧栏据此丢弃"已被停止的那一轮"的命中事件，
+          // 不然图会在停止收尾之后又被点亮（命中是在生成回答**之前**写出来的）。
+          ...(e.payload && e.payload.replyToTs ? { replyToTs: Number(e.payload.replyToTs) } : {}),
         })
       }
     }

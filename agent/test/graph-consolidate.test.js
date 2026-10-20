@@ -7,7 +7,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import { createGraph, addNode, findNode, addEdge, contextOf, userAncestry } from '../lib/knowledge-graph.js'
-import { consolidateDiscussion, addDerivedEdge, addCitationEdges, pruneRedundantCitationEdges, nextNodeId, groupExcerpts, cloneGraph } from '../lib/graph-consolidate.js'
+import { consolidateDiscussion, addDerivedEdge, addCitationEdges, pruneRedundantCitationEdges, nextNodeId, groupExcerpts, cloneGraph, segmentBook } from '../lib/graph-consolidate.js'
 
 // 假 LLM：按队列吐预设文本（与 knowledge-graph 测试同款）
 function makeLLM(results) {
@@ -240,4 +240,31 @@ test('cloneGraph：深拷贝副本，固化沙盒互不影响（自由模式用�
   assert.equal(findNode(copy, 'n_c').point, 'C', '副本可独立新建节点')
   // 无图/空图 → 空副本
   assert.deepEqual(cloneGraph(null), { nodes: [], edges: [] })
+})
+
+test('segmentBook：先取划线书名，没有划线就取消息自带的书名（纯打字提问不再丢书）', () => {
+  // ① 划线优先：同一段里划线书名与消息书名不一致时，划线说了算
+  assert.deepEqual(segmentBook([
+    { role: 'user', content: 'q1', selected: { text: '划线', book: '甲书', chapter: '三' }, bookTitle: '乙书', chapter: '九' },
+  ]), { book: '甲书', chapter: '三' })
+  // ② 段首是纯打字提问（没有 selected）→ 用消息自带的书号/书名。
+  //    2026-11 之前这里恒为空 → 收出来的节点在图上没有书、涂成默认灰。
+  assert.deepEqual(segmentBook([
+    { role: 'assistant', content: '上一轮回复' },
+    { role: 'user', content: '什么是表现主义', bookId: 'rd_abc', bookTitle: 'Theories of German Fascism' },
+  ]), { book: 'Theories of German Fascism', chapter: '' })
+  // ③ 段首纯提问、后面才划线：仍然取得到（老实现只看第一条用户消息）
+  assert.deepEqual(segmentBook([
+    { role: 'user', content: 'q1', bookTitle: '甲书' },
+    { role: 'assistant', content: 'a1' },
+    { role: 'user', content: 'q2', selected: { text: '划线', book: '甲书', chapter: '五' } },
+  ]), { book: '甲书', chapter: '五' })
+  // ④ 自由对话：按设计恒为「无所属书籍」（图上灰色），哪怕消息带着书名
+  assert.deepEqual(segmentBook([
+    { role: 'user', content: 'q', bookTitle: '自由模式', chapter: '一' },
+  ], { bookless: true }), { book: '', chapter: '' })
+  // ⑤ 空段 / 脏数据不炸
+  assert.deepEqual(segmentBook([]), { book: '', chapter: '' })
+  assert.deepEqual(segmentBook(null), { book: '', chapter: '' })
+  assert.deepEqual(segmentBook([null, { role: 'assistant' }, { role: 'user' }]), { book: '', chapter: '' })
 })

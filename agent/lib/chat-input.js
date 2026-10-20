@@ -115,3 +115,32 @@ export function messageUnit(c) {
   if (sel) unit.selected = { text: sel }
   return unit
 }
+
+/**
+ * 把一条消息拆成「引文材料」与「提问正文」两半（2026-10-17 重心修复用）。
+ *
+ * 为什么需要它：组装给模型的当轮消息时，引文 + 上下文会占掉两千多字，提问往往只有
+ * 几个字（《国家与革命》#1312："来说说代表机构"）。旧拼法是[原文…原文…引文…提问]，
+ * 模型于是把原文当题目、把提问当附注。拆开后可以把提问提到最前、原文降为材料。
+ *
+ * 与 parseMessage 的区别：parseMessage 只认 `> ` 开头的第 2 行（多行划线会拆错），
+ * 这里按**空行分块**——引文块（[引用] 头 + 若干行 `> "…"`）与提问块各自保持完整。
+ *
+ * @returns {{material: string, question: string}}
+ *   material = 引文（已去掉 `[引用]《书名 章节》` 那行，书名章节由调用方另行交代）
+ *   question = 提问正文（可能为空：只划线没提问）
+ */
+export function splitQuotedQuestion(content, selectedText = '') {
+  const s = String(content || '').trim()
+  if (!s.startsWith('[引用]')) {
+    // 纯文本消息：素材只有随消息报上来的划线（若有），正文整体算提问
+    return { material: selectedText ? `> "${selectedText}"` : '', question: s }
+  }
+  const blocks = s.split(/\n\s*\n/).map(b => b.trim()).filter(Boolean)
+  const quoteLines = String(blocks[0] || '').split('\n')
+  // 第一行是 [引用] 头；其余是 `> "划线"`（多行也原样保留）
+  const material = quoteLines.slice(1).join('\n').trim()
+  // 提问可能自己带空行，拼回去
+  const question = blocks.slice(1).join('\n\n').trim()
+  return { material, question }
+}

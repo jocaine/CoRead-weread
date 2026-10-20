@@ -293,22 +293,57 @@ export class ChatStore {
     return out
   }
 
-  /** 重建某对话的最近轮次（替代旧 restoreHistories 的文件配对）。 */
-  loadTurns(conv, { limit = 40, includeFailed = false } = {}) {
-    const rows = this.db.prepare(
-      `SELECT * FROM messages WHERE conv = ? AND role IN ('user','assistant') AND status IN ('ok','failed')
-       ORDER BY id DESC LIMIT ?`,
-    ).all(String(conv), Number(limit)).reverse()
-    const pairs = this.pairReplies({ conv })
+  /**
+   * 重建某对话的轮次（启动恢复历史用）。2026-11 重写，三条口径都改了，每条都踩过：
+   *
+   * ① **取数范围由 afterId 决定，不再"固定取最近 N 条"。**
+   *    旧实现 ORDER BY id DESC LIMIT 60，注释说是"最近 N 轮"，实际 LIMIT 数的是**消息行**，
+   *    60 行 = 30 轮；而恢复调用方以为拿到的是"从第一条开始的整段"，再拿它去跳过"已丢弃
+   *    条数"——两个坐标系一减，游标一超过 60（96 轮左右必然发生：预算 99 轮触发一次截尾就
+   *    跳 ~118）就 `Math.min` 成 0 条，**整本书的历史在重启后全空**（实测两个游标 148/158
+   *    正踩在这条线上）。现在按 afterId 过滤，取多少由调用方的点位决定，不再有魔法数字。
+   *
+   * ② **界取"回答"的 id，不取提问的 id。**
+   *    重试过的提问 id 很老、回答很新；内存里它排在末尾。按提问 id 过滤会把整轮丢掉。
+   *
+   * ③ **顺序 = 回答落库时间，不按提问 id。**
+   *    内存里 hist.push 发生在回答生成完之后（提问失败时那半轮还被 pop 掉、重试成功时再
+   *    从末尾推回去），所以"回答时间"才是它在内存里的位置。"提问 id"会把重试轮排回它当初
+   *    的位置，导致恢复出来的序列和关掉前不一致（缓存前缀、上下文承接都跟着错）。
+   *
+   * 另修一处潜伏 bug：旧实现把 pairReplies 已经转好的消息对象又套了一次 rowToMessage，
+   * 而 rowToMessage 认的是数据库列名（ts / book_id），转换过的对象上这些字段已改名——
+   * 结果是 assistant.timestamp 变成 NaN、bookId/chapter/selectedText 全丢。此前只读 content
+   * 所以没暴露，但上面 ③ 的排序要读 timestamp，必须挡住。
+   *
+   * @param {string} conv 对话 key
+   * @param {{afterId?: number, limit?: number, includeFailed?: boolean}} [opts]
+   *   afterId：只取「回答 id > afterId」的轮次（0 = 全量）
+   *   limit：0 = 不限（默认）。恢复历史必须拿全——上限由 trimHistoryByBudget 按 token 预算管
+   * @returns {Array<{user: object, assistant: object}>} 按回答时间升序
+   */
+  loadTurns(conv, { afterId = 0, limit = 0, includeFailed = false } = {}) {
+    const key = String(conv)
+    const pairs = this.pairReplies({ conv: key })   // 提问 id → 回答（pairReplies 出口已转成消息对象）
+    const users = new Map(
+      this.db.prepare("SELECT * FROM messages WHERE conv = ? AND role = 'user'").all(key)
+        .map((r) => [Number(r.id), rowToMessage(r)]),
+    )
     const turns = []
-    for (const r of rows) {
-      if (r.role !== 'user') continue
-      const rep = pairs.get(Number(r.id))
-      if (!rep) continue
+    for (const [uid, rep] of pairs) {
+      // rep 是 pairReplies 转好的消息对象，**不能再套 rowToMessage**（见函数头注释）
+      // 只认 assistant：/相处、/归档 这类指令的回执是 role='system' 的库内行，它们由
+      // appendChatOutput 直接写库、**从不进内存 hist**（那条路不走 say）。放进恢复结果
+      // 就会凭空多出内存里从来没有的条目，和关掉前的状态分叉。
+      if (rep.role !== 'assistant') continue
       if (rep.status === 'failed' && !includeFailed) continue
-      turns.push({ user: rowToMessage(r), assistant: rowToMessage(rep) })
+      if (Number(rep.id) <= Number(afterId)) continue     // 这一轮在截尾点之前：在线时已丢弃
+      const u = users.get(Number(uid))
+      if (!u) continue
+      turns.push({ user: u, assistant: rep })
     }
-    return turns
+    turns.sort((a, b) => (a.assistant.timestamp - b.assistant.timestamp) || (a.assistant.id - b.assistant.id))
+    return limit > 0 ? turns.slice(-limit) : turns
   }
 
   // ── 事件 ────────────────────────────────────────────────────────────────

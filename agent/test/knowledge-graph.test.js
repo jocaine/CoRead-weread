@@ -34,6 +34,7 @@ import {
   buildAliasPrompt,
   buildReferencePrompt,
   buildPointInstruction,
+  mergeNodeMetadata,
 } from '../lib/knowledge-graph.js'
 
 // 假 LLM：按队列吐预设文本（沿用 topicize 测试的注入模式）
@@ -499,4 +500,26 @@ test('解析：parseReferenceResult 容错（围栏、前言）', () => {
   assert.deepEqual(parseReferenceResult('{"hits":[]}'), { hits: [] })
   assert.deepEqual(parseReferenceResult('{"hits":["n_x","","n_x","n_y"]}'), { hits: ['n_x', 'n_y'] }, '去空去重保序')
   assert.equal(parseReferenceResult('{"hits":[{"nodeId":"n_x"}]}'), null, 'hits 必须是 id 数组（2026-08-27 定调：协议去掉 quote 对象）')
+})
+
+test('mergeNodeMetadata：盘上被外部改过的已存在节点合回内存（防内存旧图覆盖回填）', () => {
+  const g = createGraph()
+  addNode(g, { id: 'n_1', point: '旧', discussion: { question: 'Q？', book: '', excerpts: [] } })
+  addNode(g, { id: 'n_2', point: '内存新节点' })
+  const disk = [
+    // 外部回填：同一节点的书被补上了
+    { id: 'n_1', point: '旧', discussions: [{ question: 'Q？', book: '某书', chapter: '', excerpts: [] }] },
+    // 盘上有、内存没有的节点：**不合**（agent 的节点集合由自己管，避免复活被删节点）
+    { id: 'n_gone', point: '盘上多出来的' },
+  ]
+  assert.equal(mergeNodeMetadata(g, disk), 1, '只合叠的 1 个节点')
+  assert.equal(findNode(g, 'n_1').discussions[0].book, '某书', '外部回填的书名进到内存')
+  assert.equal(findNode(g, 'n_2').point, '内存新节点', '内存独有的新节点不动')
+  assert.equal(findNode(g, 'n_gone'), null, '盘上多出来的节点不合进来')
+  // 内容完全一致 → 不算合入
+  assert.equal(mergeNodeMetadata(g, [findNode(g, 'n_1')]), 0)
+  // 脏数据不炸
+  assert.equal(mergeNodeMetadata(g, null), 0)
+  assert.equal(mergeNodeMetadata(g, [null, {}, 3]), 0)
+  assert.equal(mergeNodeMetadata(null, disk), 0)
 })

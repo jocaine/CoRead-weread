@@ -204,6 +204,11 @@ export const AGENT_CURSOR_FILE = path.join(RUNTIME_DIR, 'agent-cursor')
 export const AGENT_STATE_FILE = path.join(RUNTIME_DIR, 'agent-state.jsonl')
 export const STREAM_FILE = path.join(RUNTIME_DIR, 'stream.jsonl')
 
+// 模型调用用量流水（2026-10 诊断）：每次 API 调用一行 JSON，记输入/命中/未命中/输出。
+// 它是**过程数据**，删了不影响任何用户数据——下一次调用接着记，只是历史报表断了。
+// 读法：node agent/scripts/usage-report.mjs（`agent/package.json` 里没挂，直接跑脚本）。
+export const USAGE_FILE = path.join(RUNTIME_DIR, 'usage.jsonl')
+
 // ── 浏览器插件的扩展 ID（2026-10：托盘「打开 CoRead 阅读器」用）───────────────
 // 它是干什么的：CoRead 自带的阅读器是**扩展自己的页面**，地址形如
 //     chrome-extension://<32 位扩展 ID>/reader.html
@@ -414,6 +419,7 @@ export const DATA_FILES = {  'knowledge-graph': GRAPH_FILE,
   'agent-cursor': AGENT_CURSOR_FILE,
   'agent-state': AGENT_STATE_FILE,
   stream: STREAM_FILE,
+  usage: USAGE_FILE,
   'extension-id': EXTENSION_ID_FILE,
   'tool-history': TOOL_HISTORY_FILE,
   'api-config': API_CONFIG_FILE,

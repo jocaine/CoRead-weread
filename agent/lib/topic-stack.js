@@ -25,8 +25,13 @@
  *
  * 实现要点：
  * - callLLM(prompt, maxTokens) 由调用方注入，与 judgeTopicization 同模式（测试插假函数，接入包真调用）。
- * - 栈条目：{ role: 'user'|'assistant', content, selected?: { text, book?, chapter? } }。
+ * - 栈条目：{ role: 'user'|'assistant', content, selected?: { text, book?, chapter? },
+ *   bookId?, bookTitle?, chapter? }。
  *   划线结构体：user 轮次带自己的划线，assistant 轮次带它针对的划线（可缺省）。
+ *   bookId/bookTitle/chapter = 这条消息**当时在读哪本书**（收口时节点归属/图上的书色用）。
+ *   它和 selected 是两件事：selected 只在带划线时有，纯打字提问也有书名 —— 以前只认
+ *   selected.book，于是纯打字提问收出来的节点在图上没有书（涂默认灰）。
+ *   自由对话不带（那类节点按设计恒为"无所属书籍"）。
  *   AI 回复由调用方后续追加进栈（本模块只读栈内容做同一性判断的上下文）。
  * - 本模块不读写任何用户文件，纯判断。
  */
@@ -192,10 +197,17 @@ export async function judgeSameProblem(message, stack, deps = {}) {
 // 一条用户消息入栈时生成栈条目（划线结构体原样带上；AI 回复由调用方后续追加）
 export function makeStackEntry(message) {
   const selected = message.selected
+  const bookTitle = String(message.bookTitle || '').trim()
+  const chapter = String(message.chapter || '').trim()
   return {
     role: 'user',
     content: String(message.userNote || '').trim(),
     ...(selected && typeof selected === 'object' && String(selected.text || '').trim() ? { selected } : {}),
+    // 这条消息当时在读哪本书（与 selected 无关：纯打字提问也带着）。
+    // 收口固化时节点靠它记"属于哪本书"——图上一个节点的颜色就是这本书的颜色。
+    ...(message.bookId ? { bookId: String(message.bookId) } : {}),
+    ...(bookTitle ? { bookTitle } : {}),
+    ...(chapter ? { chapter } : {}),
   }
 }
 

@@ -16,6 +16,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { sessionStopFile, listSessionStopFiles, RUNTIME_DIR } from '../lib/paths.js'
 import { isFreeKey } from '../lib/free-conversation.js'
+import { stopTargetsTurn, isStaleStop } from '../lib/session-stop.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const RECEIVER_SRC = path.join(__dirname, '..', '..', 'receiver', 'index.js')
@@ -63,6 +64,35 @@ test('listSessionStopFiles 只认停止信号文件，不误伤 runtime 里的�
   for (const n of names) {
     assert.match(path.basename(n), /^session-stop-[0-9a-f]{16}\.json$/)
   }
+})
+
+/**
+ * 信号"发给哪一轮"的判定（2026-11 修）。
+ *
+ * 真会被踩到的路径（不是理论）：模型调用失败时流循环一次都没跑，没人来消费那条信号；
+ * 下一次在这个对话里提问时，队列闸门读到它就整轮弃掉——用户看到的是"我刚问的问题凭空
+ * 消失了"（提问行也被删，没有回答也没有报错）。所以必须比对 targetTs。
+ */
+test('停止信号只停它指向的那一轮：别的轮次读到不消费', () => {
+  const signal = { conv: 'rd_x', targetTs: 1792238285789 }
+  assert.equal(stopTargetsTurn(signal, 1792238285789), true, '目标那一轮：停')
+  assert.equal(stopTargetsTurn(signal, 1792238293090), false, '下一条消息：不许吃它的停止信号')
+})
+
+test('停止信号没带目标 / 调用方不知道自己是哪一轮 → 维持原行为（照停）', () => {
+  // 老版本侧栏、或侧栏还没拿到 /chat 回执就点了停止（targetTs=0）
+  assert.equal(stopTargetsTurn({ conv: 'x', targetTs: 0 }, 1792238293090), true)
+  assert.equal(stopTargetsTurn(null, 1792238293090), true)
+  // _meta 记忆重写、REPL 手输：没有"哪一轮"可比，只能照停
+  assert.equal(stopTargetsTurn({ targetTs: 1792238285789 }, 0), true)
+})
+
+test('过期信号（目标轮次比当前这条更早）判为垃圾，可以清掉', () => {
+  assert.equal(isStaleStop({ targetTs: 1792238285789 }, 1792238293090), true)
+  assert.equal(isStaleStop({ targetTs: 1792238285789 }, 1792238285789), false, '就是这一轮：不是垃圾')
+  assert.equal(isStaleStop({ targetTs: 1792238293090 }, 1792238285789), false, '目标还在后面：留着')
+  assert.equal(isStaleStop({ targetTs: 0 }, 1792238293090), false, '没目标：不下"垃圾"结论')
+  assert.equal(isStaleStop(null, 1792238293090), false)
 })
 
 /**

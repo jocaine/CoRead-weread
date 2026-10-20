@@ -2104,6 +2104,13 @@
       if (!text) { this.banner.hidden = true; return }
       this._setBannerLines([text], kind)
     }
+    // 没有书的节点为什么是灰的？——只有**正式图**里"没有书"才等于"自由对话的节点"
+    //（2026-11 用户定调：只有自由对话的节点才是灰的）。教程图 / 演示图 / 测试图里的
+    // 节点本来就没有真实书籍归属，不能把它们的空当成"自由对话"。
+    _booklessMeansFree() {
+      const s = this._source
+      return s !== 'tutorial' && s !== 'demo' && s !== 'results' && s !== 'free'
+    }
     // 书籍图例（AI-025）：按书名分组列出 书籍 → 颜色，随图数据更新
     _renderBookLegend() {
       const el = this.container && this.container.querySelector('#gv-legend-books')
@@ -2117,9 +2124,14 @@
         }
       }
       const entries = [...byBook.entries()]
-      el.innerHTML = entries.length
+      // 灰这一行必须常驻：灰节点不在下面这份"有书名的书"清单里，没这一行就没人知道
+      // 那个灰点是什么意思（2026-11 用户报"这本的节点怎么是灰的"）。
+      const greyRow = this._booklessMeansFree()
+        ? '<div class="gv-lg-row"><span class="sw" style="background:' + COLORS.nodeDefault + '"></span><span class="gv-lg-name" title="自由对话收出来的节点不归属任何书，图上涂默认灰">自由对话 · 无书籍归属</span></div>'
+        : ''
+      el.innerHTML = greyRow + (entries.length
         ? entries.map(([b, c]) => '<div class="gv-lg-row"><span class="sw" style="background:' + c + '"></span><span class="gv-lg-name" title="' + escHtml(b) + '">' + escHtml(b) + '</span></div>').join('')
-        : '<div class="gv-lg-empty">（当前图无书籍归属）</div>'
+        : '<div class="gv-lg-empty">（当前图无书籍归属）</div>')
     }
     _updateSourceBadge() {
       const badge = this.container && this.container.querySelector('#gv-demo-badge')
@@ -2175,6 +2187,8 @@
       const discs = (n.discussions || []).length
       let html = '<b>' + escHtml(n.point) + '</b>'
       if (n.books.length) html += '<div style="color:#9fb0c3">' + escHtml(n.books.join(' · ')) + '</div>'
+      // 没有书名的节点（图上涂默认灰）要说明为什么灰——不然只能看到一个灰点（2026-11）
+      else if (this._booklessMeansFree()) html += '<div style="color:#9fb0c3">自由对话 · 无书籍归属</div>'
       html += '<div>' + discs + ' 次专题化讨论 · ' + (n.aliases || []).length + ' 条相关说法</div>'
       this.tooltip.innerHTML = html
       this.tooltip.classList.add('show')   // CSS 过渡淡入（AI-027）
@@ -2207,7 +2221,11 @@
       const discEl = this.detail.querySelector('#gv-d-discs')
       discEl.innerHTML = (n.discussions && n.discussions.length)
         ? n.discussions.map((d) => {
-          const book = d.book ? '《' + escHtml(bookName(d.book)) + '》' : ''
+          // 没有书名的讨论 = 自由对话收出来的节点（图上涂默认灰）。这里必须写出来，
+          // 不能像以前那样"空就整段不显示"——用户看到的会是一个没法解释的灰点。
+          const book = d.book
+            ? '《' + escHtml(bookName(d.book)) + '》'
+            : (this._booklessMeansFree() ? '自由对话 · 无书籍归属' : '')
           const chapter = d.chapter ? escHtml(d.chapter) : ''
           const excerpts = Array.isArray(d.excerpts) ? d.excerpts : []
           const meta = [book, chapter, excerpts.length ? excerpts.length + ' 轮讨论' : ''].filter(Boolean).join(' · ')
@@ -2382,6 +2400,6 @@
     ctx.fillStyle = 'rgba(30, 34, 40, ' + (0.96 * alpha * fade).toFixed(3) + ')'
     for (let i = 0; i < lines.length; i++) ctx.fillText(lines[i], x, y + i * lineH)
   }
-  console.log('[CoRead] graph-view v52 已加载：命中高亮改「一场讨论一次 user 闭包」——本场栈引用与本轮命中合并取闭包、一种圈一个含义（2026-11）')
+  console.log('[CoRead] graph-view v53 已加载：灰色 = 自由对话的节点（无书籍归属），图例/详情/悬停都写明；书本节点的书名改由收口从消息自带书名兜底（2026-11）')
   global.CoReadGraphView = { GraphView, COLORS, utils: { computePath, computeChains, computeHitLayers, chainActiveSet, labelShape, labelTier, drawLabel, topoSort, hashStr, mulberry32, clamp, wrapText, bookName, colorDist, assignBookColors } }
 })(typeof window !== 'undefined' ? window : globalThis)

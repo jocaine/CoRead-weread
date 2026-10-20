@@ -76,6 +76,87 @@ test('loadTurns：按对话重建轮次，无回答的不成轮', () => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('loadTurns：范围由 afterId 决定，不是"固定取最近 N 条"', () => {
+  // 回归背景（2026-11）：旧实现 `ORDER BY id DESC LIMIT 60`——LIMIT 数的是消息行（60 行 = 30 轮），
+  // 而恢复调用方拿这个结果再 `Math.min(游标, list.length)` 跳过开头。游标是"累计切掉条数"
+  // （一次截尾就跳 ~118），一超过 60 就跳过整段，**整本书的历史在重启后全空**。
+  const dir = tmpDir()
+  const store = openChatStore(path.join(dir, 'chat.db'))
+  const ids = []
+  for (let i = 1; i <= 40; i++) {
+    const u = store.insertMessage({ conv: 'long', role: 'user', content: `Q${i}`, ts: i * 10, status: 'ok' })
+    const a = store.insertMessage({ conv: 'long', role: 'assistant', content: `A${i}`, ts: i * 10 + 5, replyTo: u })
+    ids.push({ u, a })
+  }
+
+  const all = store.loadTurns('long')
+  assert.equal(all.length, 40, '默认全量：上限由调用方点位与 token 预算决定，不在这里截')
+
+  // 截尾点位 = 第 30 轮的回答 id（在线把前 30 轮切掉了）→ 恢复的正好是后 10 轮
+  const rest = store.loadTurns('long', { afterId: ids[29].a })
+  assert.equal(rest.length, 10, '只取点位之后的轮次')
+  assert.equal(rest[0].user.content, 'Q31')
+  assert.equal(rest[9].assistant.content, 'A40')
+
+  assert.equal(store.loadTurns('long', { afterId: ids[39].a }).length, 0, '点位在最末尾 → 没有可恢复的轮次')
+  store.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('loadTurns：顺序按回答落库时间——重试轮排到末尾，不回到它提问的位置', () => {
+  // 内存里 hist.push 发生在回答生成完之后：提问失败时那半轮被 pop 掉，重试成功才从末尾推回。
+  // 所以"回答时间"才是它在内存里的位置；按提问 id 排序会把重试轮排回当初的位置，
+  // 恢复出来的序列与关掉前不一致（缓存前缀、上下文承接都跟着错）。
+  const dir = tmpDir()
+  const store = openChatStore(path.join(dir, 'chat.db'))
+  const u1 = store.insertMessage({ conv: 'r', role: 'user', content: 'Q1', ts: 100, status: 'ok' })
+  store.insertMessage({ conv: 'r', role: 'assistant', content: '⚠️ 失败', ts: 150, status: 'failed', replyTo: u1 })
+  const u2 = store.insertMessage({ conv: 'r', role: 'user', content: 'Q2', ts: 200, status: 'ok' })
+  store.insertMessage({ conv: 'r', role: 'assistant', content: 'A2', ts: 250, replyTo: u2 })
+  store.insertMessage({ conv: 'r', role: 'assistant', content: 'A1', ts: 300, replyTo: u1 })   // Q1 重试成功
+
+  const turns = store.loadTurns('r')
+  assert.equal(turns.length, 2)
+  assert.deepEqual(turns.map((t) => t.user.content), ['Q2', 'Q1'], '重试成功的 Q1 排在末尾')
+  assert.deepEqual(turns.map((t) => t.assistant.content), ['A2', 'A1'], '失败气泡不算回答，取最终成功那条')
+  store.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('loadTurns：只认 assistant 回答——/相处、/归档 这类系统回执不成轮', () => {
+  // 指令回执是 role='system' 的行，由 appendChatOutput 直接写库、**从不进内存 hist**。
+  // 恢复时把它当成一轮，就会凭空多出内存里从来没有的条目。
+  const dir = tmpDir()
+  const store = openChatStore(path.join(dir, 'chat.db'))
+  const u1 = store.insertMessage({ conv: 's', role: 'user', content: '/相处 多举例子', ts: 100, status: 'ok' })
+  store.insertMessage({ conv: 's', role: 'system', content: '已记录：多举例子', ts: 150, replyTo: u1 })
+  const u2 = store.insertMessage({ conv: 's', role: 'user', content: 'Q2', ts: 200, status: 'ok' })
+  store.insertMessage({ conv: 's', role: 'assistant', content: 'A2', ts: 250, replyTo: u2 })
+  const turns = store.loadTurns('s')
+  assert.equal(turns.length, 1, '系统回执那一轮不该被恢复')
+  assert.equal(turns[0].user.content, 'Q2')
+  store.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('loadTurns：assistant 字段完整（回归：二次 rowToMessage 会把 timestamp/bookId 转丢）', () => {
+  // 旧实现里 pairReplies 已经把数据库行转成消息对象，loadTurns 又套了一次 rowToMessage——
+  // 而 rowToMessage 认的是数据库列名（ts / book_id），转换过的对象上这些字段已改名，
+  // 结果 assistant.timestamp 变成 NaN、bookId/chapter/selectedText 全丢。以前只读 content
+  // 所以没暴露；现在排序要读 timestamp，必须钉住。
+  const dir = tmpDir()
+  const store = openChatStore(path.join(dir, 'chat.db'))
+  const u1 = store.insertMessage({ conv: 'f', role: 'user', content: 'Q', ts: 100, status: 'ok', bookId: 'bk1', chapter: '第一章' })
+  store.insertMessage({ conv: 'f', role: 'assistant', content: 'A', ts: 150, replyTo: u1, bookId: 'bk1' })
+  const [t] = store.loadTurns('f')
+  assert.ok(Number.isFinite(t.assistant.timestamp), 'assistant.timestamp 不能是 NaN（排序靠它）')
+  assert.equal(t.assistant.timestamp, 150)
+  assert.equal(t.assistant.bookId, 'bk1', 'assistant 的书籍字段不能丢')
+  assert.equal(t.user.chapter, '第一章', 'user 的章节字段不能丢')
+  store.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('删除：按对话事务删除（不再整文件重写）；按 id 删除（清理失败气泡）', () => {
   const dir = tmpDir()
   const store = openChatStore(path.join(dir, 'chat.db'))

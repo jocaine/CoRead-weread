@@ -105,6 +105,38 @@ function cleanAliases(list) {
 }
 
 /**
+ * 把**盘上图文件**里已存在节点的内容合回内存图（防"内存旧图覆盖外部修正"）。
+ *
+ * 为什么需要它：agent 启动时把整张图读进内存，之后只在自己收口时整份写回。
+ * 于是任何**在这之间**对 GRAPH_FILE 的修改（回填书名、手工修 point、清理脚本）
+ * 都会在下一次收口时被静默覆盖 —— 2026-11 一次书名回填就是这样被盖掉的，
+ * 用户在图上看到"改了又变回去"。
+ *
+ * 规则：只合**两边都有的节点**，且以盘上那份为准。依据是节点不可变
+ *（2026-08-29 用户定调：agent 只新建节点、从不改写已有节点，见 updateNodePoint 的注释），
+ * 所以盘上那份只可能比内存新，不会更旧。内存里新加的节点、以及边，一律不动
+ *（边由 agent 独占生成与清理，盘上的边被合进来会复活已删的冗余边）。
+ *
+ * @param {object} graph 内存图（会被就地修改）
+ * @param {Array} diskNodes 盘上图文件的 nodes
+ * @returns {number} 合入的节点数（0 = 盘上没变 / 无重叠）
+ */
+export function mergeNodeMetadata(graph, diskNodes) {
+  if (!graph || !Array.isArray(graph.nodes) || !Array.isArray(diskNodes)) return 0
+  const byId = new Map(graph.nodes.map((n) => [n.id, n]))
+  let merged = 0
+  for (const d of diskNodes) {
+    if (!d || typeof d !== 'object' || !d.id) continue
+    const cur = byId.get(d.id)
+    if (!cur) continue
+    if (JSON.stringify(cur) === JSON.stringify(d)) continue
+    Object.assign(cur, d)
+    merged++
+  }
+  return merged
+}
+
+/**
  * 更新节点 point（手动修正入口：固化后节点不被系统修改——无聚合、不改写，
  * 显式修正走这里）。
  * @param {object} graph

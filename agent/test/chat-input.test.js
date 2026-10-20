@@ -14,7 +14,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { loadReplyByTs, parseMessage } from '../lib/chat-input.js'
+import { loadReplyByTs, parseMessage, splitQuotedQuestion } from '../lib/chat-input.js'
 
 function tmpFiles() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-input-test-'))
@@ -70,4 +70,37 @@ test('parseMessage：纯文本提问 / 引用格式拆解', () => {
   assert.equal(p2.chapter, '五')
   assert.equal(p2.sel, '划线B')
   assert.equal(p2.quoted, true)
+})
+
+// ── splitQuotedQuestion：引文当材料、提问当题目（2026-10-17 重心修复）───────────
+test('splitQuotedQuestion：引文与提问分开，[引用] 头去掉（书名由调用方交代）', () => {
+  const q = splitQuotedQuestion('[引用]《国家与革命》第三章 国家与革命。1871年巴黎公社的经验。马克思的分析\n> "没有代表机构，我们不可能想象什么民主，即使是无产阶级民主"\n\n\n来说说代表机构')
+  assert.equal(q.material, '> "没有代表机构，我们不可能想象什么民主，即使是无产阶级民主"', '材料只留引文行，不带 [引用] 头')
+  assert.equal(q.question, '来说说代表机构', '提问正文完整取出（含三连换行也认）')
+})
+
+test('splitQuotedQuestion：多行划线整块保留（parseMessage 只认第 2 行，这里不会拆错）', () => {
+  const q = splitQuotedQuestion('[引用]《学做工》第一章\n> "第一行\n> 第二行"\n\n接着问')
+  assert.equal(q.material, '> "第一行\n> 第二行"')
+  assert.equal(q.question, '接着问')
+})
+
+test('splitQuotedQuestion：提问自己带空行也不会被切掉后半截', () => {
+  const q = splitQuotedQuestion('[引用]《书》一\n> "划线"\n\n第一段\n\n第二段')
+  assert.equal(q.question, '第一段\n\n第二段')
+})
+
+test('splitQuotedQuestion：只划线没提问 → question 为空，不硬凑', () => {
+  const q = splitQuotedQuestion('[引用]《书》一\n> "划线"')
+  assert.equal(q.material, '> "划线"')
+  assert.equal(q.question, '')
+})
+
+test('splitQuotedQuestion：纯文本消息 → 正文整体算提问，划线（若有）当材料', () => {
+  const q1 = splitQuotedQuestion('为什么这么说？', '某段划线')
+  assert.equal(q1.question, '为什么这么说？')
+  assert.equal(q1.material, '> "某段划线"')
+  const q2 = splitQuotedQuestion('为什么这么说？')
+  assert.equal(q2.material, '', '没有划线就不编造材料')
+  assert.equal(q2.question, '为什么这么说？')
 })

@@ -27,6 +27,39 @@ export function nextNodeId(now = Date.now()) {
 }
 
 /**
+ * 一段（收口分段后的一组轮次）属于哪本书 / 哪一章。
+ *
+ * 图为节点着色时**唯一**的输入就是这个讨论的 `book`（一本书一个颜色，没有书名涂默认灰），
+ * 所以取错/取空在界面上是"这个点颜色不对"，而不是报错。
+ *
+ * 取法从窄到宽：
+ *   1. 段内任一条用户消息的**划线**（`selected.book`）—— 2026-08 起的老口径，最准；
+ *   2. 段内任一条用户消息**自带的书名**（`bookTitle`）—— 2026-11 补：划线只在那一轮
+ *      带划线时才存在，纯打字追问开头的段原本一律取不到书名，收出来的节点在图上
+ *      没有书（涂默认灰）。栈条目现在每条都带书号/书名（见 topic-stack.js 的
+ *      makeStackEntry 与 index.js 的 buildTopicUnit）。
+ *
+ * `bookless`：自由对话的节点按设计恒为"无所属书籍"（图上灰色），传 true 直接返回空。
+ *
+ * @param {Array} entries 分段内的栈条目（{ role, content, selected?, bookTitle?, chapter? }）
+ * @param {object} [opts] { bookless?: boolean }
+ * @returns {{ book: string, chapter: string }}
+ */
+export function segmentBook(entries, opts = {}) {
+  if (opts && opts.bookless) return { book: '', chapter: '' }
+  const list = Array.isArray(entries) ? entries : []
+  let book = ''
+  let chapter = ''
+  for (const e of list) {
+    if (!e || e.role !== 'user') continue
+    if (!book) book = String((e.selected && e.selected.book) || e.bookTitle || '').trim()
+    if (!chapter) chapter = String((e.selected && e.selected.chapter) || e.chapter || '').trim()
+    if (book && chapter) break
+  }
+  return { book, chapter }
+}
+
+/**
  * 深拷贝整张图（nodes + edges）。自由模式沙盒用（2026-09 定调：自由模式的固化
  * 完整链路跑在正式图的副本上，测试产物不碰正式图）。节点/边都是纯 JSON 结构，
  * 深拷贝后副本与原件互不影响。

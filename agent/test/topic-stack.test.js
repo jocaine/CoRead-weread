@@ -264,6 +264,18 @@ test('makeStackEntry：划线结构体原样透传（book/chapter 一并保留�
   assert.deepEqual(makeStackEntry({ userNote: '为什么？', selected }), { role: 'user', content: '为什么？', selected })
 })
 
+test('makeStackEntry：书名/章节独立于划线——纯打字提问也带上（收口时节点靠它归属到书）', () => {
+  // 这组字段是 2026-11 补的：以前只有划线里才有书名，纯打字提问的段收出来的节点
+  // 在图上没有书（涂默认灰）。现在每条用户消息都带"当时在读哪本"。
+  assert.deepEqual(
+    makeStackEntry({ userNote: '什么是表现主义', bookId: 'rd_abc', bookTitle: 'Theories of German Fascism', chapter: '二' }),
+    { role: 'user', content: '什么是表现主义', bookId: 'rd_abc', bookTitle: 'Theories of German Fascism', chapter: '二' },
+  )
+  // 空书名/空章节不落字段（保持条目干净，与 selected 的既有风格一致）
+  assert.deepEqual(makeStackEntry({ userNote: 'q', bookId: 'rd_abc', bookTitle: '  ', chapter: '' }),
+    { role: 'user', content: 'q', bookId: 'rd_abc' })
+})
+
 // ── 降级入栈（Q2.5 + 降级判定，2026-08-11）────────────────────────────────────
 test('空栈 + 降级救回（usedAssist）+ 带 assistantContext → pushed 且补入 AI 回复背景轮次', async () => {
   const r = await processStackMessage([], downgradeCarryOn, { callLLM: makeLLM(okTopic(false), okTopic(true)), log: () => {} })
