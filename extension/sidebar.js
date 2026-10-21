@@ -6526,6 +6526,7 @@ function openApiConfig() {
 }
 
 function closeApiConfig() {
+  apiPresets?.closeMenus()   // 下拉还开着就把弹窗关了时，别让它留到下一次打开
   apiOverlay?.classList.remove('on')
 }
 
@@ -6573,7 +6574,15 @@ async function refreshApiStatus() {
 
 // 打开配置弹窗：firstRun = 未配置时的引导态（多一行说明）
 function showApiConfigModal(cfg, firstRun) {
-  if (cfg) fillApiForm(cfg)
+  /**
+   * ⚠️ source === 'none' 表示**什么都没配过**。这时后端返回的 model 不是用户填的，
+   * 而是 lib/api-config.js 的兜底默认值（以前是 gpt-4o，2026-10-21 用户报"还有那个
+   * gpt 的默认文字"就是它）。照抄进输入框会造出两个错：
+   *   ① 看起来"已经配了模型"，其实一个字节都没存过；
+   *   ② 它非空 → 下面的预设预填以为用户填过，于是 DeepSeek 那两行填不进来。
+   * 所以这种状态下先清空，再让预设预填。
+   */
+  if (cfg) fillApiForm(cfg.source === 'none' ? { apiBase: '', apiKey: '', model: '' } : cfg)
   applyApiPresetDefaults()   // 空着的字段补预设（已有值一律不动）
   const first = document.getElementById('api-first')
   if (first) first.hidden = !firstRun

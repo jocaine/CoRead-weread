@@ -156,12 +156,25 @@
       pop.appendChild(empty)
       return
     }
+    const current = (el(kind)?.value || '').trim()
     for (const v of list) {
       const item = document.createElement('button')
       item.type = 'button'
       item.className = 'api-combo-item'
       item.setAttribute('role', 'option')
-      item.textContent = v
+      const text = document.createElement('span')
+      text.textContent = v
+      item.appendChild(text)
+      // 当前值要有明确标记：只靠浅底色「差不多」看不出是哪一条（颜色之外再给一个对勾）
+      if (v === current) {
+        item.classList.add('on')
+        item.setAttribute('aria-selected', 'true')
+        const tick = document.createElement('span')
+        tick.className = 'api-combo-check'
+        tick.setAttribute('aria-hidden', 'true')
+        tick.textContent = '✓'
+        item.appendChild(tick)
+      }
       item.addEventListener('click', () => pick(kind, v))
       pop.appendChild(item)
     }

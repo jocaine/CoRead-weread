@@ -20,7 +20,10 @@ import path from 'path'
 import { API_CONFIG_FILE, ENV_FILE } from './paths.js'
 
 export { API_CONFIG_FILE, ENV_FILE }
-export const DEFAULT_MODEL = 'gpt-4o'
+// 兜底模型（用户什么都没配时会用它，但**没有任何 Key 时也调不通**）。
+// 2026-10-21 从 'gpt-4o' 改成 DeepSeek：产品的推荐服务商换成了 DeepSeek，
+// 留着 gpt-4o 会在"未配置"的弹窗里显示成一个看起来像已配置的值（用户报的就是这个）。
+export const DEFAULT_MODEL = 'deepseek-flash'
 export const CONFIG_KEYS = ['apiBase', 'apiKey', 'model']
 
 /**
@@ -92,7 +95,7 @@ export function writeApiConfig(value, file = API_CONFIG_FILE) {
 
 /**
  * 生效配置 = 配置文件（若该字段存在）> 进程环境变量 > agent/.env 文件。
- * model 缺省回退 DEFAULT_MODEL，保持与旧版 COREAD_MODEL || 'gpt-4o' 一致。
+ * model 缺省回退 DEFAULT_MODEL（DeepSeek；旧版是 gpt-4o）。
  * configFile / envFile 可注入，便于单测不碰真实文件。
  * @returns {{apiBase: string, apiKey: string, model: string, source: 'plugin'|'env'|'none'}}
  */

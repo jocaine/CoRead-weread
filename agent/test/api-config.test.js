@@ -76,13 +76,13 @@ test('resolveApiConfig：文件里显式空值不再回退 .env（避免界面�
   assert.equal(isConfigured(cfg), false)
 })
 
-test('resolveApiConfig：无插件文件时用进程环境变量，model 缺省回退 gpt-4o', () => {
+test('resolveApiConfig：无插件文件时用进程环境变量，model 缺省回退 deepseek-flash', () => {
   const file = tmpConfigFile()
   const cfg = resolveApiConfig(
     { COREAD_API_BASE: 'https://env.example/v1/', COREAD_API_KEY: 'env-key' },
     file, path.join(path.dirname(file), 'no-such.env'))
   assert.deepEqual(cfg, {
-    apiBase: 'https://env.example/v1', apiKey: 'env-key', model: 'gpt-4o', source: 'env',
+    apiBase: 'https://env.example/v1', apiKey: 'env-key', model: 'deepseek-flash', source: 'env',
   })
   assert.equal(isConfigured(cfg), true)
 })
@@ -108,7 +108,7 @@ test('resolveApiConfig：什么都没有 → 未配置且 model 仍是默认值'
   const cfg = resolveApiConfig({}, file, path.join(path.dirname(file), 'no-such.env'))
   assert.equal(cfg.source, 'none')
   assert.equal(isConfigured(cfg), false)
-  assert.equal(cfg.model, 'gpt-4o')
+  assert.equal(cfg.model, 'deepseek-flash')
 })
 
 test('isConfigured：地址或 key 缺一即为未配置（model 有默认值）', () => {

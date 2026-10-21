@@ -2558,6 +2558,7 @@
       .hdr-icon.pulse { animation: none; }
       #coach-card { transition: none; }
       .api-combo-btn svg { transition: none; }
+      .api-combo-pop { animation: none; }
     }
 
     /* ── 已读书籍选择弹窗（2026-10）：无书默认界面 / 更多菜单 → 从已读过的书籍中
@@ -2753,7 +2754,7 @@
       top: 0;
       right: 0;
       bottom: 0;
-      width: 26px;
+      width: 28px;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -2761,15 +2762,16 @@
       background: none;
       padding: 0;
       cursor: pointer;
-      color: #888;
+      color: #666;
       border-radius: 0 6px 6px 0;
     }
-    .api-combo-btn:hover { color: #333; }
+    /* hover 给一块底色：让"这里可以点"看得出来，而不是一条没有反馈的细线 */
+    .api-combo-btn:hover { color: #111; background: #f5f6f7; }
     .api-combo-btn:focus-visible {
       outline: none;
       box-shadow: 0 0 0 3px rgba(10, 125, 67, 0.18);
     }
-    .api-combo-btn svg { width: 10px; height: 10px; transition: transform 120ms cubic-bezier(.4,0,.2,1); }
+    .api-combo-btn svg { width: 12px; height: 12px; transition: transform 120ms cubic-bezier(.4,0,.2,1); }
     .api-combo-btn[aria-expanded="true"] svg { transform: rotate(180deg); }
     .api-combo-pop {
       position: absolute;
@@ -2779,15 +2781,29 @@
       right: 0;
       padding: 4px;
       background: #fff;
-      border: 1px solid #e5e5e5;
+      border: 1px solid #d8d8d8;
       border-radius: 8px;
       box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+      animation: api-combo-in 120ms ease-out;
     }
     .api-combo-pop[hidden] { display: none; }
     /* 下方放不下时往上翻（判据与选择都在 api-presets.js 的 toggleMenu 里） */
-    .api-combo-pop.up { top: auto; bottom: calc(100% + 4px); }
+    .api-combo-pop.up { top: auto; bottom: calc(100% + 4px); animation-name: api-combo-in-up; }
+    /* 进场的小位移是给"这是一层浮在上面东西"用的：白底弹层压在白面板上，
+       只靠一条浅边和阴影，看起来像把下面的文字切了一刀。 */
+    @keyframes api-combo-in {
+      from { opacity: 0; transform: translateY(-3px); }
+      to { opacity: 1; transform: none; }
+    }
+    @keyframes api-combo-in-up {
+      from { opacity: 0; transform: translateY(3px); }
+      to { opacity: 1; transform: none; }
+    }
     .api-combo-item {
-      display: block;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
       width: 100%;
       text-align: left;
       border: none;
@@ -2800,12 +2816,16 @@
       cursor: pointer;
       overflow-wrap: anywhere;
     }
-    .api-combo-item:hover { background: #f0faf3; }
+    .api-combo-item:hover { background: #f5f6f7; }
+    /* 当前值：浅绿底 + 强调文字色 + 一个对勾（颜色之外还有形状，不靠辨色） */
+    .api-combo-item.on { background: #f0faf3; color: #0a7d43; font-weight: 600; }
+    .api-combo-item.on:hover { background: #e8f6ee; }
     .api-combo-item:focus-visible {
       outline: none;
-      background: #f0faf3;
+      background: #f5f6f7;
       box-shadow: inset 0 0 0 1px #bfe3cc;
     }
+    .api-combo-check { font-size: 11px; font-weight: 400; color: #0a7d43; }
     .api-combo-empty { font-size: 11px; color: #888; padding: 6px 8px; }
     .api-input {
       width: 100%;
@@ -3404,7 +3424,7 @@
         <div class="api-src" id="api-src" hidden>当前配置来自 agent/.env，在此保存后以插件配置为准。</div>
         <div class="api-field">
           <label class="api-label" for="api-base">API 地址</label>
-          <input type="text" class="api-input" id="api-base" dir="ltr" placeholder="https://api.deepseek.com" list="api-base-presets" autocomplete="off" spellcheck="false">
+          <input type="text" class="api-input" id="api-base" dir="ltr" placeholder="https://api.deepseek.com" autocomplete="off" spellcheck="false">
         </div>
         <div class="api-field">
           <div class="api-label-row">
@@ -3419,15 +3439,19 @@
         </div>
         <div class="api-field">
           <label class="api-label" for="api-model">模型</label>
-          <input type="text" class="api-input" id="api-model" dir="ltr" placeholder="deepseek-flash" list="api-model-presets" autocomplete="off" spellcheck="false">
+          <input type="text" class="api-input" id="api-model" dir="ltr" placeholder="deepseek-flash" autocomplete="off" spellcheck="false">
         </div>
         <div class="api-err" id="api-err"></div>
-        <!-- 预设清单（2026-10-21）：候选值**只写在这里**，sidebar.js 从 DOM 读，不另存一份表 ——
-             两处各存一份迟早会分叉（改了这里忘了那里，下拉里出现的值保存后跑不通）。
+        <!-- 预设清单（2026-10-21）：候选值**只写在这里**，extension/api-presets.js 从 DOM 读，
+             不另存一份表 —— 两处各存一份迟早会分叉（改了这里忘了那里，下拉里出现的值保存后跑不通）。
              加一家服务商 = 在下面各加一行 <option>：
                · api-base-presets  一个地址一行
                · api-model-presets 一个模型一行，data-base 写它属于哪个地址
-             （Chrome 的 <input list> 就是原生 combobox：能点开选、也能直接输任意值。） -->
+
+             ⚠️ 这两个 datalist **故意不挂到 input 的 list 属性上**：挂了之后 Chrome 会给输入框
+             叠一层它自己的下拉（箭头也不保证画出来，但点开是一套系统样式），和我们自己画的箭头、
+             列表挤在一起——2026-10-21 用户说的"combobox 样式不对"就是这么来的。
+             现在它们只当数据源（datalist 不挂 list 也照样能被 JS 读到）。 -->
         <datalist id="api-base-presets">
           <option value="https://api.deepseek.com"></option>
         </datalist>
