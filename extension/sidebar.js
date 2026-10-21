@@ -6548,6 +6548,15 @@ function fillApiForm(cfg) {
   if (model) model.value = cfg.model || ''
 }
 
+// ── 预设地址 / 模型（2026-10-21）──────────────────────────────────────────────
+// 候选值写在 sidebar.html 的两条 <datalist> 里，联动逻辑在 extension/api-presets.js
+// （单独文件，理由见那边的注释）。这里只做转发：
+//   · 预设是加速项，不是必需项 —— 那个文件没加载成功就退化为"不补默认值、不联动"，
+//     弹窗照常能开、能存（否则一个可选文件会把整个配置入口带塌）。
+const apiPresets = window.CoreadApiPresets || null
+apiPresets?.install()          // 地址 ↔ 模型联动（接线在 api-presets.js 里，只有一处）
+function applyApiPresetDefaults() { apiPresets?.applyDefaults() }
+
 // 菜单项状态文案：已配置=绿（带模型名）/ 未配置=灰 / 接收端未连=灰
 function renderApiStatus(cfg) {
   const desc = document.getElementById('mm-api-desc')
@@ -6565,6 +6574,7 @@ async function refreshApiStatus() {
 // 打开配置弹窗：firstRun = 未配置时的引导态（多一行说明）
 function showApiConfigModal(cfg, firstRun) {
   if (cfg) fillApiForm(cfg)
+  applyApiPresetDefaults()   // 空着的字段补预设（已有值一律不动）
   const first = document.getElementById('api-first')
   if (first) first.hidden = !firstRun
   const src = document.getElementById('api-src')
@@ -6634,6 +6644,20 @@ for (const id of ['api-base', 'api-key', 'api-model']) {
     else if (e.key === 'Escape') closeApiConfig()
   })
 }
+// 地址 ↔ 模型互相对齐由 api-presets.js 的 install() 接线（见上面那几行），这里不再重复绑。
+
+// 「没有 API Key？去 DeepSeek 申请」：新标签页打开，侧栏停在原地不跳走。
+// 地址从 <a href> 里取 —— 页面上写的那一个就是唯一真源，这里不再存一份副本。
+document.getElementById('api-key-help')?.addEventListener('click', (e) => {
+  e.preventDefault()
+  const url = e.currentTarget.href
+  if (!url) return
+  if (typeof chrome !== 'undefined' && chrome.tabs?.create) {
+    chrome.tabs.create({ url, active: true }).catch(() => window.open(url, '_blank', 'noopener'))
+  } else {
+    window.open(url, '_blank', 'noopener')   // 自测页（没有 chrome.tabs）走这条
+  }
+})
 
 // ── 无书默认界面 / 已读书籍的事件绑定（2026-10；2026-11 改版）──────────────
 // 无书界面已无「从已读书籍中选择」按钮：书单直接列在那里（renderNoBookList），
@@ -6709,7 +6733,7 @@ document.getElementById('bp-search')?.addEventListener('input', renderBookList)
 async function reportBuildStamp() {
   const files = [
     'sidebar.js', 'sidebar.html', 'translate-background.js', 'service_worker.js',
-    'reader.js', 'graph-view.js',
+    'reader.js', 'graph-view.js', 'api-presets.js',
   ]
   const out = {}
   for (const f of files) {

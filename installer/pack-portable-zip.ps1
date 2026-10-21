@@ -170,7 +170,7 @@ New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
 #     data\              ← 你的全部数据（备份就复制这一个文件夹）
 #     extension\         ← 浏览器插件（装插件时必须选它）
 #     internal\          ← 程序本体（Node 运行环境、引擎、接收端、说明书、排障脚本）
-# 另有 builtin\（现在是空目录）与 logs\（日志），两者都不是用户数据。
+# 另有 builtin\（内置教程 PDF，2026-10-21 起）与 logs\（日志），两者都不是用户数据。
 # 数据能从 internal\ 里拿出来，靠的是 agent/lib/paths.js 这一处路径真源：
 # 它按"agent 是不是装在 internal\ 下"判断包根在哪，进而定位包根下的 data\。
 $internal = Join-Path $StageDir 'internal'
@@ -179,7 +179,7 @@ New-Item -ItemType Directory -Path $internal -Force | Out-Null
 # ── 2b. 数据目录与内置数据目录（2026-10 目录重构）────────────────────
 # 新布局（依据 agent/lib/paths.js）：
 #   <包根>\data\      用户数据，按类型分格。**备份 = 复制这一个文件夹。**
-#   <包根>\builtin\   空目录（2026-10 起不再随包分发图谱文件，见第 3 步注释）。不属于用户，不参与备份。
+#   <包根>\builtin\   内置教程 PDF（2026-10-21 起）。不属于用户，不参与备份。
 #   <包根>\logs\      日志（托盘输出、侧栏调试上报）。可随时清空。
 # 为什么数据放在包根、不再藏在 internal\ 里：internal\ 的定位是"程序，用户别动"
 # （README-FIRST.txt 原话），数据关在里面就违背这个定位。旧布局的实际代价见
@@ -287,7 +287,28 @@ Write-Step 'internal\agent\AGENT.md'
 # 代价（明确接受，记在这里免得以后当 bug 查）：*升级上来的老用户*如果正式图还没落盘，
 # 就少了"离线固化图"这层回退。要恢复这个能力，得**提交一份真正通用的图谱**再放行，
 # 不能再用作者本机那份。
-Write-Step 'builtin\（空目录：不再随包分发图谱文件）'
+Write-Step 'builtin\（不随包分发图谱文件）'
+
+# ── builtin\ 里现在唯一的东西：内置教程书（2026-10-21）─────────────────────
+# 用户报的问题："打出来的包没有自带 coread 教程。"
+# 教程 PDF 三个位置都不合适，各有一条硬理由：
+#   · data\       —— 打包闸门会拦（data\ 必须只有空壳）。那道闸门是对的：升级最自然的做法
+#                    是"解压新包覆盖旧文件夹"，包里多带任何一个数据文件，都会在那一刻
+#                    盖掉用户自己的记录（2026-10 用 api-config.json 踩过一次）。
+#   · extension\  —— PDF 不是插件资源，白白给插件目录加 1.2 MB。
+#   · builtin\    —— 对的：这一格的定义就是"分发用内置资源：不属于用户、不参与备份"。
+# 投放由 receiver 在**第一次启动**时做（receiver\guide-book.js：拷进书库 + 写标记，
+# 用户从书库删掉后不会再冒出来）。所以包里**只放这一份 PDF**，不预置 data\。
+# 源文件是入库的 installer\portable\coread-tutorial.pdf —— 不是仓库根那个用户原件，
+# 那样 CI 或别人 clone 下来打包会**静默少一本教程**（本地过、CI 挂，正是本仓库最忌讳的一类）。
+$guideSrc = Join-Path $PSScriptRoot 'portable\coread-tutorial.pdf'
+if (-not (Test-Path $guideSrc)) {
+  Fail '缺少 installer\portable\coread-tutorial.pdf —— 它是内置教程书，从 git 恢复：git checkout HEAD -- installer/portable'
+}
+$guideBytes = (Get-Item $guideSrc).Length
+if ($guideBytes -lt 100KB) { Fail ("内置教程 PDF 只有 " + [math]::Round($guideBytes / 1KB) + " KB，像是坏文件或占位文件") }
+Copy-Item $guideSrc (Join-Path $builtinRoot 'coread-tutorial.pdf')
+Write-Step ("builtin\coread-tutorial.pdf (" + [math]::Round($guideBytes / 1KB) + " KB)")
 
 # 两个冒烟夹具（judge-smoke-cases.json / smoke-stack-sequences.json）**不进包**（2026-10 改）。
 #
@@ -326,9 +347,21 @@ foreach ($f in $userScripts) {
 # receiver 的程序文件放 internal\receiver（与 agent 同级：lib/paths.js 靠这个同级关系定位包根）
 $recvOut = Join-Path $internal 'receiver'
 New-Item -ItemType Directory -Path $recvOut -Force | Out-Null
-foreach ($f in @('index.js', 'package.json', 'graph-data.js')) {
+foreach ($f in @('index.js', 'package.json', 'graph-data.js', 'guide-book.js')) {
   $p = Join-Path $repo "receiver\$f"
   if (Test-Path $p) { Copy-Item $p $recvOut }
+}
+# 漏拷的代价（2026-10-21 真踩到，且是"包能打出来、用户一启动就崩"那种）：
+# receiver\index.js 开头 import './guide-book.js'，那个文件没进包时，Node 直接
+# ERR_MODULE_NOT_FOUND —— 用户看到的是"双击没反应"，而打包脚本一路绿灯（$need 里没它）。
+# 所以这里不靠人记：receiver\ 下**每个** .js 都必须在上面这份名单里。
+$recvList = @('index.js', 'graph-data.js', 'guide-book.js')
+$recvStray = @(Get-ChildItem (Join-Path $repo 'receiver') -Filter *.js -File -EA SilentlyContinue |
+  Where-Object { $recvList -notcontains $_.Name })
+if ($recvStray.Count) {
+  Fail ("receiver\ 下有程序文件没进包：" + (($recvStray | Select-Object -ExpandProperty Name) -join ', ') +
+    "`n   漏一个，包里的 receiver 会因为 import 找不到文件而起不来（双击无反应）。" +
+    "`n   补进本段的 \$recvList 与拷贝名单，并把文件名加进 zip 校验清单。")
 }
 
 # extension 放在最外层显眼位置。
@@ -546,16 +579,21 @@ foreach ($d in @('data\config', 'data\profile', 'data\sessions', 'data\reading',
       ForEach-Object { $bad += "$($_.FullName) （data\ 下只允许空目录与说明文件）" }
   }
 }
-# builtin\ 必须**完全为空**（2026-10 改，见上面第 3 步的注释）。
-# 以前这里是一张"允许两个通用图谱文件"的白名单，还配了一道"与仓库源文件比 SHA256"的
-# 校验 —— 但那个源文件就是作者本机的私人图谱，于是校验退化成"副本跟自己比"，
-# 永远通过，白名单反而成了放行证。教训：**校验要跟一个外部基准比**（git 里的内容、
-# 或一个写死的哈希），跟自己的来源比等于没比。
+# ── builtin\ 里只允许内置教程这一本 PDF（2026-10-21 起）────────────────────
+# 2026-10 之前这里写的是"builtin\ 必须完全为空"，原因是那个位置曾经放着**作者的私人图谱**
+# （本地打包带出去、CI 打包反而躲过）。那条教训的实质是"不许有来历不明的文件"，
+# 所以现在改成**按文件名白名单**：只认我们刚刚拷进去的那一本教程，别的一律中止。
+# 白名单之外不再有任何例外；"跟源文件比 SHA256"这种校验不要加回来 ——
+# 副本就是从源文件拷来的，跟自己比永远通过，等于没比（2026-10 已经踩过）。
 $builtinFull = Join-Path $StageDir 'builtin'
 if (Test-Path $builtinFull) {
-  $stray = @(Get-ChildItem $builtinFull -Recurse -File -Force -EA SilentlyContinue)
+  $stray = @(Get-ChildItem $builtinFull -Recurse -File -Force -EA SilentlyContinue |
+    Where-Object { $_.Name -ne 'coread-tutorial.pdf' })
   if ($stray.Count) {
-    $stray | Select-Object -First 5 | ForEach-Object { $bad += "$($_.FullName) （builtin 里不允许有任何文件）" }
+    $stray | Select-Object -First 5 | ForEach-Object { $bad += "$($_.FullName) （builtin 里只允许内置教程 PDF）" }
+  }
+  if (-not (Test-Path (Join-Path $builtinFull 'coread-tutorial.pdf'))) {
+    $bad += "$builtinFull （内置教程 PDF 不在包里）"
   }
 }
 
@@ -637,10 +675,14 @@ $need = @(
   'internal\agent\scripts\backup-chat.mjs',
   'internal\agent\scripts\chat.db.diag-wal.mjs',
   'internal\receiver\index.js',
+  # 内置教程的投放模块：receiver\index.js 在启动时就 import 它，缺了 = 本机服务起不来
+  #（2026-10-21 真漏过一次：包能打出来，一启动就 ERR_MODULE_NOT_FOUND）。
+  'internal\receiver\guide-book.js',
   # 数据目录（程序运行时往这里写；空壳随包分发，2026-10 重构后数据在包根 data\）
   # 注意：**只有空目录才会在 zip 里有条目**。有内容的目录不会单独出现，
   # 要校验就直接写里面的文件名（写成 'data\config\' 会假报 MISS —— 实测踩过）。
-  # 反过来：data\config\ 与 builtin\ 现在都是空的，所以它们**有**目录条目。
+  # 反过来：data\config\ 是空的，所以它**有**目录条目；builtin\ 里现在有教程 PDF，
+  # 所以它下面按文件名校验（见清单里 builtin\coread-tutorial.pdf 那条）。
   'data\README.txt',
   # data\config\ 现在是**空目录**（包里不再带 api-config.json，见第 3 步的注释）——
   # 只有空目录才会在 zip 里有条目，所以要写成目录名本身。
@@ -650,9 +692,9 @@ $need = @(
   'data\reading\',
   'data\runtime\',
   'data\toolbox\',
-  # builtin\ 现在是**空目录**（2026-10 起不再随包分发任何图谱文件，见第 3 步注释）。
-  # 只有空目录才会在 zip 里有条目，所以这里写目录名本身。
-  'builtin\',
+  # builtin\ 里有内置教程 PDF（2026-10-21 起；它不是空目录了，所以校验的是文件本身）。
+  # 少了它，用户装完看不到教程 —— 而这一点在界面上看不出来（书库里就是没有那一本）。
+  'builtin\coread-tutorial.pdf',
   # 图标（托盘用）
   'assets\icons\coread.ico',
   # 插件图标

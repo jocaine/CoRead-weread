@@ -32,8 +32,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 import {
   CHAT_DB, STREAM_FILE, AGENT_STATE_FILE, TOPIC_STACK_FILE, TOOLBOX_DIR, TOOL_HISTORY_FILE,
   BOOKS_DIR, ANNOTATIONS_FILE, SESSIONS_DIR, DEBUG_LOG, LOGS_DIR, layoutSummary, ensureDirs,
-  sessionStopFile, EXTENSION_ID_FILE, isExtensionId,
+  sessionStopFile, EXTENSION_ID_FILE, isExtensionId, BUILTIN_DIR, READING_DIR,
 } from '../agent/lib/paths.js'
+// 内置教程书：随包放在 builtin\，第一次启动时拷进书库（2026-10-21，规矩见该文件头部）
+import { seedGuideBook } from './guide-book.js'
 
 const PORT = parseInt(process.env.COREAD_PORT || '7239')
 // 兼容旧变量名：Inbox 以前指"标注/聊天文件所在目录"，现在是 data\reading\（标注落点）
@@ -42,6 +44,18 @@ const TOOL_HISTORY = TOOL_HISTORY_FILE
 
 // 数据目录先建齐（全新安装时 data\ 整个不存在）。幂等，agent 启动时也会调一次。
 ensureDirs()
+
+// 内置教程书：只在第一次启动时拷进书库，之后（哪怕用户删了）都不再放。
+// 必须在开始监听端口之前跑完——书库列表一来就要能看到它。
+// 开发目录没有 builtin\ 里的 PDF，这里会静默跳过（reason = 'no-builtin'）。
+{
+  seedGuideBook({
+    builtinDir: BUILTIN_DIR,
+    booksDir: BOOKS_DIR,
+    readingDir: READING_DIR,
+    log: (m) => console.log('[reader] ' + m),
+  })
+}
 
 
 // ── SSE ──────────────────────────────────────────────────────────────────────

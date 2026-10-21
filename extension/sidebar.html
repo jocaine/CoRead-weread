@@ -2557,6 +2557,7 @@
     @media (prefers-reduced-motion: reduce) {
       .hdr-icon.pulse { animation: none; }
       #coach-card { transition: none; }
+      .api-combo-btn svg { transition: none; }
     }
 
     /* ── 已读书籍选择弹窗（2026-10）：无书默认界面 / 更多菜单 → 从已读过的书籍中
@@ -2722,6 +2723,90 @@
     .api-src[hidden] { display: none; }
     .api-field { margin-bottom: 10px; }
     .api-label { display: block; font-size: 12px; color: #555; margin-bottom: 4px; }
+    /* 标签行（2026-10-21）：左边字段名，右边一条出路（Key 那一行的「没有 API Key？」）。
+       只有这一处用，所以不另造一套标签尺寸，只把 label 自己的下边距交给这一行。 */
+    .api-label-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    .api-label-row .api-label { margin-bottom: 0; }
+    /* 链接色用强调**文字**色 #0a7d43（在白色面板上对比度 5.03）；
+       #07c160 当文字只有 2.30，不达标。 */
+    .api-help { font-size: 11px; color: #0a7d43; text-decoration: none; white-space: nowrap; }
+    .api-help:hover { text-decoration: underline; }
+    .api-help:focus-visible {
+      outline: none;
+      border-radius: 4px;
+      box-shadow: 0 0 0 3px rgba(10, 125, 67, 0.18);
+    }
+    /* 预设下拉（2026-10-21）：外壳、箭头、列表都由 extension/api-presets.js 生成
+       （它没加载成功时这几条规则没有元素可命中，输入框就是一个普通输入框）。
+       为什么自己画：Chrome 不保证给 <input list> 画那个下拉箭头，实测看不见，
+       于是"这里能选预设"在界面上完全看不出来。 */
+    .api-combo { position: relative; }
+    .api-combo .api-input { padding-right: 30px; }
+    .api-combo-btn {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 26px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: none;
+      background: none;
+      padding: 0;
+      cursor: pointer;
+      color: #888;
+      border-radius: 0 6px 6px 0;
+    }
+    .api-combo-btn:hover { color: #333; }
+    .api-combo-btn:focus-visible {
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(10, 125, 67, 0.18);
+    }
+    .api-combo-btn svg { width: 10px; height: 10px; transition: transform 120ms cubic-bezier(.4,0,.2,1); }
+    .api-combo-btn[aria-expanded="true"] svg { transform: rotate(180deg); }
+    .api-combo-pop {
+      position: absolute;
+      z-index: 5;
+      top: calc(100% + 4px);
+      left: 0;
+      right: 0;
+      padding: 4px;
+      background: #fff;
+      border: 1px solid #e5e5e5;
+      border-radius: 8px;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+    }
+    .api-combo-pop[hidden] { display: none; }
+    /* 下方放不下时往上翻（判据与选择都在 api-presets.js 的 toggleMenu 里） */
+    .api-combo-pop.up { top: auto; bottom: calc(100% + 4px); }
+    .api-combo-item {
+      display: block;
+      width: 100%;
+      text-align: left;
+      border: none;
+      background: none;
+      font-family: inherit;
+      font-size: 12px;
+      color: #333;
+      padding: 6px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      overflow-wrap: anywhere;
+    }
+    .api-combo-item:hover { background: #f0faf3; }
+    .api-combo-item:focus-visible {
+      outline: none;
+      background: #f0faf3;
+      box-shadow: inset 0 0 0 1px #bfe3cc;
+    }
+    .api-combo-empty { font-size: 11px; color: #888; padding: 6px 8px; }
     .api-input {
       width: 100%;
       box-sizing: border-box;
@@ -3314,22 +3399,42 @@
         <button class="api-close" id="api-close-btn" title="关闭">✕</button>
       </div>
       <div class="api-body">
-        <div class="api-hint">支持任何兼容 OpenAI 协议的服务商（DeepSeek / OpenAI / Kimi / Ollama…）。<br>配置保存在本机，保存后立即生效，无需重启。</div>
+        <div class="api-hint">支持任何兼容 OpenAI 协议的服务商（DeepSeek / OpenAI / Kimi / Ollama…）。<br>地址与模型可选预设，也可直接填；配置只存本机，保存即生效。</div>
         <div class="api-first" id="api-first" hidden>尚未配置模型 API，填写以下三项后才能开始共读讨论。</div>
         <div class="api-src" id="api-src" hidden>当前配置来自 agent/.env，在此保存后以插件配置为准。</div>
         <div class="api-field">
           <label class="api-label" for="api-base">API 地址</label>
-          <input type="text" class="api-input" id="api-base" dir="ltr" placeholder="https://api.deepseek.com/v1" autocomplete="off" spellcheck="false">
+          <input type="text" class="api-input" id="api-base" dir="ltr" placeholder="https://api.deepseek.com" list="api-base-presets" autocomplete="off" spellcheck="false">
         </div>
         <div class="api-field">
-          <label class="api-label" for="api-key">API Key</label>
+          <div class="api-label-row">
+            <label class="api-label" for="api-key">API Key</label>
+            <!-- 没有 Key 的人就是卡在这一步：给一条能直接走下去的路。
+                 地址是 DeepSeek 开放平台的登录页（用户点名的那一个），新标签页打开、侧栏不跳走。
+                 href 保留着：键盘回车/中键仍然能用（JS 那条路只管点击）。 -->
+            <a class="api-help" id="api-key-help" href="https://platform.deepseek.com/sign_in"
+               target="_blank" rel="noopener noreferrer">没有 API Key？去 DeepSeek 申请</a>
+          </div>
           <input type="text" class="api-input" id="api-key" dir="ltr" placeholder="sk-…" autocomplete="off" spellcheck="false">
         </div>
         <div class="api-field">
           <label class="api-label" for="api-model">模型</label>
-          <input type="text" class="api-input" id="api-model" dir="ltr" placeholder="deepseek-chat" autocomplete="off" spellcheck="false">
+          <input type="text" class="api-input" id="api-model" dir="ltr" placeholder="deepseek-flash" list="api-model-presets" autocomplete="off" spellcheck="false">
         </div>
         <div class="api-err" id="api-err"></div>
+        <!-- 预设清单（2026-10-21）：候选值**只写在这里**，sidebar.js 从 DOM 读，不另存一份表 ——
+             两处各存一份迟早会分叉（改了这里忘了那里，下拉里出现的值保存后跑不通）。
+             加一家服务商 = 在下面各加一行 <option>：
+               · api-base-presets  一个地址一行
+               · api-model-presets 一个模型一行，data-base 写它属于哪个地址
+             （Chrome 的 <input list> 就是原生 combobox：能点开选、也能直接输任意值。） -->
+        <datalist id="api-base-presets">
+          <option value="https://api.deepseek.com"></option>
+        </datalist>
+        <datalist id="api-model-presets">
+          <option value="deepseek-flash" data-base="https://api.deepseek.com"></option>
+          <option value="deepseek-v4-pro" data-base="https://api.deepseek.com"></option>
+        </datalist>
       </div>
       <div class="api-actions">
         <button class="api-cancel" id="api-cancel-btn">取消</button>
@@ -3447,6 +3552,8 @@
 
   <script src="reader-notes.js"></script>
   <script src="graph-view.js"></script>
+  <!-- 模型 API 弹窗的预设联动（2026-10-21）：必须在 sidebar.js 之前，它要给 window.CoreadApiPresets 赋值 -->
+  <script src="api-presets.js"></script>
   <script src="sidebar.js"></script>
 </body>
 </html>
