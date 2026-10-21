@@ -42,10 +42,14 @@ export const GUIDE_MARKER = 'guide-book.json'
  * 这本当成"不是阅读器的书"直接跳过）。
  */
 const READER_META = 'reader-meta.json'
+/** 共读侧元信息（书名 / 已读过的书籍）：与 receiver/index.js 的 writeBookMeta 同一形态 */
+const BOOK_META = 'meta.json'
+/** 书的目录名前缀：`rd_` + 内容哈希（与 receiver/index.js 的 readerBookDir 同一口径） */
+const READER_BOOK_PREFIX = 'rd_'
 
-/** 目录名：`rd_` + 内容哈希（与 receiver/index.js 的 readerDir 同一口径） */
+/** 目录名：`rd_` + 内容哈希 */
 function readerBookDir(booksDir, hash) {
-  return path.join(booksDir, 'rd_' + hash)
+  return path.join(booksDir, READER_BOOK_PREFIX + hash)
 }
 
 /**
@@ -63,7 +67,12 @@ function readerBookDir(booksDir, hash) {
 export function seedGuideBook({ builtinDir, booksDir, readingDir, log = () => {} }) {
   const marker = path.join(readingDir, GUIDE_MARKER)
   try {
-    if (fs.existsSync(marker)) return { seeded: false, reason: 'already' }
+    // 已经投放过了：只补一份共读侧 meta.json（老版本投放时没写它），别的一个字节都不动
+    const prev = readMarker(marker)
+    if (prev) {
+      if (prev.hash) ensureBookMeta(booksDir, prev.hash)
+      return { seeded: false, reason: 'already', hash: prev.hash }
+    }
 
     const src = path.join(builtinDir, GUIDE_PDF)
     let bytes
@@ -79,6 +88,7 @@ export function seedGuideBook({ builtinDir, booksDir, readingDir, log = () => {}
 
     if (fs.existsSync(sourceFile) || fs.existsSync(metaFile)) {
       // 书库里已经有这本：一个字节都不动，只记下"给过了"
+      ensureBookMeta(booksDir, hash)
       writeMarker(marker, { hash, name: GUIDE_NAME, note: '书库里已有，未覆盖' })
       return { seeded: false, reason: 'exists', hash }
     }
@@ -94,6 +104,7 @@ export function seedGuideBook({ builtinDir, booksDir, readingDir, log = () => {}
       hash,
       updatedAt: Date.now(),
     }, null, 2))
+    ensureBookMeta(booksDir, hash)
     writeMarker(marker, { hash, name: GUIDE_NAME })
     log(`已把内置教程放进书库：${GUIDE_NAME}`)
     return { seeded: true, reason: 'seeded', hash }
@@ -101,6 +112,95 @@ export function seedGuideBook({ builtinDir, booksDir, readingDir, log = () => {}
     log(`投放内置教程失败（不影响启动，下次再试）：${(e && e.message) || e}`)
     return { seeded: false, reason: 'error' }
   }
+}
+
+/**
+ * 教程的**开场会话**（2026-10-21，用户定调："一打开就有它的会话，而且里面有内容"）。
+ *
+ * 为什么必须提前写进对话库：教程是一本 PDF，打开它时侧栏会切到"这本书的会话"。
+ * 如果那里是空的，用户看到的是一块白板 —— 教程该在的地方，反而最空。
+ *
+ * 只写 **assistant** 消息，不伪造用户提问：用户消息会被当成用户真说过的话，
+ * 进会意图、进记忆、进以后每一轮上下文，造假成本太高。
+ */
+export const GUIDE_OPENING = [
+  '这是《CoRead 使用教程》的会话。教程本身是旁边那本 5 页的 PDF：先读一遍，再把没看明白的地方问在这里。',
+  '用法记住一句就够：选中想说的那段，点「设为引用」，带着它提问。\n\n'
+  + '讨论够充分的事会收口成会意图里的一个点，下次提问能命中它。'
+  + '这条会话只属于这本教程，换到别的书不会跟过去。',
+]
+
+/**
+ * 给教程这本书写开场会话（幂等，只写一次）。
+ *
+ * 三条规矩：
+ *  1. 标记里记 `conversation: true` —— 用户把这段对话删了，不再补回来；
+ *  2. 书里已经有消息就一条都不写（老用户可能自己聊过），只补标记；
+ *  3. 失败不影响启动：教程照常能读，只是会话是空的。
+ *
+ * @param {{ store: any, readingDir: string, log?: (m: string) => void }} o
+ * @returns {{ seeded: boolean, reason: string }}
+ */
+export function seedGuideConversation({ store, readingDir, log = () => {} }) {
+  const markerFile = path.join(readingDir, GUIDE_MARKER)
+  const marker = readMarker(markerFile)
+  if (!marker || !marker.hash) return { seeded: false, reason: 'no-book' }   // 还没投放这本书
+  if (marker.conversation) return { seeded: false, reason: 'already' }
+  const bookId = READER_BOOK_PREFIX + marker.hash
+  try {
+    const existing = store.listMessages({ conv: bookId, limit: 1 })
+    if (existing.length) {
+      writeMarker(markerFile, { ...marker, conversation: true, note: '已有对话，未覆盖' })
+      return { seeded: false, reason: 'has-messages' }
+    }
+    const now = Date.now()
+    GUIDE_OPENING.forEach((content, i) => {
+      store.insertMessage({
+        conv: bookId,
+        role: 'assistant',
+        content,
+        ts: now + i,                    // 连续两条：时间戳递增，历史回放顺序才稳
+        bookId,
+        bookTitle: GUIDE_NAME,
+        payload: { seed: 'guide-book', v: 1 },   // 留痕：以后要改/清这段开场，认得出这几条
+      })
+    })
+    writeMarker(markerFile, { ...marker, conversation: true })
+    log(`已为内置教程写好开场会话（${GUIDE_OPENING.length} 条）`)
+    return { seeded: true, reason: 'seeded' }
+  } catch (e) {
+    log(`写教程开场会话失败（不影响阅读）：${(e && e.message) || e}`)
+    return { seeded: false, reason: 'error' }
+  }
+}
+
+function readMarker(file) {
+  try {
+    const d = JSON.parse(fs.readFileSync(file, 'utf8'))
+    return d && typeof d === 'object' ? d : null
+  } catch { return null }
+}
+
+/**
+ * 共读侧 `meta.json`：让这本在侧栏「已读过的书籍」里也是一个会话
+ * （只写书库侧 reader-meta.json 时，侧栏要等用户聊过一次才认得出它）。
+ * 只在文件不存在时写，绝不改已有内容（那份可能已被用户聊过）。
+ */
+function ensureBookMeta(booksDir, hash) {
+  const dir = readerBookDir(booksDir, hash)
+  // ⚠️ 书已经不在了（用户从书库删了）就什么都不写，**连目录都不建**：
+  // 建出来会是一个没有 source.pdf 的空书目录 —— 书库不列它，用户却能在磁盘上看到它。
+  if (!fs.existsSync(dir)) return
+  const file = path.join(dir, BOOK_META)
+  if (fs.existsSync(file)) return
+  const bookId = READER_BOOK_PREFIX + hash
+  fs.writeFileSync(file, JSON.stringify({
+    bookId,
+    baseBookId: bookId,
+    bookTitle: GUIDE_NAME,
+    wereadBookId: '',
+    updatedAt: Date.now(),
+  }))
 }
 
 function writeMarker(file, data) {

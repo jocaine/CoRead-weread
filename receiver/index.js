@@ -35,7 +35,7 @@ import {
   sessionStopFile, EXTENSION_ID_FILE, isExtensionId, BUILTIN_DIR, READING_DIR,
 } from '../agent/lib/paths.js'
 // 内置教程书：随包放在 builtin\，第一次启动时拷进书库（2026-10-21，规矩见该文件头部）
-import { seedGuideBook } from './guide-book.js'
+import { seedGuideBook, seedGuideConversation } from './guide-book.js'
 
 const PORT = parseInt(process.env.COREAD_PORT || '7239')
 // 兼容旧变量名：Inbox 以前指"标注/聊天文件所在目录"，现在是 data\reading\（标注落点）
@@ -44,18 +44,6 @@ const TOOL_HISTORY = TOOL_HISTORY_FILE
 
 // 数据目录先建齐（全新安装时 data\ 整个不存在）。幂等，agent 启动时也会调一次。
 ensureDirs()
-
-// 内置教程书：只在第一次启动时拷进书库，之后（哪怕用户删了）都不再放。
-// 必须在开始监听端口之前跑完——书库列表一来就要能看到它。
-// 开发目录没有 builtin\ 里的 PDF，这里会静默跳过（reason = 'no-builtin'）。
-{
-  seedGuideBook({
-    builtinDir: BUILTIN_DIR,
-    booksDir: BOOKS_DIR,
-    readingDir: READING_DIR,
-    log: (m) => console.log('[reader] ' + m),
-  })
-}
 
 
 // ── SSE ──────────────────────────────────────────────────────────────────────
@@ -1920,6 +1908,28 @@ const server = http.createServer(async (req, res) => {
     res.end(e.message)
   }
 })
+
+// ── 内置教程书：随包放在 builtin\，首次启动时放进书库 + 写好开场会话 ──────────
+// 为什么放在这里、而不是文件开头：开场会话要写聊天库，而 `_store`（chatStore 的缓存）
+// 在文件靠前的位置才初始化 —— 在它之前调会撞 TDZ（实测报 "Cannot access '_store'
+// before initialization"，被下面的 try/catch 接住，于是"教程在、会话空"，静默失效）。
+// 唯一的时间要求是"开始监听之前跑完"：书库列表一来就要能看到它。
+// 开发目录没有 builtin\ 里的 PDF，这里会静默跳过（reason = 'no-builtin'）。
+{
+  const log = (m) => console.log('[reader] ' + m)
+  seedGuideBook({
+    builtinDir: BUILTIN_DIR,
+    booksDir: BOOKS_DIR,
+    readingDir: READING_DIR,
+    log,
+  })
+  try {
+    seedGuideConversation({ store: chatStore(), readingDir: READING_DIR, log })
+  } catch (e) {
+    // 对话库打不开也不能拖垮本机服务：教程照常能读，只是会话是空的
+    log(`写教程开场会话失败（不影响启动）：${(e && e.message) || e}`)
+  }
+}
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`CoRead receiver listening on http://localhost:${PORT}`)
