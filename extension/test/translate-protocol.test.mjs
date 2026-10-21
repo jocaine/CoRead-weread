@@ -8,9 +8,11 @@ import assert from 'node:assert/strict'
 
 import {
   IMAGE_PROMPT,
+  RECOGNIZE_PROMPT,
   RELOCATE_PROMPT,
   RETRANSLATE_PROMPT,
   RETRY_PROMPT,
+  RETRY_RECOGNIZE_PROMPT,
   SELECTION_PROMPT,
   PROMPT_VERSION,
   buildChatBody,
@@ -25,6 +27,7 @@ import {
   normalizeApiBase,
   originPattern,
   parseRelocateReply,
+  parseRecognized,
   RECEIVER_URL,
   reportExtensionToHost,
   parseTranslation,
@@ -41,11 +44,23 @@ test('IMAGE_PROMPT 要求 JSON 输出并锁定 original/translation 两个字段
   assert.ok(PROMPT_VERSION >= 1)
 })
 
-test('三个 prompt 都是非空字符串', () => {
-  for (const p of [IMAGE_PROMPT, RETRANSLATE_PROMPT, SELECTION_PROMPT, RETRY_PROMPT]) {
+test('所有 prompt 都是非空字符串', () => {
+  for (const p of [IMAGE_PROMPT, RECOGNIZE_PROMPT, RETRANSLATE_PROMPT, SELECTION_PROMPT, RETRY_PROMPT, RETRY_RECOGNIZE_PROMPT]) {
     assert.equal(typeof p, 'string')
     assert.ok(p.trim().length > 20)
   }
+})
+
+test('RECOGNIZE_PROMPT 只要 original，且明确不是翻译', () => {
+  assert.match(RECOGNIZE_PROMPT, /original/)
+  assert.match(RECOGNIZE_PROMPT, /原文识别/)
+  assert.match(RECOGNIZE_PROMPT, /不是翻译/)
+  // 换行问题（2026-11）：要求段落之间空行、段内不要按截图行宽断行
+  assert.match(RECOGNIZE_PROMPT, /段落之间空一行/)
+  assert.match(RECOGNIZE_PROMPT, /不要把一句话按截图的行宽切成多行/)
+  // 输出协议里不许出现 translation 字段（调用方按"没有译文"处理）
+  assert.doesNotMatch(RECOGNIZE_PROMPT, /"translation"/)
+  assert.notEqual(RECOGNIZE_PROMPT, IMAGE_PROMPT)
 })
 
 test('SELECTION_PROMPT 只要求 translation，且不提截图识别误差', () => {
@@ -182,6 +197,23 @@ test('parseTranslation 缺 original 时返回空串，不抛错', () => {
 test('parseTranslation 三种失败都抛 PARSE_ERROR', () => {
   for (const raw of ['没有 JSON', '{"original":"Hello"}', '{"translation":"   "}', '[1,2]']) {
     assert.throws(() => parseTranslation(raw), (e) => e.code === 'PARSE_ERROR', 'raw=' + raw)
+  }
+})
+
+// ── 解析「只识别原文」 ────────────────────────────────────────────────────────
+test('parseRecognized 解析标准 JSON，并容忍代码块与多余文字', () => {
+  assert.equal(parseRecognized('{"original":"Hello"}'), 'Hello')
+  assert.equal(parseRecognized('```json\n{"original":"Hello"}\n```'), 'Hello')
+  assert.equal(parseRecognized('识别结果：{"original":"Hello"} 以上。'), 'Hello')
+})
+
+test('parseRecognized 没有 translation 也算成功（这一步本来就不翻译）', () => {
+  assert.equal(parseRecognized('{"original":"Hello","translation":"你好"}'), 'Hello')
+})
+
+test('parseRecognized 缺 original / 空原文 / 非对象都抛 PARSE_ERROR', () => {
+  for (const raw of ['没有 JSON', '{"translation":"你好"}', '{"original":"   "}', '[1,2]']) {
+    assert.throws(() => parseRecognized(raw), (e) => e.code === 'PARSE_ERROR', 'raw=' + raw)
   }
 })
 

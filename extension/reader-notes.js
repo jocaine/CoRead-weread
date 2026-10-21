@@ -9,8 +9,22 @@
  *   本组件 → send({action:'readerCommand', type, id, text?})
  *   阅读器 → send({action:'readerSync', snapshot}) → 后台广播 → 本组件 update()
  *
+ * ── 从书页跳过来（2026-11）──────────────────────────────────────────────────
+ * 用户在**书页上**点了某条已翻过的译文区域时，阅读器会在快照里带上 revealId/revealAt，
+ * 本组件据此把列表滚到那一条并闪一下（见 render / jumpToItem）。
+ * 只认这一种信号：activeId 也用于"刚翻完一条、设为当前"，那条路按老规矩不拽列表。
+ *
+ * ── 只识别原文的条目（2026-11）────────────────────────────────────────────
+ * 框选动作条里选「识别原文」时，阅读器只让模型识别原文、不翻译，**也不自动设引用**
+ * （reader.js 的 recognizeRegionText）。那条条目带 `recognized`，本组件：
+ *   · 在正文上方标一句"只识别了原文，未翻译"；
+ *   · 把「复制译文」改成「复制原文」；
+ *   · 多给一个「翻译」按钮——点了走现成的 retranslate 通道，把它变成真译文
+ *     （阅读器那边会清掉 recognized）。
+ * 要不要设引用，由用户在这张卡片上自己点「设为引用」（点完才切回对话界面）。
+ *
  * ── 划选共读（2026-11）──────────────────────────────────────────────────────
- * 扫描件的框选翻译整页之后，用户想讨论的常常只是其中一句——而那一页没有可划的词
+ * 扫描件的框选识别 / 翻译整页之后，用户想讨论的常常只是其中一句——而那一页没有可划的词
  * （图片页没有文字层）。所以译文里的文字可以直接划选：
  *   · 选中 → 浮出一个**深色小工具条**（.rn-tip，与阅读器划词浮标 .rd-tip 同一套视觉）
  *   · 点「设为引用」→ 走后台既有的 setTranslationRef（不新增通道），只把这一段设成引用
@@ -37,14 +51,23 @@
   border-bottom: 1px solid var(--line, #eef1f4); flex: none;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rn-list { overflow: auto; padding: 8px; display: flex; flex-direction: column; gap: 8px; flex: 1; min-height: 0; }
-.rn-item { border: 1px solid var(--line, #dfe3e8); border-radius: 8px; padding: 8px 10px; background: #fff; }
+.rn-item { border: 1px solid var(--line, #dfe3e8); border-radius: 8px; padding: 8px 10px; background: #fff;
+  /* 颜色/描边的过渡只服务两件事：选中态、以及"从书页点过来"时那一闪（见 .is-jumped） */
+  transition: border-color 120ms cubic-bezier(.4, 0, .2, 1), background-color 120ms, box-shadow 120ms; }
 .rn-item.is-active { border-color: #f0c070; background: #fffaf0; }
+/* 从书页上点了某条译文 → 对照栏滚到它、并闪一下（2026-11）。
+   与阅读器里 .rd-flash 是同一个意思：那边闪书页、这边闪卡片，告诉人"跳的是这一条"。
+   只加一道浅浅的描边，不改变卡片尺寸；900ms 后由 JS 摘掉这个类。 */
+.rn-item.is-jumped { box-shadow: 0 0 0 2px rgba(240, 192, 112, .55); }
 .rn-item.is-error { border-color: #e8b4b4; }
 .rn-src { color: var(--muted, #6b7280); line-height: 1.5; max-height: 4.6em; overflow: hidden;
   cursor: pointer; border-left: 2px solid #d8e6dd; padding-left: 8px; margin-bottom: 6px; }
 .rn-src:hover { color: #23262b; }
 .rn-src.is-open { max-height: none; }
 .rn-dst { line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+/* 只识别了原文、没有翻译的条目（框选「识别原文」那条路，2026-11）：
+   在正文上方标一句，免得用户把识别结果当成译文。11px 是规格下限。 */
+.rn-note { display: block; font-size: 11px; line-height: 1.5; color: var(--muted, #6b7280); margin-bottom: 4px; user-select: none; }
 .rn-pending { color: var(--muted, #6b7280); }
 .rn-err { color: #9a3b3b; }
 .rn-acts { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8px; flex-wrap: wrap; }
@@ -84,7 +107,7 @@
 .rn-edit-acts button.rn-ghost { border-color: #e5e5e5; background: #fff; }
 .rn-edit-acts button.rn-ghost:hover { background: #f2f4f7; }
 .rn-edit-acts button[disabled] { opacity: .55; cursor: default; }
-@media (prefers-reduced-motion: reduce) { .rn-edit-acts button { transition: none; } }
+@media (prefers-reduced-motion: reduce) { .rn-item, .rn-edit-acts button { transition: none; } }
 .rn-empty { padding: 16px; color: var(--muted, #6b7280); line-height: 1.8; }
 .rn-empty kbd { border: 1px solid var(--line, #dfe3e8); border-bottom-width: 2px; border-radius: 4px;
   padding: 0 4px; background: #fafbfc; font-family: inherit; }
@@ -269,6 +292,29 @@
     let editingId = ''
     /** 面板刚挂上（侧栏重启 / 第一次打开）：第一次渲染要**滚到最新那条**，见 render */
     let firstRender = true
+    /**
+     * 上一次处理过的"书页点击"（快照里的 revealAt，见 reader.js 的 revealEntry）。
+     *
+     * 为什么不能只看 activeId：activeId 同时被"新译文翻完、设为当前"写，
+     * 那条路按老规矩（用户贴着底才跟过去）——要是也拿来滚列表，
+     * 正在看旧条目的用户会被每翻一段就拽走一次。
+     */
+    let lastRevealAt = 0
+    /** 面板不可见时收到的跳转请求：先记下，等宿主把它显示出来再滚（见 onShown / pendingJump） */
+    let pendingJump = null
+    /** 卡片"闪一下"的计时器，以及"闪的是哪一条、闪到什么时候"（见 flashItem / render） */
+    let flashTimer = null
+    let flashId = ''
+    let flashUntil = 0
+    /**
+     * 一条"书页点击"最多算新鲜多久。
+     *
+     * 面板可能是在点击**之后**才被打开的（侧栏冷启动、或用户过一阵才点「译文」）：
+     * 后台缓存的那份快照里还躺着上一次点击的 revealAt，照跳过去会把用户带到
+     * 一条与此刻无关的译文上。面板一直开着时用不到这条——那一刻就已经跳了。
+     * 15 秒足够覆盖"侧栏正在启动"这段。
+     */
+    const REVEAL_FRESH_MS = 15000
 
     root.classList.add('rn-wrap')
     root.replaceChildren()
@@ -292,8 +338,8 @@
     const list = el('div', 'rn-list')
     const empty = el('div', 'rn-empty')
     empty.append(
-      el('div', null, '划选一段原文按 Alt+T 翻译；扫描件用阅读器工具栏的「框选翻译」。'),
-      el('div', null, '译文会显示在这里，并贴回原文位置。'),
+      el('div', null, '划选一段原文按 Alt+T 翻译；扫描件用阅读器工具栏的「框选识别」，可选识别原文或翻译。'),
+      el('div', null, '识别结果与译文都会显示在这里，并贴回原文位置。'),
       el('div', null, '想只讨论其中一句？在译文里划出那一句，点浮出来的「设为引用」。'),
     )
     root.append(head, bookLine, list, empty)
@@ -719,8 +765,102 @@
       return box
     }
 
+    /**
+     * 面板此刻看得见吗？
+     *
+     * `#reader-notes` 是用 display:none 收起的（见 sidebar.html）：收起时量出来全是 0，
+     * 这时候滚列表既不会生效、也量不出"那一条在不在视野里"，只能先记下来（见 pendingJump）。
+     */
+    function isShown() {
+      try { return root.getClientRects().length > 0 && list.clientHeight > 0 } catch (e) { return false }
+    }
+
+    /** 动画能不能用：系统里开了"减少动态效果"就不做平滑滚动（视觉规格的硬要求）。 */
+    function animated() {
+      try {
+        return !(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)
+      } catch (e) { return true }
+    }
+
+    /**
+     * 跳过去的那一条闪一下。
+     *
+     * 与阅读器的 .rd-flash 对称：那边从「跳到原文」过来时闪书页，这边从书页点过来时闪卡片，
+     * 都是"这就是你要找的那一项"的确认。用一次性的 box-shadow，不参与布局。
+     */
+    function flashItem(item) {
+      clearTimeout(flashTimer)
+      for (const n of list.querySelectorAll('.rn-item.is-jumped')) n.classList.remove('is-jumped')
+      flashId = item.dataset.id || ''
+      flashUntil = Date.now() + 900
+      item.classList.add('is-jumped')
+      flashTimer = setTimeout(() => {
+        flashId = ''
+        flashUntil = 0
+        for (const n of list.querySelectorAll('.rn-item.is-jumped')) n.classList.remove('is-jumped')
+      }, 900)
+    }
+
+    /**
+     * 把某一条滚进视野（书页上点了译文 → 对照栏要跟上，2026-11）。
+     *
+     * 已经在视野里就**不再滚**：这个动作的语义是"书页上那一条在对照栏的哪儿"，
+     * 不是"把列表重新摆一遍"——差几像素也重摆会让人觉得界面在自作主张。
+     *
+     * `instant` 给"有选区要恢复"那种情况用：划选工具条是按选区矩形摆的（position:fixed），
+     * 平滑滚动会让它停在半路上，跟文字错位。
+     *
+     * 返回 false 有两种：列表里没有这一条；或面板收起着（已记进 pendingJump，等 onShown）。
+     */
+    function jumpToItem(id, instant) {
+      const item = [...list.querySelectorAll('.rn-item')].find((n) => n.dataset.id === id)
+      if (!item) return false
+      if (!isShown()) { pendingJump = { id }; return false }
+      const lr = list.getBoundingClientRect()
+      const ir = item.getBoundingClientRect()
+      const fullyVisible = ir.top >= lr.top - 1 && ir.bottom <= lr.bottom + 1
+      if (!fullyVisible) {
+        // 高了就对齐顶部（否则看不见开头）；不然按最近的一边贴过去，少滚动几像素
+        let top
+        if (ir.height >= lr.height || ir.top < lr.top) top = list.scrollTop + (ir.top - lr.top) - 8
+        else top = list.scrollTop + (ir.bottom - lr.bottom) + 8
+        top = Math.max(0, Math.min(list.scrollHeight - list.clientHeight, top))
+        if (instant || !animated()) list.scrollTop = top
+        else list.scrollTo({ top, behavior: 'smooth' })
+      }
+      flashItem(item)
+      return true
+    }
+
     function render() {
       const entries = snapshot.entries || []
+      /**
+       * 「书页上点了某条译文」→ 这一次要滚到那一条（2026-11）。
+       *
+       * 判据是 revealAt 变了，而**不是** activeId 变了：后者也被"刚翻完、设为当前"写
+       *（reader.js 的 focusEntry），那条路按老规矩是"用户贴着底才跟过去"（见下面的 atBottom）——
+       * 一律跟着滚的话，正在看旧条目的用户每翻一段就被拽走一次。
+       *
+       * 快照可能是点击很久之后才到的（侧栏刚启动）：超过 REVEAL_FRESH_MS 就不跳，
+       * 只把这个时刻记下来，免得下次渲染又把它当成本次点击。
+       */
+      const revealAt = Number(snapshot.revealAt) || 0
+      let jumpId = ''
+      if (revealAt && revealAt !== lastRevealAt) {
+        lastRevealAt = revealAt
+        const id = String(snapshot.revealId || '')
+        /**
+         * 还要求"页面上点的那条就是此刻的当前项"。
+         *
+         * 这份标记是**一次点击**留下的，但它会一直躺在快照里：之后用户可能又在侧栏点了
+         * 别的条目的「跳到原文」（activeId 换人）。面板重开时若只看到旧的 revealAt，
+         * 就会把人带回到那一条早已不是当前项的译文上。
+         * 页面点击的那一刻两个 id 必然相等（见 reader.js 的 revealEntry），所以这个条件是免费的。
+         */
+        if (id && id === String(snapshot.activeId || '') && Date.now() - revealAt <= REVEAL_FRESH_MS) jumpId = id
+      }
+      // 面板收着时记下的跳转，条目已经被删了就别留着（onShown 找不到人，白等）
+      if (pendingJump && !entries.some((e) => e.id === pendingJump.id)) pendingJump = null
       count.textContent = entries.length + ' 条'
       bookLine.textContent = snapshot.book
         ? snapshot.book.name + (snapshot.total ? '　第 ' + (snapshot.page || 1) + ' / ' + snapshot.total + ' 页' : '')
@@ -745,21 +885,36 @@
         if (editing) item.classList.add('is-editing')
 
         const dst = el('div', 'rn-dst')
-        if (e.pending) dst.append(el('span', 'rn-pending', '翻译中…'))
+        if (e.pending) dst.append(el('span', 'rn-pending', e.recognizing ? '识别原文中…' : '翻译中…'))
         else if (e.error) dst.append(el('span', 'rn-err', '失败：' + e.error))
-        else dst.textContent = e.translation || ''
+        else if (e.recognized) {
+          /**
+           * 框选「识别原文」那条路（2026-11）：只识别了原文，没有翻译。
+           * 正文照常显示识别结果（用户要的就是"把原文放进译文栏"），但上面标一句，
+           * 免得把这段原文当成译文。后面的"改原文 → 重译"可以把它变成真译文。
+           */
+          dst.append(el('span', 'rn-note', '只识别了原文，未翻译'), document.createTextNode(e.translation || ''))
+        } else dst.textContent = e.translation || ''
 
         if (editing) {
           // 编辑器**就地**替换原文预览：卡片不跳，同一段文字也只出现一次
           item.append(buildEditor(e), dst)
         } else {
-          const src = el('div', 'rn-src', e.source || (e.kind === 'image' ? '（图片区域）' : ''))
-          src.title = '点击跳到原文'
-          src.addEventListener('click', () => {
-            src.classList.toggle('is-open')
-            send({ action: 'readerCommand', type: 'reveal', id: e.id })
-          })
-          item.append(src, dst)
+          /**
+           * 只识别原文的条目不再重复一遍"原文预览"：正文放的就是识别结果（见上面的 .rn-note），
+           * 再在上面挂一条同文的预览只会让卡片显得重复。要回书页有「跳到原文」。
+           */
+          if (e.recognized) {
+            item.append(dst)
+          } else {
+            const src = el('div', 'rn-src', e.source || (e.kind === 'image' ? '（图片区域）' : ''))
+            src.title = '点击跳到原文'
+            src.addEventListener('click', () => {
+              src.classList.toggle('is-open')
+              send({ action: 'readerCommand', type: 'reveal', id: e.id })
+            })
+            item.append(src, dst)
+          }
 
           const acts = el('div', 'rn-acts')
           const mk = (label, fn, cls) => {
@@ -774,9 +929,35 @@
           if (String(e.source || '').trim()) {
             btns.push(mk('改原文', () => { editingId = e.id; render() }))
           }
+          /**
+           * 只识别原文的条目（框选「识别原文」出来的卡）：给一个「翻译」按钮。
+           *
+           * 走的是现成的 `retranslate` 通道 —— 把识别出的原文当 text 报回去，
+           * 阅读器那就当一次普通翻译（会清掉 recognized，"未翻译"提示随之消失）。
+           * 不新开一条命令：这条通道本来就负责"用给定原文换一份译文"。
+           * 翻译中（pending）不给按钮，避免连点两次白花一次模型调用；
+           * 点下去先禁用，等阅读器推回第一份 pending 快照，按钮会被整卡重排替换掉。
+           * 失败要在**侧栏**也说一声：阅读器那边的 toast 在另一个页面，用户未必看得见。
+           */
+          if (e.recognized && !e.pending && String(e.source || '').trim()) {
+            btns.push(mk('翻译', async (ev) => {
+              const btn = ev && ev.currentTarget
+              if (btn) { btn.disabled = true; btn.textContent = '翻译中…' }
+              let r = null
+              try {
+                r = await send({ action: 'readerCommand', type: 'retranslate', id: e.id, text: e.source })
+              } catch (err) {
+                r = { ok: false, error: { message: String((err && err.message) || err) } }
+              }
+              if (!r || r.ok === false) {
+                toast('翻译失败：' + ((r && r.error && r.error.message) || '原因未知'), true)
+                if (btn) { btn.disabled = false; btn.textContent = '翻译' }
+              }
+            }))
+          }
           btns.push(
-            mk('复制译文', async () => {
-              const ok = await copyText(e.translation || '')
+            mk(e.recognized ? '复制原文' : '复制译文', async () => {
+              const ok = await copyText(e.translation || e.source || '')
               toast(ok ? '已复制' : '复制失败', !ok)
             }),
             mk('设为引用', () => makeReference(e.id), 'rn-ref'),
@@ -792,11 +973,21 @@
       // 列表刚被整个重建（replaceChildren）：划线的 Range 全失效了，动作条必须收起，
       // 否则它指着一段已经不存在的文字（点了会删错/没反应）。
       hideRefTip()
+      // 跳转排在恢复选区**之前**：工具条是按选区矩形摆的（position: fixed），
+      // 必须等列表滚到最终位置再量，否则它会停在半路上、跟文字错开。
+      const jumped = jumpId ? jumpToItem(jumpId, !!(sel.id && sel.text)) : false
       // 先把选区按存的原文画回去，再画下划线。
       // ⚠️ 顺序不能反：restoreSelection 会改选区（不动 DOM），markQuotes 只读 DOM。
       restoreSelection()
       markRefs()
-      if (firstRender || atBottom) list.scrollTop = list.scrollHeight
+      // 重建之后"闪一下"的那个类也丢了：还在 900ms 内就补回去（同一次点击可能引来两份快照：
+      // 刚挂载时 readerGet 那份 + 阅读器立刻推的 readerUpdate 那份，用户看到的不该是闪一下就灭）
+      if (flashId && Date.now() < flashUntil) {
+        const hit = [...list.querySelectorAll('.rn-item')].find((n) => n.dataset.id === flashId)
+        if (hit) hit.classList.add('is-jumped')
+      }
+      // 跳过了就不要再按"贴底 / 首次"重摆：否则刚滚到的那一条会被一下拽到列表末尾
+      if (!jumped && (firstRender || atBottom)) list.scrollTop = list.scrollHeight
       firstRender = false
     }
 
@@ -806,6 +997,20 @@
       update(next) {
         snapshot = Object.assign({}, snapshot, next || {})
         render()
+      },
+      /**
+       * 宿主把面板显示出来了（sidebar.js 的 openNotes 在加上 .on 之后调用）。
+       *
+       * 为什么需要它：面板收着的时候量不出高度，滚不了列表。那期间若正好收到
+       * "书页上点过某条"（见 render 的 pendingJump），只能先记下；
+       * 等显示出来、布局生效了再滚，这样"点书页 → 面板正被打开"两个动作不会互相错过。
+       */
+      onShown() {
+        if (!pendingJump) return
+        const id = pendingJump.id
+        pendingJump = null
+        // 等一帧：display:none → flex 之后，这一帧之前量出来的 clientHeight 还是 0
+        requestAnimationFrame(() => jumpToItem(id, false))
       },
       /** 收起面板时清选区：下次打开是干净的（不带着上次那半句） */
       clearSelection,

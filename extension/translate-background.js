@@ -13,6 +13,7 @@
  *   { action: 'translateSelection' }          → { ok, data }     划词翻译
  *   { action: 'captureScreen' }               → { ok, dataUrl }  仅 overlay 内部用
  *   { action: 'translateImage', dataUrl }     → { ok, data: { original, translation } }
+ *   { action: 'recognizeImage', dataUrl }     → { ok, data: { original } }  只识别、不翻译（框选设引用）
  *   { action: 'translateText', text, source } → { ok, data: { original, translation } }
  *   { action: 'testConnection' }              → { ok, text }
  */
@@ -21,8 +22,10 @@ import {
   API_CONFIG_PATH,
   IMAGE_PROMPT,
   RECEIVER_URL,
+  RECOGNIZE_PROMPT,
   RETRANSLATE_PROMPT,
   RETRY_PROMPT,
+  RETRY_RECOGNIZE_PROMPT,
   SELECTION_PROMPT,
   STORE_KEYS,
   buildChatBody,
@@ -34,6 +37,7 @@ import {
   classifyHttpError,
   extractReplyText,
   originPattern,
+  parseRecognized,
   parseRelocateReply,
   parseTranslation,
   relocateSnippet,
@@ -54,13 +58,13 @@ const HANDLERS = {
   translateSelection,
   captureScreen,
   translateImage,
+  recognizeImage,
   translateText,
   recordTranslation,
   restoreTranslations,
   clearTranslations,
   setTranslationRef,
   openReaderBook,
-  openSidePanelForLesson,
   relocateAnchor,
   readerSync,
   readerGet,
@@ -561,6 +565,37 @@ async function translateImage(msg) {
   }
 }
 
+/**
+ * 只识别框选区域里的原文，**不翻译**（2026-11 框选「设为引用」用）。
+ *
+ * 为什么单开一条而不是复用 translateImage：用户选的是「设为引用」，这一步不该多翻一次
+ * （要多花钱、多等，而且译文会被后续的引用流程晾着没用）；输出协议也刻意只要 original，
+ * 调用方拿不到 translation 就不会误用。
+ *
+ * 与 translateImage 同样的两道兜底：解析失败把模型原话贴回去再要一次 JSON；仍不成如实报错。
+ */
+async function recognizeImage(msg) {
+  const off = await requireEnabled()
+  if (off) return off
+  const dataUrl = String(msg?.dataUrl ?? '')
+  if (!dataUrl.startsWith('data:image/')) {
+    return fail('BAD_REQUEST', '未收到截图数据')
+  }
+  const first = await chat({ content: buildImageContent(RECOGNIZE_PROMPT, dataUrl) })
+  if (!first.ok) return first
+  try {
+    return { ok: true, data: { original: parseRecognized(first.text) } }
+  } catch {
+    const retry = await chat({ content: buildTextContent(RETRY_RECOGNIZE_PROMPT, first.text) })
+    if (retry.ok) {
+      try {
+        return { ok: true, data: { original: parseRecognized(retry.text) }, retried: true }
+      } catch {}
+    }
+    return fail('PARSE_ERROR', '没有从这块区域里识别出文字。请重新框选，或改用「翻译」')
+  }
+}
+
 async function translateText(msg) {
   const off = await requireEnabled()
   if (off) return off
@@ -832,6 +867,14 @@ async function readerCommand(msg) {
     // 只有 reference 用得上；漏掉它的话阅读器只能退回"整卡"，表现是"划了半句、
     // 进引用的却是整页译文"——而且不报错。转发是白名单式的，所以新增字段必须加成这里。
     quote: msg && msg.quote,
+    /**
+     * bookId：**删除引用时**要带上它（forgetRef）。
+     *
+     * 为什么：侧栏存着所有书的引用，而阅读器页面只画当前这一本。不带书 ID 的话，
+     * 在 A 书里删一条引用会把 B 书阅读器里同文的标记一起抹掉——同文不同书，
+     * 肉眼几乎发现不了，只在"那本书的某一段突然没线了"时才暴露。
+     */
+    bookId: msg && msg.bookId,
   }
   /**
    * ⚠️ **自环闸门**（2026-11 修，这是"设为引用点不动"的根因）。
@@ -1226,9 +1269,11 @@ const MAX_TRANSLATION_CHARS = 4000
  * 的 contextForRef），所以这段说明只是**兜底** —— 只有调用方什么上下文都没给时才用到
  *（老客户端、或上游取不到译文）。它现在的价值是"说清缺什么"，而不是常态。
  *
- * 为什么不做 OCR 补一段真原文：那是又一次模型调用，要等、要花钱，而用户此刻正在
- * 等着设引用；而且 OCR 出来的文字与用户框选的那块未必对得上，"给错上下文"比
- * "明说没有上下文"更坏（同 contextAround 的既有原则）。
+ * 为什么不在**设引用时**临时再 OCR 补一段真原文：那是又一次模型调用，要等、要花钱，
+ * 而用户此刻正在等着设引用；而且 OCR 出来的文字与用户框选的那块未必对得上，
+ * "给错上下文"比"明说没有上下文"更坏（同 contextAround 的既有原则）。
+ * （2026-11 另有一条**用户明确点出来的**路径：框选动作条里选「设为引用」时，会先做一次
+ *  原文识别，把识别结果作为条目与引用身份 —— 那是独立的一步，不是在这里偷偷补上下文。）
  */
 const IMAGE_CONTEXT_NOTE = '（本段来自扫描件的框选翻译：这一页没有可提取的文字层，'
   + '因此没有原文可查，也没有划线附近的原文。判断依据只有下面这段译文本身。）'
@@ -1352,83 +1397,6 @@ function reportDebug(data) {
       body: JSON.stringify({ source: 'background', ...data, timestamp: Date.now() }),
     }).catch(() => {})
   } catch (e) {}
-}
-
-/**
- * 打开侧栏并让它接上课（书里「开始本课」按钮走这条）。
- *
- * ⚠️ `chrome.sidePanel.open()` 是**必须由用户手势触发**的接口（浏览器策略，不是我们的 bug）：
- * 手势能不能穿过 sendMessage 传到后台，各版本行为不一致——实测有时成功、有时报
- * "may only be called in response to a user gesture"。
- * 所以这里**如实回报 opened**，让书页那个按钮能说真话（"侧栏没自动打开，请手动开一下"），
- * 而不是假装开始了。真正的接续不靠这个调用：引导状态在 chrome.storage 里，
- * 侧栏一打开就 restoreRun() 接上。
- */
-/**
- * 请侧栏开某一课（书里「开始本课」按钮走这条）。
- *
- * ── 两件事必须分开做（2026-11 用户实测踩到）────────────────────────────────
- * ① **广播**：告诉侧栏"读一下 storage、把那一课接上"。
- * ② **打开侧栏**：`chrome.sidePanel.open()` 是**必须由用户手势触发**的接口。
- *
- * 原先把 ② 写在前面、① 跟在后面，于是 `open()` 一失败（实测**每次都失败**，见下）
- * 就把 ① 也一起带走了——侧栏明明开着，却收不到"开始这一课"的通知。这是最坏的一种：
- * 功能其实可用，只因为顺序写错而整条失效。
- *
- * ── 为什么 open() 必然失败（实测三次，日志在 logs\debug.jsonl）──────────────
- *   15:45:56 / 15:46:52  open-side-panel-lesson  opened=false
- *   error=`sidePanel.open()` may only be called in response to a user gesture.
- * 手势**不会**穿过 sendMessage 从阅读器页传到后台。这是浏览器的安全边界，不是 bug，
- * 所以只能如实告知用户去点一下工具栏图标；打开时靠 restoreRun() 自动接上（① 那条路）。
- *
- * ── 为什么要先查"侧栏在不在"────────────────────────────────────────────────
- * 侧栏开着的时候**根本不需要** open()。先用 getContexts 查一次，在就跳过，
- * 这样最坏情况下也不会白报一个失败给用户看。
- */
-async function openSidePanelForLesson(msg) {
-  // ① 广播（无条件，与"能不能打开"完全无关）
-  const ping = () => {
-    try {
-      const p = chrome.runtime.sendMessage({ action: 'coreadTutorialLesson', chapter: msg?.chapter })
-      if (p && p.catch) p.catch(() => {})
-    } catch (e) {}
-  }
-  ping()
-  setTimeout(ping, 500)     // 侧栏刚被打开时脚本可能还没就绪，再补一次
-
-  // ② 侧栏已经在？那就不用 open() 了
-  let alreadyOpen = false
-  try {
-    if (chrome.runtime.getContexts) {
-      const ctxs = await chrome.runtime.getContexts({ contextTypes: ['SIDE_PANEL'] })
-      alreadyOpen = !!(ctxs && ctxs.length)
-    }
-  } catch (e) {}
-
-  let opened = alreadyOpen
-  let error = ''
-  if (!alreadyOpen) {
-    try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true })
-      await chrome.sidePanel.open({ windowId: tab ? tab.windowId : undefined })
-      opened = true
-    } catch (e) {
-      // 最常见的失败就是"缺手势"。如实回报，让书里那块卡片能说真话：
-      // 引导在右侧侧栏，点一下工具栏图标就接上了（状态在 storage 里等着）。
-      error = String((e && e.message) || e)
-    }
-  }
-
-  reportDebug({
-    source: 'open-side-panel-lesson', stage: 'done',
-    broadcast: true, alreadyOpen, opened, error,
-    // ⚠️ `chapter` 传 0 时原来会被省略，于是日志里根本看不出"调用方到底传没传"。
-    // 我因此误判过一次"用户跑的是旧版本"——其实是新版本、只是没写这个字段。
-    // 诊断字段宁可冗余：现场只有一次，缺一个字段就要多跑一轮。
-    inChapter: Number(msg?.chapter) || 0,
-    chapter: Number(msg?.chapter) || 0,
-  })
-  return { ok: true, broadcast: true, alreadyOpen, opened, error }
 }
 
 /**

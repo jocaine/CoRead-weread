@@ -10,7 +10,7 @@ import fs from 'fs'
 import path from 'path'
 import { execSync } from 'child_process'
 import { fileURLToPath } from 'url'
-import { GRAPH_FILE, readGraphFile, buildDemoGraph, readTutorialGraph } from './graph-data.js'  // AI-020：会意图图数据
+import { GRAPH_FILE, readGraphFile, buildDemoGraph } from './graph-data.js'  // AI-020：会意图图数据
 import { writeApiConfig, validateApiConfigInput, resolveApiConfig, isConfigured } from '../agent/lib/api-config.js'  // 模型 API 配置（侧栏「⋯」入口的读写端）
 // 自由模式多对话（2026-11 用户定调）：对话注册表（新建 / 列表 / 重命名 / 删除 + 消息计数）。
 // agent 在归档时写同一份注册表（留墓碑记录），两边都用同一个 lib 保证读写口径一致。
@@ -380,119 +380,6 @@ function normalizeReaderHash(h) {
 // 所以：**进来先归一化**。裸哈希（老扩展 / 老书库列表）与带前缀的都认，出来一律带前缀。
 const READER_BOOK_PREFIX = 'rd_'
 
-// ── 内置教程书（2026-11）──────────────────────────────────────────────────────
-/**
- * 教程书在共读侧的固定书 ID：`rd_` + 一个 64 位十六进制常量。
- *
- * ⚠️ 三处必须逐字相同：这里、`extension/tutorial/index.js` 的 TUTORIAL_HEX、
- * `extension/reader.js` 的 TUTORIAL_HEX（静态闸门 test/selftest/check-tutorial.mjs 会比对）。
- * 为什么是固定常量而不是真哈希：教程书没有文件，而书 ID 必须过三处正则
- * （本文件 :370 与 :407、sidebar.js 的 applyBookContext），取
- * sha256('CoRead 使用手册 v1') 当常量就一次通过，三处校验一个字都不用改。
- */
-const TUTORIAL_HEX = 'e0c91cb6aa56dd0057235ba7374c03e599e1e37e09b3bc9f55f64e1a5b98a25e'
-const TUTORIAL_BOOK_ID = READER_BOOK_PREFIX + TUTORIAL_HEX
-
-/**
- * 教程书正文在哪：**扩展目录**里（`<父目录>\extension\tutorial\book`），不在 data\ 下。
- *
- * 为什么接收端要自己找它（而不是等扩展来报）：教程书是**随包分发**的，
- * 而「已读书籍」列表来自 data\reading\books\ —— 用户可能先开侧栏（那时阅读器还没
- * 打开过教程书），不先在启动时登记进去，第一次安装的用户会看不到这本书。
- * 扩展打开教程书时也会走一次 /reader-book，那是同一个登记动作的第二次机会。
- *
- * 目录推导为什么这么写：父目录是 agent 与 receiver 的共同父目录
- * （开发时 = 仓库根；便携包里 = internal\），两种布局下 `extension\` 都在它下面。
- * 判定依据与 agent/lib/paths.js 的 PARENT_NAME 同源，但**这不是数据路径**，
- * 所以不进那个文件的真源表——它是"程序自带的只读内容"，不是用户数据。
- */
-function tutorialBookDir() {
-  const fatherDir = path.join(__dirname, '..')
-  for (const rel of [['extension', 'tutorial', 'book'], ['internal', 'extension', 'tutorial', 'book']]) {
-    const p = path.join(fatherDir, ...rel)
-    try { if (fs.statSync(p).isDirectory()) return p } catch {}
-  }
-  return ''
-}
-
-/**
- * 扩展目录（开发时 = 仓库根的 `extension\`；便携包里 = `internal\extension\`）。
- * 用途和 tutorialBookDir 同一类：读**程序自带的只读内容**（教程的会意图种子），
- * 不是用户数据，所以同样不进 agent/lib/paths.js 的真源表。
- * @returns {string} 找到的扩展目录；找不到返回空串（调用方自己兜底）
- */
-function extensionDir() {
-  const fatherDir = path.join(__dirname, '..')
-  for (const rel of [['extension'], ['internal', 'extension']]) {
-    const p = path.join(fatherDir, ...rel)
-    try { if (fs.statSync(p).isDirectory()) return p } catch {}
-  }
-  return ''
-}
-
-function readJsonIfExists(file) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null }
-}
-
-/**
- * 把一章的**正文字块**拼成给 agent 用的纯文本。
- *
- * 为什么这一步不是可有可无：agent 是拿划线原文去 `chapters\*.txt` 里找
- * "你已经读过的那几章"（agent/index.js:435-489）。没有这份文本，用户在教程书里
- * 划的线就找不到正文，那一问会得到一句"未找到对应章节"——书就白做成一本书了。
- */
-function tutorialChapterText(chapter) {
-  const parts = []
-  for (const b of (chapter && chapter.blocks) || []) {
-    if (!b) continue
-    // 「课」块本身没有正文（它的标题与步骤是界面上说的，不是书里读的），跳过。
-    // 但课块的 intro 若有文字要算正文——那是写给读者看的，agent 也该看得到。
-    if (b.type === 'lesson') { if (b.text) parts.push(b.text); continue }
-    if (b.text) parts.push(b.text)
-    if (Array.isArray(b.items)) parts.push(...b.items)
-    if (b.attribution) parts.push(b.attribution)
-  }
-  return parts.join('\n\n')
-}
-
-/**
- * 登记教程书 + 导出它的章节正文。**每次接收端启动都做一遍**（幂等）。
- *
- * 为什么不"只在缺失时写一次"：教程正文随版本走。升级之后用户该看到新内容，
- * 而 data\ 里那份是上一版导出的。每次重写最简单，代价只是七个小文件。
- * 明确接受的代价：**用户手改 data\reading\books\<教程>\chapters\ 下的文本会被覆盖**——
- * 那本来就不是他的东西（正文的真源在扩展里），要改内容得改代码。
- *
- * @returns {{ok:boolean, reason?:string, chapters?:number, title?:string}}
- */
-function ensureTutorialBook() {
-  const dir = tutorialBookDir()
-  if (!dir) return { ok: false, reason: '找不到教程书目录（extension/tutorial/book）' }
-  const manifest = readJsonIfExists(path.join(dir, 'book.json'))
-  if (!manifest || !Array.isArray(manifest.chapters) || !manifest.chapters.length) {
-    return { ok: false, reason: 'book.json 读不到或没有章节' }
-  }
-  const target = bookDir(TUTORIAL_BOOK_ID)          // 顺带建好 chapters\ 目录
-  const chaptersDir = path.join(target, 'chapters')
-  fs.mkdirSync(chaptersDir, { recursive: true })
-  let written = 0
-  for (const c of manifest.chapters) {
-    if (!c || !c.key) continue
-    const chapter = readJsonIfExists(path.join(dir, c.key, 'chapter.json'))
-    if (!chapter) continue
-    const text = tutorialChapterText(chapter)
-    if (!text) continue
-    fs.writeFileSync(path.join(chaptersDir, sanitizePathPart(c.key) + '.txt'), text)
-    written++
-  }
-  writeBookMeta(TUTORIAL_BOOK_ID, {
-    bookId: TUTORIAL_BOOK_ID,
-    baseBookId: TUTORIAL_BOOK_ID,
-    bookTitle: String(manifest.title || '第一次共读'),
-  })
-  return { ok: true, chapters: written, title: manifest.title || '' }
-}
-
 /** 阅读器元信息里的"新鲜度"字段：合并时取两边较新者，不参与"信息是否已覆盖"的比对 */
 const RECENCY_KEYS = new Set(['lastOpenedAt', 'updatedAt'])
 
@@ -750,29 +637,6 @@ function listReaderBooks() {
     // hash 回裸哈希（去掉目录名上的 rd_ 前缀）：扩展那边一律用裸哈希当键
     //（chrome.storage 的 rd:book:<hash>、/reader-book-file?hash=），别在这里换形态
     out.push(Object.assign({}, meta, { hash: normalizeReaderHash(name), size, hasFile: size > 0 }))
-  }
-  // 内置教程书补进书库列表（2026-11）：它注册时写的是共读侧 meta.json，
-  // 没有 reader-meta.json，所以上面那个循环看不见它。而用户在阅读器「书库」里
-  // 需要能点开它——它不是靠自己出场的，得有人把它放进去。
-  // 为什么在这里补而不是让扩展自己拼：这个接口是"书库里有什么"的唯一答案，
-  // 让调用方各自补一条，迟早会补出两种说法。
-  const tdir = path.join(BOOKS_DIR, TUTORIAL_BOOK_ID)
-  if (!out.some((b) => normalizeReaderHash(b.hash) === TUTORIAL_HEX) && fs.existsSync(tdir)) {
-    const bm = readJsonIfExists(path.join(tdir, 'meta.json')) || {}
-    const rm = readReaderMeta(TUTORIAL_HEX) || {}
-    out.push({
-      hash: TUTORIAL_HEX,
-      name: bm.bookTitle || rm.name || '第一次共读',
-      pages: rm.pages || 0,
-      entries: 0,
-      builtin: true,
-      // 永远排在最前面：新手第一眼要看到的就是这本
-      lastOpenedAt: Math.max(Number(rm.lastOpenedAt) || 0, Date.now() + 31536000000),
-      size: 0,
-      // 没有 PDF 原件，但有正文——所以 hasFile 必须为真，否则书库里那一条会被点灰
-      hasFile: true,
-      isTutorial: true,
-    })
   }
   out.sort((a, b) => (b.lastOpenedAt || 0) - (a.lastOpenedAt || 0))
   return out
@@ -1119,38 +983,26 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  // 会意图拓扑图（GET /graph[?demo=1][?free=1][?tutorial=1]）——AI-020
-  // 返回 { nodes, edges, updatedAt, demo, free, source, tutorial }：节点 = 知识点
+  // 会意图拓扑图（GET /graph[?demo=1][?free=1]）——AI-020
+  // 返回 { nodes, edges, updatedAt, demo, free, source }：节点 = 知识点
   // （point/aliases/discussions），边 = 用户问题意识轨迹（from → to，kind: user|derived）。
   //
   // 数据源按参数**互斥**地选一条，绝不混：
   //   · 默认（不带参数）→ data\profile\knowledge-graph.json，用户自己的图
   //   · ?demo=1     → 演示拓扑（builtin\knowledge-graph-demo.json），真实图为空时预览用
-  //   · ?tutorial=1 → **教程专用样例图**（扩展自带的 tutorial/graph-seed.json）
+  //（`?tutorial=1` 那条路随内置教程书一起删掉了，2026-10-20）
   //
   // ?free=1（2026-11 起**不再切换数据源**）：旧实现返回 knowledge-graph.free.json——
   // 那是 2026-09 自由模式沙盒的产物（正式图深拷贝 + 测试节点）。沙盒早已没有写入方，
   // 文件冻结在 2026-09-19；而 2026-11 的自由对话产物一律写正式图。两侧错位导致
   // "归档后自由模式里看不到新节点"。现在这个参数被忽略、一律返回正式图——
   // 老侧栏仍会带它发请求，所以参数本身不能删（删了老版本侧栏会拿到别的分支）。
-  //
-  // 为什么要最后那条（2026-11 用户要求）：教程要教"收口/命中"，而新用户的图是空的，
-  // 空图讲不了；但往用户自己的图里塞假节点更糟（那是他的资产）。
-  // 所以教程那条路**单独一份数据、单独一个开关**，默认的 /graph 一个字都不碰——
-  // "教程里看得见图"与"用户的图干净"因此可以同时成立。
   if (req.method === 'GET' && req.url.split('?')[0] === '/graph') {
     // 来源限制：只允许扩展读图（评审 P1 同款）
     if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
     const u = new URL(req.url, 'http://localhost')
     let out = readGraphFile()
-    if (u.searchParams.get('tutorial') === '1') {
-      // 教程图**只**来自扩展里那份种子，读不到就返回空图（不回退到用户的图——
-      // 一回退就等于把用户的节点混进来了，正是用户明确不要的）
-      const tg = readTutorialGraph(path.join(extensionDir(), 'tutorial', 'graph-seed.json'))
-      out = tg
-        ? { nodes: tg.nodes, edges: tg.edges, updatedAt: Date.now(), tutorial: true }
-        : { nodes: [], edges: [], updatedAt: Date.now(), tutorial: true, empty: true }
-    } else if (u.searchParams.get('demo') === '1') {
+    if (u.searchParams.get('demo') === '1') {
       const dg = buildDemoGraph()
       if (dg) out = { nodes: dg.nodes, edges: dg.edges, updatedAt: Date.now(), demo: true }
     }
@@ -2061,17 +1913,6 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`Annotations: ${ANNOTATIONS_FILE}`)
   console.log(`Books:       ${BOOKS_DIR}`)
   console.log(`Chat DB:     ${CHAT_DB}`)
-  // 内置教程书：登记 + 导出章节正文（幂等，每次启动重做一遍，理由见该函数注释）。
-  // 放启动时做而不是等扩展来报：用户可能先开侧栏，「已读书籍」里就该有这本书。
-  try {
-    const t = ensureTutorialBook()
-    console.log(t.ok
-      ? `Tutorial:    ${t.title}（已登记，导出 ${t.chapters} 章正文）`
-      : `Tutorial:    跳过（${t.reason}）`)
-  } catch (e) {
-    // 教程书出问题不该拦住整个接收端：它是附加内容，坏了也要能正常共读别的书
-    console.log(`Tutorial:    登记失败（${e.message}）`)
-  }
 })
 
 // ── 优雅退出 ─────────────────────────────────────────────────────────────────

@@ -30,23 +30,9 @@ import {
   linesFromFixedItems,
 } from './reader-anchor.js'
 import { RECEIVER_URL } from './translate-protocol.js'   // 后台地址的真源，不另写一份
-import * as Tutorial from './tutorial/index.js'          // 内置教程书（2026-11）
 // 「读到哪儿」的算术（第几页 + 页内比例）：纯函数，单测在 extension/test/reader-position.test.mjs
 // ⚠️ 只取这两个：`clamp01` 本文件里已经有一个（:1920，别处也在用），不要再导一个同名的进来
-import { fracInBox, positionFromBoxes, deltaToPosition } from './reader-position.js'
-
-/**
- * 内置教程书的固定 ID（64 位十六进制）。
- *
- * ⚠️ 必须与 `tutorial/index.js` 的 TUTORIAL_HEX **逐字相同**（自测会比对）。
- * 为什么是"固定常量"而不是算出来的：教程书没有 PDF、没有内容哈希，但**不能因此发明
- * 第二种书 ID 形态**——接收端与侧栏有三处正则校验（receiver/index.js:370 与 :407、
- * sidebar.js 的 applyBookContext），非十六进制的 ID 会被当场拦掉。
- * 取 sha256('CoRead 使用手册 v1') 当常量，它天生满足三处校验，一个校验都不用改。
- */
-const TUTORIAL_HEX = 'e0c91cb6aa56dd0057235ba7374c03e599e1e37e09b3bc9f55f64e1a5b98a25e'
-/** 教程书在书库列表里的 hash 键（与 PDF 那套同形：裸十六进制） */
-const TUTORIAL_HASH = TUTORIAL_HEX
+import { positionFromBoxes, deltaToPosition } from './reader-position.js'
 
 // ── 运行环境 ──────────────────────────────────────────────────────────────────
 // 扩展页面里走 chrome.runtime.getURL；自测（普通页面）里退回相对路径，
@@ -128,7 +114,11 @@ const els = {
   scanHint: $('rd-scan-hint'),
   tip: $('rd-tip'),
   tipTranslate: $('rd-tip-translate'),
+  tipRef: $('rd-tip-ref'),
   tipCopy: $('rd-tip-copy'),
+  boxTip: $('rd-box-tip'),
+  boxTranslate: $('rd-box-translate'),
+  boxRecognize: $('rd-box-recognize'),
   toast: $('rd-toast'),
   delOverlay: $('rd-del-overlay'),
   delTitle: $('rd-del-title'),
@@ -139,15 +129,6 @@ const els = {
 
 const state = {
   doc: null,
-  // ── 当前打开的是哪一种文档（2026-11 加教程书时抽出来的那一层）────────────────
-  // 以前"有没有打开东西"处处以 `state.doc`（pdf.js 文档对象）为准：状态栏、页码、
-  // 「当前在看哪本书」的快照、保存、命令处理……全都在读它。教程书没有 pdf.js 文档，
-  // 于是不占住这个位置的话，侧栏就不认为你在读它，引用与提问全没有归属——
-  // 那不是"少个功能"，是整本书在共读那条线上不存在。
-  // 所以这里把「打开的是什么」显式收成一个字段，`state.doc` 只表示"是 PDF 且已加载"。
-  docKind: '',              // '' | 'pdf' | 'tutorial'
-  tutorialOpen: false,      // 教程书是不是当前这本
-  tutorialPage: 0,          // 教程书的当前章（1 起）
   hash: '',
   name: '',
   scale: 1.25,
@@ -157,15 +138,44 @@ const state = {
   archived: false,      // 当前这本是不是已经在书库里
   entries: [],          // {id, anchors:[{page,start,end}], source, translation, at}
   refsSeen: [],         // 已设成引用的段落 {selectedText, translation, at}（给译文面板画下划线）
+  /**
+   * 「这条引用落在书里哪一处」：`{ text, anchors:[{page,start,end}], at }`（2026-11 修）。
+   *
+   * 为什么需要单独一份：接收端的引用存档只记文字（引用身份），**不记 PDF 的页内偏移**；
+   * 而书页上的标记必须靠偏移才能解析成 Range。于是设引用那一刻把锚点记在本地——
+   * 这是唯一知道"用户当时划的是哪一段"的地方（见 noteRefMark）。
+   *
+   * 真值仍在 refsSeen（接收端那份"这本书还有哪些引用"）：refreshRefs 成功后按文字
+   * 裁掉已被删除的（见 pruneRefMarks）。这份只是"画在哪里"的缓存，随进度记录落盘。
+   */
+  refMarks: [],
   refsAt: 0,            // 上一次从接收端拉这份清单的时刻（TTL 用，见 refreshRefs）
   refsFail: 0,          // 连续失败次数（退避重试用，见 scheduleRefsRetry）
   refsRetryTimer: null, // 排队中的那次重试
   activeId: '',
+  /**
+   * 用户最后一次在**书页上**点了哪一条译文区域（2026-11）。
+   *
+   * 为什么 activeId 不够：activeId 同时也是"刚翻完一条、把它设为当前"（focusEntry）在写。
+   * 侧栏的译文对照要区分这两件事——
+   *   · **书页上点过来的** → 列表必须**滚到那一条**（用户刚在书里看到它，对照栏得对上）
+   *   · **刚翻完设为当前** → 按老规矩（阅读者贴着底才跟过去，不然别把他从旧条目上拽走）
+   * 所以这里另记一份只由"页面上点译文"产生的标记，用**时刻**而不是布尔值：
+   * 同一条再点一次也要能触发，布尔值不变就跳不动了。
+   */
+  revealId: '',
+  revealAt: 0,
   pendingAnchorFlash: '',
   boxMode: false,
   /** 这一轮框选是不是"一次性"（Alt+S 进来的是；工具栏按钮进来的不是，见 startBoxSelect） */
   boxOneShot: false,
   boxDrag: null,
+  /**
+   * 框选拖完、动作条还开着时的那块区域：`{ page, frac, marquee }`（2026-11）。
+   * 原先一松手就翻译；现在先问「识别原文」还是「翻译」，这块就是等待选择的目标。
+   * marquee 是页面上还留着的那道选框（选动作前一直可见）。动作条收起 / 换书 / 重新拖框会清掉。
+   */
+  boxChoice: null,
   renderQueue: [],
   rendering: 0,
   renderCount: 0,          // 画布位图真正重画过多少次（性能回归时看这个数）
@@ -262,20 +272,18 @@ function readerBookId(hash) {
   return hash ? 'rd_' + hash : ''
 }
 
-/** 当前有没有打开一本书（PDF 或教程书都算）。见 state.docKind 那段注释。 */
+/** 当前有没有打开一本书（PDF） */
 function hasBook() {
-  return !!(state.doc || state.tutorialOpen)
+  return !!state.doc
 }
 
 /** 当前这本书在共读侧的 ID（没开书时返空串） */
 function currentBookId() {
-  if (state.tutorialOpen) return readerBookId(TUTORIAL_HEX)
   return state.doc && state.hash ? readerBookId(state.hash) : ''
 }
 
-/** 当前这本书的"页数"：PDF 是页，教程书是章（书的目录就是它的页） */
+/** 当前这本书的页数 */
 function bookTotal() {
-  if (state.tutorialOpen) return Tutorial.chapterCount() || 1
   return state.doc ? state.doc.numPages : 0
 }
 
@@ -314,8 +322,6 @@ async function archiveToLibrary(bytes, name) {
  * 更新书库里的元信息（书名、页数、译文条数、读到第几页），并把这本登记到**共读侧**
  * （receiver 会写 `<书ID>/meta.json`，即「已读过时的书籍」列表的数据源）。
  *
- * 教程书（2026-11）走同一个接口、同一个字段：对接收端来说它就是一本阅读器里的书，
- * 只是它的"页数"是章数、没有 PDF 原件（hash 用它的固定 ID）。
  * 写失败不提示——receiver 没起来时阅读照常，只是没有共读侧记录（与书库本身同款行为）。
  *
  * ⚠️ `pos` 必须是**当前真实位置**（默认现算一个）。为什么把它做成参数（2026-11 二次改版）：
@@ -326,21 +332,6 @@ async function archiveToLibrary(bytes, name) {
  */
 function touchLibraryMeta(posArg) {
   const pos = posArg || currentPosition()
-  if (state.tutorialOpen) {
-    receiverJson('/reader-book', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        hash: TUTORIAL_HEX,
-        bookId: readerBookId(TUTORIAL_HEX),
-        name: state.name,
-        pages: bookTotal(),
-        entries: 0,
-        page: pos.page,
-      }),
-    }).catch(() => {})
-    return
-  }
   if (!state.hash) return
   receiverJson('/reader-book', {
     method: 'POST',
@@ -374,22 +365,11 @@ function fmtWhen(ts) {
 }
 
 /**
- * 书库列表里的一条：内置教程书 + 放进来过的 PDF。
- *
- * 教程书为什么必须在这里、而不是等 receiver 报回来（2026-11）：
- * 它是**随包分发**的，不是用户放进去的——接收端没起来时书单里就不该没有它。
- * 所以它由扩展自己保证，接收端那条路只负责补元信息。
- */
-function tutorialLibEntry() {
-  return { hash: TUTORIAL_HASH, name: Tutorial.title(), builtin: true, hasFile: true, isTutorial: true }
-}
-
-/**
  * 空状态底部那句说明——**只在需要的时候出现**（2026-11，按 coread-visual-spec 重做）。
  *
  * 三种状态，三种话，各自只回答"我现在该干什么"：
  *   ① 书库里有你自己放过的书 → "点书名接着读"（一句操作指引，不解释产品）
- *   ② 一本都没有（只剩内置手册）→ 说明**什么时候该用这个阅读器**。它在这儿是有用的：
+ *   ② 一本都没有 → 说明**什么时候该用这个阅读器**。它在这儿是有用的：
  *      屏幕空着，而用户手上多半正有个微读转不动的 PDF —— 这句话回答的正是他此刻的问题。
  *      顺带把定位说清（默认走微读传书，外文和转不动的走这里），免得他以为这是主推路径。
  *   ③ 还在读 → 空着，别在没结论的时候先说话。
@@ -443,22 +423,13 @@ function renderLibrary(books) {
     const name = document.createElement('span')
     name.className = 'rd-lib-name'
     name.textContent = b.name || '未命名.pdf'
-    if (b.isTutorial) {
-      const tag = document.createElement('span')
-      tag.className = 'rd-lib-tag'
-      tag.textContent = '使用手册'
-      name.appendChild(tag)
-    }
 
     const meta = document.createElement('span')
     meta.className = 'rd-lib-meta'
     const bits = []
-    if (b.isTutorial) bits.push('共 ' + (Tutorial.chapterCount() || 7) + ' 章')
-    else {
-      if (b.pages) bits.push(b.pages + ' 页')
-      if (b.entries) bits.push(b.entries + ' 条译文')
-      if (b.size) bits.push(fmtSize(b.size))
-    }
+    if (b.pages) bits.push(b.pages + ' 页')
+    if (b.entries) bits.push(b.entries + ' 条译文')
+    if (b.size) bits.push(fmtSize(b.size))
     if (b.lastOpenedAt) bits.push(fmtWhen(b.lastOpenedAt))
     meta.textContent = bits.join(' · ')
 
@@ -466,61 +437,80 @@ function renderLibrary(books) {
     item.appendChild(main)
 
     /**
-     * 删除按钮（2026-11）：书库里每一项（除内置手册）都有。
+     * 删除按钮（2026-11）：书库里每一项都有。
      *   · **不需要判断"有没有文件"**——没有文件的项根本不会出现在这个列表里
      *     （receiver 的 listReaderBooks 会把"原件不在、只剩记录"的直接清掉）。
      *     这条规则是用户定的："没有就是没有了"。
-     *   · 教程书例外：内置手册不是"文件 + 记录"这套里的东西。
      */
-    if (!b.isTutorial) {
-      const del = document.createElement('span')   // 用 span：button 不能嵌 button
-      del.className = 'rd-lib-del'
-      del.setAttribute('role', 'button')
-      del.setAttribute('tabindex', '0')
-      del.title = '从书库删除这个 PDF 文件'
-      del.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
-        + 'stroke-linecap="round" stroke-linejoin="round">'
-        + '<path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>'
-      const onDel = (e) => {
-        e.preventDefault()
-        e.stopPropagation()   // 别触发整行点击（那是"打开这一本"）
-        deleteReaderBook(b)
-      }
-      del.addEventListener('click', onDel)
-      del.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') onDel(e) })
-      item.appendChild(del)
+    const del = document.createElement('span')   // 用 span：button 不能嵌 button
+    del.className = 'rd-lib-del'
+    del.setAttribute('role', 'button')
+    del.setAttribute('tabindex', '0')
+    del.title = '从书库删除这个 PDF 文件'
+    del.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+      + 'stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>'
+    const onDel = (e) => {
+      e.preventDefault()
+      e.stopPropagation()   // 别触发整行点击（那是"打开这一本"）
+      deleteReaderBook(b)
     }
+    del.addEventListener('click', onDel)
+    del.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') onDel(e) })
+    item.appendChild(del)
 
-    item.addEventListener('click', () => { b.isTutorial ? openTutorial() : openFromLibrary(b) })
+    item.addEventListener('click', () => openFromLibrary(b))
     box.appendChild(item)
   }
 }
 
+/**
+ * 读书库清单。
+ *
+ * ⚠️ **失败要重试，不能只试一次**（2026-10-20 用户实测："重启后插件找不到接收端"）。
+ *
+ * 为什么这一条是真缺口：扩展一重载，`reader.html` 也跟着重载，而它加载的那一刻
+ * 接收端**可能正在关/开**。实测时间线：22:08:51 重载扩展（本页重新加载）→
+ * 22:08:54 旧的接收端被结束 → 22:09:17 新的接收端才起来。
+ * 原来这里只试一次，失败就把 `"本机服务未启动"` 写进状态栏**再也不改**——
+ * 接收端明明已经起来了，用户看到的还是"找不到接收端"，只能手动刷新页面。
+ * 现在：退避重试几次（0.8s / 1.6s / 3.2s / 4s …），期间状态栏写"重试中…"；
+ * 全都失败才认输，并且**保留上一次读到的书单**（短暂连不上不该把列表清空）。
+ * 另外页面重新可见时再补一次（切回这个标签页就能自愈）。
+ */
+let _libRetry = 0
 async function loadLibrary() {
   if (!els.libraryList) return
   _libLoading = true
-  els.libraryStatus.textContent = '读取中…'
+  if (!(state.library || []).length) els.libraryStatus.textContent = '读取中…'
   renderEmptyNote()          // 还在读 → 那句说明先别出来（见 renderEmptyNote 的状态表）
   try {
     const data = await receiverJson('/reader-books')
-    const books = (data.books || []).filter((b) => !isTutorialHash(b.hash))
+    const books = data.books || []
     state.library = books
     _libLoading = false
-    // 教程书排在最前面：新手第一眼要看到的就是它
-    renderLibrary([tutorialLibEntry()].concat(books))
+    _libRetry = 0
+    renderLibrary(books)
   } catch (e) {
-    // 接收端没起来也不该把教程书一起丢掉：它是扩展自带的，跟本机服务在不在没关系
-    state.library = []
     _libLoading = false
-    els.libraryStatus.textContent = '本机服务未启动（仅内置手册可读）'
-    renderLibrary([tutorialLibEntry()])
+    if (_libRetry < 5) {
+      _libRetry++
+      els.libraryStatus.textContent = '本机服务未启动，重试中…'
+      setTimeout(loadLibrary, Math.min(4000, 400 * Math.pow(2, _libRetry - 1)))
+      renderEmptyNote()
+      return
+    }
+    renderLibrary(state.library || [])   // 保留上次的清单，不清空
+    els.libraryStatus.textContent = '本机服务未启动（可在本机服务启动后切回本页重试）'
   }
 }
 
-/** 这个 hash 是不是内置教程书的（接收端可能把它的书库记录也报回来，去重要用） */
-function isTutorialHash(h) {
-  return String(h || '').toLowerCase().replace(/^rd_/, '') === TUTORIAL_HASH
-}
+// 切回这个标签页时若还处在"没连上"的状态，再补一次（不重试的话用户只能手动刷新）
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !_libRetry) return
+  _libRetry = 0
+  loadLibrary()
+})
 
 /**
  * 从书库删掉一项（2026-11）。
@@ -604,56 +594,6 @@ function askDelete(title, message) {
   })
 }
 
-/**
- * 打开内置教程书。
- *
- * 它跟 PDF 那条路（openBytes）是并列的两条，不是分支套分支：
- * 关闭现有文档 → 认成"一本书"→ 把页面容器交给教程渲染器 → 报告换书。
- * 最后一步不能省：侧栏靠那份快照认"当前在读哪本书"，没有它，
- * 教程书里划的线、问的问题就都没有归属。
- */
-async function openTutorial() {
-  closeDoc()
-  state.docKind = 'tutorial'
-  state.tutorialOpen = true
-  state.name = Tutorial.title()
-  els.name.textContent = state.name
-  setEmptyVisible(false)
-  els.status.style.color = ''
-  setToolbar('tutorial')
-  try {
-    // 打开期间置位：这段时间书还没落地，`hasBook()` 是 false——
-    // 而"正在打开"与"没有书"对侧栏是两件完全不同的事（见 readerBookInfo 的注释）。
-    // 缺了它，侧栏会在这段窗口里收到"没有书"并把当前书清掉（书单铺开、底部那格换成 PDF 入口条）。
-    state.loading = true
-    // 把阅读器的三项能力交给教程：与后台通信（划词点「共读」要设当前引用）、提示条、
-    // 以及"开始某一课"（书里那个「开始本课」按钮要能唤起侧栏引导）。
-    // 为什么不让教程自己 import 侧栏那边的东西：会成环，而且它俩不在同一个页面里。
-    const r = await Tutorial.open(els.pages, { callBackground, toast, startLesson: startTutorialLesson })
-    state.tutorialPage = r.page || 1
-    els.pageinfo.textContent = '第 ' + state.tutorialPage + ' / ' + r.total + ' 章'
-    /**
-     * 章内位置也要回到原处：一章往往有好几屏，只回到"第几章"等于没记住"读到哪儿"。
-     * `Tutorial.open` 负责"开哪一章"（它读的是同一条记录的 page），这里负责"章内落到哪"。
-     */
-    const rec = await loadRecord(Tutorial.TUTORIAL_STORE_KEY)
-    restorePosition({ page: state.tutorialPage, frac: rec && rec.frac }, '打开教程书时恢复上次位置')
-    toast('已打开：' + state.name + '（共 ' + r.total + ' 章，点顶栏「目录」可跳章）')
-  } catch (e) {
-    state.loading = false
-    // 教程书读不出来要明说原因，不能留一片白
-    state.tutorialOpen = false
-    state.docKind = ''
-    setToolbar('library')
-    setEmptyVisible(true)
-    els.name.textContent = '未打开 PDF'
-    failOpen('内置手册打不开：' + ((e && e.message) || e))
-    return
-  }
-  state.loading = false
-  notifyBookChanged()
-}
-
 /** 从书库打开：把原件取回来（不用再选文件） */
 async function openFromLibrary(book) {
   toast('正在从书库读取 ' + (book.name || '') + '…')
@@ -691,13 +631,11 @@ function showLibrary() {
 }
 
 // ── 章节目录（2026-11）───────────────────────────────────────────────────────
-// 用户的反馈原话："你说有七章，但是我无法切换到后面章节，没有找到入口"。
-// 确实如此：在此之前页码只是**显示**，从来不是**入口**。
+// 在此之前页码只是**显示**，从来不是**入口**：用户找不到"跳到后面章节"的地方。
 //
-// 三种内容，按"有没有真章节"降级：
-//   1. 教程书     → 书自带的章节表（这本是我们自己写的，章节是确定的）
-//   2. 有书签的 PDF → pdf.js 的 getOutline()，**真书签**（学术书大量有），按树渲染
-//   3. 其余的 PDF  → 只有页码滑杆（我们**不去猜章节**：靠字号猜出来的目录，
+// 两种内容，按"有没有真章节"降级：
+//   1. 有书签的 PDF → pdf.js 的 getOutline()，**真书签**（学术书大量有），按树渲染
+//   2. 其余的 PDF  → 只有页码滑杆（我们**不去猜章节**：靠字号猜出来的目录，
 //                    猜错了比没有更烦人，而且没法向用户解释为什么这条"章节"落在这儿）
 const TOC_OUTLINE_TIMEOUT = 4000
 /** 已取到的书签目录（按 hash 缓存，换书重取）。null = 这本书没有书签 */
@@ -750,10 +688,10 @@ async function loadPdfOutline() {
 }
 
 /** 目录每一条：标题 + 页码，点了就跳 */
-function tocItem({ title, page, depth, current }) {
+function tocItem({ title, page, depth }) {
   const b = document.createElement('button')
   b.type = 'button'
-  b.className = 'rd-toc-item' + (current ? ' is-on' : '')
+  b.className = 'rd-toc-item'
   b.dataset.depth = String(depth || 0)
   b.dataset.page = String(page || 0)
   const label = document.createElement('span')
@@ -763,56 +701,26 @@ function tocItem({ title, page, depth, current }) {
   num.textContent = page ? String(page) : '—'
   b.append(label, num)
   b.addEventListener('click', () => {
-    if (page) gotoChapter(page)
+    if (page) gotoPage(page)
     closeToc()
   })
   return b
 }
 
-/**
- * 跳到第 n 章/页。**教程书走"真开章"这条路，不是滚动过去**。
- *
- * 为什么必须分开（2026-11 用户自检报回来的真 bug）：教程书的"当前章"由
- * `Tutorial.currentIndex()` 表示，而它只在 `Tutorial.openChapter()` 里更新。
- * 原先目录点击一律走 `gotoPage()`（滚动），于是**滚动位置到了、书的当前章还停在旧的那一章**——
- * 接着发生的滚动会按旧的章算状态，刷新时"上次读到第几章"也可能存错。
- * 表现是"点目录跳过去了，但状态栏还写着第 1 章"（自检报告里就是 `jumped:true, index:0`）。
- */
-async function gotoChapter(num) {
-  if (!state.tutorialOpen) { gotoPage(num); return }
-  cancelRestore('用户主动跳章')          // 明确的跳转优先，别再纠偏跟它抢
-  const i = Math.max(0, Math.min(Tutorial.chapterCount() - 1, Number(num) - 1))
-  try {
-    const r = await Tutorial.openChapter(i, els.pages, { callBackground, toast })
-    state.tutorialPage = r.page || i + 1
-    els.pageinfo.textContent = '第 ' + state.tutorialPage + ' / ' + r.total + ' 章'
-    // 开章会重建页面容器，滚动位置回到顶部：这是"翻到新一章"该有的样子
-    els.scroll.scrollTop = 0
-    scheduleSave()
-  } catch (e) {
-    toast('跳章失败：' + ((e && e.message) || e), true)
-  }
-}
-
 /** 刷新目录里的"当前位置"标记与滑杆（滚动时不重建 DOM） */
 function syncTocPosition() {
   if (!els.toc || els.toc.hidden) return
-  // 教程书的"当前"是章号，来源同上：只有 Tutorial 知道（pdf 那条路才是量页面）
-  const cur = state.tutorialOpen
-    ? ((Tutorial.currentIndex() >= 0 ? Tutorial.currentIndex() + 1 : 1))
-    : currentPage()
+  const cur = currentPage()
   const total = bookTotal()
   if (els.tocRange) {
     els.tocRange.max = String(total || 1)
     els.tocRange.value = String(cur)
   }
   if (els.tocPos) {
-    els.tocPos.textContent = state.tutorialOpen
-      ? `${cur} / ${total} 章`
-      : `${cur} / ${total} 页`
+    els.tocPos.textContent = `${cur} / ${total} 页`
   }
   for (const el of els.tocList.querySelectorAll('.rd-toc-item')) {
-    const on = !state.tutorialOpen && Number(el.dataset.page) === cur
+    const on = Number(el.dataset.page) === cur
     el.classList.toggle('is-on', on)
   }
 }
@@ -820,39 +728,26 @@ function syncTocPosition() {
 async function openToc() {
   if (!hasBook() || !els.toc) return
   els.toc.hidden = false
-  els.tocKind.textContent = state.tutorialOpen ? '本书章节' : 'PDF 书签 + 页码'
+  els.tocKind.textContent = 'PDF 书签 + 页码'
   els.tocList.replaceChildren()
   const loading = document.createElement('div')
   loading.className = 'rd-toc-empty'
   loading.textContent = '读取中…'
   els.tocList.appendChild(loading)
 
-  if (state.tutorialOpen) {
-    els.tocList.replaceChildren()
-    const toc = Tutorial.toc()
-    const cur = Tutorial.currentIndex() + 1
+  const items = await loadPdfOutline()
+  els.tocList.replaceChildren()
+  if (!items.length) {
+    const empty = document.createElement('div')
+    empty.className = 'rd-toc-empty'
+    empty.textContent = '这本 PDF 里没有书签目录（书签是制作 PDF 时做进去的，扫不出内容）。用上面的滑杆翻页。'
+    els.tocList.appendChild(empty)
+  } else {
     const sec = document.createElement('div')
     sec.className = 'rd-toc-sec'
-    sec.textContent = Tutorial.title()
+    sec.textContent = `书签目录 · ${items.length} 条`
     els.tocList.appendChild(sec)
-    for (const c of toc) {
-      els.tocList.appendChild(tocItem({ title: c.title, page: c.num, depth: 0, current: c.num === cur }))
-    }
-  } else {
-    const items = await loadPdfOutline()
-    els.tocList.replaceChildren()
-    if (!items.length) {
-      const empty = document.createElement('div')
-      empty.className = 'rd-toc-empty'
-      empty.textContent = '这本 PDF 里没有书签目录（书签是制作 PDF 时做进去的，扫不出内容）。用上面的滑杆翻页。'
-      els.tocList.appendChild(empty)
-    } else {
-      const sec = document.createElement('div')
-      sec.className = 'rd-toc-sec'
-      sec.textContent = `书签目录 · ${items.length} 条`
-      els.tocList.appendChild(sec)
-      for (const it of items) els.tocList.appendChild(tocItem(it))
-    }
+    for (const it of items) els.tocList.appendChild(tocItem(it))
   }
   syncTocPosition()
 }
@@ -922,7 +817,7 @@ async function openBytes(bytes, name, opts = {}) {
 
 // ── 阅读位置：读到哪儿（量参考线）、回到哪儿（落位 + 纠偏）────────────────────
 //
-// 位置的**唯一定义**是"第几页/章 + 页内比例 frac"，算术全在 reader-position.js（有单测），
+// 位置的**唯一定义**是"第几页 + 页内比例 frac"，算术全在 reader-position.js（有单测），
 // 这里只做两件事：把 DOM 的矩形喂进去、把算出来的滚动量落下来。
 //
 // ⚠️ 两条不许分叉的规矩（agent/test/reader-position-wiring.test.js 盯着）：
@@ -939,59 +834,32 @@ function scrollRefLine() {
 /** 每一页的盒子（按页序），喂给 reader-position.js 的纯函数 */
 function pageBoxes() {
   const c = els.scroll.getBoundingClientRect()
-  /**
-   * 教程书一次只渲染**一章**（tutorial/render.js 会 replaceChildren 再放一个 .tut-page），
-   * 所以它的"页"就是那一个元素，章号来自 Tutorial。不这么兜的话 state.pages 为空，
-   * 位置算术对教程书永远返回 {page:1, frac:0} —— 每次打开都回到第一章。
-   */
-  if (state.tutorialOpen) {
-    const el = els.pages.querySelector('.tut-page')
-    if (!el) return []
-    const r = el.getBoundingClientRect()
-    return [{ page: currentPage(), top: r.top - c.top, height: r.height }]
-  }
   return state.pages.map((p) => {
     const r = p.wrap.getBoundingClientRect()
     return { page: p.num, top: r.top - c.top, height: r.height }
   })
 }
 
-/** 当前在第几页 / 第几章 */
+/** 当前在第几页 */
 function currentPage() {
-  if (state.tutorialOpen) {
-    // 教程书的"第几章"只有 Tutorial 知道：state.pages 在教程书下是空的，
-    // 拿它量**永远是第 1 章**（教程书每次打开都回到第一章，就是这么来的）
-    const i = Tutorial.currentIndex()
-    return i >= 0 ? i + 1 : 1
-  }
   return currentPosition().page
 }
 
 /** 当前位置：{page, frac}（frac 0=页顶 1=页底） */
 function currentPosition() {
-  if (state.tutorialOpen) {
-    const i = Tutorial.currentIndex()
-    const ch = i >= 0 ? i + 1 : 1
-    const boxes = pageBoxes()
-    const b = boxes[ch - 1] || boxes[0]
-    // 一章就是一个滚动单位，章内位置同样按比例记
-    return { page: ch, frac: b ? fracInBox(scrollRefLine(), b.top, b.height) : 0 }
-  }
   return positionFromBoxes(scrollRefLine(), pageBoxes())
 }
 
-/** 状态栏的"第几页 / 第几章"（滚动时要跟着走；教程书的章号来自 Tutorial） */
+/** 状态栏的"第几页"（滚动时要跟着走） */
 function updatePageInfo() {
   if (!els.pageinfo || !hasBook()) return
-  const text = state.tutorialOpen
-    ? '第 ' + currentPage() + ' / ' + bookTotal() + ' 章'
-    : '第 ' + currentPage() + ' / ' + bookTotal() + ' 页'
+  const text = '第 ' + currentPage() + ' / ' + bookTotal() + ' 页'
   if (els.pageinfo.textContent !== text) els.pageinfo.textContent = text
 }
 
 /**
- * 跳到第 n 页/章。
- * @param {number} num 页号（教程书是章号，但那条路该走 gotoChapter）
+ * 跳到第 n 页。
+ * @param {number} num 页号
  * @param {boolean} [smooth] 平滑滚动；滑杆连发 input 时传 false（十几个平滑滚动会打架）
  */
 function gotoPage(num, smooth = true) {
@@ -1019,17 +887,9 @@ function gotoPage(num, smooth = true) {
 function applyPosition(target) {
   const pos = target || (state.restore && state.restore.pos)
   if (!pos || !pos.page) return 'no-box'
-  let el = null
-  if (state.tutorialOpen) {
-    // 教程书只渲染了"当前那一章"：要落的章不是它，就没有盒子（调用方负责先翻章）
-    if (Number(pos.page) !== currentPage()) return 'no-box'
-    el = els.pages.querySelector('.tut-page')
-    if (!el) return 'no-box'
-  } else {
-    const p = state.pages[pos.page - 1]
-    if (!p) return 'no-box'
-    el = p.wrap
-  }
+  const p = state.pages[pos.page - 1]
+  if (!p) return 'no-box'
+  const el = p.wrap
   const c = els.scroll.getBoundingClientRect()
   const r = el.getBoundingClientRect()
   const delta = deltaToPosition(SCROLL_REF_PAD, r.top - c.top, r.height, pos.frac)
@@ -1114,20 +974,12 @@ function cancelRestore(why) {
 }
 
 /**
- * 滚动时做的事：把"当前在第几章/页"跟真实滚动位置对齐。
- *
- * 教程书那条分支**必须**问 Tutorial：它的当前章只在 Tutorial.openChapter() 里更新，
- * 而状态栏/目录/保存都读 state.tutorialPage。不对齐的表现是"滚过去了，状态栏还写着第 1 章"。
+ * 滚动时做的事：把"当前在第几页"跟真实滚动位置对齐。
  *
  * ⚠️ 不在滚动里直接写 storage：滚动一秒能触发几十次，而写 storage 是每本书一整条记录。
  * 落定之后由 finishRestore / scheduleSave 存一次。
  */
 function onScroll() {
-  if (state.tutorialOpen) {
-    const i = Tutorial.currentIndex()
-    const ch = i >= 0 ? i + 1 : 1
-    if (ch !== state.tutorialPage) state.tutorialPage = ch
-  }
   updatePageInfo()
   syncTocPosition()
   if (state.restore) applyPosition(state.restore.pos)
@@ -1187,6 +1039,17 @@ async function loadDocument(bytes, name) {
     if (saved.scale) state.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, saved.scale))
     state.entries = Array.isArray(saved.entries) ? saved.entries : []
     /**
+     * 旧记录里的「识别原文」可能是按截图视觉行硬换行的（2026-11 用户实测"一行一句"）。
+     * 读回时按新规则整理一次：段内换行接回去、空行保留为分段。
+     * 只碰 recognized 的条目——普通译文的换行按原样保留。
+     */
+    for (const e of state.entries) {
+      if (e && e.recognized) {
+        e.source = reflowOcrText(e.source)
+        e.translation = reflowOcrText(e.translation)
+      }
+    }
+    /**
      * 已设成引用的段落（画下划线用）。
      *
      * **先读回上次落盘的那份**，再去接收端刷新（下面的 refreshRefs）：
@@ -1195,6 +1058,13 @@ async function loadDocument(bytes, name) {
      * 这份是缓存，拉取成功会被覆盖成真值。
      */
     state.refsSeen = Array.isArray(saved.refs) ? saved.refs : []
+    /**
+     * 引用落在书里的锚点（见 state.refMarks）。
+     *
+     * 与上面那份清单一起落盘：重启时接收端往往比阅读器晚就绪，那一刻只能靠本地这份
+     * 先把书页上的绿线画出来；接收端起来后 refreshRefs 会按真值裁一遍。
+     */
+    state.refMarks = Array.isArray(saved.refMarks) ? saved.refMarks : []
     state.refsAt = 0
     els.pages.style.setProperty('--total-scale-factor', String(state.scale))
     applyScaleToPlaceholders()
@@ -1224,115 +1094,32 @@ async function loadDocument(bytes, name) {
   // 第一次打开没有历史缩放：直接按窗口宽度铺满，省得每次都要手动点「适宽」
   //（它排在恢复之后：改缩放会改页高，而纠偏会按新几何补落一次）
   if (!saved || !saved.scale) await fitWidth()
+  // 顶栏的"第 x / y 页"要立刻有位：不能等用户滚一下才出现
+  updatePageInfo()
 
   toast('已打开：' + state.name + '（' + doc.numPages + ' 页）')
   if (saved && state.entries.length) toast('已恢复 ' + state.entries.length + ' 条译文的原文位置')
 }
 
-/**
- * 开始某一课（书里那个「开始本课」按钮）。
- *
- * 这一课**在侧栏里跑**（引导要高亮侧栏的真实控件），所以这里做两件事：
- *   ① 把"要跑哪一课"写进 chrome.storage（与侧栏引导共用的那个键）——
- *      写它而不是发消息，是因为**侧栏此刻可能没开着**：消息没有收件人，而 storage 会等着它；
- *      侧栏一打开就 restoreRun() 接上（见 tutorial-script.js）。
- *   ② 请后台把侧栏打开。`sidePanel.open()` 需要用户手势，本次点击正好是，
- *      但手势能不能穿过消息传到后台**不保证**——所以失败要如实说，不能让按钮假装成功。
- *
- * @param {number} chapterNum 章号（1 起）
- */
-async function startTutorialLesson(chapterNum) {
-  const lesson = Tutorial.lessonFor(chapterNum)
-  if (!lesson) return { ok: false, error: '这一章没有对应的课' }
-  const idx = Tutorial.lessonIndex(chapterNum)
-  try {
-    // 先写状态再打招呼：侧栏无论"收到了通知"还是"启动时自己读"，读到的都是这一份
-    await chrome.storage.local.set({
-      tutorialRun: { active: true, lesson: idx, step: 0, at: Date.now(), from: 'book' },
-    })
-  } catch (e) {
-    return { ok: false, error: '写不进引导状态：' + String((e && e.message) || e) }
-  }
-  // 请后台广播 + 试着打开侧栏。
-  // `opened` 基本必然是 false：`chrome.sidePanel.open()` 需要用户手势，而手势不会
-  // 穿过 sendMessage 传过去（实测三次全失败，见 logs\debug.jsonl 的 open-side-panel-lesson）。
-  // 所以**不再把它当失败**——真正让课上起来的是"状态已在 storage 里 + 侧栏打开时 restoreRun"。
-  let opened = false
-  let alreadyOpen = false
-  try {
-    const cmd = await chrome.runtime.sendMessage({ action: 'openSidePanelForLesson', chapter: chapterNum })
-    opened = !!(cmd && cmd.ok && cmd.opened)
-    alreadyOpen = !!(cmd && cmd.alreadyOpen)
-  } catch (e) {}
-  return {
-    ok: true, lesson: idx, opened, alreadyOpen,
-    hint: opened
-      ? '引导已经在右侧侧栏里开始了。'
-      : '引导在**右侧侧栏**里等着——如果它没自己开：点浏览器工具栏上的 CoRead 图标，'
-        + '或者按 Ctrl+Shift+Y。侧栏一打开就会接上这一课（状态已经存好了）。',
-  }
-}
-
-/**
- * 把当前选中的正文设为侧栏的当前引用（教程第一步走的就是它）。
- * 走的是现成的后台动作 setTranslationRef。
- */
-async function setSelectionAsRef(text) {
-  return await callBackground({
-    action: 'setTranslationRef',
-    original: text,
-    translation: text,
-    url: 'reader://' + TUTORIAL_HEX,
-    pageTitle: state.name,
-    bookId: readerBookId(TUTORIAL_HEX),
-    bookTitle: state.name || '',
-  })
-}
-
-/**
- * 把当前选中的正文设为侧栏的当前引用（教程书的划词、自检的 submitSelection 都走它）。
- * 与 PDF 那条路的区别：PDF 走 setTranslationRef 时还带原文锚点与上下文，
- * 教程书没有锚点，只把文字交上去。
- */
-async function submitSelectionAsRef(hit) {
-  const text = String((hit && hit.text) || '').trim()
-  if (!text) {
-    toast('请先划选一段正文', true)
-    return { ok: false, error: { message: '没有选中文字' } }
-  }
-  const res = await setSelectionAsRef(text)
-  if (res && res.ok) {
-    toast('已设为引用')
-    hideTip()
-    clearSelection()
-  } else {
-    toast('设为引用失败：' + ((res && res.error && res.error.message) || '原因未知'), true)
-  }
-  return res || { ok: false }
-}
-
 function closeDoc() {
   const hadBook = hasBook()
   cancelRestore('换书 / 关书')       // 换书时别让上一本的落位纠偏继续拽滚动条
-  // 教程书：停掉它的动画、清掉挂载点。放在最前面——它自己会清空 els.pages
-  if (state.tutorialOpen) {
-    try { Tutorial.close() } catch {}
-    state.tutorialOpen = false
-    state.tutorialPage = 0
-    // 教程书关掉 → 顶栏先回到"在读 PDF"那一态；紧接着要回书库的调用方
-    //（showLibrary / failOpen）会再把它切成 library。这里不能直接切成 library：
-    // closeDoc() 也被"换一本 PDF"这条路用着（openBytes 开头就调它），
-    // 那条路上切成 library 会让顶栏闪一下再切回来。
-    setToolbar('pdf')
-  }
+  // 换书 / 回书库时若还停在框选模式：退出来。
+  // 不退出的话新书页仍是"框选中"（文字选不中、十字光标），用户会以为新书坏了；
+  // 一次性模式框完弹出的动作条也要一并收起（它指的是上一本书里的那一块）。
+  endBoxSelect('close')
+  hideBoxTip()
   io.disconnect()
   state.doc = null
-  state.docKind = ''
   state.pages = []
   state.entries = []
   // 换书就换一份"已引用的段落"（下划线按书算，别把上一本的画到这一本上）
   state.refsSeen = []
+  // 引用落在书里的锚点同理：那是**上一本**的页内偏移，留下来会把线画到新书的错页
+  state.refMarks = []
   state.activeId = ''
+  state.revealId = ''
+  state.revealAt = 0
   state.lastRenderError = null
   state.hash = ''
   els.pages.replaceChildren()
@@ -1347,15 +1134,14 @@ function closeDoc() {
 }
 
 /**
- * 顶栏的三种样子（2026-11 重做，用户连着报了两轮）。
+ * 顶栏的两种样子（2026-11 重做，用户连着报了两轮）。
  *
  * ── 为什么要把这件事收成一个函数 ──────────────────────────────────────────────
- * 原先只有一条 `showPdfChrome(on)` 的布尔开关：它是为"教程书"那一种情况写的，
- * 而且在里面**顺手把空状态也藏了**。于是多出一种状态就没地方放了——用户报的
- * "阅读器顶上的工具栏在书库界面也会全部出现"就是这么来的：
- * `showLibrary()` 只是把空状态放回来，**从头到尾没碰过工具栏**，
- * 所以从书里点「书库」之后，上一本的书名、「412 页」、「120%」、「框选翻译」「译文」
- * 全都留在顶上。那不是"设计如此"，是这条开关表达不了"我在书库"。
+ * 原先只有一条 `showPdfChrome(on)` 的布尔开关，而且在里面**顺手把空状态也藏了**；
+ * 而 `showLibrary()` 只是把空状态放回来，**从头到尾没碰过工具栏**。
+ * 于是从书里点「书库」之后，上一本的书名、「412 页」、「120%」、「框选识别」「译文」
+ * 全都留在顶上 —— 用户报的"阅读器顶上的工具栏在书库界面也会全部出现"就是这么来的。
+ * 那不是"设计如此"，是这条开关表达不了"我在书库"。
  *
  * ── 用户第二轮又指出三条（都成立，都已改）──────────────────────────────────
  *   ① **"在书库界面为什么还要显示书库"**：我已经在书库里了，这一格是空动作。
@@ -1374,19 +1160,12 @@ function closeDoc() {
  *   library（没打开任何东西）
  *      留下：状态（那格这时显示词"书库"，说明"你在哪儿"，同时本机服务连不上时
  *            由它报错——所以这格不能藏）、空状态里那枚 `openMain`。
- *      藏起来：打开 PDF、书库、目录、书名、页码、缩放、框选翻译、适宽、译文。
+ *      藏起来：打开 PDF、书库、目录、书名、页码、缩放、框选识别、适宽、译文。
  *
  *   pdf（在读 PDF）
  *      全都要（含顶栏那枚"打开 PDF"：这时它才是"再打开一个"）。
- *
- *   tutorial（内置手册）
- *      留下：书名、渲染状态、页码、目录
- *      藏起来：打开 PDF、书库、缩放、适宽、框选翻译、译文
- *      理由：一本说明书里摆着点了没反应的「框选翻译」，比根本没有它更糟——
- *            用户会以为教程坏了或者自己没装对（这条是原先就有的判断，保留）。
- *            页码那一格不藏：它显示章名与第几章，是教程书唯一有意义的进度提示。
- *            ⚠️ 与旧版的一处差别：`openMain`（书库标题行右端那枚按钮）现在也归本函数管，
- *            因为空状态紧跟着它一起显隐（见下面 setEmptyVisible 的注释）。
+ *      ⚠️ `openMain`（书库标题行右端那枚按钮）也归本函数管，因为空状态紧跟着它一起显隐
+ *      （见下面 setEmptyVisible 的注释）。
  */
 const CHROME = {
   library:  ['openMain', 'status'],
@@ -1395,9 +1174,8 @@ const CHROME = {
   // 与扩展自检一个显式落点（`els.fit` 仍被绑定）。别顺手加回清单——
   // 加回来 setToolbar 每次跑都会把它 `hidden = false`，那个按钮就又冒出来了。
   pdf:      ['open', 'openMain', 'libraryBtn', 'tocBtn', 'zoomIn', 'zoomOut', 'zoom', 'box', 'notes', 'name', 'status', 'pageinfo'],
-  tutorial: ['tocBtn', 'pageinfo', 'name', 'status'],
 }
-/** 全部可显隐的工具栏元素（三种状态里出现过的并集），用来先把所有都藏掉再按清单打开 */
+/** 全部可显隐的工具栏元素（两种状态里出现过的并集），用来先把所有都藏掉再按清单打开 */
 const CHROME_ALL = ['open', 'openMain', 'libraryBtn', 'tocBtn', 'zoomIn', 'zoomOut', 'zoom', 'box', 'notes', 'name', 'status', 'pageinfo']
 
 /**
@@ -1863,18 +1641,6 @@ function selectionAnchors() {
   const sel = window.getSelection()
   if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null
   const range = sel.getRangeAt(0)
-  /**
-   * 教程书：正文是 HTML，**没有 PDF 文字层** —— 下面那套"落没落在 layer 里"的判断
-   * 对它永远不成立，于是浮标不出现、划词设为引用这一步根本走不到。
-   * 所以这一支单独处理：只要选区在书页容器里就算数，锚点为空（教程书用不上页内偏移，
-   * 引用直接拿选中的字符串，见 textOfSelection）。
-   */
-  if (state.tutorialOpen) {
-    if (!els.pages.contains(range.commonAncestorContainer)) return null
-    const text = String(sel.toString() || '').trim()
-    if (!text) return null
-    return { anchors: [], text, range }
-  }
   // 只认落在文字层里的选区：页面上其它地方（对照栏）的选区不该触发翻译
   const startLayer = state.pages.find((p) => p.layer && p.layer.contains(range.startContainer))
   if (!startLayer) return null
@@ -1953,14 +1719,37 @@ async function sourceText(anchors) {
 /**
  * 这次选区对应的原文。
  *
- * 教程书没有文字层（anchors 为空），直接用选中的字符串；PDF 走 sourceText ——
- * 它会顺带把"词间空格被 pdf.js 吞了"的那类 PDF 补回空格。两条路的差别就在这里，
- * 所以统一从这一个入口取，别在调用点各判一次。
+ * 统一从这一个入口取：`sourceText` 会顺带把"词间空格被 pdf.js 吞了"的那类 PDF 补回空格，
+ * 所以别在调用点各判一次。
  */
 async function textOfSelection(hit) {
   if (!hit) return ''
-  if (hit.text) return String(hit.text)
   return await sourceText(hit.anchors || [])
+}
+
+/**
+ * 把 OCR 读回来的原文按段落整理一下换行（2026-11 用户实测：识别原文在窄栏里一行一句）。
+ *
+ * 为什么需要它：OCR prompt 以前要求"保留原有的段落与换行"，模型就会照着**截图的行宽**
+ * 硬换行。扫描件一页几十行，中文又常常一行十几个字，丢进侧栏那种窄卡片里就变成
+ * 一行一句、参差不齐；既不像文章，也不方便读。
+ *
+ * 整理规则（只动换行，不动字）：
+ *   · 空行 = 段落分隔，保留；
+ *   · 段内换行接回去 —— 中文接中文不加空格、英文加空格、行尾连字符断词直接接，
+ *     全部复用 PDF 文字层那套 joinLines（同一个问题只该有一份规则）。
+ *
+ * 边界：只吃单换行/空行；模型若把两段用**单个**换行隔开，这里认不出来，会接成一段。
+ * 所以 RECOGNIZE_PROMPT 里明确要求"段落之间空一行"。
+ */
+function reflowOcrText(text) {
+  const s = String(text || '').replace(/\r\n?/g, '\n').trim()
+  if (!s) return ''
+  return s
+    .split(/\n[ \t]*\n+/)          // 空行 = 段落
+    .map((para) => joinLines(para.split('\n')))
+    .filter(Boolean)
+    .join('\n\n')
 }
 
 // ── 划线附近的原文（随引用交给共读侧）─────────────────────────────────────────
@@ -2090,28 +1879,47 @@ async function contextAround(anchors) {
 }
 
 function onSelectionSettled() {
+  /**
+   * 框选模式 / 框选动作条还开着时，不弹划词浮标。
+   *
+   * 为什么需要这一条：进入框选前若已经有一段选区，它可能还留在页面上；框选那一拖结束后，
+   * 这里会被 mouseup 再叫一次，把「翻译 / 设为引用 / 复制」浮标叠到框选动作条上。
+   * 两条动作条同时出现，用户不知道该点哪一条。
+   */
+  if (state.boxMode || state.boxChoice) { hideTip(); return }
   const hit = selectionAnchors()
   if (!hit) { hideTip(); return }
   state.lastSelection = hit
   showTipAt(hit.range)
 }
 
-function showTipAt(range) {
-  const rect = range.getBoundingClientRect()
-  if (!rect || (!rect.width && !rect.height)) { hideTip(); return }
-  // 教程书里这一步是"把这段交给共读"（不是翻译）：按钮上就得这么写，
-  // 否则用户在教程里看到的提示与实际动作对不上
-  els.tipTranslate.textContent = state.tutorialOpen ? '共读' : '翻译'
-  els.tipTranslate.title = state.tutorialOpen ? '把选中的这段设为当前引用' : '翻译选中的这段'
-  els.tip.hidden = false
-  const w = els.tip.offsetWidth || 120
-  const h = els.tip.offsetHeight || 32
+/**
+ * 把一条动作条摆到 rect 上方（上方放不下就摆到下方）。
+ * 划词浮标与框选动作条共用这一份：位置算法只该有一处，否则迟早一条对一条错。
+ */
+function placeTipAt(node, rect) {
+  node.hidden = false
+  // 先显形再量尺寸（hidden 时 offsetWidth 恒为 0，量出来会把位置算错）
+  const w = node.offsetWidth || 120
+  const h = node.offsetHeight || 32
   let left = rect.left + rect.width / 2 - w / 2
   let top = rect.top - h - 8
   if (top < 8) top = rect.bottom + 8
+  // 纵向上也夹进视口：框很大时"摆到框下方"会掉出屏幕（框选动作条尤其容易）
+  top = Math.max(8, Math.min(window.innerHeight - h - 8, top))
   left = Math.max(8, Math.min(window.innerWidth - w - 8, left))
-  els.tip.style.left = left + 'px'
-  els.tip.style.top = top + 'px'
+  node.style.left = left + 'px'
+  node.style.top = top + 'px'
+}
+
+function showTipAt(range) {
+  const rect = range.getBoundingClientRect()
+  if (!rect || (!rect.width && !rect.height)) { hideTip(); return }
+  els.tipTranslate.textContent = '翻译'
+  els.tipTranslate.title = '翻译选中的这段'
+  // PDF 这条路原先只有翻译与复制，想只引不翻的人没有入口（2026-11 用户要求补上）。
+  if (els.tipRef) els.tipRef.hidden = false
+  placeTipAt(els.tip, rect)
 }
 
 /**
@@ -2138,9 +1946,6 @@ async function translateSelection() {
   // 同一段再翻一次不该多出一条
   const dup = findDuplicate({ kind: 'text', anchors: hit.anchors })
   if (dup && reuseDuplicate(dup)) { hideTip(); return }
-
-  // 教程书没有外语正文可翻：这一步的动作是**把这段设为引用**（共读的第一步）
-  if (state.tutorialOpen || !(hit.anchors || []).length) return await submitSelectionAsRef(hit)
 
   const source = await textOfSelection(hit)
   if (!source.trim()) { toast('未获取到可翻译的文字', true); return }
@@ -2180,9 +1985,79 @@ async function translateSelection() {
   scheduleSave()
 }
 
-// ── 框选翻译（扫描件 / 图片页）───────────────────────────────────────────────
+/**
+ * 划词「设为引用」：不翻译，直接把选中的原文交给共读侧（2026-11 用户要求）。
+ *
+ * 两个分支：
+ *   ① 这段**已经翻过** → 引用带上译文（用户读的是译文），与译文面板的「设为引用」一致
+ *   ② 没翻过 → 把原文当引用身份报上去；translation 留空，侧栏按 refDisplayText 回落显示原文
+ *
+ * 成功之后**把侧栏切回对话界面**（2026-11 用户要求）：设引用的下一步一定是提问，
+ * 停在译文对照里还得自己点「返回」。这与译文面板里点「设为引用」的行为一致（见
+ * reader-notes.js 的 makeReference），连那 200ms 的等待理由也相同。
+ *
+ * 上下文照旧带 `contextAround`：PDF 没有章节正文可查，agent 只有这一份。
+ */
+async function referenceSelection() {
+  const hit = state.lastSelection || selectionAnchors()
+  if (!hit) {
+    toast('请先划选一段正文', true)
+    return { ok: false, error: { message: '没有选中文字' } }
+  }
+
+  // 已经翻过（且翻完了）：直接复用译文条目，别让用户为了设引用再等一次翻译
+  const dup = (hit.anchors && hit.anchors.length)
+    ? findDuplicate({ kind: 'text', anchors: hit.anchors })
+    : null
+  if (dup && dup.translation && !dup.pending) {
+    const r = await setAsReference(dup)
+    if (r && r.ok) {
+      hideTip()
+      clearSelection()
+      showChatAfterReference()
+    }
+    return r
+  }
+
+  const source = String(await textOfSelection(hit)).trim()
+  if (!source) {
+    toast('未获取到可引用的文字', true)
+    return { ok: false, error: { message: '没有可引用的原文' } }
+  }
+  const context = await contextAround(hit.anchors || [])
+  let res
+  try {
+    res = await callBackground({
+      action: 'setTranslationRef',
+      original: source,
+      // 不翻译：不传 translation。侧栏的 refDisplayText 会回落到 selectedText（原文）
+      ...(context ? { context } : {}),
+      url: 'reader://' + state.hash + (state.name ? '#' + state.name : ''),
+      pageTitle: state.name,
+      bookId: readerBookId(state.hash),
+      bookTitle: state.name || '',
+    })
+  } catch (e) {
+    res = { ok: false, error: { message: String((e && e.message) || e) } }
+  }
+  if (res && res.ok) {
+    toast('已设为引用')
+    hideTip()
+    clearSelection()
+    // 记下这段（给译文面板画"已经引过了"的下划线，见 refsSeen / noteRefLocal）。
+    // translation 留空：这一条引用没有译文，卡片显示的就是原文。
+    // anchors 必须带上：它是"书页上那道绿线画在哪"的唯一依据（见 noteRefMark）。
+    rememberRef({ source, translation: '', kind: 'text', anchors: hit.anchors }, '')
+    showChatAfterReference()
+  } else {
+    toast('设为引用失败：' + ((res && res.error && res.error.message) || '原因未知'), true)
+  }
+  return res || { ok: false }
+}
+
+// ── 框选识别 / 翻译（扫描件 / 图片页）──────────────────────────────────────────
 // 图片页里没有文字节点，Range 与 Custom Highlight 都用不上。所以这条路是：
-// 在页面上拖一个框 → 把框里的画布像素裁出来 → 交给模型读图 → 译文进对照栏。
+// 在页面上拖一个框 → 把框里的画布像素裁出来 → 交给模型读图（识别原文 / 翻译）。
 // 位置记成「页内比例」，与文字锚点一样与缩放无关（PDF 版式固定，比例永远成立）。
 /**
  * 框选模式：**工具栏那枚按钮是切换式的，快捷键 Alt+S 仍是一次性的**（2026-11 用户要求）。
@@ -2194,7 +2069,7 @@ async function translateSelection() {
  *      每处都得回顶栏点一下（用户这次提的正是这个）；
  *   ③ 现在：**按钮切换 + 快捷键一次性**。
  * 既然切换式的老毛病是"忘了自己在框选模式"，那就让它**一直看得见**：
- * 只要在模式里，页面顶部常驻一条 `框选模式 · 拖出选区 · Esc 退出`（见 els.boxBar）。
+ * 只要在模式里，页面顶部常驻一条 `框选识别 · 拖出选区 · Esc 退出`（见 els.boxBar）。
  * 那条横在正文上方，划词被拦时用户一眼就知道为什么，不会再以为界面坏了。
  *
  * ⚠️ Alt+S 保持一次性：快捷键是"来一下就走"的手势，按完还要再按一次才退出反而别扭。
@@ -2207,12 +2082,18 @@ function startBoxSelect(opts) {
    * 它是切换式的，框完继续留在模式里，方便扫描件连着框好几处。
    */
   state.boxOneShot = !!(opts && opts.oneShot)
+  // 重新进入 / 再按一次 Alt+S：上一块还没选动作的框作废（它已经不代表"这次要框的"了）
+  hideBoxTip()
+  // 进入框选时把上一次可能残留的文字选区撤掉：否则它会跟着带到框选动作条那一步，
+  // 鼠标一松就再弹一个划词浮标（见 onSelectionSettled 的那道闸）
+  clearSelection()
+  hideTip()
   if (state.boxMode) return
   state.boxMode = true
   applyBoxModeChrome()
   toast(state.boxOneShot
-    ? '在页面上拖出选区（完成后自动退出，Esc 取消）'
-    : '框选模式：拖出选区翻译 · Esc 或再点一次退出')
+    ? '在页面上拖出选区，再选「识别原文」或「翻译」（完成后自动退出，Esc 取消）'
+    : '框选识别：拖出选区，再选「识别原文」或「翻译」 · Esc 或再点一次退出')
 }
 
 /** 开关（工具栏那枚按钮用）：在模式里就退出，不在就进入 */
@@ -2229,10 +2110,10 @@ function applyBoxModeChrome() {
   if (els.box) {
     els.box.classList.toggle('is-on', state.boxMode)
     els.box.setAttribute('aria-pressed', state.boxMode ? 'true' : 'false')
-    els.box.textContent = state.boxMode ? '框选中' : '框选翻译'
+    els.box.textContent = state.boxMode ? '框选中' : '框选识别'
     els.box.title = state.boxMode
       ? '正在框选：在页面上拖出选区（点这里或按 Esc 退出）'
-      : '进入框选：在页面上拖出选区，由模型读图翻译（Alt+S 来一下就走）'
+      : '进入框选识别：在页面上拖出选区，再选「识别原文」或「翻译」（Alt+S 来一下就走）'
   }
   if (els.boxBar) els.boxBar.hidden = !state.boxMode
   if (els.pages) els.pages.classList.toggle('is-boxing', state.boxMode)
@@ -2246,6 +2127,8 @@ function endBoxSelect(reason) {
     try { state.boxDrag.marquee.remove() } catch (e) {}
     state.boxDrag = null
   }
+  // 一次性（done）要留着刚弹出的动作条让人选；主动退出（Esc / 再点一次）则一并收起
+  if (reason !== 'done') hideBoxTip()
   if (reason === 'esc') toast('已退出框选模式')
 }
 
@@ -2264,6 +2147,9 @@ function onBoxStart(ev) {
   const start = pageLocalPoint(pageEl, ev)
   if (!start) return
   ev.preventDefault()
+  // 上一块还没选动作就又拖了新框：旧动作条作废（它指的是上一块）
+  hideBoxTip()
+  hideTip()
 
   const marquee = document.createElement('div')
   marquee.className = 'rd-marquee'
@@ -2292,7 +2178,12 @@ function onBoxStart(ev) {
     const d = state.boxDrag
     state.boxDrag = null
     if (!d) return
-    d.marquee.remove()
+    /**
+     * 框**保留**到用户选完动作为止（2026-11 用户实测：松手就把框删掉，界面上只剩动作条，
+     * 用户不知道自己框的是哪一块；要等选了翻译 / 引用、生成了 .rd-mark 才重新看见）。
+     * 所以这里不再无条件 d.marquee.remove()：有效框交给 showBoxTip 接管，hideBoxTip 收尾；
+     * 没拖出有效框（只是点了一下）才当场清掉。
+     */
     /**
      * 框完**不一定退出**（2026-11 改）：
      *   · 一次性（Alt+S）→ 退出，符合"来一下就走"；
@@ -2301,10 +2192,75 @@ function onBoxStart(ev) {
      * 页面上常驻的那条提示条负责提醒（见 applyBoxModeChrome）。
      */
     if (state.boxOneShot) endBoxSelect('done')
-    if (d.moved && d.rect) translateRegion(d.pageEl, d.rect)
+    if (d.moved && d.rect) {
+      /**
+       * 原先这里直接 translateRegion（一松手就翻）。2026-11 起先弹动作条：
+       * 用户要的是一个「识别原文」的入口，而模型调用不该在用户还没选时就先花掉。
+       * 框还在页面上（位置记成页内比例），选「识别原文」走 OCR、选「翻译」才裁图送模型。
+       */
+      showBoxTip(d.pageEl, d.rect, d.marquee)
+    } else {
+      d.marquee.remove()
+    }
   }
   document.addEventListener('mousemove', move, true)
   document.addEventListener('mouseup', up, true)
+}
+
+/**
+ * 框选拖完后的动作条：翻译，还是只识别原文（2026-11）。
+ *
+ * 为什么先问一句：框选原先一松手就翻译，扫描件用户想"只要原文、不想翻"时不得不先等一次
+ * 翻译、再去译文栏里处理——多花一次模型调用，多等一段。
+ * 这里只摆选择，不预先裁图；选「翻译」才走 translateRegion，选「识别原文」才走
+ * recognizeRegionText。
+ *
+ * ⚠️ 「识别原文」不再自动设引用（2026-11 用户定调）：它只把原文放进译文栏，
+ * 之后由用户在卡片上决定「翻译」还是「设为引用」。
+ *
+ * `marquee` = 拖拽时留在页面上的那个框。它**不删**，由 state.boxChoice 接管，
+ * 让用户在选动作时一直看得见"我框的是哪一块"；hideBoxTip 时才一起收掉。
+ */
+function showBoxTip(pageEl, frac, marquee) {
+  const num = Number(pageEl && pageEl.dataset.page)
+  const p = state.pages[num - 1]
+  if (!p || !p.canvas || !p.wrap) {
+    if (marquee) { try { marquee.remove() } catch (e) {} }
+    toast('本页尚未渲染完成，请稍后重试', true)
+    return
+  }
+  // 上一块如果还没收尾（正常不会走到，onBoxStart 已经收过），别把两个框叠在一起
+  if (state.boxChoice) hideBoxTip()
+  state.boxChoice = { page: num, frac: { x: frac.x, y: frac.y, w: frac.w, h: frac.h }, marquee: marquee || null }
+  const pr = p.wrap.getBoundingClientRect()
+  const rect = {
+    left: pr.left + frac.x * pr.width,
+    top: pr.top + frac.y * pr.height,
+    width: Math.max(1, frac.w * pr.width),
+    height: Math.max(1, frac.h * pr.height),
+  }
+  placeTipAt(els.boxTip, rect)
+  // 文本框与框选动作条不该同时出现：用户此刻是在给刚拖出来的框选动作
+  hideTip()
+}
+
+function hideBoxTip() {
+  if (els.boxTip) els.boxTip.hidden = true
+  // 待选动作的那块框跟着动作条一起收掉（选中动作时它会被真正的 .rd-mark 接替）
+  const c = state.boxChoice
+  if (c && c.marquee) { try { c.marquee.remove() } catch (e) {} }
+  state.boxChoice = null
+}
+
+/** 动作条上的两个按钮共用：取走待处理的框，再交给对应的那条路。 */
+function runBoxChoice(kind) {
+  const c = state.boxChoice
+  hideBoxTip()
+  if (!c) return
+  const p = state.pages[c.page - 1]
+  if (!p || !p.wrap) { toast('这一页已经不在视图里了，请重新框选', true); return }
+  if (kind === 'recognize') recognizeRegionText(p.wrap, c.frac)
+  else translateRegion(p.wrap, c.frac)
 }
 
 /** 从画布上裁出这块区域。画布像素 = CSS 尺寸 × 设备倍率，用比例算就不必关心倍率。 */
@@ -2360,9 +2316,96 @@ async function translateRegion(pageEl, frac) {
   entry.source = (res.data && res.data.original) || ''
   entry.translation = (res.data && res.data.translation) || ''
   entry.error = ''
+  // 这块原先可能只是"识别原文"（框选识别原文那条路），现在有真译文了：
+  // 面板上的"只识别了原文"提示要撤掉（见 reader-notes.js 的 .rn-note）
+  entry.recognized = false
+  entry.recognizing = false
   renderEntries()
   focusEntry(entry.id)
   scheduleSave()
+}
+
+/**
+ * 框选「识别原文」：只识别原文，**不翻译、也不自动设引用**（2026-11 用户定调）。
+ *
+ * 图片页没有文字层，所以先用模型把框里的字识别出来，然后按用户说的
+ * "直接把原文放进译文栏"：
+ *   · 建一条图片条目，source/translation 都放识别结果；
+ *   · 面板上标一句"只识别了原文，未翻译"（recognized），并给一个「翻译」按钮；
+ *   · **不**调用 setAsReference —— 引不引用由用户在卡片上自己决定（卡片本来就有
+ *     「设为引用」按钮，点了才会切回对话界面）。
+ *
+ * 为什么 translation 也放原文：译文栏那张卡的正文读的就是 translation。若留空，
+ * 用户只看到一张空白卡片；此刻要展示的就是识别出的原文。用户点「翻译」之后，
+ * retranslateEntry 会用真译文覆盖它并清掉 recognized。
+ *
+ * 同一块已经识别 / 已经翻过 → 直接把它设为当前并露出那张卡，不再花一次模型调用。
+ */
+async function recognizeRegionText(pageEl, frac) {
+  const num = Number(pageEl.dataset.page)
+  const p = state.pages[num - 1]
+  if (!p || !p.canvas) { toast('本页尚未渲染完成，请稍后重试', true); return }
+  if (frac.w < 0.01 || frac.h < 0.005) { toast('选区过小，请重新框选', true); return }
+
+  const dup = findDuplicate({ kind: 'image', page: num, rect: frac })
+  // 同一块正在翻译 / 正在识别：别再发一次模型调用（那会两条路同时往这一条上写）
+  if (dup && dup.pending) { toast('这块还在处理中，请稍后再试', true); return }
+  if (dup && (dup.source || dup.translation)) {
+    // 已经识别过（或已翻过）：不重复花钱，直接把那张卡露出来让用户决定下一步
+    requestNotesOpen()
+    focusEntry(dup.id)
+    return
+  }
+
+  let dataUrl
+  try {
+    dataUrl = cropCanvas(p.canvas, frac)
+  } catch (e) {
+    toast('裁图失败：' + ((e && e.message) || e), true)
+    return
+  }
+
+  requestNotesOpen()
+  const entry = dup || {
+    id: 'i' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    kind: 'image', page: num, rect: frac,
+    source: '', translation: '', at: Date.now(), pending: true,
+  }
+  entry.pending = true
+  entry.recognizing = true
+  entry.error = ''
+  entry.rect = frac
+  if (!dup) state.entries.push(entry)
+  renderEntries()
+  renderImageMarks()
+
+  const res = await callBackground({ action: 'recognizeImage', dataUrl })
+  entry.pending = false
+  entry.recognizing = false
+  if (!res || !res.ok) {
+    entry.error = (res && res.error && res.error.message) || '识别失败'
+    renderEntries()
+    renderImageMarks()
+    toast('识别失败：' + entry.error, true)
+    return
+  }
+  const original = reflowOcrText((res.data && res.data.original) || '')
+  if (!original) {
+    entry.error = '没有识别到文字'
+    renderEntries()
+    renderImageMarks()
+    toast('没有识别到文字，请重新框选', true)
+    return
+  }
+  entry.source = original
+  entry.translation = original
+  entry.recognized = true
+  entry.error = ''
+  renderEntries()
+  renderImageMarks()
+  focusEntry(entry.id)
+  scheduleSave()
+  toast('已识别原文')
 }
 
 /** 把图片类译文的位置标记画到页面上（按页内百分比，所以缩放时自动跟着走） */
@@ -2396,10 +2439,9 @@ function scheduleSync() {
 function notesSnapshot() {
   return {
     // bookId 是共读侧 ID（见 readerBookId）：侧栏的译文对照、引用归属都按它走，
-    // 不是每处各自用 hash 拼一遍。教程书（2026-11）走同一个字段——
-    // 对侧栏来说它就是"当前在看的这本书"，不需要知道它是 PDF 还是教程。
+    // 不是每处各自用 hash 拼一遍。
     book: hasBook()
-      ? { bookId: currentBookId(), hash: state.tutorialOpen ? TUTORIAL_HEX : state.hash, name: state.name }
+      ? { bookId: currentBookId(), hash: state.hash, name: state.name }
       : null,
     // notify：这份快照要不要顺带把侧栏的"当前书"切过来。只有**换书**（打开/切换/关掉
     // 一份 PDF）才置真，"翻页/翻译出条新译文"这类同步不置 —— 否则每次滚动都会把侧栏
@@ -2408,12 +2450,25 @@ function notesSnapshot() {
     page: hasBook() ? currentPage() : 0,
     total: bookTotal(),
     activeId: state.activeId,
+    /**
+     * 「用户刚在书页上点了哪一条」——侧栏的译文对照据此**滚到那一条**（见 reader-notes.js）。
+     * 只有 `onReaderClick` 那条路会写它（见 revealEntry 的 fromPage）：
+     * 侧栏自己点「跳到原文」、翻译完成设为当前都不会带它，所以那些动作不会把列表拽走。
+     * 带时刻是为了让"同一条再点一次"也成立（详见 state.revealAt 的注释）。
+     */
+    revealId: state.revealId,
+    revealAt: state.revealAt,
     entries: state.entries.map((e) => ({
       id: e.id,
       kind: e.kind || 'text',
       source: e.source || '',
       translation: e.translation || '',
       pending: !!e.pending,
+      // 框选「识别原文」这条路（2026-11）：条目只识别了原文、没有翻译。
+      // 面板据此在正文上方标一句，并把「复制译文」改成「复制原文」。
+      recognized: !!e.recognized,
+      // 正在识别原文（与 pending 的"翻译中"区分开，面板显示"识别原文中…"）
+      recognizing: !!e.recognizing,
       error: e.error || '',
       at: e.at || 0,
     })),
@@ -2473,6 +2528,11 @@ async function refreshRefs(reason, opts = {}) {
       }))
       .slice(0, REFS_SEEN_MAX)
     state.refsFail = 0
+    // 清单变了：书页上"已引用"的标记按这张真值表重画。
+    // 删掉的引用留下的锚点在这里被裁掉；老数据（本地没记过锚点的）由
+    // refreshHighlights 按文字在附近页里补找。
+    if (pruneRefMarks()) scheduleSave()
+    refreshHighlights()
     scheduleSync()   // 清单变了，推一份新快照给面板重画下划线
     return true
   } catch (e) {
@@ -2518,12 +2578,25 @@ function refsSeen() {
   return Array.isArray(state.refsSeen) ? state.refsSeen : []
 }
 
-function noteRefLocal(entry, quote) {
+/**
+ * 一条引用的「文字身份」与「显示那半边」。
+ *
+ * 口径必须与 translate-background.js 的 setTranslationRef 一致（原文优先；没有原文的
+ * 扫描件才落到摘录 / 整段译文）——本地记的锚点靠这段文字与接收端的 selectedText 对齐，
+ * 两边口径不同，书页上的下划线就会对不上那一条引用。
+ */
+function refFieldsOf(entry, quote) {
   const original = String((entry && entry.source) || '').trim()
   const picked = String(quote || '').trim()
-  const selectedText = original || picked || String((entry && entry.translation) || '').trim()
+  return {
+    selectedText: original || picked || String((entry && entry.translation) || '').trim(),
+    translation: picked || String((entry && entry.translation) || '').trim(),
+  }
+}
+
+function noteRefLocal(entry, quote) {
+  const { selectedText, translation } = refFieldsOf(entry, quote)
   if (!selectedText) return
-  const translation = picked || String((entry && entry.translation) || '').trim()
   if (!Array.isArray(state.refsSeen)) state.refsSeen = []
   const i = state.refsSeen.findIndex((r) => r.selectedText === selectedText)
   if (i >= 0) state.refsSeen.splice(i, 1)
@@ -2533,20 +2606,83 @@ function noteRefLocal(entry, quote) {
   state.refsAt = 0        // 本地这一笔之后允许立刻再拉一次（把别的路径改的也对齐）
 }
 
+/**
+ * 记下这条引用**落在书里哪一处**（见 state.refMarks）。
+ *
+ * 只在有锚点时记：图片条目（扫描件）没有文字层锚点，画不了文字下划线，它本来就有
+ * `.rd-mark` 的虚线框；硬记一笔空锚点只会让裁剪逻辑以为"这条已经有位置了"。
+ */
+function noteRefMark(entry, quote) {
+  const { selectedText } = refFieldsOf(entry, quote)
+  const anchors = (entry && Array.isArray(entry.anchors)) ? entry.anchors : []
+  if (!selectedText || !anchors.length) return false
+  if (!Array.isArray(state.refMarks)) state.refMarks = []
+  const i = state.refMarks.findIndex((m) => String((m && m.text) || '') === selectedText)
+  if (i >= 0) state.refMarks.splice(i, 1)
+  state.refMarks.unshift({
+    text: selectedText,
+    anchors: anchors.map((a) => ({ page: a.page, start: a.start, end: a.end })),
+    at: Date.now(),
+  })
+  if (state.refMarks.length > REFS_SEEN_MAX) state.refMarks.length = REFS_SEEN_MAX
+  return true
+}
+
+/**
+ * 按接收端的引用清单裁掉"已经删掉的引用"留下的锚点。
+ *
+ * 与译文面板的下划线同一条原则：真值在接收端，本地这份只是缓存——侧栏删了引用，
+ * 书页上那道线不能赖着不走。
+ */
+function pruneRefMarks() {
+  if (!Array.isArray(state.refMarks) || !state.refMarks.length) return false
+  const live = new Set(refsSeen().map((r) => String((r && r.selectedText) || '').trim()))
+  const before = state.refMarks.length
+  const now = Date.now()
+  /**
+   * 刚设出来的引用给一段宽限：refreshRefs 是异步的，一次**在设引用之前发出**的拉取
+   * 可能带着旧清单晚到（设引用 → 点开译文面板会同时触发）。没有这条宽限，那一笔
+   * 刚画上的线会被旧清单当场裁掉，而它的锚点也就跟着丢了。
+   */
+  const GRACE_MS = 10000
+  state.refMarks = state.refMarks.filter((m) =>
+    live.has(String((m && m.text) || '').trim()) || (now - Number((m && m.at) || 0) < GRACE_MS))
+  return state.refMarks.length !== before
+}
+
 /** 侧栏删了一条引用 → 本地先把那一条摘掉（下一份快照就别再画它了）。 */
 function forgetRefLocal(selectedText) {
   const want = String(selectedText || '')
-  if (!want || !Array.isArray(state.refsSeen)) return false
-  const before = state.refsSeen.length
-  state.refsSeen = state.refsSeen.filter((r) => String(r.selectedText || '') !== want)
-  if (state.refsSeen.length !== before) { scheduleSync(); return true }
+  if (!want) return false
+  const beforeRefs = refsSeen().length
+  const beforeMarks = Array.isArray(state.refMarks) ? state.refMarks.length : 0
+  state.refsSeen = refsSeen().filter((r) => String(r.selectedText || '') !== want)
+  // 同一条引用在**书页上**的标记也要立刻消失（else 侧栏删了、书页还留着一道绿线）
+  if (Array.isArray(state.refMarks)) {
+    state.refMarks = state.refMarks.filter((m) => String((m && m.text) || '') !== want)
+  }
+  if (state.refsSeen.length !== beforeRefs || (state.refMarks || []).length !== beforeMarks) {
+    refreshHighlights()
+    scheduleSync()
+    scheduleSave()
+    return true
+  }
   return false
 }
 
-/** 记下"这一段设成引用了"（乐观更新，见 noteRefLocal）。 */
+/**
+ * 记下"这一段设成引用了"（乐观更新，见 noteRefLocal）。
+ *
+ * 这里同时是**设完引用、书页上立刻出现标记**的入口（2026-11 用户报的 bug：划词设为引用后
+ * 选区被撤掉，书页上什么都没留下，用户找不到自己引了哪一段）。
+ */
 function rememberRef(entry, quote) {
   noteRefLocal(entry, quote)
+  noteRefMark(entry, quote)
+  refreshHighlights()
   scheduleSync()
+  // 清单与锚点都落盘：重启时接收端可能还没起来，先按本地这份把标记画出来
+  scheduleSave()
 }
 
 // ── 译文对照：显示在 CoRead 侧栏里 ───────────────────────────────────────────
@@ -2589,6 +2725,22 @@ function requestNotesClose() {
   chrome.runtime.sendMessage({ action: 'notesClose' }).catch(() => {})
 }
 
+/**
+ * 设完引用 → 把侧栏切回对话界面（2026-11 用户要求）。
+ *
+ * 为什么走 `notesClose` 而不是新开一条消息：译文对照就是侧栏上的一个整屏覆盖层
+ * （`#reader-notes` 的 `.on`），收起它露出来的正是下面的对话界面 —— 与译文面板里
+ * 点「设为引用」后 `onClose` 的效果相同。
+ *
+ * 为什么要等 200ms：后台还要把引用 POST 给接收端、接收端再推 SSE 回来，侧栏的引用卡
+ * 靠那条 SSE 填。收起太快，用户会先看到上一条引用卡、再跳成新的（原因同
+ * reader-notes.js 的 makeReference）。200ms 是那边实测够用的量级。
+ */
+async function showChatAfterReference() {
+  await new Promise((r) => setTimeout(r, 200))
+  requestNotesClose()
+}
+
 // ── 重复翻译：同一段不要生成第二条 ────────────────────────────────────────────
 
 function sameAnchorSet(a, b) {
@@ -2613,9 +2765,14 @@ function findDuplicate(probe) {
 /**
  * 复用一条旧条目（同一段再翻一次时用）。
  * 已有译文就直接把它设为当前并回报"已复用"；还在翻译中 / 上次失败的交回调用方去重翻。
+ *
+ * ⚠️ `recognized`（只识别原文、没翻译）**不算已有译文**：那条卡的正文里虽然放着识别出的
+ * 原文，但用户点「翻译」要的是真译文。不排除它的话，同一块再选「翻译」只会把卡片滚出来、
+ * 什么都不翻（2026-11 加「设为引用」时踩到的分叉）。
  */
 function reuseDuplicate(dup) {
   if (!dup || dup.pending || dup.error) return false
+  if (dup.recognized) return false
   if (!dup.translation) return false
   focusEntry(dup.id)
   return true
@@ -2669,7 +2826,153 @@ function clearHighlights() {
   if (window.CSS && CSS.highlights) {
     CSS.highlights.delete('rd-src')
     CSS.highlights.delete('rd-src-active')
+    CSS.highlights.delete('rd-ref')
   }
+}
+
+/**
+ * 引用匹配用的「去空白」口径。
+ *
+ * 与 content.js（微读页面的共读标记）和 reader-notes.js（译文卡片里的下划线）同一套：
+ * PDF 文字层抽出来的行间空格与存下来的原文未必逐字一致，不去掉空白就对不上。
+ */
+function compactRefText(s) {
+  return String(s || '').replace(/\s+/g, '')
+}
+
+/** 去空白后的偏移 → 原串偏移（找不到返回 -1） */
+function rawOffsetOfCompact(raw, at) {
+  let seen = 0
+  for (let i = 0; i < raw.length; i++) {
+    if (/\s/.test(raw[i])) continue
+    if (seen === at) return i
+    seen++
+  }
+  return seen === at ? raw.length : -1
+}
+
+/**
+ * 在**一页**文字层里按原文找一段，返回页内锚点。
+ *
+ * 这是给"本地没有记过锚点的老引用"用的兜底（见 refRanges ③）：
+ * 只按**前 64 字**做一次精确匹配（去空白后），**不做"再退一步按前 12 字找"**。
+ * 12 字太短：书里同页出现同样十几个字的地方不少，宁可这一条暂时不画，
+ * 也不能把隔壁一句标成引用（同 contextAround 的"宁可没有，不可给错"）。
+ * 页内文字对不上（典型：行尾断词被修正过）就不画，用户翻到那一页也不会标错。
+ *
+ * 页文字缓存在 p.plainText / p.compactText 上：文字层只在首次渲染时建一次
+ *（缩放走 textLayer.update，不重建 DOM），所以这层缓存不会过期；换书时 p 整个丢掉。
+ */
+function anchorOfTextOnPage(p, text) {
+  if (!p || !p.layer) return null
+  if (p.compactText === undefined) {
+    const spans = pageTextIndex(p.layer).spans
+    p.plainText = spans.map((s) => s.textContent || '').join('')
+    p.compactText = compactRefText(p.plainText)
+  }
+  const want = compactRefText(text)
+  if (want.length < 4 || !p.compactText) return null
+  const needle = want.slice(0, 64)
+  const at = p.compactText.indexOf(needle)
+  if (at < 0) return null
+  const start = rawOffsetOfCompact(p.plainText, at)
+  const end = rawOffsetOfCompact(p.plainText, at + needle.length)
+  if (start < 0 || end <= start) return null
+  return { page: p.num, start, end }
+}
+
+/**
+ * 在当前页附近（±3 页，与 locateText 同一范围）按文字找一段引用的锚点。
+ * `curPage` 由调用方算一次传进来：逐条引用各算一遍"当前第几页"没有必要。
+ *
+ * 为什么不搜全书：同一句话可能在书里出现多次，标错位置比不标更坏；
+ * 用户翻到那一页（它渲染时会再调 refreshHighlights）自然就找得到。
+ */
+function locateRefAnchorNear(text, curPage) {
+  if (!state.pages.length) return null
+  const cur = Math.max(1, Number(curPage) || 1)
+  const order = [cur]
+  for (let d = 1; d <= 3; d++) {
+    if (cur - d >= 1) order.push(cur - d)
+    if (cur + d <= state.pages.length) order.push(cur + d)
+  }
+  for (const n of order) {
+    const p = state.pages[n - 1]
+    if (!p || !p.rendered) continue
+    const a = anchorOfTextOnPage(p, text)
+    if (a) return a
+  }
+  return null
+}
+
+/**
+ * 书页上"已经设成引用"的那些 Range（CSS Custom Highlight 的 rd-ref）。
+ *
+ * 三个来源，从准到松：
+ *   ① 设引用那一刻记下的锚点（state.refMarks）——用户划的就是它
+ *   ② 本地没锚点、但"引用的文字身份"对得上某条译文的原文 → 用那条译文的锚点
+ *   ③ 还是没有 → 按文字在当前页附近找一次，找到就**补记**进 refMarks（下次不必再找）
+ *
+ * 为什么要 ②③：这个标记是 2026-11 才加的，此前设过的引用 receiver 里只有文字、
+ * 没有偏移。只做 ① 的话，用户会看到"新引的有线、旧引的没有"——那与"有的有、有的没有"
+ * 是同一种坏。
+ */
+function refRanges() {
+  const out = []
+  const seen = new Set()
+  const push = (a) => {
+    if (!a) return false
+    const key = (Number(a.page) || 0) + ':' + (Number(a.start) || 0) + ':' + (Number(a.end) || 0)
+    if (seen.has(key)) return false
+    const r = resolveAnchor(a)
+    if (!r) return false
+    seen.add(key)
+    out.push(r)
+    return true
+  }
+
+  // ① 设引用时记下的锚点
+  const covered = new Set()
+  for (const m of state.refMarks || []) {
+    covered.add(compactRefText(m && m.text))
+    for (const a of (m && m.anchors) || []) push(a)
+  }
+  /** 这一轮新认出来的锚点（②③ 共用）：跑完一并补记，下一轮就不必再找 */
+  const located = []
+
+  // ② 老引用：引用的文字身份对得上哪条译文的原文，就用那条译文的锚点
+  for (const r of refsSeen()) {
+    const t = compactRefText(r && r.selectedText)
+    if (!t || covered.has(t)) continue
+    for (const e of state.entries) {
+      if (!e || !e.anchors || !e.anchors.length) continue
+      if (compactRefText(e.source) !== t) continue
+      for (const a of e.anchors) push(a)
+      // 条目可能还没渲染（这时 push 解析不出 Range）：锚点本身是对的，
+      // 照样补记下来 —— 等那页渲染时 refreshHighlights 会把它画出来
+      located.push({ source: e.source, anchors: e.anchors })
+      covered.add(t)   // 对上了就不再往下找（同一段在书里出现两次也只标这一处）
+      break
+    }
+  }
+
+  // ③ 还是没有锚点的：按文字在附近找一次，找到就补记下来
+  let curPage = 0
+  for (const r of refsSeen()) {
+    const t = compactRefText(r && r.selectedText)
+    if (!t || covered.has(t)) continue
+    if (!curPage) curPage = Math.max(1, currentPage() || 1)
+    const a = locateRefAnchorNear(String((r && r.selectedText) || ''), curPage)
+    if (!a) continue
+    if (push(a)) located.push({ source: String(r.selectedText || ''), anchors: [a] })
+    covered.add(t)
+  }
+  if (located.length) {
+    for (const m of located) noteRefMark(m)
+    // 补记的锚点要落盘：下一轮重启就不必再按文字找一遍
+    scheduleSave()
+  }
+  return out
 }
 
 function refreshHighlights() {
@@ -2688,6 +2991,14 @@ function refreshHighlights() {
   else CSS.highlights.delete('rd-src')
   if (active.length) CSS.highlights.set('rd-src-active', new Highlight(...active))
   else CSS.highlights.delete('rd-src-active')
+  /**
+   * 「这一段被我引用了」的标记（2026-11 修：此前设完引用书页上什么都没画）。
+   * **最后注册**：注册顺序决定叠放优先级，放在译文底色之后，绿线才不会被
+   * 50% 不透明的译文底色盖掉。
+   */
+  const refs = refRanges()
+  if (refs.length) CSS.highlights.set('rd-ref', new Highlight(...refs))
+  else CSS.highlights.delete('rd-ref')
 }
 
 /** 点页面上某处时命中哪一条译文：图片条目按页内比例，文字条目按锚点矩形 */
@@ -2723,6 +3034,9 @@ function pointInSelection(x, y) {
 
 function onReaderClick(ev) {
   if (state.boxMode) return
+  // 框选动作条还开着：这一下要么落在动作条上、要么是在放弃它，
+  // 不该顺手当成"点了已翻过的区域"去改当前译文
+  if (state.boxChoice) return
   if (ev.button !== 0) return
   const el = ev.target
   if (el && el.closest && el.closest('button, a, input, textarea, .rd-tip, .rd-toc, .rd-del-box, #rd-toast')) return
@@ -2731,7 +3045,8 @@ function onReaderClick(ev) {
   const hit = entryAtPoint(ev.clientX, ev.clientY)
   if (!hit) return
   requestNotesOpen()
-  revealEntry(hit.id)
+  // fromPage：这次是**书页上点过来的**，侧栏的译文对照要同时跳到这一条（见 revealEntry）
+  revealEntry(hit.id, { fromPage: true })
 }
 
 function entryAtPoint(clientX, clientY) {
@@ -2816,11 +3131,25 @@ function scrollToEntry(e) {
   els.scroll.scrollBy({ top: delta, behavior: 'smooth' })
 }
 
-async function revealEntry(id) {
+/**
+ * 把某一条设为当前并跳到它在书页上的位置。
+ *
+ * `opts.fromPage` = 这次是**用户在书页上直接点的译文区域**（onReaderClick）：
+ * 只有这时才写 revealId/revealAt，让侧栏的译文对照也滚到对应条目。
+ * 侧栏自己发来的 `reveal`（点「跳到原文」）不带这个标记——用户人就在列表里，
+ * 再把列表滚一遍只会在原地抖一下。
+ */
+async function revealEntry(id, opts = {}) {
   const e = state.entries.find((x) => x.id === id)
   if (!e) return
   state.activeId = id
+  if (opts.fromPage) {
+    state.revealId = id
+    state.revealAt = Date.now()
+  }
   renderEntries()
+  // 面板那边要的是"点下去的同一瞬间跳过去"，不能等 scheduleSync 的 200ms 防抖。
+  syncNotes()
   renderImageMarks()
   const pageNum = (e.anchors && e.anchors[0] && e.anchors[0].page) || e.page
   if (pageNum) {
@@ -2854,17 +3183,26 @@ async function revealEntry(id) {
 async function setAsReference(entry, quote) {
   if (!entry || !entry.translation) return { ok: false, error: { message: '该条目暂无译文' } }
   const picked = String(quote || '').trim()
+  /**
+   * 只识别了原文、没翻译的条目（框选「识别原文」出来的卡片，之后在卡片上点「设为引用」）：
+   * 它的 translation 放的是识别结果（面板正文要显示它），但**不能当成译文报给共读侧** ——
+   * 否则引用卡与 agent 都会以为这段已经是中文译文。没划选时就不带 translation，
+   * 侧栏按 refDisplayText 回落到 selectedText（原文），语义才正确。
+   */
+  const recognizedOnly = !!entry.recognized && !picked
   // 上下文随引用一起报上去（PDF 没有章节正文可查，agent 那边只有这一份）。
   // 两条路（见 reader-anchor.js 的 contextForRef）：
   //   · 文字条目 → 划线**附近各 300 字**（contextAround）
-  //   · 扫描件（截图/框选翻译）→ 没有原文也没有文字层，退回**整张卡片的译文**：
+  //   · 扫描件（截图/框选识别或翻译）→ 没有原文也没有文字层，退回**整张卡片的译文**：
   //     用户划的那一句的前后文就在这张卡上，不送出去 agent 只剩孤零零一句。
-  const context = contextForRef(await contextAround(entry.anchors), entry)
+  // 只识别原文的条目没有"另一份译文"可当上下文：原文就是 selectedText 本身，不重复送。
+  const context = recognizedOnly ? '' : contextForRef(await contextAround(entry.anchors), entry)
+  const shown = picked || (recognizedOnly ? '' : entry.translation)
   const res = await callBackground({
     action: 'setTranslationRef',
     original: entry.source,
     // 划选了就报那一段；没划选报整段（与改动前一致）
-    translation: picked || entry.translation,
+    ...(shown ? { translation: shown } : {}),
     ...(picked ? { quote: picked } : {}),
     ...(entry.kind === 'image' ? { image: true } : {}),
     context,
@@ -2875,8 +3213,12 @@ async function setAsReference(entry, quote) {
   })
   if (res && res.ok) {
     toast('已设为引用')
-    // 记下这一段（给译文面板画"已经引过了"的下划线，见 refsSeen / noteRefLocal）
-    rememberRef(entry, picked)
+    // 记下这一段（给译文面板画"已经引过了"的下划线，见 refsSeen / noteRefLocal）。
+    // 只识别原文的条目也按"没有译文"记，下划线靠 selectedText 找到正文里的原文。
+    // anchors 要带上：设成引用之后，书页上那一段也得看得见（见 noteRefMark）。
+    rememberRef(recognizedOnly
+      ? { source: entry.source, translation: '', anchors: entry.anchors }
+      : entry, picked)
   }
   return res
 }
@@ -2890,6 +3232,8 @@ async function onReaderCommand(msg) {
   if (type === 'clear') {
     state.entries = []
     state.activeId = ''
+    state.revealId = ''
+    state.revealAt = 0
     renderEntries()
     refreshHighlights()
     renderImageMarks()
@@ -2902,15 +3246,28 @@ async function onReaderCommand(msg) {
     return await setAsReference(e, msg.quote)
   }
   if (type === 'retranslate') return await retranslateEntry(msg.id, msg.text)
-  // 侧栏删了一条引用 → 把本地那份"已引用段落"里对应的那一条摘掉（下划线随之消失）
-  if (type === 'forgetRef') { forgetRefLocal(String(msg.text || '')); return { ok: true } }
+  // 侧栏删了一条引用 → 把本地那份"已引用段落"里对应的那一条摘掉（书页绿线随之消失）
+  if (type === 'forgetRef') {
+    /**
+     * 只处理**当前这本书**的删除：侧栏存着所有书的引用，消息里带 bookId 是为了
+     * 在 A 书删引用时别把 B 书阅读器里同文的标记一起抹掉（同文不同书很难肉眼发现）。
+     * 老版本侧栏不带 bookId → 照旧按文字处理（本页只能画当前这本，风险等于改动前）。
+     */
+    const wantBook = String(msg.bookId || '')
+    if (wantBook && hasBook()) {
+      const mine = currentBookId()
+      const same = wantBook === mine || wantBook.indexOf(mine) === 0 || mine.indexOf(wantBook) === 0
+      if (!same) return { ok: true, ignored: 'not-this-book' }
+    }
+    forgetRefLocal(String(msg.text || ''))
+    return { ok: true }
+  }
   /**
    * 在**当前打开的这一本**里找到一段原文，滚过去并圈出来（2026-11）。
    *
    * 为什么加它：侧栏点「跳到原文」时，原先一律走"按章重新打开"（深链 ?open=&chapter=）。
-   * 而引用上**没有可靠的章号**——教程书的引用是我们自己造的，chapterNum 是 undefined，
-   * 于是 Number(undefined) || 0 = 0、深链缺了 &chapter=，阅读器只能从头打开，
-   * 用户看到的就是"回到主界面"（他实测报的正是这个）。
+   * 而引用上**没有可靠的章号**——chapterNum 是 undefined，于是 Number(undefined) || 0 = 0、
+   * 深链缺了 &chapter=，阅读器只能从头打开，用户看到的就是"回到主界面"（他实测报的正是这个）。
    *
    * 更根本的是：用户点"跳到原文"要的是**让我看见那句话在哪**，不是"把整本书重新打开一遍"。
    * 所以这里做同页定位：不重载、不丢阅读位置、找到就滚过去高亮一圈。
@@ -2926,6 +3283,8 @@ async function onReaderCommand(msg) {
 function removeEntry(id) {
   state.entries = state.entries.filter((e) => e.id !== id)
   if (state.activeId === id) state.activeId = ''
+  // 把"页面点过哪一条"的标记也清掉：否则侧栏下次拿快照还会去找一个已经删掉的条目
+  if (state.revealId === id) { state.revealId = ''; state.revealAt = 0 }
   renderEntries()
   refreshHighlights()
   renderImageMarks()
@@ -2939,6 +3298,12 @@ function removeEntry(id) {
 async function retranslateEntry(id, text) {
   const e = state.entries.find((x) => x.id === id)
   if (!e) return { ok: false, error: { message: '未找到该条目' } }
+  /**
+   * 这条原来是"只识别原文、没翻译"吗？
+   * 是的话，这次动作其实是**第一次翻译**（面板上那个「翻译」按钮走的就是这条路），
+   * 提示语与失败文案都不该说"重译"。
+   */
+  const wasRecognized = !!e.recognized
   const next = String(text || '').trim()
   if (!next) return { ok: false, error: { message: '原文不能为空' } }
   e.source = next
@@ -2949,12 +3314,15 @@ async function retranslateEntry(id, text) {
   e.pending = false
   if (!res || !res.ok) {
     e.error = (res && res.error && res.error.message) || '翻译失败'
-    toast('重译失败：' + e.error, true)
+    toast((wasRecognized ? '翻译失败：' : '重译失败：') + e.error, true)
     renderEntries()
     return res || { ok: false }
   }
   e.translation = (res.data && res.data.translation) || ''
-  toast('已重译')
+  // 原来是"只识别原文"的条目：现在有真译文了，面板的"未翻译"提示要撤掉
+  e.recognized = false
+  e.recognizing = false
+  toast(wasRecognized ? '已翻译' : '已重译')
   renderEntries()
   refreshHighlights()
   scheduleSave()
@@ -3021,7 +3389,7 @@ function readerBookInfo() {
     ok: true,
     book: {
       bookId: currentBookId(),
-      hash: state.tutorialOpen ? TUTORIAL_HEX : state.hash,
+      hash: state.hash,
       name: state.name,
       page: currentPage(),
       total: bookTotal(),
@@ -3043,66 +3411,31 @@ const SELFCHECK_OPS = {
   /** 活着吗（自检第一句就问它：模块没报错才有后面那些） */
   alive: async () => 'object',
 
-  /** 教程书开着没、在第几章 */
-  tutorialSnapshot: async () => ({
-    open: !!state.tutorialOpen,
-    chapters: state.tutorialOpen ? Tutorial.chapterCount() : 0,
-    index: state.tutorialOpen ? Tutorial.currentIndex() : -1,
-    page: state.tutorialPage,
-  }),
-
   bookName: async () => state.name || '',
   bookId: async () => currentBookId(),
   hasBook: async () => hasBook(),
 
-  /** 状态栏那行字（"第 x / y 章"就在这里） */
+  /** 状态栏那行字（"第 x / y 页"就在这里） */
   pageInfo: async () => String(els.pageinfo.textContent || ''),
 
-  /** 打开目录并数一下条目 */
+  /** 打开目录并数一下条目（PDF 的书签要异步取，得等它取完再数） */
   tocOpen: async () => {
-    if (els.toc.hidden) toggleToc()
-    return { open: !els.toc.hidden, items: els.tocList ? els.tocList.children.length : 0 }
+    if (els.toc.hidden) await openToc()
+    return {
+      open: !els.toc.hidden,
+      items: els.tocList ? els.tocList.querySelectorAll('.rd-toc-item').length : 0,
+    }
   },
 
-  /** 跳到第 index 条（0 起）——教程书走"真开章"，PDF 走滚动 */
+  /** 跳到第 index 条（0 起）——PDF 走滚动 */
   tocJump: async (index) => {
     const i = Math.max(0, Number(index) || 0)
-    if (state.tutorialOpen) await gotoChapter(i + 1)
-    else gotoPage(i + 1, false)
+    gotoPage(i + 1, false)
     return {
       jumped: true,
-      index: state.tutorialOpen ? Tutorial.currentIndex() : i,
+      index: i,
       info: String(els.pageinfo.textContent || ''),
     }
-  },
-
-  /** 当前这一章的「开始本课」卡片（有没有、第几章、标题） */
-  lessonCard: async () => {
-    const box = els.pages.querySelector('.tut-lesson')
-    if (!box) return { exists: false, chapter: 0, title: '' }
-    const title = box.querySelector('.tut-lesson-title')
-    return {
-      exists: true,
-      chapter: Number(box.dataset.lesson) || 0,
-      title: String((title && title.textContent) || ''),
-    }
-  },
-
-  /**
-   * 点一下「开始本课」，再**把状态读回来**。
-   * 只回报"我调过了"是不够的：这一环断了不报错，只是点了没反应。
-   */
-  startLesson: async () => {
-    const btn = els.pages.querySelector('.tut-lesson-btn')
-    if (!btn) return { wrote: false, reason: '这一章没有课' }
-    btn.click()
-    let run = null
-    for (let i = 0; i < 20; i++) {
-      run = await readTutorialRun()
-      if (run && run.active) break
-      await new Promise((r) => setTimeout(r, 100))
-    }
-    return { wrote: !!(run && run.active), run }
   },
 
   /** 快捷键绑上了什么（写错的表现是静默失效，所以要把真相读出来） */
@@ -3129,6 +3462,28 @@ const SELFCHECK_OPS = {
   },
 
   /**
+   * 「设为引用」之后，被引用的那一段在书页上到底有没有标记（2026-11 用户报的 bug）。
+   *
+   * 自检必须能看见这件事：这条链路以前一路"成功"（后台存了、侧栏有卡片），
+   * 唯独书页上什么都没画——只看返回值是发现不了的。
+   */
+  refMarkProbe: async () => {
+    const ranges = refRanges()
+    const reg = (window.CSS && CSS.highlights && CSS.highlights.get)
+      ? CSS.highlights.get('rd-ref')
+      : null
+    return {
+      ranges: ranges.length,
+      registered: reg ? reg.size : 0,
+      marks: Array.isArray(state.refMarks) ? state.refMarks.length : 0,
+      refs: refsSeen().length,
+      first: (Array.isArray(state.refMarks) && state.refMarks[0])
+        ? String(state.refMarks[0].text || '').slice(0, 40)
+        : '',
+    }
+  },
+
+  /**
    * 当场量的位置 + 记录里存的位置。
    * 两个都要给：只给一个的话，分不清"存错了"还是"恢复错了"——而用户看到的现象一模一样。
    */
@@ -3140,19 +3495,17 @@ const SELFCHECK_OPS = {
       page: pos.page,
       frac: Number(Number(pos.frac).toFixed(4)),
       restoring: !!state.restore,
-      tutorial: !!state.tutorialOpen,
       storedPage: rec ? Number(rec.page) || 0 : 0,
       storedFrac: rec ? Number(rec.frac) || 0 : 0,
     }
   },
 
-  /** 把位置摆到"第 page 章/页的 frac 处"，persist 时顺手落盘 */
+  /** 把位置摆到"第 page 页的 frac 处"，persist 时顺手落盘 */
   setPosition: async (arg) => {
     const page = Math.max(1, Number((arg && arg.page) || 1))
     const frac = clamp01((arg && arg.frac) || 0)
-    if (state.tutorialOpen) await gotoChapter(page)
-    else gotoPage(page, false)
-    // 跳章会把滚动条归零，所以页内比例必须在**跳完之后**再落一次
+    gotoPage(page, false)
+    // 页内比例必须在**跳完之后**再落一次：gotoPage 只滚到页顶
     applyPosition({ page, frac })
     updatePageInfo()
     syncTocPosition()
@@ -3167,20 +3520,21 @@ const SELFCHECK_OPS = {
     }
   },
 
-  /** 在教程正文上划出一段（自检要验"划词 → 浮标 → 共读"这条真实链路） */
+  /** 在已渲染的正文里划出一段（自检要验"划词 → 浮标"这条真实链路） */
   selectParagraph: async () => {
-    if (!state.tutorialOpen) return { ok: false, reason: '没有打开教程书' }
-    const paras = [...els.pages.querySelectorAll('p, li')]
-      .filter((el) => String(el.textContent || '').trim().length > 12)
-    const p = paras[0]
-    if (!p) return { ok: false, reason: '这一章没有可划的正文' }
-    const walk = document.createTreeWalker(p, NodeFilter.SHOW_TEXT)
-    const node = walk.nextNode()
-    if (!node) return { ok: false, reason: '段落里没有文字节点' }
-    const len = Math.min(24, (node.nodeValue || '').length)
-    const range = document.createRange()
-    range.setStart(node, 0)
-    range.setEnd(node, len)
+    // pdf.js 渲染是异步的：自检刚跳过来时，目标页可能还没画出文字层。等一小会儿，顺便催渲染。
+    const deadline = Date.now() + 4000
+    let p = null
+    while (!p && Date.now() < deadline) {
+      p = state.pages.find((x) => x.rendered && x.layer && pageTextIndex(x.layer).total > 24)
+      if (p) break
+      const near = state.pages.find((x) => !x.rendered && isPageNear(x, 400))
+      if (near) enqueueRender(near.num)
+      await new Promise((r) => setTimeout(r, 120))
+    }
+    if (!p) return { ok: false, reason: '还没有渲染出可划的正文' }
+    const range = rangeFromOffsets(p.layer, 0, 24)
+    if (!range) return { ok: false, reason: '正文里没有文字节点' }
     const sel = window.getSelection()
     sel.removeAllRanges()
     sel.addRange(range)
@@ -3194,9 +3548,9 @@ const SELFCHECK_OPS = {
     }
   },
 
-  /** 点一下浮标（教程书里那一下就是"设为引用"） */
+  /** 点一下浮标（把选中的这段设为引用） */
   submitSelection: async () => {
-    const res = await translateSelection()
+    const res = await referenceSelection()
     return { ok: !!(res && res.ok !== false), raw: res || null }
   },
 }
@@ -3212,19 +3566,8 @@ async function runSelfcheckOp(op, arg) {
   }
 }
 
-/** 读侧栏引导的状态（「开始本课」写的就是它，见 startTutorialLesson） */
-async function readTutorialRun() {
-  try {
-    const got = await chrome.storage.local.get('tutorialRun')
-    return (got && got.tutorialRun) || null
-  } catch (e) {
-    return null
-  }
-}
-
 /** 读**当前这本**书的进度记录（没有书 / 没存过 → null） */
 async function readOwnRecord() {
-  if (state.tutorialOpen) return await loadRecord(Tutorial.TUTORIAL_STORE_KEY)
   if (!state.hash) return null
   return await loadRecord(state.hash)
 }
@@ -3262,7 +3605,7 @@ if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage)
   })
 }
 function scheduleSave() {
-  const key = state.tutorialOpen ? Tutorial.TUTORIAL_STORE_KEY : (state.hash ? STORE_PREFIX + state.hash : '')
+  const key = state.hash ? STORE_PREFIX + state.hash : ''
   if (!key) return
   if (!state.saveTimer) state.saveTimer = setTimeout(() => { state.saveTimer = null; saveRecord() }, 600)
   state.savePending = { key, name: state.name }
@@ -3272,10 +3615,9 @@ async function saveRecord() {
   const pending = state.savePending
   state.savePending = null
   // 没有排队记录（直接调用/自测）时按当前书现算一份
-  const key = (pending && pending.key) ||
-    (state.tutorialOpen ? Tutorial.TUTORIAL_STORE_KEY : (state.hash ? STORE_PREFIX + state.hash : ''))
+  const key = (pending && pending.key) || (state.hash ? STORE_PREFIX + state.hash : '')
   if (!key || !hasBook()) return
-  const pos = currentPosition()          // 唯一定义：第几页/章 + 页内比例
+  const pos = currentPosition()          // 唯一定义：第几页 + 页内比例
   touchLibraryMeta(pos)                  // 顺手更新书库里的页数/译文条数/读到第几页
   if (typeof chrome === 'undefined' || !chrome.storage) return
   const record = {
@@ -3294,11 +3636,17 @@ async function saveRecord() {
       page: e.page,
       source: e.source,
       translation: e.translation,
+      // 「只识别了原文、没有翻译」要跟着落盘：否则重启后那张卡会变回一张普通译文卡
+      //（正文仍是识别结果，只是"未翻译"的说明没了）
+      recognized: !!e.recognized,
       at: e.at,
     })),
     // 已设成引用的段落：落盘是为了"重启后立刻能画下划线"（见 loadDocument 里那段说明）。
     // 它是缓存，接收端拉回来之后会被覆盖；条数上限与内存那份一致。
     refs: refsSeen().slice(0, REFS_SEEN_MAX),
+    // 这些引用落在书里的哪一处（见 state.refMarks）：书页绿线靠它解析 Range，
+    // 接收端的存档里没有 PDF 偏移，只能本地存
+    refMarks: (Array.isArray(state.refMarks) ? state.refMarks : []).slice(0, REFS_SEEN_MAX),
     updatedAt: Date.now(),
   }
   try {
@@ -3308,12 +3656,6 @@ async function saveRecord() {
   }
 }
 
-/**
- * 读回一本书的进度记录。
- * @param {string} hashOrKey 裸内容哈希（PDF 那条路），或**完整存储键**
- *   （教程书传的是 `Tutorial.TUTORIAL_STORE_KEY`，本身就是 `rd:book:<hex>`）。
- *   两种书共用同一套记录格式，所以这里只做"要不要补前缀"，不另开一套。
- */
 /**
  * 这条记录是不是"当前这本书"的？
  *
@@ -3332,11 +3674,11 @@ function sameRecordBook(rec) {
   if (a && b && a !== b) return false
   return true
 }
-async function loadRecord(hashOrKey) {
+/** 读回一本书的进度记录（裸内容哈希 → `rd:book:<hash>`） */
+async function loadRecord(hash) {
   if (typeof chrome === 'undefined' || !chrome.storage) return null
   try {
-    const s = String(hashOrKey || '')
-    const key = s.startsWith(STORE_PREFIX) ? s : STORE_PREFIX + s
+    const key = STORE_PREFIX + String(hash || '')
     const got = await chrome.storage.local.get(key)
     return got[key] || null
   } catch {
@@ -3368,25 +3710,33 @@ els.tocClose.addEventListener('click', closeToc)
 els.toc.addEventListener('click', (ev) => { if (ev.target === els.toc) closeToc() })
 els.tocRange.addEventListener('input', () => {
   // 拖动时**不要**平滑滚动：滑杆会连发十几个 input，每个都触发一次平滑滚动会打架
-  // 教程书的滑杆刻度是**章**，所以走 gotoChapter（那里才是"真开章"），不是滚动
-  if (state.tutorialOpen) gotoChapter(Number(els.tocRange.value))
-  else gotoPage(Number(els.tocRange.value), false)
+  gotoPage(Number(els.tocRange.value), false)
 })
-els.tocFirst.addEventListener('click', () => (state.tutorialOpen ? gotoChapter(1) : gotoPage(1)))
-els.tocLast.addEventListener('click', () => (state.tutorialOpen ? gotoChapter(bookTotal()) : gotoPage(bookTotal())))
+els.tocFirst.addEventListener('click', () => gotoPage(1))
+els.tocLast.addEventListener('click', () => gotoPage(bookTotal()))
 // 工具栏那枚是**切换式**（点一下进、再点一下出）；Alt+S 是一次性，两条路见 startBoxSelect
 els.box.addEventListener('click', () => toggleBoxSelect())
 els.boxExit.addEventListener('click', () => endBoxSelect('toggle'))
 els.pages.addEventListener('mousedown', onBoxStart)
 els.notes.addEventListener('click', requestNotesOpen)
 els.tipTranslate.addEventListener('click', translateSelection)
+// 划词「设为引用」：不翻译，直接把选中的原文交给共读侧（2026-11）
+els.tipRef.addEventListener('click', () => { referenceSelection() })
 els.tipCopy.addEventListener('click', async () => {
   const hit = state.lastSelection
   if (hit) copyText(await sourceText(hit.anchors))
   hideTip()
 })
+// 框选动作条：翻译 / 只识别原文放进译文栏（2026-11）
+els.boxTranslate.addEventListener('click', () => runBoxChoice('translate'))
+els.boxRecognize.addEventListener('click', () => runBoxChoice('recognize'))
 
-els.scroll.addEventListener('scroll', onScroll, { passive: true })
+els.scroll.addEventListener('scroll', () => {
+  // 框选动作条是按拖框那一刻的屏幕位置摆的；一滚动它就和框错位了，直接收起。
+  // 划词浮标不在这里收：它有既有的 selectionchange / mousedown 那套（改动前就这样）。
+  hideBoxTip()
+  onScroll()
+}, { passive: true })
 /**
  * 用户一动手，就**停掉落位纠偏**（2026-11 二次改版）：纠偏的意义是"把打开时的
  * 布局漂移抵掉"，而用户自己滚了之后，"他要去的地方"已经不由旧记录决定了——
@@ -3407,7 +3757,7 @@ document.addEventListener('visibilitychange', () => {
 document.addEventListener('click', onReaderClick)
 // 双击空白处（既不在译文高亮上，也没选中文字）→ 收起侧栏里的译文对照
 document.addEventListener('dblclick', (ev) => {
-  if (state.boxMode) return
+  if (state.boxMode || state.boxChoice) return
   if (els.tip.contains(ev.target)) return
   const sel = window.getSelection()
   if (sel && !sel.isCollapsed && sel.toString().trim()) return
@@ -3418,12 +3768,14 @@ document.addEventListener('dblclick', (ev) => {
 document.addEventListener('keyup', (e) => { if (e.shiftKey || e.key === 'Shift') setTimeout(onSelectionSettled, 0) })
 document.addEventListener('mousedown', (e) => {
   if (!els.tip.contains(e.target)) hideTip()
+  // 点在动作条自己身上时别收（先让它把 click 收到）；点别处 = 放弃这块框选
+  if (!els.boxTip.contains(e.target)) hideBoxTip()
 })
 
 document.addEventListener('keydown', (e) => {
   if (e.altKey && (e.key === 't' || e.key === 'T')) { e.preventDefault(); translateSelection(); return }
   /**
-   * 框选翻译的快捷键：**一次性**（按一次框一次、框完自动退）。
+   * 框选识别的快捷键：**一次性**（按一次框一次、框完自动退）。
    * 与工具栏那枚切换式按钮是两条路，各有各的顺手处——理由写在 startBoxSelect 上方。
    * `oneShot: true` 每次都要传：它同时负责"再按一次 Alt+S 时把标记改成一次性"。
    */
@@ -3440,10 +3792,13 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (state.boxMode) endBoxSelect('esc')
     else hideTip()
+    // 一次性模式（Alt+S）框完已经退出了，但动作条可能还开着：Esc 也要能收掉
+    hideBoxTip()
   }
 })
 
 window.addEventListener('resize', () => {
+  hideBoxTip()      // 动作条按旧窗口位置摆的，尺寸一变就错位
   clearTimeout(window.__rdFitTimer)
   // 拖窗口会连续触发，必须走便宜路径
   window.__rdFitTimer = setTimeout(() => { if (state.fitWidth) fitWidth(true) }, 200)
@@ -3485,21 +3840,15 @@ async function handleOpenParam() {
     const u = new URL(location.href)
     hash = (u.searchParams.get('open') || '').toLowerCase()
     if (!/^[a-f0-9]{16,64}$/.test(hash)) return false
-    // `&chapter=<n>`（可选）：打开后直接翻到第 n 章。
-    // 侧栏里点一条引用要"跳回原文"，而引用属于某一章；深链只带书 ID 的话
-    // 打开的是上次那一章，用户会以为跳错了（2026-11 用户反馈的那条路）。
+    // `&chapter=<n>`（可选）：打开后直接翻到第 n 页。
+    // 侧栏里点一条引用要"跳回原文"，深链只带书 ID 的话打开的是上次那一页，
+    // 用户会以为跳错了（2026-11 用户反馈的那条路）。
     const chapter = Number(u.searchParams.get('chapter')) || 0
-    // 教程书是扩展自带的，不走接收端，直接开
-    if (hash === TUTORIAL_HEX) {
-      await openTutorial()
-      if (chapter > 0) await gotoChapter(chapter)
-    } else {
-      // 等书库列表回来：从书库打开要那份元信息（书名、页数）才好看
-      await loadLibrary().catch(() => {})
-      const hit = (state.library || []).find((b) => String(b.hash).toLowerCase() === hash)
-      await openFromLibrary(hit || { hash, name: u.searchParams.get('name') || '未命名.pdf' })
-      if (chapter > 0) gotoPage(chapter)
-    }
+    // 等书库列表回来：从书库打开要那份元信息（书名、页数）才好看
+    await loadLibrary().catch(() => {})
+    const hit = (state.library || []).find((b) => String(b.hash).toLowerCase() === hash)
+    await openFromLibrary(hit || { hash, name: u.searchParams.get('name') || '未命名.pdf' })
+    if (chapter > 0) gotoPage(chapter)
     u.searchParams.delete('open')
     u.searchParams.delete('name')
     u.searchParams.delete('chapter')
@@ -3540,7 +3889,7 @@ function handlePickParam() {
   } catch (e) {
     return false
   }
-  if (state.hash || state.tutorialOpen) return false
+  if (state.hash) return false
   requestAnimationFrame(() => { try { els.file && els.file.click() } catch (e) {} })
   return true
 }
@@ -3571,6 +3920,18 @@ window.__readerTest = {
   /** 划线附近各 300 字（随「设为引用」交给共读侧的上下文）——自测断言它 */
   contextAround,
   refreshHighlights,
+  /** 「设为引用」之后书页上的标记（自测断言它；见 refMarkProbe 的说明） */
+  refMarkInfo() {
+    const reg = (window.CSS && CSS.highlights && CSS.highlights.get) ? CSS.highlights.get('rd-ref') : null
+    return {
+      ranges: refRanges().length,
+      registered: reg ? reg.size : 0,
+      marks: (state.refMarks || []).map((m) => ({
+        text: String((m && m.text) || '').slice(0, 40),
+        anchors: (m && m.anchors) || [],
+      })),
+    }
+  },
   refreshCount() {
     let n = 0
     for (const e of state.entries) for (const a of e.anchors || []) if (resolveAnchor(a)) n++
@@ -3583,6 +3944,15 @@ window.__readerTest = {
   startBoxSelect,
   endBoxSelect,
   translateRegion,
+  /** 框选动作条与两条分流（2026-11）——自测要验"松手后不立刻翻译、选动作才走" */
+  showBoxTip,
+  hideBoxTip,
+  runBoxChoice,
+  recognizeRegionText,
+  /** OCR 换行的整理（段内接回、空行保留）——自测要验它 */
+  reflowOcrText,
+  /** 划词「设为引用」（不翻译）——自测要验它发出的 setTranslationRef 负载 */
+  referenceSelection,
   renderImageMarks,
   notesSnapshot,
   syncNotes,
@@ -3595,7 +3965,6 @@ window.__readerTest = {
   openFromLibrary,
   showLibrary,
   archiveToLibrary,
-  openTutorial,
   hasBook,
   currentBookId,
   // 目录与「打开侧栏」也是走自测验的东西，一并交出去
@@ -3603,13 +3972,8 @@ window.__readerTest = {
   closeToc,
   toggleToc,
   loadPdfOutline,
-  submitSelection: Tutorial.submitSelection,
-  /** 教程书：把它的测试入口也交出去（自测要驱动章节、课程入口与 ID 比对） */
-  tutorial: Tutorial,
-  /** 跳章（教程书走真开章、PDF 走滚动翻页）——自测要验它 */
-  gotoChapter,
-  /** 书里「开始本课」那条链路：写引导状态 + 请后台开侧栏 */
-  startTutorialLesson,
+  /** 把当前选区提交为引用（点浮标那一下）——自测要验它 */
+  submitSelection: referenceSelection,
   libraryState() {
     return {
       status: els.libraryStatus ? els.libraryStatus.textContent : '',

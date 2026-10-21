@@ -6,9 +6,6 @@
 <title>CoRead 阅读器</title>
 <link rel="stylesheet" href="vendor/pdfjs/text-layer.css">
 <link rel="stylesheet" href="reader.css">
-<!-- 教程书的样式（只有书页排版）。这一版书里不再有"演一遍"的假界面：
-     一章 = 一课，课在**真实侧栏**里跑，引导层样式见 tutorial-guide.js。 -->
-<link rel="stylesheet" href="tutorial/tutorial.css">
 </head>
 <body>
 
@@ -19,7 +16,7 @@
        ── 版式（2026-11 重排，用户："一堆乱七八糟的东西"）──────────────────────
        分两组，中间用留白隔开：
          左 = 文件与导航：打开 PDF · 书库 │ 目录 │ 书名
-         右 = 视图与翻译：− 100% ＋ │ 框选翻译 · 译文
+         右 = 视图与翻译：− 100% ＋ │ 框选识别 · 译文
        重排时去掉 / 合并了三处：
          · 缩放原来被页码和状态隔成"− … 100% … ＋"三格，现在贴成一组；
            「适宽」并进这一组——**点百分比数字就回到适宽**（原先 100% 时点「适宽」没反应，
@@ -43,9 +40,9 @@
   <button id="rd-zoom-in" class="rd-btn" type="button" title="放大（Ctrl++）">＋</button>
   <button id="rd-fit" class="rd-btn" type="button" title="按窗口宽度缩放（Ctrl+0）" hidden>适宽</button>
   <span class="rd-bar-sep" aria-hidden="true"></span>
-  <!-- 翻译组 -->
+  <!-- 识别与翻译组：框选后可选「识别原文」或「翻译」 -->
   <button id="rd-box" class="rd-btn" type="button" aria-pressed="false"
-          title="进入框选：在页面上拖出选区，由模型读图翻译（Alt+S 来一下就走）">框选翻译</button>
+          title="进入框选识别：在页面上拖出选区，再选「识别原文」或「翻译」（Alt+S 来一下就走）">框选识别</button>
   <button id="rd-notes" class="rd-btn" type="button" title="在侧栏打开译文对照">译文</button>
   <!-- 渲染状态与页码：状态平时藏（见 updateStatus），页码常驻 -->
   <span id="rd-status" class="rd-muted" hidden></span>
@@ -54,11 +51,11 @@
 
 <main class="rd-main">
   <!-- 框选模式的常驻提示（2026-11）：只在框选模式里显示，横在正文上方。
-       为什么必须有它：工具栏那枚「框选翻译」是切换式的，而**忘了退出**正是这个功能
+       为什么必须有它：工具栏那枚「框选识别」是切换式的，而**忘了退出**正是这个功能
        历来最大的坑（以前切模式时，忘了退就"划不中字了"，用户以为界面坏了）。
        有这条常驻提示，用户随时看得见自己在什么模式里，切换式才敢用。 -->
   <div id="rd-box-bar" class="rd-box-bar" hidden>
-    <span class="rd-box-bar-txt">框选模式：在页面上拖出选区翻译</span>
+    <span class="rd-box-bar-txt">框选识别：在页面上拖出选区，再选「识别原文」或「翻译」</span>
     <span class="rd-box-bar-key">Esc 退出</span>
     <button id="rd-box-exit" class="rd-box-bar-btn" type="button">退出</button>
   </div>
@@ -86,7 +83,7 @@
 
       <p class="rd-empty-note" id="rd-empty-note" hidden></p>
       <p class="rd-hint" id="rd-drag-hint">也可以把 PDF 直接拖到窗口里。</p>
-      <p class="rd-hint rd-warn" id="rd-scan-hint" hidden>本 PDF 没有文字层（扫描件，页面内容为图片），无法使用划词翻译。请点击工具栏的<b>「框选翻译」</b>（或按 Alt+S），在页面上拖出选区，由模型读图翻译，译文同样会贴回本页。</p>
+      <p class="rd-hint rd-warn" id="rd-scan-hint" hidden>本 PDF 没有文字层（扫描件，页面内容为图片），无法使用划词翻译。请点击工具栏的<b>「框选识别」</b>（或按 Alt+S），在页面上拖出选区，再选「识别原文」或「翻译」。</p>
     </div>
   </div>
 
@@ -96,13 +93,23 @@
 
 <div id="rd-tip" class="rd-tip" hidden>
   <button id="rd-tip-translate" type="button">翻译</button>
+  <button id="rd-tip-ref" type="button" title="把选中的这段设为当前引用（不翻译）">设为引用</button>
   <button id="rd-tip-copy" type="button" title="仅复制原文">复制</button>
 </div>
 
+<!-- 框选完成后的动作条（2026-11）：翻译，还是只识别原文。
+     为什么要有它：框选原先一松手就直接翻译，扫描件没有办法"只想要原文、不想翻"。
+     两条路都从这里分流，位置贴着刚拖出来的那个框。
+     「识别原文」只把原文放进译文栏，**不**自动设引用、也不翻译；
+     之后在译文栏那张卡片上可以再点「翻译」或「设为引用」。 -->
+<div id="rd-box-tip" class="rd-tip" hidden>
+  <button id="rd-box-translate" type="button" title="翻译这块区域">翻译</button>
+  <button id="rd-box-recognize" type="button" title="只识别这块区域的原文，放进译文栏（不翻译、不自动设引用）">识别原文</button>
+</div>
+
 <!-- 章节目录（2026-11）：
-     · 教程书 → 书自带的七章（这本是我们的，章节表就在书里）
-     · PDF    → pdf.js 读到的**真书签目录**（b.getOutline()，很多学术 PDF 都有），
-                外加一条页码滑杆；没有书签的 PDF 就只剩滑杆。
+     · PDF → pdf.js 读到的**真书签目录**（b.getOutline()，很多学术 PDF 都有），
+             外加一条页码滑杆；没有书签的 PDF 就只剩滑杆。
      为什么不做"靠字号猜章节"：猜错的目录比没有目录更烦人，而且无从解释。 -->
 <div id="rd-toc" class="rd-toc" hidden>
   <div class="rd-toc-panel">

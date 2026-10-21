@@ -1,15 +1,17 @@
 /**
  * CoRead 网页阅读源适配器 —— 中文马克思主义文库（www.marxists.org/chinese）
  * AI-021 rev2（用户定调 2026-11）：不做任何 URL 自动归书 / 自动跳转，
- * 由读者手动建书并把页面绑定到书（绑定映射存页面 localStorage），读者自己维护。
+ * 由读者手动把页面绑定到书（绑定映射存 chrome.storage.local，页面与侧栏共享），
+ * 读者自己维护。
  *
  * 页面 → 书 绑定：{ key, bookId, bookTitle, ts, dir }
  *   dir=true ：key 是目录前缀（如 /chinese/lenin/1901-1902/），该目录下所有页归这本书
  *   dir=false：key 是精确页面路径，单页绑定（覆盖目录绑定，取最长/最精确匹配）
  *
- * 建书：读者输入书名 → POST /book-create（receiver 生成 mia_ 书并落 meta.json）。
- * 书名由读者输入，不抓远程页面（旧页面 GB2312/GBK 若按 UTF-8 抓取会乱码）；
- * 章节标题取当前页 DOM 标题（浏览器已正确解码）。
+ * 书可以是**已有的任何一本书**（微信读书的书 / 阅读器里的 PDF / 网页文章建出来的书），
+ * 也可以现场新建一本网页书：读者输入书名 → POST /book-create（receiver 生成 mia_ 书
+ * 并落 meta.json）。书名由读者输入，不抓远程页面（旧页面 GB2312/GBK 若按 UTF-8
+ * 抓取会乱码）；章节标题取当前页 DOM 标题（浏览器已正确解码）。
  *
  * 其余职责沿用 rev1：正文足迹缓存 /content、划线共读 /annotation、
  * 划线重绘与删除、跳转落点（coread-scroll 消息 / #coread= hash）、结构探针 /debug。
@@ -318,12 +320,33 @@
     const j = await postJson('/book-create', { bookTitle: title, source: 'mia' });
     return j && j.bookId ? { bookId: j.bookId, bookTitle: j.bookTitle } : null;
   }
-  async function existingMiaBooks() {
+  /**
+   * 可加入的书：`/books` 里的**全部真实书籍**，不再只限网页文章建出来的 `mia_` 书。
+   *
+   * 2026-11 用户报："阅读网页源时，弹窗只能加入网页源文章的对话，不能加入正式书籍的
+   * 对话。"根因就是旧实现这里把非 `mia_` 的书全滤掉了 —— 微信读书的书与阅读器里的
+   * PDF 都进不了下拉。网页上的划线本来就该能归到正在读的那本书里，所以这里放开；
+   * 分组（见 bookGroupOf）只影响下拉里的展示顺序，不改变"能不能选"。
+   */
+  async function existingBooks() {
     const j = await getJson('/books');
     if (!j || !Array.isArray(j.books)) return [];
-    return j.books.filter(function (b) {
-      return /^mia_[0-9a-f]{20}$/.test(b.base) || /^mia_/.test(b.base);
-    }).sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0) });
+    return j.books
+      // 与侧栏认书的口径一致（sidebar.js 的 applyBookContext / coreadManualBook）：
+      // 不满足这个形态的 ID 发过去也会被侧栏丢掉，不如一开始就不列出来。
+      .filter(function (b) {
+        const base = String((b && b.base) || '');
+        // 双下划线前缀是侧栏/接收端的哨兵上下文（如自由模式），不是真书
+        return /^[A-Za-z0-9_]{12,}$/.test(base) && base.indexOf('__') !== 0;
+      })
+      .sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0) });
+  }
+  /** 书的来源：只用于下拉的 <optgroup> 标题，不参与任何判断。 */
+  function bookGroupOf(base) {
+    const b = String(base || '');
+    if (b.indexOf('mia_') === 0) return 'mia';
+    if (/^rd_[a-f0-9]{16,64}$/i.test(b)) return 'reader';
+    return 'weread';
   }
   function setBindingEntry(entry) {
     bindingsCache = bindingsCache.filter(function (b) { return b.key !== entry.key });
@@ -353,8 +376,8 @@
     box.appendChild(head);
 
     // ── ① 这本书 ──────────────────────────────────────────────────────────
-    let miaBooks = [];
-    try { miaBooks = await existingMiaBooks() } catch (e) {}
+    let books = [];
+    try { books = await existingBooks() } catch (e) {}
     box.appendChild(makeEl('div', 'cm-sec-label', '① 这本书'));
     const rowBook = makeEl('div', 'cm-cards');
 
@@ -362,7 +385,7 @@
     const radioA = makeEl('input'); radioA.type = 'radio'; radioA.name = 'cm-book-src'; radioA.value = 'exist';
     const bodyA = makeEl('span', 'cm-card-body');
     bodyA.appendChild(makeEl('span', 'cm-card-title', '加入已有的书'));
-    bodyA.appendChild(makeEl('span', 'cm-card-desc', miaBooks.length ? '继续划线、讨论' : '暂无书籍，可新建一本'));
+    bodyA.appendChild(makeEl('span', 'cm-card-desc', books.length ? '继续这本书的对话' : '还没有书，先建一本'));
     cardA.appendChild(radioA); cardA.appendChild(bodyA);
     rowBook.appendChild(cardA);
 
@@ -375,16 +398,24 @@
     rowBook.appendChild(cardB);
     box.appendChild(rowBook);
 
-    // 加入已有书 → 下拉
+    // 加入已有书 → 下拉。微信读书 / 网页文章 / 阅读器分开显示：三类书的对话都按
+    // bookId 归属，分组只是让人一眼找到"我正在读的那本正式书"。
     const wrapSel = makeEl('div', 'cm-field');
     const sel = makeEl('select');
     const optPh = makeEl('option', null, '选择一本书…');
     optPh.value = '';
     sel.appendChild(optPh);
-    for (const b of miaBooks) {
-      const o = makeEl('option', null, '《' + (b.bookTitle || b.base) + '》');
-      o.value = b.base;
-      sel.appendChild(o);
+    for (const group of [['weread', '微信读书'], ['mia', '网页文章'], ['reader', 'CoRead 阅读器']]) {
+      const list = books.filter(function (b) { return bookGroupOf(b.base) === group[0] });
+      if (!list.length) continue;
+      const og = makeEl('optgroup');
+      og.label = group[1];
+      for (const b of list) {
+        const o = makeEl('option', null, '《' + (b.bookTitle || b.base) + '》');
+        o.value = b.base;
+        og.appendChild(o);
+      }
+      sel.appendChild(og);
     }
     wrapSel.appendChild(sel);
     box.appendChild(wrapSel);
@@ -446,7 +477,7 @@
       const useNew = radioB.checked;
       wrapInp.hidden = !useNew;
       wrapSel.hidden = useNew;
-      cardA.className = 'cm-card' + (radioA.checked ? ' on' : '') + (miaBooks.length ? '' : ' cm-card-dis');
+      cardA.className = 'cm-card' + (radioA.checked ? ' on' : '') + (books.length ? '' : ' cm-card-dis');
       cardB.className = 'cm-card' + (radioB.checked ? ' on' : '');
       if (useNew) inp.focus();
     }
@@ -454,7 +485,7 @@
     radioB.addEventListener('change', syncBookSrc);
 
     // ── 初始状态 ───────────────────────────────────────────────────────────
-    const boundInList = bindingNow && miaBooks.some(function (b) { return b.base === bindingNow.bookId });
+    const boundInList = bindingNow && books.some(function (b) { return b.base === bindingNow.bookId });
     // 这本书：有当前绑定且书还在 → 已有；书没了 → 新书并预填原名；无绑定 → 有书可选已有，没书只能新建
     if (bindingNow && !boundInList) {
       radioB.checked = true;
@@ -463,7 +494,7 @@
       radioA.checked = true;
       sel.value = bindingNow.bookId;
       inp.value = bindingNow.bookTitle || '';
-    } else if (miaBooks.length) {
+    } else if (books.length) {
       radioA.checked = true;
       inp.value = cleanTitle(document.title).slice(0, 60);
     } else {
@@ -505,7 +536,7 @@
       if (radioA.checked) {
         bookId = sel.value || '';
         if (!bookId) { toast('请先选择一本书，或切换为「创建一本新书」'); return; }
-        const hit = miaBooks.find(function (b) { return b.base === bookId });
+        const hit = books.find(function (b) { return b.base === bookId });
         bookTitle = hit ? hit.bookTitle || '' : '';
       } else {
         const title = inp.value.trim();
@@ -1273,8 +1304,8 @@
     } catch (e) {}
   }
 
-  // 注：绑定读取发生在脚本解析时（localStorage）。同一会话内其它 tab 的绑定变更
-  // 在下次页面加载时生效；本 tab 内的绑定/解除立即生效。
+  // 注：绑定在 boot 时从 chrome.storage.local 拉取一次；之后任何 tab / 侧栏的变更
+  // 都由上面的 onChanged 立即生效，不需要等下次页面加载。
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);
   } else {

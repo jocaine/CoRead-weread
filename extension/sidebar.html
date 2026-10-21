@@ -2453,58 +2453,6 @@
       flex-shrink: 0;
     }
     #manual-banner[hidden] { display: none; }
-    /* 「继续教程」条（2026-11）：暂停提示。样式跟手动选书横幅同族，但用绿底强调
-       "这里有一件事可以点"。 */
-    #tut-resume-bar {
-      background: #eaf7f0;
-      border-bottom: 1px solid #cfe6d8;
-      padding: 6px 12px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 11px;
-      color: #0a7d43;
-      flex-shrink: 0;
-    }
-    #tut-resume-bar[hidden] { display: none; }
-    #tut-resume-bar .trb-icon { flex: 0 0 auto; font-size: 11px; }
-    #tut-resume-bar .trb-text {
-      flex: 1;
-      min-width: 0;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      font-weight: 600;
-    }
-    #tut-resume-bar .trb-btn {
-      flex: 0 0 auto;
-      font: inherit;
-      font-size: 11px;
-      border: 1px solid #9fd0b4;
-      background: #fff;
-      color: #0a7d43;
-      border-radius: 4px;
-      padding: 2px 8px;
-      cursor: pointer;
-    }
-    #tut-resume-bar .trb-go { background: #0a7d43; border-color: #0a7d43; color: #fff; font-weight: 600; }
-    #tut-resume-bar .trb-drop { color: #6b7c73; border-color: #d6e2da; }
-    /* 抽屉里的「教程例句」分组（2026-11）：教程自带，不写进用户引用库。
-       单独给它一行小标题，用户才知道这几条不是他划的。 */
-    .drawer-tut-head {
-      padding: 7px 12px 5px;
-      font-size: 11px;
-      color: #0a7d43;
-      background: #f2faf5;
-      border-bottom: 1px solid #e2f1e8;
-    }
-    .drawer-tut-item {
-      background: #fbfefc;
-      border-left: 3px solid #9fd0b4;
-      cursor: pointer;
-    }
-    .drawer-tut-item:hover { background: #f2faf5; }
-    .drawer-tut-item .di-note { font-size: 11px; color: #7d8f86; margin-top: 2px; }
     .mb-book {
       flex: 1;
       min-width: 0;
@@ -2529,6 +2477,87 @@
     .mb-btn:hover { border-color: #06ad56; color: #06ad56; }
     .mb-exit { color: #999; border-color: #ddd; }
     .mb-exit:hover { border-color: #a82e22; color: #a82e22; }
+
+    /* ── 会意图引导卡（2026-10-20）──
+       出现的时机只有一个：用户**第一个**知识点节点自然产生的那一刻（见 sidebar.js 的
+       maybeCoachFirstNode）。所以它不该长得像"常驻横幅"，而像一个刚发生的事的通知：
+       浅绿底 + 标题行 + 三段正文 + 两颗按钮。看过就写 graphCoachSeen，不再出现。 */
+    #coach-card {
+      background: #f4fbf7;
+      border-bottom: 1px solid #d5f2e1;
+      padding: 10px 12px 8px;
+      flex-shrink: 0;
+      font-size: 12px;
+      color: #2f4a3c;
+      line-height: 1.6;
+    }
+    #coach-card[hidden] { display: none; }
+    #coach-card .cc-head {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+    #coach-card .cc-badge {
+      flex: 0 0 auto;
+      width: 18px; height: 18px;
+      border-radius: 50%;
+      background: #07c160;
+      color: #fff;
+      font-size: 11px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #coach-card .cc-title {
+      flex: 1;
+      min-width: 0;
+      font-weight: 600;
+      color: #1f7a49;
+      font-size: 12px;
+    }
+    #coach-card .cc-close {
+      flex: 0 0 auto;
+      border: 0; background: transparent;
+      color: #8aa79a; cursor: pointer; font-size: 12px; padding: 0 2px;
+    }
+    #coach-card .cc-close:hover { color: #a82e22; }
+    #coach-card .cc-body p { margin: 0 0 4px; }
+    #coach-card .cc-body b { color: #1f7a49; }
+    #coach-card .cc-acts { display: flex; gap: 8px; margin-top: 8px; }
+    #coach-card .cc-preview-note {
+      background: #fffbe6;
+      border: 1px solid #f0e2b6;
+      color: #8a6d1f;
+      padding: 4px 8px;
+      border-radius: 4px;
+    }
+    #coach-card .cc-btn {
+      border: 1px solid #bfe3cc;
+      background: #fff;
+      color: #07c160;
+      border-radius: 4px;
+      padding: 3px 10px;
+      font-size: 11px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    #coach-card .cc-btn:hover { border-color: #06ad56; color: #06ad56; }
+    #coach-card .cc-primary {
+      background: #07c160; border-color: #07c160; color: #fff; font-weight: 600;
+    }
+    #coach-card .cc-primary:hover { background: #06ad56; border-color: #06ad56; color: #fff; }
+    /* ◎ 脉冲：卡片出来时把入口闪一下，否则用户找不到该点哪儿 */
+    @keyframes gv-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(7, 193, 96, 0.55); }
+      50% { box-shadow: 0 0 0 5px rgba(7, 193, 96, 0); }
+    }
+    .hdr-icon.pulse { animation: gv-pulse 1.2s ease-out 3; border-radius: 50%; }
+    /* 视觉规格的硬要求：尊重"减少动态效果"（系统里的开关）。这条以前四个样式文件里 0 次。 */
+    @media (prefers-reduced-motion: reduce) {
+      .hdr-icon.pulse { animation: none; }
+      #coach-card { transition: none; }
+    }
 
     /* ── 已读书籍选择弹窗（2026-10）：无书默认界面 / 更多菜单 → 从已读过的书籍中
        选择，手动查看该书聊天记录（openBookPicker / pickBook） */
@@ -2915,15 +2944,8 @@
       <span class="ms-state">自由</span>
     </button>
     <button class="hdr-icon" id="graph-btn" title="会意图（知识点拓扑图）">◎</button>
-    <!-- 顶部的「教程」按钮已去掉（2026-11 用户要求）。
-         它原先在这里、只在当前书是那本手册时露头，作为"开始引导课"的入口。
-         课本身没删：书页上的「开始本课」仍然能把课交给侧栏（见 sidebar.js 的
-         coreadTutorialLesson）。要重新给侧栏一个入口时，别忘了一并想清楚
-         "当前书是教程书"这个判据——它同时也是"侧栏认的书被抢走了"的症状。 -->
     <button class="hdr-icon" id="more-btn" title="更多设置">⋯</button>
-    <!-- 更多设置菜单（字号等）：作为 #header（position:relative）子元素锚定到右上。
-         data-guide-pin：教程第 6 课要指着菜单里的「📕 PDF 阅读器」讲，
-         没有这个标记的话菜单整块被引导遮罩压暗，用户根本看不见被指的那一条。 -->
+    <!-- 更多设置菜单（字号等）：作为 #header（position:relative）子元素锚定到右上 -->
     <div id="more-menu" data-guide-pin>
       <div class="mm-font">
         <span class="mm-font-label">消息字号</span>
@@ -2964,6 +2986,13 @@
       <div class="mm-item" id="mm-exit-manual" title="退出手动选书，恢复跟随微信读书当前阅读" hidden>
         <span class="mm-name">↩ 停止手动选书</span>
         <span class="mm-desc">恢复自动跟随</span>
+      </div>
+      <!-- 会意图引导（2026-10-20；10-21 扩成完整三步）：正式出现只有一次（第一个知识点诞生时）。
+           这里点一下就走**完整流程**：照 ◎ → 打开图并落到那个点 → 讲什么叫命中。
+           它不写"看过"标记，所以点多少次都不影响以后自动出现。 -->
+      <div class="mm-item" id="mm-graph-coach" title="走一遍完整引导（三步）：会意图入口、节点详情、命中怎么发生">
+        <span class="mm-name">◎ 会意图引导（走一遍）</span>
+        <span class="mm-desc">会意图怎么看 · 命中怎么发生</span>
       </div>
       <!-- 自检（2026-11）：在**真实环境**里跑一遍关键流程并把结果写成报告。
            为什么要有它：Chrome 137 起自动化浏览器装不进未打包扩展，AI 助手没法自己验，
@@ -3057,7 +3086,7 @@
           ③ "本地 PDF 也能读" —— 补上了主语，但**没说什么时候该用**，等于没说；
         三次同源：想在一条窄栏里同时说完"是什么 + 定位 + 约束"，就成了必须解码的句子。
         现在只留**一个场景**（外文）——那是最强的那个；中文书的兜底场景不塞进这七个字，
-        留给阅读器空态和教程去讲。
+        留给阅读器空态去讲。
 
         按钮写「打开 PDF →」而不是「打开阅读器 →」：点了弹出来的是**选文件**对话框，
         而本地 PDF 是它唯一能选的东西（书库里的书要进阅读器里再点「书库」）。 -->
@@ -3066,16 +3095,6 @@
       <button class="nb-reader-btn" id="nb-reader-btn" type="button"
               title="CoRead 阅读器：划词就译、译文按段落锚在原文上（微读传不上去的那种 PDF 也能读）">打开 PDF →</button>
     </div>
-  </div>
-
-  <!-- 「继续教程」条（2026-11）：教程中途被关掉时，下次打开侧栏**不自动开始上课**，
-       只显示这一条，由用户点「继续」才接上（用户实测报过"更新扩展后一打开就冒出教程"）。
-       引导层会把它排除在遮罩之外（见 tutorial-guide.js 的 data-guide-pin）。 -->
-  <div id="tut-resume-bar" data-guide-pin hidden>
-    <span class="trb-icon">▶</span>
-    <span class="trb-text">教程暂停中</span>
-    <button class="trb-btn trb-go" type="button">继续</button>
-    <button class="trb-btn trb-drop" type="button" title="不再继续这条教程记录">不再继续</button>
   </div>
 
   <!-- 手动选书横幅（2026-10）：手动查看某本已读书籍时显示在消息区上方 -->
@@ -3100,6 +3119,27 @@
     <button class="fc-btn fc-new" id="fc-new" title="新建对话：开启独立的讨论上下文，与当前对话互不影响">＋ 新对话</button>
     <button class="fc-btn fc-archive" id="fc-archive" title="归档本对话：可选择保存记忆、收口进会意图；归档后对话与消息一并删除">⤓ 归档</button>
     <div class="fc-hint" id="fc-hint" hidden></div>
+  </div>
+
+  <!-- 会意图引导（2026-10-20）：教程 PDF 里不讲会意图（用户定调），所以这段由程序在
+       **恰当的时机**给——用户第一个知识点节点自然产生的那一刻（sidebar.js 的
+       maybeCoachFirstNode）。讲两件事：① 这个点是什么、去哪儿看；② 以后怎么在会话里
+       用它（节点命中）。只出现一次，看过写 graphCoachSeen；⋯ 菜单里有「重看会意图引导」。 -->
+  <div id="coach-card" hidden>
+    <div class="cc-head">
+      <span class="cc-badge">◎</span>
+      <span class="cc-title">第一个知识点出来了</span>
+      <button class="cc-close" id="cc-close" title="知道了，不再提示">✕</button>
+    </div>
+    <div class="cc-body">
+      <p>上一场讨论已收口为一个知识点。打开会意图即定位到它。</p>
+      <p><b>怎么用：</b>说清是哪个说法——「之前聊过的『授权是自下而上的』，跟这个是一回事吗？」</p>
+      <p class="cc-preview-note" hidden><b>预览：</b>图里还没有点，打开后不会圈出任何点。</p>
+    </div>
+    <div class="cc-acts">
+      <button class="cc-btn cc-primary" id="cc-open">打开看看</button>
+      <button class="cc-btn" id="cc-later">知道了</button>
+    </div>
   </div>
 
   <div id="msgs">
@@ -3407,13 +3447,6 @@
 
   <script src="reader-notes.js"></script>
   <script src="graph-view.js"></script>
-  <!-- 教程的"引导模式"（2026-11）：聚光灯挖洞 + 在真实侧栏里逐步引导用户动手。
-       这两个文件不用在这里引 —— sidebar.js 用到时按需 import()（见那边的 loadTutorial）。
-       为什么：sidebar.js 是经典脚本（它头部写了原因），引了也用不上 import 的模块。
-
-       预设例句**不走模块这条路**：它是数据，放在 tutorial/sample-refs.json 里，
-       由 sidebar.js 启动时读一次——明确、失败有痕迹，而且没有"模块还没加载完"的空窗。
-       用户的原话是"你直接给他添加些预设的例句有什么难的"：静态内容就不该有"还没到"这种状态。 -->
   <script src="sidebar.js"></script>
 </body>
 </html>

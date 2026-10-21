@@ -336,17 +336,8 @@ foreach ($f in @('index.js', 'package.json', 'graph-data.js')) {
 # 藏进"不要动"的文件夹里说不通。它本身也是纯前端资源，没有可动的风险。
 Copy-Item (Join-Path $repo 'extension') $StageDir -Recurse
 Remove-Item (Join-Path $StageDir 'extension\test') -Recurse -Force -EA SilentlyContinue
-
-# extension\tutorial\（2026-11）：**内置教程书**的正文，必须进包。
-# 它是《第一次共读》那本书的 7 章内容 + 动画脚本，由 reader.html 打开、由接收端
-# 导出成 chapters\*.txt 给共读 agent 读（否则用户在教程里划线提问会找不到正文）。
-# 为什么不去动 builtin\：那一格被本脚本下面的闸门强制要求"完全为空"（2026-10 为
-# "作者的私人图谱曾被本地打包带出去"而立）。这份内容是程序自带的只读素材，
-# 跟扩展一起走才对——用户装插件时已经把它装进去了，包根不必再放一份。
-$tutBook = Join-Path $StageDir 'extension\tutorial\book\book.json'
-if (-not (Test-Path $tutBook)) { Fail '内置教程书没进包：extension\tutorial\book\book.json 不在暂存目录里' }
-$tutChapters = @(Get-ChildItem (Join-Path $StageDir 'extension\tutorial\book') -Directory -EA SilentlyContinue).Count
-Write-Step ("extension\tutorial\ 内置教程书（{0} 章）" -f $tutChapters)
+# 教程（2026-10-20 起）不再是一套内置的虚拟书，改成一本真 PDF 由用户放进书库，
+# 所以 extension\tutorial\ 那一整套已经删除——这里不再有关于它的任何校验。
 
 # 图标：托盘用的 coread.ico 放包根 assets\icons\（托盘就按这个相对路径找它）；
 # 浏览器插件图标在 extension\icons\ 里，随 extension 一起走。
@@ -666,30 +657,11 @@ $need = @(
   'assets\icons\coread.ico',
   # 插件图标
   'extension\icons\icon128.png',
-  # 内置教程书（2026-11）：阅读器打开它、接收端导出它的章节给 agent。
-  # 写进校验清单是为了让"教程没进包"这种静默缺失在打包时就炸出来——
-  # 少了它用户看到的不是报错，而是书单里没有那本书（最难查的那种缺）。
-  'extension\tutorial\book\book.json',
-  'extension\tutorial\book\c01\chapter.json',
-  'extension\tutorial\index.js',
-  'extension\tutorial\render.js',
-  # 课程表（2026-11）：书与侧栏共读的一份，一章 = 一课。
-  # 少了它书里就没有「开始本课」按钮、侧栏也没有课可上，而且是**静默**的（不报错）。
-  'extension\tutorial\lessons.js',
-  # 教程专用的会意图种子（2026-11）：只在 `?tutorial=1` 时被接收端读取，
-  # 绝不进用户的 knowledge-graph.json。少了它，教程里打开会意图是空的。
-  'extension\tutorial\graph-seed.json',
-  # 预设例句（2026-11）：静态数据，侧栏启动直接读。少了它，抽屉里那批「教程例句」
-  # 是空的（静默），用户在第 2 步就无路可走。
-  'extension\tutorial\sample-refs.json',
-  'extension\tutorial\tutorial.css',
   # 自检页（2026-11）：Chrome 137 起自动化浏览器装不进未打包扩展，AI 助手没法自己验，
   # 于是让扩展在用户真实环境里自己跑一遍、把报告写给助手读。**它必须进包**——
   # 少了它，出问题时又回到"用户口述现象、助手猜"的老路（上一轮就是这么踩的）。
   'extension\selfcheck.html',
-  'extension\selfcheck.js',
-  'extension\tutorial-guide.js',
-  'extension\tutorial-script.js'
+  'extension\selfcheck.js'
 )
 $missing = 0
 foreach ($n in $need) {

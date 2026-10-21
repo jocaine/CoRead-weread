@@ -157,27 +157,17 @@ reportExtensionToHost()
 chrome.runtime.onStartup.addListener(() => reportExtensionToHost())
 chrome.runtime.onInstalled.addListener(() => reportExtensionToHost())
 
-// ── 教程状态的作废（2026-11 用户报的 bug）────────────────────────────────────
-// 用户更新扩展后一打开侧栏，教程引导自己冒了出来。根因是教程状态存在 chrome.storage 里、
-// 跨会话有效，而上一版"侧栏每次打开都 restoreRun()"——于是任何一次打开都可能把
-// 一条旧记录接起来。现在侧栏那边改成"只显示「继续教程」入口、点了才continue"（见 sidebar.js），
-// 这里再加一道：**每次扩展启动都把那份状态作废**。
-//
-// 为什么用"启动即作废"而不是"够新就留"：教程是"你开始才存在"的东西，不该活过一次
-// 扩展的全生命周期。用户关掉浏览器、更新插件、禁用再启用，都该回到干净状态。
-// 代价是"浏览器重启后不能接着上次"——这个代价明确接受，因为"教程自己冒出来"更糟。
-async function clearTutorialStateOnBoot(reason) {
+// ── 教程状态迁移（2026-10-20）───────────────────────────────────────────────
+// 内置的《第一次共读》连同它的课程引导已经**整套删掉**，改成一本真的 PDF
+//（用户放进书库的《CoRead 使用教程》）。这里只做一件事：把老版本留在 storage 里的
+// `tutorialRun` 清掉——不清的话它永远躺在那儿没人读，属于"看不见的垃圾"。
+// 只需要跑一次，所以不再挂 onStartup / onInstalled（那两条是为旧功能的生命周期服务的）。
+;(async () => {
   try {
     const st = await chrome.storage.local.get('tutorialRun')
-    if (st && st.tutorialRun) {
-      await chrome.storage.local.remove('tutorialRun')
-      console.info('[教程] 已作废上一次的教程状态（' + reason + '）')
-    }
+    if (st && st.tutorialRun) await chrome.storage.local.remove('tutorialRun')
   } catch (e) {}
-}
-clearTutorialStateOnBoot('service worker 启动')
-chrome.runtime.onStartup.addListener(() => clearTutorialStateOnBoot('浏览器启动'))
-chrome.runtime.onInstalled.addListener(() => clearTutorialStateOnBoot('扩展装上/更新/重载'))
+})()
 
 // ── 翻译能力（框选截图 / 划词）────────────────────────────────────────────────
 // 逻辑都在 translate-background.js 里，只在这里装配，避免和共读的 SW 逻辑混在一起。

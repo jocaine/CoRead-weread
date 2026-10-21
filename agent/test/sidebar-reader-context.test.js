@@ -106,12 +106,13 @@ function buildDom() {
  *   · `queryThrows`  后台那条查询直接抛错（后台没起来 / service worker 在重启）
  *   · `noReqEcho`    答复里**没有带回 req** —— 说明答话的不是后台那条路
  *   · `wereadCtx`    活动标签页（微读书页）对 getReadingContext 的回答（null = 没应声）
+ *   · `pageBinding`  活动标签页（文库网页）对 coreadBindingQuery 的回答（null = 没应声/未绑定）
  *   · `activeTabId`  chrome.tabs.query 报的活动标签页 id（null = 查不出来）
  */
 function loadSidebar({
   activeKind = 'reader', readerBook = null, unknown = false, loading = false,
   tabId = 11, url = '', queryThrows = false, noReqEcho = false,
-  wereadCtx = null, activeTabId = 11,
+  wereadCtx = null, pageBinding = null, activeTabId = 11,
 } = {}) {
   const { doc, getById } = buildDom()
   const storage = {}
@@ -147,6 +148,7 @@ function loadSidebar({
       sendMessage: async (id, msg) => {
         tabMsgs.push({ id, msg })
         if (msg && msg.action === 'getReadingContext') return wereadCtx
+        if (msg && msg.action === 'coreadBindingQuery') return pageBinding
         return null
       },
       get: async (id) => ({ id, active: id === activeTabId }),
@@ -201,7 +203,7 @@ function loadSidebar({
 ;globalThis.__X = {
   refreshCurrentBook,
   applyReaderBookFromSnapshot,
-  effectiveBook, effectiveBookBase, applyBookContext,
+  effectiveBook, effectiveBookBase, applyBookContext, isPageSourceUrl,
   getState: () => ({ currentBook: _currentBook, manualBook: _manualBook, freeMode: _freeMode, readerReportsBook: _readerReportsBook }),
   setManualBook: (b) => { _manualBook = b },
 };`
@@ -311,7 +313,49 @@ test('活动标签页是文库网页（marxists/bilibili）→ 同样是无书',
   const { X } = loadSidebar({ activeKind: 'page', readerBook: null })
   X.applyReaderBookFromSnapshot({ book: BOOK, notify: true })
   await X.refreshCurrentBook()
-  assert.equal(X.effectiveBookBase(), '', '文库页面上的书由用户自己绑定/手动选（见 coreadManualBook）')
+  assert.equal(X.effectiveBookBase(), '', '未绑定的文库页面是无书；绑定后的页面由 refreshCurrentBook 问页面自己（见 coreadBindingQuery）')
+})
+
+test('文库网页已绑定正式书 → 切回这个标签页时侧栏认那本书（绑定不能只在绑定那一瞬生效）', async () => {
+  const formal = { ok: true, bound: true, bookId: '480328505d095c4808beaf4', bookTitle: '大国大城' }
+  const { X } = loadSidebar({ activeKind: 'page', readerBook: null, pageBinding: formal })
+  assert.equal(X.effectiveBookBase(), '', '前置：一开始没有当前书')
+  await X.refreshCurrentBook()
+  assert.equal(X.effectiveBookBase(), formal.bookId, '页面自己报的绑定就是这本书')
+  assert.equal(X.effectiveBook().bookTitle, formal.bookTitle, '书名也带回来（头部要用）')
+})
+
+test('文库网页已绑定网页文章的书（mia_）→ 切回来也认它', async () => {
+  const mia = { ok: true, bound: true, bookId: 'mia_8a66411378a3f8d9116f', bookTitle: '列宁：怎么办？' }
+  const { X } = loadSidebar({ activeKind: 'page', readerBook: null, pageBinding: mia })
+  await X.refreshCurrentBook()
+  assert.equal(X.effectiveBookBase(), mia.bookId)
+})
+
+test('文库网页的绑定查询没应声（内容脚本没起来）→ 按未绑定处理，不误认书', async () => {
+  const { X } = loadSidebar({ activeKind: 'page', readerBook: null, pageBinding: null })
+  X.applyReaderBookFromSnapshot({ book: BOOK, notify: true })
+  await X.refreshCurrentBook()
+  assert.equal(X.effectiveBookBase(), '', '问不到绑定 ≠ 有书；等页面加载完会再问一次（tabs.onUpdated）')
+})
+
+test('isPageSourceUrl：跳转判据认网页阅读源，不认微读/阅读器地址，也不吃子串伪装', () => {
+  const { X } = loadSidebar()
+  const yes = [
+    'https://www.marxists.org/chinese/lenin/1917/x.htm',
+    'https://marxists.org/chinese/lenin/1917/x.htm',
+    'https://www.bilibili.com/read/cv123456',
+    'http://www.bilibili.com/read/cv123456',
+  ]
+  for (const u of yes) assert.equal(X.isPageSourceUrl(u), true, u + ' 应认作网页阅读源')
+  const no = [
+    'https://weread.qq.com/web/reader/abc',
+    'chrome-extension://x/reader.html',
+    'https://evilmarxists.org/chinese/x',
+    'https://www.bilibili.com.evil.com/x',
+    '',
+  ]
+  for (const u of no) assert.equal(X.isPageSourceUrl(u), false, u + ' 不应认作网页阅读源')
 })
 
 test('活动标签页判不出来（拿不到标签页）→ 保持原样，绝不误清', async () => {
@@ -415,6 +459,21 @@ test('微读页面的广播：只有活动标签页、且是顶层 frame 的才�
 })
 
 // ── 手动选书 / 自由模式的既有规矩不受影响 ──────────────────────────────────
+
+test('网页绑定到正式书籍：coreadManualBook 把侧栏切到那本书的对话', async () => {
+  // 2026-11 用户报的"网页弹窗只能加入网页源文章的书"——书单修好后，这条链路也得通：
+  // 网页对话框点 OK 会发 coreadManualBook，侧栏必须把当前书切成那本正式书，
+  // 之后提问/引用才归到它的对话里。
+  const { X, fire } = loadSidebar({ activeKind: 'page', readerBook: null })
+  // 先等启动链那次 refreshCurrentBook 跑完（活动页是文库页 → 它会先把当前书清空）；
+  // 真实场景里用户点「绑定这本书」远晚于面板加载，不会撞上这一拍。
+  await flush()
+  const formal = { bookId: '480328505d095c4808beaf4', bookTitle: '大国大城' }
+  fire({ action: 'coreadManualBook', ...formal }, { tab: { id: 11 }, frameId: 0 })
+  await flush()
+  assert.equal(X.effectiveBookBase(), formal.bookId, '当前书 = 网页上绑定到的那本正式书')
+  assert.equal(X.effectiveBook().bookTitle, formal.bookTitle, '书名也带过去（头部与对话归属都要）')
+})
 
 test('自由模式下不被阅读器拽走', () => {
   const { X } = loadSidebar()

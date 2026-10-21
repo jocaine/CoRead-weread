@@ -288,15 +288,24 @@ function refreshDot() {
 function setBackendAlive(alive) {
   const was = _backendAlive
   _backendAlive = alive
+  // 状态**变化**才记（每 5 秒刷一条日志会把 debug.jsonl 冲爆）。
+  // 为什么必须留痕：指示灯灰着的时候，"轮询不通"和"推送通道没连上"是两种完全不同的
+  // 故障，而它们都表现成一个灰点（2026-10-20 用户报"接收端在跑、灯是灰的"，
+  // 就是靠这行日志分清的）。
+  if (was !== alive) postSidebarDebug({ stage: 'conn-state', alive, sse: _sseOpen })
   refreshDot()   // 灯是唯一的常驻提示；发送被拦时的解释走弹窗（见 showSendFailedNotice）
   // 本机服务刚起来（启动顺序常是"先开侧栏、后开 CoRead"）：无书界面正停在
   // 「读不到已读书籍」的话顺手重拉一次书单，省得用户自己去找那个「重试」
   if (alive && !was && _nbShown && _booksFailed) refreshNoBookBooks()
+  // 本机服务刚起来：补一次"图里有几个点"的基线（见 initGraphCoachBaseline）。
+  // 少了它，先开侧栏后启动 CoRead 的用户永远等不到第一个知识点的引导。
+  if (alive && !was) initGraphCoachBaseline()
 }
 
 function setSseOpen(open) {
   if (open === _sseOpen) return
   _sseOpen = open
+  postSidebarDebug({ stage: 'conn-state', alive: _backendAlive, sse: _sseOpen })
   refreshDot()
 }
 
@@ -582,65 +591,15 @@ function applySetRef(ann) {
 // ⚠️ 参数列表必须带 `sendResponse`：里面有分支要**同步回答**（侧栏探针），
 // 漏了就报 `sendResponse is not defined`——自检报告里当场现形（2026-11）。
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  // 书里点了「开始本课」：这一课在**侧栏**里跑（引导要高亮侧栏的真实控件）。
-  // 状态是书那边写进 storage 的，所以这里不接参数、直接 restoreRun() 读——
-  // 单一真源，避免"消息里带一份、storage 里又一份"两边不一致。
-  //
-  // 每一步都写 debug 日志（2026-11）：这条链路跨三个上下文，断了**不报错、只是没反应**。
-  // 上一轮用户报"侧栏没带起来"时，日志里只有后台那一条、侧栏这边完全空白，
-  // 于是分不清"广播没送到"还是"送到了但起不来"。补上这几条就能一眼分开。
-  if (msg?.action === 'coreadTutorialLesson') {
-    postSidebarDebug({ stage: 'tutorial-lesson-ping', chapter: msg.chapter, freeMode: _freeMode })
-    /**
-     * 开始上课时**必须先退出自由模式**（2026-11 自检抓到）。
-     *
-     * 用户在书里点了「开始本课」，意图是"在这本书上走一遍共读流程"；而自由模式是
-     * "没有书的随手记"。两者互斥——留在自由模式里，侧栏认的是一段自由对话而不是这本书，
-     * 课的每一步都会落空：例句不显示（见 tutorialSampleAnns）、引用卡是自由模式那一套、
-     * 引导层指着的地方点不动。用户看到的就是"教程没反应"。
-     * 这里替用户切回来（`toggleFreeMode` 自带 toast，用户看得见模式被切了）。
-     */
-    if (_freeMode) {
-      try {
-        toggleFreeMode()
-        postSidebarDebug({ stage: 'tutorial-lesson-exit-free' })
-      } catch (e) {
-        postSidebarDebug({ stage: 'tutorial-lesson-exit-free-failed', error: String((e && e.message) || e) })
-      }
-    }
-    loadTutorial()
-      .then((t) => {
-        // ⚠️ 这里把 `t` 的**真实形状**也报上去（2026-11）：实测出现过 `hasRestore:false`
-        // 而代码里 `loadTutorial()` 明明返回 `{guide, script}` —— 只看一个布尔值
-        // 分不清是"形状不对"还是"模块没导出那个函数"。报上类型与键名就能一眼分开。
-        postSidebarDebug({
-          stage: 'tutorial-lesson-loaded',
-          type: typeof t,
-          isArray: Array.isArray(t),
-          keys: t && typeof t === 'object' ? Object.keys(t).join(',') : String(t),
-          scriptKeys: t && t.script ? Object.keys(t.script).join(',') : '(无 script)',
-          // ⚠️ 查的是 `t.script.restoreRun`（`loadTutorial()` 返回 `{guide, script}`）。
-          // 先前写成 `t.restoreRun`——那是 undefined，于是**永远**回报 hasRestore:false、
-          // 永远不接课。实测日志里就是这样：ping → loaded(hasRestore:false) → restored(ok:false)。
-          // 这种错不报错、只是没反应，靠日志里那个 false 才看出来。
-          hasRestore: !!(t && t.script && t.script.restoreRun),
-        })
-        if (!t || !t.script || !t.script.restoreRun) return 'BAD_SHAPE'
-        return t.script.restoreRun()
-      })
-      .then((ok) => postSidebarDebug({ stage: 'tutorial-lesson-restored', ok: String(ok) }))
-      .catch((e) => postSidebarDebug({ stage: 'tutorial-lesson-failed', error: String((e && e.message) || e) }))
-    return
-  }
-  if (msg?.action === 'coreadTutorialProbe') {
-    // 教程 / 自检问侧栏的真实状态（2026-11）。为什么要这个口子：
+  if (msg?.action === 'coreadSidebarProbe') {
+    // 自检问侧栏的真实状态（2026-11）。为什么要这个口子：
     // 用户连报几轮"还是不行"，而我只能从日志反推"他点的是哪个按钮、抽屉里到底有没有东西"。
     // 有了它，自检可以直接问侧栏要一份**可读的事实**，不用猜。
     //
     // 注意是**同步回答**（sendResponse 立刻回，不返回 true 等异步）：
-    // 它只读内存里的几个变量，没有异步成分，而调用方（教程）等不起往返。
+    // 它只读内存里的几个变量，没有异步成分。
     try {
-      sendResponse(tutorialProbe())
+      sendResponse(sidebarProbe())
     } catch (e) {
       sendResponse({ ok: false, error: String((e && e.message) || e) })
     }
@@ -650,7 +609,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
    * 自检要能"**真的点一下**"（2026-11 用户质问："为什么不能用插件内的来试试看"）。
    *
    * ── 为什么必须加这条通道 ────────────────────────────────────────────────────
-   * 上面那条 `coreadTutorialProbe` 只能**问**状态，点不了任何东西。而用户报的
+   * 上面那条 `coreadSidebarProbe` 只能**问**状态，点不了任何东西。而用户报的
    * "点切换引用之后底层界面跳回选书界面"——问的时候一切正常，**点下去**才出事。
    * 于是自检一直是绿的，用户那边一直是坏的。
    *
@@ -671,7 +630,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       picker: !!document.getElementById('book-picker')?.classList?.contains('on'),
       drawer: !!document.getElementById('ref-drawer')?.classList?.contains('on'),
       ref: String((document.getElementById('rc-text') || {}).textContent || ''),
-      sampleItems: document.querySelectorAll('#drawer-list .drawer-tut-item').length,
+      drawerItems: document.querySelectorAll('#drawer-list .drawer-item').length,
       // 「回到选书界面」的**准确**判据（2026-11 自检实测订正）：
       // 原先我用的是书单浮层 `#book-picker`，而用户看到的那一跳其实是**无书视图**
       //（`#no-book-view`：内联已读书籍列表 + 底部那格换成 PDF 入口条）。
@@ -682,19 +641,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     const selfcheckOps = {
       state: sideState,
-      /**
-       * 自检跑「切换引用」这一段之前先退出自由模式（2026-11 实测）。
-       *
-       * 为什么自检要动这个开关：自由模式里侧栏认的不是这本书，引用卡是另一套 UI，
-       * 这一段的前提根本不成立（实测红了两条前置断言）。让自检**把状态摆对**，
-       * 好过让它在一个跑不了的状态下报一堆看不懂的红。
-       * 与产品行为一致：开始上课时侧栏自己也会退出自由模式（见 coreadTutorialLesson）。
-       */
-      exitFreeMode() {
-        const was = _freeMode
-        if (_freeMode) toggleFreeMode()
-        return { ok: true, wasFree: was }
-      },
       /** 用户点「切换引用 ▸」：就是那个按钮、就是那个处理器（openDrawer + 快照） */
       clickSwitchRef() {
         const b = document.getElementById('rc-switch-btn')
@@ -702,13 +648,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         b.click()
         return { ok: true, clicked: 'rc-switch-btn' }
       },
-      /** 用户点抽屉里的第 N 条教程例句：走它自己的 click 处理器（pickReference + 关抽屉） */
-      clickSample(arg) {
+      /** 用户点抽屉里的第 N 条引用：走它自己的 click 处理器（pickReference + 关抽屉） */
+      clickDrawerItem(arg) {
         const i = Number(arg) || 0
-        const items = document.querySelectorAll('#drawer-list .drawer-tut-item')
+        const items = document.querySelectorAll('#drawer-list .drawer-item')
         if (!items[i]) return { ok: false, error: '抽屉里没有第 ' + i + ' 条（当前 ' + items.length + ' 条）' }
-        // 报回去的是**例句原文**（`.di-text` 里那一句），不是整个条目的文字——
-        // 条目里还带注释（"第 1 章 · …"），拿它去比对引用卡会永远对不上。
+        // 报回去的是**引用原文**（`.di-text` 里那一句），不是整个条目的文字——
+        // 条目里还带章节/书名等附注，拿它去比对引用卡会永远对不上。
         const text = String((items[i].querySelector('.di-text') || {}).textContent || '')
         items[i].click()
         return { ok: true, clicked: i, text: text }
@@ -1194,133 +1140,34 @@ function matchVisibleInPreview(text, q) {
 }
 
 /**
- * 教程预置引用（2026-11 用户要求）。
+ * 侧栏的真实状态（供自检查询）。
  *
- * 数据在 `extension/tutorial/sample-refs.json`，**侧栏启动时 fetch 一次**。
- *
- * ── 为什么不是"用的时候再去模块里取" ─────────────────────────────────────────
- * 用户的原话是"你直接给他添加些预设的例句有什么难的"。他是对的：上一版让它依赖了
- * 三件不该依赖的事——侧栏认不认得出当前是教程书（`effectiveBookBase() !== TUTORIAL_BASE`
- * 就返回空）、ES 模块加载完没有、抽屉什么时候渲染。任何一环不满足，用户看到的就是空列表，
- * 而且**不报错**，他只能点"跳过"。
- *
- * 所以现在：**静态数据、启动即读、没有任何前置条件、不进用户的引用库**
- * （不调 addRecentAnn——用户划的线是他自己的东西）。
+ * 这是"不要再猜"的落点：当前书认出来没、抽屉开着没、引用卡里现在是什么、卡上有哪些按钮
+ * ——全部一次性读出来。这些都是本页面内存里的东西，回答没有异步成分。
  */
-let SAMPLE_REFS = null
-async function loadSampleRefs() {
-  try {
-    const r = await fetch(chrome.runtime.getURL('tutorial/sample-refs.json'))
-    if (!r.ok) throw new Error('HTTP ' + r.status)
-    const j = await r.json()
-    SAMPLE_REFS = (j && Array.isArray(j.items)) ? j : null
-    postSidebarDebug({ stage: 'sample-refs-loaded', count: SAMPLE_REFS ? SAMPLE_REFS.items.length : 0 })
-  } catch (e) {
-    // 读不到就报出来——这类"静默空列表"正是上一版最难查的地方
-    postSidebarDebug({ stage: 'sample-refs-load-failed', error: String((e && e.message) || e) })
-    SAMPLE_REFS = null
-  }
-}
-
-let _lastSampleDiag = 0
-function tutorialSampleAnns() {
-  const mod = SAMPLE_REFS
-  if (!mod || !Array.isArray(mod.items) || !mod.items.length) {
-    diagOnce({ reason: '例句表没读到（见 sample-refs-load-failed）' })
-    return []
-  }
-  /**
-   * ⚠️⚠️ **只在《第一次共读》这本书里显示**（2026-11 用户实测："我在别的书打开「切换引用」，
-   * 还是能看到给教程准备的那几条例句"）。
-   *
-   * 这条检查**本来就有**，在某一轮重写里丢了。日志留着证据（更早的记录）：
-   *   {"stage":"sample-refs","bookBase":"","tutorialBase":"rd_e0c91cb6aa56dd005",
-   *    "hasMod":true,"count":6,"reason":"当前书不是教程书"}
-   * 丢了之后只剩下一条"自由模式"的判断（那是另一件事：自由模式里点了没反应），
-   * 于是**除了自由模式，随便哪本书打开抽屉都能看到这 6 条例句**。
-   *
-   * 判据用例句表**自己带的** `bookId`（= 教程书在共读侧的 ID），不再另引一个常量：
-   * "这些例句属于哪本书"和"什么时候显示它们"从此来自同一处，不会再分叉。
-   * 自由模式也在这一条里被挡掉——那时 effectiveBookBase() 是一段自由对话的 key，不是这本书。
-   */
-  const bookNow = effectiveBookBase()
-  if (bookNow !== mod.bookId) {
-    diagOnce({
-      reason: '当前书不是教程书',
-      bookBase: String(bookNow || '').slice(0, 24),
-      tutorialBase: String(mod.bookId || '').slice(0, 24),
-      hasMod: true,
-      freeMode: _freeMode,
-    })
-    return []
-  }
-  return mod.items.map((it, i) => ({
-    bookId: mod.bookId,
-    bookTitle: mod.bookTitle,
-    chapter: mod.chapter || '',
-    selectedText: it.text,
-    note: it.note || '',
-    __tutorialSample: true,
-    ts: 0 - i,   // 保证排序稳定（样例永远排在一起，不参与"最近"排序）
-  }))
-}
-
-/** 诊断节流：抽屉会被反复打开，别把日志刷爆 */
-function diagOnce(extra) {
-  const now = Date.now()
-  if (now - _lastSampleDiag < 1500) return
-  _lastSampleDiag = now
-  postSidebarDebug(Object.assign({ stage: 'sample-refs', count: (SAMPLE_REFS && SAMPLE_REFS.items || []).length }, extra))
-}
-
-/**
- * 侧栏的真实状态（供教程与自检查询）。
- *
- * 这是"不要再猜"的落点：例句在不在、当前书认没认出来、教程走到第几步、
- * 引用卡里现在是什么——全部一次性读出来。这些都是本页面内存里的东西，回答没有异步成分。
- */
-function tutorialProbe() {
-  const script = window.__tutorialScript
-  const st = script && script.state ? script.state() : null
-  const items = tutorialSampleAnns()
-  const drawerList = document.getElementById('drawer-list')
-  const drawerSamples = drawerList ? drawerList.querySelectorAll('.drawer-tut-item').length : 0
+function sidebarProbe() {
   return {
     ok: true,
-    // 例句相关的三件事分开报：数据读到没、能造出几条、抽屉里真渲染出几条
-    sampleDataLoaded: !!(SAMPLE_REFS && SAMPLE_REFS.items && SAMPLE_REFS.items.length),
-    sampleCount: items.length,
-    drawerSampleItems: drawerSamples,
-    drawerHasSamples: drawerSamples > 0,
     drawerOpen: !!(document.getElementById('ref-drawer') || {}).classList
       && document.getElementById('ref-drawer').classList.contains('on'),
     bookBase: effectiveBookBase(),
-    isTutorialBook: effectiveBookBase() === TUTORIAL_BASE,
     refText: String(((document.getElementById('rc-text') || {}).textContent) || '').slice(0, 40),
-    tutorial: st ? { active: st.active, lesson: st.lesson, step: st.step, stepCount: st.stepCount, title: st.title } : null,
-    guide: (() => {
-      const tip = document.getElementById('tut-guide-tip')
-      if (!tip || tip.hidden) return null
-      return {
-        step: (tip.querySelector('.tg-step') || {}).textContent || '',
-        title: (tip.querySelector('.tg-title') || {}).textContent || '',
-        actions: [...tip.querySelectorAll('.tg-acts button')].map((b) => b.textContent),
-      }
-    })(),
+    // 抽屉里现在有几条引用（自检用它验"切换引用"这一步真的把东西摆出来了）
+    drawerItems: document.querySelectorAll('#drawer-list .drawer-item').length,
     // 引用卡上那两个按钮的实际位置——"用户到底点了哪个"这个问题以后不必再靠日志反推
     refCardButtons: [...document.querySelectorAll('#ref-current button, .rc-head button')].map((b) => ({
       id: b.id, text: String(b.textContent || '').trim().slice(0, 12), title: String(b.title || '').slice(0, 20),
     })),
   }
 }
-window.__coreadTutorialProbe = tutorialProbe
+window.__coreadSidebarProbe = sidebarProbe
 
 /**
- * 把一条引用设为当前引用（教程例句与"继续教程"都要用）。
+ * 把一条引用设为当前引用（抽屉里点一条、或"设为当前引用"那条链路都走它）。
  *
  * 为什么要把"选引用"抽出来：原来只有抽屉里那一条 DOM 处理器会这么干，
- * 于是别的地方（教程引导卡片上的「用这句」按钮）想选一条只能**再写一遍**——
- * 而"再写一遍"的代价是两边会分叉（一边清了待选标记、另一边忘了）。
+ * 于是别的地方想选一条只能**再写一遍**——而"再写一遍"的代价是两边会分叉
+ * （一边清了待选标记、另一边忘了）。
  */
 function pickReference(ann) {
   if (!ann) return false
@@ -1329,39 +1176,6 @@ function pickReference(ann) {
   saveState()
   renderRefUI()
   return true
-}
-
-/** 供教程引导卡片调用：按例句原文挑一条（参数是文本，不是对象——跨模块传引用不稳妥） */
-window.__coreadPickSampleRef = function (text) {
-  const want = String(text || '').trim()
-  if (!want) return false
-  const list = tutorialSampleAnns()
-  const hit = list.find((s) => s.selectedText === want)
-  if (!hit) {
-    postSidebarDebug({ stage: 'pick-sample-miss', want: want.slice(0, 24), count: list.length })
-    return false
-  }
-  pickReference(hit)
-  closeDrawer()
-  postSidebarDebug({ stage: 'pick-sample-ok', text: want.slice(0, 24) })
-  return true
-}
-
-/** 抽屉里一条教程例句（结构与真引用条目一致，所以"选中"走的是同一条路） */
-function buildTutorialSampleItem(s) {
-  const item = document.createElement('div')
-  item.className = 'drawer-item drawer-tut-item'
-  item.dataset.guidePin = ''      // 引导层不遮：教程那一步就是要点它
-  item.innerHTML = `<div class="di-text"></div>` + (s.note ? `<div class="di-note"></div>` : '')
-  item.querySelector('.di-text').textContent = s.selectedText
-  if (s.note) item.querySelector('.di-note').textContent = s.note
-  item.addEventListener('click', (e) => {
-    e.stopPropagation()
-    // 走与真引用**完全相同**的选中路径（pickReference）：这样"切换引用"学到的东西对真引用一样成立
-    pickReference(s)
-    closeDrawer()
-  })
-  return item
 }
 
 function renderDrawer() {
@@ -1377,20 +1191,7 @@ function renderDrawer() {
 
   const anns = filterAnns()
 
-  // 教程预置引用（2026-11 用户要求："事先准备好一些引用"）。
-  // 只在《第一次共读》这本书里出现，且**只进这个抽屉**，不写进用户的引用库——
-  // 用户的划线是他的东西，不该被我们塞样例进去。
-  const tutSamples = tutorialSampleAnns()
-  if (tutSamples.length) {
-    const head = document.createElement('div')
-    head.className = 'drawer-tut-head'
-    head.textContent = '教程例句（这本手册自带的样例，不会进你的引用库）'
-    list.appendChild(head)
-    for (const s of tutSamples) list.appendChild(buildTutorialSampleItem(s))
-  }
-
   if (anns.length === 0) {
-    if (tutSamples.length) return   // 上面已经给了样例，不再显示"无匹配引用"
     const hint = !effBook
       ? '未在读书籍页：请打开一本书，或从已读书籍中选择'
       : '无匹配引用'
@@ -1538,8 +1339,6 @@ async function openDrawerWithSearch(query) {
 
 function closeDrawer() {
   document.getElementById('ref-drawer').classList.remove('on')
-  // 抽屉收掉之后高亮要挪回引用卡，否则它会悬在一个已经消失的面板上
-  try { guideBackFromDrawer() } catch (e) {}
 }
 
 function renderRefUI() {
@@ -1914,11 +1713,13 @@ async function refreshCurrentBook() {
    * ② 活动标签页不是阅读器 → 它在不在"读书"由**它的身份**决定（后台的 `activeKind`）。
    *
    * 这一类结论只查 URL、不问消息，所以可以放心执行——包括清空：
-   *   'weread'（书架/详情/搜索）、'page'（文库网页）、'other'（任何别的网页） → 没有书
+   *   'weread'（书架/详情/搜索）、'other'（任何别的网页） → 没有书
+   *   'page'（文库网页） → 页面自己知道它被绑定到哪本书（binding 存在 chrome.storage.local，
+   *                        见 source-mia.js）；已绑定就认那本，未绑定才回到无书界面
    *   'unknown'（拿不到活动标签页：没有窗口 / 查询失败） → 什么都不知道，**别动侧栏**
    */
   const kind = String(r.activeKind || 'unknown')
-  if (kind === 'other' || kind === 'weread' || kind === 'page') {
+  if (kind === 'other' || kind === 'weread') {
     postSidebarDebug({
       stage: 'active-tab-not-reading',
       kind,
@@ -1926,6 +1727,43 @@ async function refreshCurrentBook() {
       why: '活动标签页不是在读书的页面 → 与微读那本书被切走时一样，回到无书界面',
     })
     applyBookContext({ bookId: '' }, 'active-tab:活动标签页是「' + kind + '」，不是在读书', { authoritative: true })
+    return
+  }
+  if (kind === 'page') {
+    /**
+     * 网页阅读源：页面自己报绑定（AI-021）。
+     *
+     * 为什么必须问：绑定是**一次**用户动作（弹窗里点「绑定这本书」），而 `coreadManualBook`
+     * 只在绑定的那一瞬间送到侧栏。用户切到别的标签页再切回来、或重开侧栏时，那条消息早没了；
+     * 若不在这里补问，侧栏会按"活动标签页不是读书页"清成无书界面，而页面明明还绑着书，
+     * 用户就得去书单里重新点一次——"加入一本书"看起来像没生效。
+     *
+     * 只问**活动标签页的顶层 frame**：source-mia 在 iframe 里也跑，广播式询问会被子 frame
+     * 抢答（它按自己的路径解析绑定，可能解析出另一本书）。问不到就当未绑定：页面还在加载时
+     * 内容脚本确实可能没起来，等 `tabs.onUpdated` 的 complete 会再问一次。
+     */
+    let binding = null
+    const tabId = Number(r.tabId)
+    if (Number.isFinite(tabId) && tabId > 0) {
+      try {
+        binding = await chrome.tabs.sendMessage(tabId, { action: 'coreadBindingQuery' }, { frameId: 0 }).catch(() => null)
+      } catch (e) {}
+    }
+    if (binding && binding.ok && binding.bound && binding.bookId) {
+      applyBookContext(
+        { bookId: binding.bookId, bookTitle: binding.bookTitle || '' },
+        'page-branch:网页阅读源页面已绑定这本书',
+        { authoritative: true },
+      )
+      return
+    }
+    postSidebarDebug({
+      stage: 'active-tab-page-unbound',
+      was: String(effectiveBookBase() || '(空)').slice(0, 20),
+      answered: !!binding,
+      why: '活动标签页是文库网页，且页面没报出绑定 → 无书（侧栏给「加入一本书」入口）',
+    })
+    applyBookContext({ bookId: '' }, 'page-branch:网页阅读源页面未绑定', { authoritative: true })
     return
   }
   if (kind === 'unknown') {
@@ -2099,92 +1937,6 @@ let _nbShown = false       // 无书界面上一轮是否可见：只在「隐�
 let _nbRenderKey = null    // 上次渲染的书单指纹：没变就不重建 DOM（见 renderNoBookList）
 const NB_SEARCH_MIN = 6    // 书多于这个数才显示搜索框（书少时它只是白占一行）
 
-// ── 教程的「引导模式」入口（2026-11）─────────────────────────────────────────
-// 用户对教程的要求是"像游戏那种教程"：在**真实界面**上高亮、让他自己动手。
-// 实现放在两个 ES 模块里（聚光灯层 + 脚本），而本文件是经典脚本、用不了 import 语句，
-// 所以这里按需动态 import 一次、缓存住。
-//
-// 教程书在共读侧的固定 ID（与 reader.js / receiver 里的那个常量逐字相同，
-// 静态闸门 test/selftest/check-tutorial.mjs 会比对）。
-const TUTORIAL_BASE = 'rd_e0c91cb6aa56dd0057235ba7374c03e599e1e37e09b3bc9f55f64e1a5b98a25e'
-
-let _tutorialMod = null
-async function loadTutorial() {
-  if (!_tutorialMod) {
-    _tutorialMod = Promise.all([
-      import('./tutorial-guide.js'),
-      import('./tutorial-script.js'),
-      // 课程表与样例引用都来自这一份（`lessons.js`），书与侧栏共读——
-      // 侧栏这边只用它的 SAMPLE_REFS（抽屉里那批例句）
-      import('./tutorial/lessons.js'),
-    ]).then(([guide, script, lessons]) => {
-      window.__coreadSampleRefs = lessons.SAMPLE_REFS || null
-      return { guide, script, lessons }
-    })
-  }
-  return await _tutorialMod
-}
-
-/** 「开始教程」按钮（只在当前这本书就是那本手册时显示）——按钮已去掉（2026-11 用户要求），
- *  这个函数随之没有作用；保留一个空实现是为了让调用点不必再散落判断。 */
-function renderTutorialEntry() {}
-
-/**
- * 侧栏顶部那条「继续教程」（2026-11）。
- *
- * 存在的理由：教程中途被关掉（用户去阅读器划词、或者关掉侧栏），状态留在存储里。
- * 上一版的做法是"下次打开侧栏就自动接上"——结果扩展一更新、用户一开侧栏，
- * 教程自己冒出来，看起来像插件坏了（用户实测报过）。
- * 现在改成：**显示一个入口，点它才继续**。既没丢进度，也不会自己动。
- */
-async function offerResumeTutorial() {
-  const bar = document.getElementById('tut-resume-bar')
-  if (!bar) return
-  const { script } = await loadTutorial()
-  const st = await (script.pausedState ? script.pausedState() : null)
-  if (!st || !st.paused || st.stale) { bar.hidden = true; return }
-  const label = bar.querySelector('.trb-text')
-  if (label) {
-    label.textContent = `教程停在第 ${st.lesson + 1} 课 · 第 ${st.step + 1}/${st.stepCount} 步（${st.title}）`
-  }
-  bar.hidden = false
-  const go = bar.querySelector('.trb-go')
-  if (go && !go.dataset.bound) {
-    go.dataset.bound = '1'
-    go.addEventListener('click', async () => {
-      const r = await script.resume()
-      bar.hidden = true
-      if (!r) showToast('这条教程记录已经失效，请重新开始', true)
-    })
-  }
-  const drop = bar.querySelector('.trb-drop')
-  if (drop && !drop.dataset.bound) {
-    drop.dataset.bound = '1'
-    drop.addEventListener('click', async () => {
-      await script.stop('用户放弃继续')
-      bar.hidden = true
-    })
-  }
-}
-
-/**
- * 「开始教程」的入口（2026-11）。
- *
- * ⚠️ 顶部那个「教程」按钮**已按用户要求去掉**，所以这个函数目前**没有调用方**——
- * 留着是因为"从侧栏起一课"这件事本身还要用（改成 PDF 之后书页上挂不了按钮，
- * 很可能重新需要一个侧栏入口），而它里面有一条容易踩的坑值得留在原地：
- * 参数是**课号**（lessons.js 里的下标），不是书 ID。传错不报错——`Number({})` 是 NaN，
- * 被 `|| 0` 兜住，于是永远开第 1 课，属于静默走错。
- *
- * 现在课仍然能从**书页**上的「开始本课」启动（经后台广播 → coreadTutorialLesson）。
- */
-async function startTutorial() {
-  const { script } = await loadTutorial()
-  const r = await script.start(0)
-  postSidebarDebug({ stage: 'tutorial-start-from-sidebar', lesson: r && r.lesson })
-  showToast('教程已开始：第 1 步在左边的阅读器里划词')
-}
-
 // ── 无书默认界面 ──────────────────────────────────────────────────────────────
 // 显示/隐藏 + 同步禁用聊天输入（无书时发消息没有归属书，历史回放无从展示，
 // 直接禁用输入让行为规范）
@@ -2272,7 +2024,6 @@ function renderNoBookView() {
    * 无书状态下 renderIntro 会走 base 为空那一支，不会把卡又画回来。
    */
   syncIntro()
-  renderTutorialEntry()  // 空实现（顶部「教程」按钮已去掉，2026-11 用户要求）
   refreshWebBindEntry()  // AI-021：无书状态时按活动 tab 显示/隐藏网页绑定入口
 }
 
@@ -2466,6 +2217,17 @@ function renderNoBookList() {
 // + 该页尚未绑定（向页面适配器查询）。绑定由页面上的对话框完成，绑定后
 // storage 变更（miaBindings）触发本函数刷新，入口消失，页面右下角胶囊常驻。
 const WEB_PAGE_RE = /^https:\/\/(www\.marxists\.org\/chinese|www\.bilibili\.com)\//
+
+/**
+ * 这个 URL 是不是网页阅读源页面（marxists / B 站）。
+ *
+ * 与 `WEB_PAGE_RE` 分工不同：那条只回答"侧栏要不要给绑定入口"，必须严格对齐
+ * manifest 的注入范围；这条回答"一条引用是不是从网页上划出来的"——网页可以绑定到
+ * 微信读书的书或阅读器里的书（2026-11 放开），所以跳转时不能只看 bookId 前缀。
+ */
+function isPageSourceUrl(url) {
+  return /^https?:\/\/(?:[A-Za-z0-9-]+\.)*(?:marxists\.org|bilibili\.com)\//i.test(String(url || ''))
+}
 async function refreshWebBindEntry() {
   const card = document.getElementById('nb-web-card')
   const urlEl = document.getElementById('nb-web-url')
@@ -2684,39 +2446,8 @@ function bindMaskClose(overlay, close) {
 // 打开引用列表（卡片上的切换引用按钮）
 document.getElementById('rc-switch-btn').addEventListener('click', () => {
   openDrawer()
-  // ⚠️ 抽屉一打开，引导的高亮要**跟着挪到抽屉上**（2026-11 用户反馈：
-  // "点击了切换引用之后你的高亮也应该贴着切换引用栏"）。
-  // 原来的问题：目标一直钉在引用卡上，而抽屉是盖在界面上的另一层——
-  // 高亮框和一整片抽屉错位，用户看到的是"高亮框在讲一个你已经看不见的东西"。
-  guideFollowDrawer()
-  postSidebarDebug({ stage: 'drawer-open', tutorialActive: !!(window.__tutorialScript && window.__tutorialScript.state().active) })
+  postSidebarDebug({ stage: 'drawer-open' })
 })
-
-/**
- * 抽屉打开时，把引导的高亮挪到抽屉头部（只在本步确实和引用有关时才挪）。
- *
- * 只挪"引用类"的那几步：其他步骤（打字 / 等接话）打开抽屉属于用户自己乱点，
- * 那时把高亮挪走反而让他找不着原来的目标。
- */
-function guideFollowDrawer() {
-  const S = window.__tutorialScript
-  if (!S || !S.state().active) return
-  const st = S.state()
-  const step = S.currentStep ? S.currentStep() : null
-  const targetId = (step && step.target) || ''
-  if (targetId !== 'ref-current' && targetId !== 'rc-switch-btn') return
-  S.anchorTo && S.anchorTo(document.querySelector('#ref-drawer .drawer-panel') || document.getElementById('ref-drawer'), '.drawer-head')
-}
-
-/** 抽屉关掉之后，把高亮挪回引用卡（不然它会悬在已经消失的抽屉上） */
-function guideBackFromDrawer() {
-  const S = window.__tutorialScript
-  if (!S || !S.state().active) return
-  const step = S.currentStep ? S.currentStep() : null
-  const targetId = (step && step.target) || ''
-  if (targetId !== 'ref-current' && targetId !== 'rc-switch-btn') return
-  S.anchorTo && S.anchorTo(document.getElementById('ref-current'))
-}
 
 // 卡片折叠/展开
 document.getElementById('rc-collapse-btn').addEventListener('click', () => {
@@ -3426,8 +3157,10 @@ function connect() {
   // 断线重连时带 lastId 续传：只重放上次断开后没收到的事件（AI-006）。
   // 首次连接 _lastEventId=0 → 不带参数 → receiver 不回放（历史由 /history 加载）。
   const q = _lastEventId > 0 ? `?lastId=${_lastEventId}` : ''
+  postSidebarDebug({ stage: 'sse-connecting', lastId: _lastEventId })
   sseConn = new EventSource(`${RECEIVER}/events${q}`)
   sseConn.onopen = () => {
+    postSidebarDebug({ stage: 'sse-open' })
     setSseOpen(true)
     // 接收端此刻才起来时，把菜单里的「接收端未连接」刷成真实配置状态（只刷新不弹窗）
     refreshApiStatus()
@@ -3442,7 +3175,12 @@ function connect() {
       if (d._seq) _lastEventId = Math.max(_lastEventId, d._seq)  // 记录进度，供续传
       if (d.type === 'connected') { setSseOpen(true); return }
       // 会意图刷新（AI-020）：图文件更新 → 图视图开着就重拉
-      if (d.type === 'graph-updated') { if (graphView?.isOpen()) graphView.reload(); return }
+      if (d.type === 'graph-updated') {
+        // 第一个知识点诞生时引导一次（见 maybeCoachFirstNode：只认"开机 0 个 → 现在有"）
+        maybeCoachFirstNode()
+        if (graphView?.isOpen()) graphView.reload()
+        return
+      }
       // 2026-09：实时栈变化 → 重拉 /stack-hits，恢复/清除"当前讨论命中"高亮
       if (d.type === 'stack-updated') { refreshStackHits(); return }
       // 停止当前回答（2026-02）：接收端已受理停止请求 → 本地收尾。
@@ -3621,6 +3359,9 @@ function connect() {
     } catch {}
   }
   sseConn.onerror = () => {
+    // 记下 readyState：0=CONNECTING（还在重试）1=OPEN（罕见：open 之后又报错）
+    // 2=CLOSED（**致命**：浏览器已经放弃，必须自己重建，否则永远是灰的）
+    postSidebarDebug({ stage: 'sse-error', readyState: sseConn ? sseConn.readyState : -1 })
     setSseOpen(false)
     sseConn.close()
     sseConn = null
@@ -4507,6 +4248,9 @@ async function jumpToAnnotation(ann) {
   try {
     const base = baseBookId(ann.bookId)
     if (!base) { console.warn('[CoRead] jump: missing bookId'); return }
+    // 网页上划出来的引用：不管它归到哪本书（网页书 / 微读正式书 / 阅读器 PDF），
+    // 跳转目标都是那个网页。判据是 sourceUrl 的站点，不是 bookId 前缀。
+    const fromWebPage = isPageSourceUrl(ann.sourceUrl)
 
     // ---- 诊断（2026-11）：把"当时到底拿到了什么"写下来 ----------------------------
     // 为什么要这一条：用户报"点切换引用回到选书界面"，而我加的那条 `rd_` 分支**没进**——
@@ -4517,6 +4261,7 @@ async function jumpToAnnotation(ann) {
       annBookId: String(ann.bookId || '').slice(0, 32),
       base: String(base || '').slice(0, 32),
       isRd: base.indexOf('rd_') === 0,
+      fromWebPage,
       text: String(ann.selectedText || '').slice(0, 24),
       chapterNum: ann.chapterNum === undefined ? '(无)' : ann.chapterNum,
     })
@@ -4534,7 +4279,7 @@ async function jumpToAnnotation(ann) {
     //   ③ **不要依赖引用里的章号**：教程书的引用是我们自己造的，它**没有** chapterNum，
     //      于是 `Number(undefined) || 0` = 0，深链缺了 `&chapter=`，阅读器只能从头打开——
     //      这正是用户看到的"回到主界面"。
-    if (base.indexOf('rd_') === 0) {
+    if (base.indexOf('rd_') === 0 && !fromWebPage) {
       try {
         const r = await chrome.runtime.sendMessage({
           action: 'readerCommand', type: 'locate', text: String(ann.selectedText || ''),
@@ -4558,10 +4303,14 @@ async function jumpToAnnotation(ann) {
       return
     }
 
-    // 网页阅读源（AI-021，mia_* 书）：跳转 = 打开标注所在网页并滚动到原文。
+    // 网页阅读源（AI-021）：跳转 = 打开标注所在网页并滚动到原文。
     // 目标 URL 带 #coread=<encodeURIComponent(selectedText)>，source-mia.js 加载后定位滚动；
     // 已在同一页则直接发 coread-scroll 消息，不重载。↩ 返回记录原 tab（URL 级恢复）。
-    if (base.indexOf('mia_') === 0) {
+    //
+    // 旧条件只认 `mia_` 书。网页现在也能绑定到正式书籍（微信读书 / 阅读器），
+    // 那些引用同样带着网页 sourceUrl，必须走这条路；`mia_` 仍保留在条件里，
+    // 是为了让缺 sourceUrl 的旧网页引用仍能报出"缺少页面地址"，而不是掉进微读跳转。
+    if (fromWebPage || base.indexOf('mia_') === 0) {
       const srcUrl = String(ann.sourceUrl || '')
       if (!srcUrl || !ann.selectedText) {
         showToast('该引用缺少页面地址，无法跳转', true)
@@ -4996,6 +4745,22 @@ async function deleteRef(ann) {
   // 必须在 receiver 删除完成之后发，否则重新拉取的 /annotations 仍含已删引用，
   // 绿色共读标记会被重新画回来（删了又出现）。
   try { chrome.runtime.sendMessage({ action: 'refreshCoReadMarks' }) } catch {}
+
+  /**
+   * 同一件事也要告诉**阅读器**（2026-11）：它在书页上画的"已引用"绿线（rd-ref）
+   * 同样以这份存档为准，而删除不一定经过译文面板——引用卡、抽屉里都能删。
+   * 不通知的话，用户会看到"侧栏里已经删了，书页上还留着一道线"，要等下一次
+   * refreshRefs（切回标签页 / 打开译文面板）才消失。
+   *
+   * 带上 bookId：侧栏存着所有书的引用，不带的话在 A 书删一条会把 B 书阅读器里
+   * 同文的标记一起抹掉（同文不同书，肉眼几乎发现不了）。
+   */
+  try {
+    chrome.runtime.sendMessage({
+      action: 'readerCommand', type: 'forgetRef',
+      text: ann.selectedText, bookId: ann.bookId,
+    })
+  } catch {}
 
   // 若是微信读书划线同步来的引用，同步删除微信读书里的划线。
   // 有持久化 bookmarkId 就直传（content script 直接可用，绕开内存映射/frame 差异）；
@@ -6277,16 +6042,397 @@ const graphView = typeof CoReadGraphView !== 'undefined'
 const graphBtn = document.getElementById('graph-btn')
 if (graphBtn && graphView) {
   graphBtn.addEventListener('click', () => {
-    // 教程模式（2026-11 用户要求）：在《第一次共读》里打开会意图时，只显示**教程自带的
-    // 样例节点**，不显示用户自己的图；反过来也绝不把样例写进用户的图。
-    // 判据放在这里（侧栏知道当前书 ID），图视图只管"这次拉哪一种"。
-    const onTutorial = effectiveBookBase() === TUTORIAL_BASE
-    graphView.setTutorialMode(onTutorial)
-    postSidebarDebug({ stage: 'graph-open', tutorial: onTutorial, book: effectiveBookBase().slice(0, 16) })
+    postSidebarDebug({ stage: 'graph-open', book: effectiveBookBase().slice(0, 16) })
     graphView.open()
     refreshStackHits()
   })
 }
+// ── 会意图引导：第一个知识点诞生时，带用户去看一眼（2026-10-20）──────────────
+/**
+ * 为什么要有它：教程 PDF 里**不讲会意图**（用户定调），但"收口 → 知识点 → 命中"
+ * 是这东西跟普通 AI 聊天的分水岭。等用户自己发现，多半永远发现不了。
+ *
+ * 出现的时机只有一个，而且必须是真的"第一次"：**开机时图里一个点都没有，之后有了**。
+ * 为什么不用"图里有节点 && 没看过"当判据：老用户图里早就有几十个点了，
+ * 那样会在某次无关的更新时突然蹦出一张"你的第一个知识点出来了"，可笑且不可信。
+ * 看过就写 `graphCoachSeen`，永不再现；⋯ 菜单里有「重看会意图引导」可以手动放出来。
+ */
+const GRAPH_COACH_KEY = 'graphCoachSeen'
+let _coachShown = false
+let _coachNodeId = ''
+let _coachPreview = false          // true = 预览态（图里还没点，只给看样式）
+let _coachPersist = false          // 关掉时要不要写"看过"标记（只有真触发才写）
+let _spotMod = null                // { Spotlight, shared } —— 聚光灯模块，按需加载一次
+let _spot = null                   // 复用的实例（一个页面一个就够）
+
+/**
+ * 聚光灯模块（`extension/spotlight.js`）按需加载。
+ *
+ * 为什么不用静态 import：sidebar.js 是**经典脚本**（它头部解释了原因），写不了 import 语句，
+ * 只能动态 import()。加载失败**不能把引导带死**——所以调用方有兜底（退回内置卡片）。
+ */
+async function loadSpotlight() {
+  if (_spot) return _spot
+  if (!_spotMod) _spotMod = await import('./spotlight.js')
+  _spot = _spotMod.sharedSpotlight({ dim: 0.45, padding: 6, radius: 8 })
+  return _spot
+}
+
+/** 引导当前是不是"活着"（卡片或聚光灯任一个在） */
+function coachActive() {
+  const card = document.getElementById('coach-card')
+  if (card && !card.hidden) return true
+  return !!(_spot && _spot.active)
+}
+
+function hideCoachSpotlight() {
+  if (_spot) { try { _spot.hide() } catch (e) {} }
+}
+let _nodeCountAtBoot = -1        // -1 = 还没读到（本机服务还没起来）
+
+async function fetchGraphNodes() {
+  try {
+    const r = await fetch(RECEIVER + '/graph', { cache: 'no-store' })
+    if (!r.ok) return null
+    const g = await r.json()
+    return Array.isArray(g.nodes) ? g.nodes : null
+  } catch (e) { return null }
+}
+
+/** 最新的那个点（收口刚写进去的就是它）。图里没点返回 null。 */
+function newestNode(nodes) {
+  if (!Array.isArray(nodes) || !nodes.length) return null
+  return nodes.slice().sort((a, b) =>
+    (Number(b.updatedAt || b.createdAt || 0)) - (Number(a.updatedAt || a.createdAt || 0)))[0] || null
+}
+
+async function coachSeen() {
+  try {
+    const st = await chrome.storage.local.get(GRAPH_COACH_KEY)
+    return !!(st && st[GRAPH_COACH_KEY])
+  } catch (e) { return false }
+}
+
+/** 开机基线：读一次"现在图里有几个点"。读不到（本机服务没起）就保持 -1，等它起来再补。 */
+async function initGraphCoachBaseline() {
+  if (_nodeCountAtBoot !== -1) return
+  if (await coachSeen()) { _nodeCountAtBoot = 0; return }   // 看过就不必再算
+  const nodes = await fetchGraphNodes()
+  if (nodes) {
+    _nodeCountAtBoot = nodes.length
+    postSidebarDebug({ stage: 'graph-coach-baseline', nodes: nodes.length })
+  }
+}
+
+/**
+ * 把卡片放出来。
+ * @param {{nodeId?:string, count?:number, preview?:boolean, persist?:boolean}} o
+ *   preview  = "图里还没有点，只给你看样式" → 卡片里多一句黄底说明
+ *   persist  = 关掉时是否写"看过"标记。**只有真正的第一次触发才写**；
+ *              手动看（⋯ 菜单）不写——否则用户看一次，真正的自动引导就永久关掉了。
+ */
+function showCoachCard({ nodeId = '', count = 0, preview = false, persist = false } = {}) {
+  const card = document.getElementById('coach-card')
+  if (!card) return
+  _coachNodeId = nodeId || ''
+  _coachPreview = !!preview
+  _coachPersist = !!persist
+  card.hidden = false
+  const note = card.querySelector('.cc-preview-note')
+  if (note) note.hidden = !preview
+  // 闪一下 ◎：卡片上说了"打开会意图"，但用户未必知道入口在哪
+  const g = document.getElementById('graph-btn')
+  if (g) { g.classList.add('pulse'); setTimeout(() => g.classList.remove('pulse'), 4200) }
+  postSidebarDebug({
+    stage: persist ? 'graph-coach-shown' : 'graph-coach-preview',
+    node: String(_coachNodeId).slice(0, 24),
+    nodes: count,
+  })
+}
+
+/**
+ * 引导的**首选**形态：聚光灯照亮右上角的 ◎，旁边挂一张卡。
+ *
+ * 为什么不用页面里那块常驻卡（showCoachCard）：引导的价值在于"把用户的眼睛带到那个按钮上"。
+ * 常驻卡只能说明，聚光灯能把整屏压暗、只留 ◎ 亮着——这是用户点得下去的关键。
+ * 卡片仍然保留，作为**兜底**（聚光灯模块加载失败时用），不是主路径。
+ *
+ * @returns {Promise<boolean>} 聚光灯成功起来 → true；否则 false（调用方退回卡片）
+ */
+async function showCoachSpotlight({ nodeId = '', persist = false } = {}) {
+  let spot
+  try {
+    spot = await loadSpotlight()
+  } catch (e) {
+    postSidebarDebug({ stage: 'spotlight-load-failed', error: String((e && e.message) || e) })
+    return false
+  }
+  if (!spot) return false
+  _coachNodeId = nodeId || ''
+  _coachPreview = false
+  _coachPersist = !!persist
+  const ok = spot.pointTo('#graph-btn', {
+    step: '第一个知识点',
+    title: '它收口成了一个点',
+    body: ['点 ◎ 打开会意图。', '后续提问带上这个说法，即可命中。'],
+    actions: [
+      { id: 'open', label: '打开看看', primary: true },
+      { id: 'later', label: '知道了' },
+    ],
+    // 单次回调（同一个实例会被不同引导复用，所以不放在实例上）
+    onAction: (id) => { if (id === 'open') openGraphForCoach(); else dismissCoach() },
+  })
+  if (!ok) return false
+  postSidebarDebug({ stage: persist ? 'graph-coach-shown' : 'graph-coach-preview', via: 'spotlight', node: String(_coachNodeId).slice(0, 24) })
+  return true
+}
+
+/** 图更新了：如果"开机 0 个点，现在有了"，就是第一个知识点诞生 —— 引导一次 */
+async function maybeCoachFirstNode() {
+  if (_coachShown) return
+  if (_nodeCountAtBoot !== 0) return          // 只认"从 0 到 1"
+  if (await coachSeen()) return
+  const nodes = await fetchGraphNodes()
+  if (!nodes || !nodes.length) return
+  _coachShown = true
+  const newest = newestNode(nodes)
+  const nodeId = (newest && newest.id) || ''
+  // 首选聚光灯；起不来（模块加载失败等）才退回页面内那块卡
+  const ok = await showCoachSpotlight({ nodeId, persist: true })
+  if (!ok) showCoachCard({ nodeId, count: nodes.length, persist: true })
+}
+
+/** 等某个选择器的元素出现**并且可见**（引导要照它，得等它真的画出来） */
+async function waitElVisible(sel, ms = 8000) {
+  const end = Date.now() + Math.max(500, ms)
+  while (Date.now() < end) {
+    const el = document.querySelector(sel)
+    if (el && !el.hidden && el.getBoundingClientRect().width > 0) return el
+    await new Promise((r) => setTimeout(r, 150))
+  }
+  return null
+}
+
+/**
+ * **完整引导流程（三步）** —— ⋯ 菜单里的「◎ 会意图引导」走这一条。
+ *
+ *   第 1 步：只照亮右上角 ◎，告诉他"点这里"
+ *   第 2 步：把图打开并落到那个点上，然后照亮右边的**详情面板**（这就是那个点）
+ *   第 3 步：照亮图本身，讲清"换个说法再问 → 这条来路亮起来 = 节点命中"
+ *
+ * 为什么生产触发（第一个知识点自然诞生）**只走第 1 步**：那是在用户正聊天时弹出的，
+ * 自动把整张图盖上来太打扰。想看全流程就点菜单——这就是"调试入口"的用途。
+ */
+async function startCoachDemo({ persist = false } = {}) {
+  let spot
+  try {
+    spot = await loadSpotlight()
+  } catch (e) {
+    postSidebarDebug({ stage: 'spotlight-load-failed', error: String((e && e.message) || e) })
+    const list = (await fetchGraphNodes()) || []
+    const newest = newestNode(list)
+    showCoachCard({ nodeId: (newest && newest.id) || '', count: list.length, preview: !newest, persist })
+    return false
+  }
+  const list = (await fetchGraphNodes()) || []
+  const newest = newestNode(list)
+  _coachNodeId = (newest && newest.id) || ''
+  _coachPersist = !!persist
+  _coachShown = false            // 演示不占用"正式出过一次"的状态
+  postSidebarDebug({ stage: 'graph-coach-demo', step: 1, nodes: list.length })
+
+  const finish = () => {
+    try { spot.hide() } catch (e) {}
+    if (_coachPersist) {
+      try { chrome.storage.local.set({ [GRAPH_COACH_KEY]: Date.now() }) } catch (e) {}
+    }
+    _coachPersist = false
+  }
+
+  const step3 = () => {
+    postSidebarDebug({ stage: 'graph-coach-demo', step: 3 })
+    /**
+     * 这一课要讲的是"**怎么把会意图里的点用起来**"。写法顺序（2026-10-21 用户退回过三版）：
+     *   ① 先讲**机制**——它每一问都会先去会意图里找旧节点，命中了就把那条来路带进这一轮。
+     *      没有这一句，下面直接甩"两种问法都能命中"就是莫名其妙的结论（用户原话）。
+     *   ② 再给**两种问法**（显式 / 隐式），各自一句可直接照抄的话。
+     *   ③ 边界：只说"上次那事儿"（无线索空指）不认——这条是判定代码里写死的规则。
+     *
+     * 另外两条硬边界：
+     *   · 例子不放**完整节点标题**（会让人以为要背标题）；
+     *   · 例子不能是**名词**（"授权"是词，节点存的是**说法**）。
+     *
+     * 注意：这里**没有**"填一句试试"按钮（2026-10-21 用户删掉）。理由：那会把引导变成
+     * 替他打字——我们教的是"怎么问"，不该代劳；而且填进输入框的话他大概率直接发出去，
+     * 变成一条不是自己想问的话。
+     */
+    spot.cardOnly({
+      step: '第 3 步 / 共 3 步',
+      title: '先检索，再回答',
+      body: [
+        '每次提问，先在会意图检索旧节点；命中则并入该节点的来路。',
+        '命中靠提问里的表述：',
+        '> 显式：之前聊过的「授权是自下而上的」',
+        '> 隐式：那套授权自下而上的体系为什么一直没有走通',
+        '表述不必与节点原文一致，但须明确。',
+      ],
+      actions: [{ id: 'done', label: '明白了', primary: true }],
+      onAction: () => finish(),
+    })
+  }
+
+  const step2 = async () => {
+    // 图里一个点都没有：别假装能指（引导绝不能指着空气说话）
+    if (!_coachNodeId) {
+      postSidebarDebug({ stage: 'graph-coach-demo', step: 2, detail: false, reason: 'no-node' })
+      spot.cardOnly({
+        step: '第 2 步 / 共 3 步',
+        title: '图里还没有点',
+        body: ['讨论充分后，自动收口为节点。'],
+        actions: [{ id: 'next', label: '继续看命中', primary: true }, { id: 'done', label: '知道了' }],
+        onAction: (id) => { if (id === 'next') step3(); else finish() },
+      })
+      return
+    }
+    try { openGraphForCoach() } catch (e) { finish(); return }
+    // 等详情面板真的画出来（图是异步拉的，节点选中也是异步的）
+    const panel = await waitElVisible('#gv-detail', 5000)
+    postSidebarDebug({ stage: 'graph-coach-demo', step: 2, detail: !!panel })
+    if (!panel) {
+      spot.cardOnly({
+        step: '第 2 步 / 共 3 步',
+        title: '没定位到那个点',
+        body: ['图刚生成，稍等；也可直接点该节点。'],
+        actions: [{ id: 'next', label: '继续看命中', primary: true }, { id: 'done', label: '知道了' }],
+        onAction: (id) => { if (id === 'next') step3(); else finish() },
+      })
+      return
+    }
+    const ok = spot.pointTo('#gv-detail', {
+      step: '第 2 步 / 共 3 步',
+      title: '这就是那个点',
+      body: ['右侧为详情：说法与来路。'],
+      actions: [{ id: 'next', label: '下一步', primary: true }, { id: 'done', label: '先看到这' }],
+      placement: 'left',
+      onAction: (id) => { if (id === 'next') step3(); else finish() },
+    })
+    if (!ok) finish()
+  }
+
+  const ok = spot.pointTo('#graph-btn', {
+    step: '第 1 步 / 共 3 步',
+    title: '第一个知识点出来了',
+    body: ['点右上角 ◎ 打开会意图。'],
+    actions: [{ id: 'next', label: '下一步', primary: true }, { id: 'done', label: '先不看' }],
+    // 用户自己点了 ◎ 也算"做到"，直接进第 2 步
+    dismissOnTargetClick: true,
+    onTargetClick: () => step2(),
+    onAction: (id) => { if (id === 'next') { try { spot.hide() } catch (e) {} step2() } else finish() },
+  })
+  if (!ok) finish()
+  return ok
+}
+
+function dismissCoach() {
+  const card = document.getElementById('coach-card')
+  if (card) card.hidden = true
+  const g = document.getElementById('graph-btn')
+  if (g) g.classList.remove('pulse')
+  hideCoachSpotlight()
+  // 只有"真正的第一次"才写标记（见 showCoachCard 的 persist 说明）
+  if (_coachPersist) {
+    try { chrome.storage.local.set({ [GRAPH_COACH_KEY]: Date.now() }) } catch (e) {}
+  }
+  _coachPreview = false
+  _coachPersist = false
+}
+
+function openGraphForCoach() {
+  const nodeId = _coachNodeId
+  dismissCoach()
+  if (!graphView) return
+  postSidebarDebug({ stage: 'graph-coach-open', node: String(nodeId).slice(0, 24) })
+  graphView.open()
+  refreshStackHits()
+  /**
+   * 指出那个点（2026-10-21 补）。
+   *
+   * 原先这里调的是 `focusNodeChain`，而它在"当前没有多链高亮"时是**空操作**——
+   * 刚收口出来的第一个点打开图时没有任何命中链，所以它什么都不做。
+   * 也就是说卡片上那句"这个点会被圈出来"当时是**空话**。
+   * 现在用 `revealNode`：等图拉完 → selectNode（高亮来路 + 相机对准 + 打开右侧详情）。
+   */
+  if (nodeId) {
+    graphView.revealNode(nodeId)
+      .then((ok) => postSidebarDebug({ stage: 'graph-coach-reveal', node: String(nodeId).slice(0, 24), ok: !!ok }))
+      .catch(() => {})
+  }
+}
+
+document.getElementById('cc-open')?.addEventListener('click', openGraphForCoach)
+document.getElementById('cc-later')?.addEventListener('click', dismissCoach)
+document.getElementById('cc-close')?.addEventListener('click', dismissCoach)
+
+/**
+ * ── 调试入口（2026-10-20）────────────────────────────────────────────────────
+ *
+ * 为什么要留一个：这张卡的正式触发条件是"用户第一个知识点自然收口"——
+ * 要等一场真讨论聊透，而且**只出现一次**（写 `graphCoachSeen` 之后永不再现）。
+ * 没有这个入口，改样式 / 验文案 / 复现问题都要先伪造一场收口，成本太高。
+ *
+ * 怎么打开 console：**右键侧栏 → 检查**（或 `chrome://extensions` → CoRead →
+ * 「检查视图」→ `sidebar.html`）。然后在 console 里：
+ *
+ *   __coreadDebug.coach.show()     放一次卡片（图里有节点就圈最新那个；没有就只给样式）
+ *   __coreadDebug.coach.trigger()  走一遍**生产路径**：假装开机时是 0 个点，看它会不会触发
+ *   __coreadDebug.coach.reset()    清掉"看过"标记 + 收掉卡片，让真正的第一个节点还能触发
+ *   __coreadDebug.state()          这几个内部量：基线、是否已出过、要圈哪个点、当前书
+ *
+ * 这些动作都只动界面与本地记忆，不碰用户的图、不写任何讨论。
+ */
+window.__coreadDebug = {
+  coach: {
+    async show() {
+      const list = (await fetchGraphNodes()) || []
+      const newest = newestNode(list)
+      showCoachCard({ nodeId: (newest && newest.id) || '', count: list.length, preview: !newest })
+      return { nodes: list.length, node: (newest && newest.id) || '', preview: !newest }
+    },
+    async trigger() {
+      _coachShown = false
+      _nodeCountAtBoot = 0                       // 伪造"开机时一个点都没有"
+      try { await chrome.storage.local.remove(GRAPH_COACH_KEY) } catch (e) {}
+      await maybeCoachFirstNode()
+      const card = document.getElementById('coach-card')
+      return { shown: !!(card && !card.hidden), baseline: _nodeCountAtBoot, node: _coachNodeId }
+    },
+    reset() {
+      try { chrome.storage.local.remove(GRAPH_COACH_KEY) } catch (e) {}
+      _coachShown = false
+      _coachPreview = false
+      _nodeCountAtBoot = -1
+      const card = document.getElementById('coach-card')
+      if (card) card.hidden = true
+      const g = document.getElementById('graph-btn')
+      if (g) g.classList.remove('pulse')
+      initGraphCoachBaseline()                   // 重新读一次基线（异步，不阻塞返回值）
+      return true
+    },
+  },
+  state() {
+    return {
+      baseline: _nodeCountAtBoot,          // -1 还没读到；0 图里当时是空的
+      shown: _coachShown,
+      preview: _coachPreview,
+      nodeId: _coachNodeId,
+      freeMode: _freeMode,
+      book: effectiveBookBase(),
+      cardHidden: !!document.getElementById('coach-card')?.hidden,
+    }
+  },
+}
+
+
 const pickBtn = document.getElementById('fr-pick-btn')
 if (pickBtn) pickBtn.addEventListener('click', openPickMode)
 // 本次引用窗体折叠/展开（2026-11）：表头 ▾ 切换；折叠态点概览直接展开（同 AI-018 的
@@ -6527,7 +6673,7 @@ document.getElementById('mm-exit-manual')?.addEventListener('click', () => {
   if (moreMenu) moreMenu.classList.remove('on')
   exitManualBook()
 })
-// 自检（2026-11）：开一个新标签页跑自检。它要读写 chrome.* 与教程模块，
+// 自检（2026-11）：开一个新标签页跑自检。它要读写 chrome.* 与各模块，
 // 只能在扩展自己的页面里跑，所以是"开页面"而不是"就地跑"。
 document.getElementById('mm-selfcheck')?.addEventListener('click', () => {
   if (moreMenu) moreMenu.classList.remove('on')
@@ -6535,32 +6681,24 @@ document.getElementById('mm-selfcheck')?.addEventListener('click', () => {
     showToast('打不开自检页：' + String((e && e.message) || e))
   })
 })
+// 会意图引导（2026-10-20；2026-10-21 改成完整三步）：正式出现只有一次，错过了就没有入口了。
+// 这里点一下就走**完整流程**（照 ◎ → 打开图落到那个点 → 讲命中），见 startCoachDemo。
+// 不写"看过"标记，点多少次都不影响以后自动出现。
+document.getElementById('mm-graph-coach')?.addEventListener('click', async () => {
+  if (moreMenu) moreMenu.classList.remove('on')
+  await startCoachDemo({ persist: false })
+})
 document.getElementById('mb-switch-btn')?.addEventListener('click', openBookPicker)
 document.getElementById('mb-exit-btn')?.addEventListener('click', exitManualBook)
 document.getElementById('bp-close-btn')?.addEventListener('click', closeBookPicker)
 bindMaskClose(document.getElementById('book-picker'), closeBookPicker)  // 点击遮罩关闭（按+松都在遮罩上才算）
 document.getElementById('bp-search')?.addEventListener('input', renderBookList)
 
-// ── 「开始教程」按钮（2026-11）──────────────────────────────────────────────
-// 顶部那个按钮已按用户要求去掉，绑定一并删掉（留着会去绑一个不存在的元素——
-// 虽然 `?.` 不会报错，但那属于"看起来还接得上、其实没有入口"的假象）。
-// 侧栏被关掉/重载时，把引导层收掉并**标成暂停**——
-// 重开侧栏时**不会**自动弹出教程（2026-11 用户报的 bug：更新扩展后一打开就冒出教程），
-// 而是显示一个「继续教程」的入口，由用户点才接上。
-window.addEventListener('pagehide', () => {
-  if (!_tutorialMod) return
-  _tutorialMod.then(({ script }) => {
-    // 只收界面 + 标记暂停，**不删状态**：回来还能接着走，但不自动开始
-    script.state && script.state().active && import('./tutorial-guide.js').then((g) => g.hide())
-    script.pause && script.pause()
-  }).catch(() => {})
-})
-
 /**
  * 侧栏每次打开就上报自己的**构建指纹**（2026-11）。
  *
  * ── 为什么必须有它 ────────────────────────────────────────────────────────────
- * 这套教程改成现在这样之后，用户报了两次"还是不行"，而真相是**他机器上跑的还是旧代码**：
+ * 用户报过两次"还是不行"，而真相是**他机器上跑的还是旧代码**：
  * 扩展要手动重新加载才生效，但没有任何地方能一眼看出"当前跑的是哪一版"。
  * 于是每一轮都变成"我改 → 他试 → 呈现旧行为 → 我再猜"，白烧两轮。
  *
@@ -6571,8 +6709,7 @@ window.addEventListener('pagehide', () => {
 async function reportBuildStamp() {
   const files = [
     'sidebar.js', 'sidebar.html', 'translate-background.js', 'service_worker.js',
-    'reader.js', 'graph-view.js', 'tutorial-script.js', 'tutorial-guide.js',
-    'tutorial/lessons.js', 'tutorial/graph-seed.json',
+    'reader.js', 'graph-view.js',
   ]
   const out = {}
   for (const f of files) {
@@ -6591,7 +6728,7 @@ async function reportBuildStamp() {
 checkApiConfigOnOpen()  // 打开插件即检查模型 API：确认未配置就自动弹出配置弹窗（用户定调）
 startPingLoop()         // 存活轮询：驱动连接指示灯 + 决定能不能发送（见 setDot 上方说明）
 reportBuildStamp()      // 上报构建指纹：一眼看出当前跑的是哪一版（见函数注释）
-loadSampleRefs()        // 读教程预设例句：**启动即读、无前置条件**（见函数注释）
+initGraphCoachBaseline() // 记下"图里现在有几个点"：第一个知识点诞生时要用它判"从 0 到 1"
 loadState()
   .then(loadHistory)
   .then(applyPendingRefSearch)
@@ -6612,24 +6749,22 @@ loadState()
     // loadHistory 里已经调过一次，这里是兜底（幂等）。
     syncIntro()
   })
-  // 教程：侧栏刚打开时**不自动开始上课**（2026-11 用户报的 bug：更新扩展后一打开就冒出教程）。
-  // 只问一句"存储里有没有一条暂停中的教程"，有就在侧栏顶部显示一个「继续教程」入口——
-  // 由用户点才接上。这是"教程不该自己冒出来"与"中途关掉别丢进度"之间的取舍点。
-  .then(() => loadTutorial().catch((e) => {
-    /**
-     * 教程模块 import 失败必须**在这里吃掉**，不能让这条启动链断在半路（2026-11）。
-     *
-     * 为什么：这是启动链上唯一一处动态 import（教程引导那两个 ES module），而它失败的
-     * 形态有两种，都不是"用户该看见的错"：扩展更新后浏览器里还留着旧文件、或者沙箱/离线
-     * 环境根本没有那两个文件。原先 `loadTutorial()` 没有 catch，于是一次失败就把
-     * `offerResumeTutorial()` 也一起带走，并在控制台留一个没人看的 unhandled rejection
-     *（跑 DOM 层自测时，这个拒绝会被 node:test 算到**当时正在跑的测试**头上，
-     * 把与教程毫无关系的断言判红）。
-     * 教程是"点了才开始"的东西，加载失败唯一该做的就是留痕、别装死——其余功能照常。
-     */
-    postSidebarDebug({ stage: 'tutorial-load-failed', error: String((e && e.message) || e) })
-  }))     // 顺带把样例引用（SAMPLE_REFS）就位，抽屉里要用
-  .then(() => offerResumeTutorial().catch(() => {}))
+  /**
+   * ⚠️ **这条链断在哪一步，都不许把 SSE 一起带走**（2026-10-20 用户实测：接收端明明
+   * 在跑，指示灯一直是灰的）。
+   *
+   * 指示灯要绿，得同时满足"问得出去"（/ping 轮询，它在链外，一直正常）和"答得回来"
+   * （SSE `/events` 连着）。而 SSE 原先**只挂在这条 promise 链的第三步**：
+   * `loadState → loadHistory → applyPendingRefSearch → connect`。
+   * 链上任何一步 reject（历史拉取失败、引用恢复抛错…），`connect()` 就**永远不跑**，
+   * 而链尾也没有 catch —— 于是面板安静地停在"灯是灰的、但轮询是通的"这个状态：
+   * 用户在界面上看到的正是"接收端明明在跑、插件却显示灰的"。
+   *
+   * 现在：链上失败只记一条日志；`connect()` 另外**无条件**调一次（它内部幂等：
+   * `if (sseConn) return`），链跑完再补一次。SSE 不再依赖历史加载成功。
+   */
+  .catch((e) => postSidebarDebug({ stage: 'init-chain-failed', error: String((e && e.message) || e) }))
+connect()               // 事件流单独起，不等历史（幂等）
 loadJumpBack()  // AI-006：面板重开后恢复「↩ 返回」能力（有未过期的跳转记录时）
 
 // 活动 tab 变化时刷新当前书（AI-001）：用户在多本书 / 多个微信读书 tab 间切换
@@ -6699,7 +6834,17 @@ document.getElementById('nb-bind-btn')?.addEventListener('click', async () => {
 // AI-021：绑定/解除后（页面或其它上下文写入 miaBindings）刷新入口
 try {
   chrome.storage.onChanged.addListener(function (changes, area) {
-    if (area === 'local' && changes && changes.miaBindings) refreshWebBindEntry()
+    if (area !== 'local' || !changes || !changes.miaBindings) return
+    refreshWebBindEntry()
+    /**
+     * 绑定状态变了，**当前书也要跟着重算**。
+     *
+     * 只在绑定的那一瞬发 `coreadManualBook` 是不够的：页面上的「解除绑定」不会发那条消息，
+     * 侧栏就会一直挂着刚解除的书；反过来，别的标签页/旧会话写入绑定时侧栏也可能还停在无书界面。
+     * `refreshCurrentBook` 对文库页会问页面自己（kind='page'），已绑定认书、解除后回无书，
+     * 正好把两头都收口。写 `miaBindings` 不会触发它再写绑定，不存在自环。
+     */
+    refreshCurrentBook().catch(function () {})
   })
 } catch {}
 
@@ -6989,11 +7134,11 @@ async function deleteRefFromNotes(ref) {
   const gone = await deleteRef(hit)
   if (!gone) return false
 
-  // 让阅读器把这一段从"已引用"清单里摘掉：它随即重推一份快照，下划线立刻消失。
-  // 不这么做就得等它下次按 TTL 拉取（REFS_TTL_MS = 2 秒），用户会看到"删了还留着"。
-  try {
-    chrome.runtime.sendMessage({ action: 'readerCommand', type: 'forgetRef', text: hit.selectedText })
-  } catch {}
+  /**
+   * 通知阅读器这件事现在统一在 `deleteRef()` 里做（2026-11）：
+   * 卡片 / 抽屉 / 译文面板三条删除路径都走它，只在这里再发一遍会重复。
+   * 面板这边拿到 true 就够了——它据此收起动作条、抹掉卡片里的下划线。
+   */
   return true
 }
 
@@ -7022,6 +7167,9 @@ function openNotes() {
       .catch(() => {})
   }
   box.classList.add('on')
+  // 面板收着时可能已经收到"书页上点了某条译文"（滚动要等看得见才量得出位置，
+  // 见 reader-notes.js 的 pendingJump / onShown）。显示出来以后补上这一跳。
+  if (notesPanel && notesPanel.onShown) notesPanel.onShown()
 }
 
 function closeNotes() {

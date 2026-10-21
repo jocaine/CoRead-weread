@@ -560,14 +560,9 @@
     async _doLoad(demo, free) {
       this._demo = !!demo
       if (free !== undefined) this._free = !!free
-      // 教程模式（2026-11）：用户要求"教程里的会意图只显示教程自带的样例节点，
-      // 不要显示他自己的、也不要反过来污染他自己的图"。所以这里走**独立的一个参数**，
-      // 接收端那边是独立一份数据（扩展自带的 tutorial/graph-seed.json）。
-      // 判据由 setTutorialMode 传进来，不在这个文件里判断"当前是不是教程书"——
-      // 那是侧栏（知道当前书 ID）的事，这里只管"这次拉哪一种图"。
       this._setLoading('加载中…')
       try {
-        const q = this._tutorial ? '?tutorial=1' : this._demo ? '?demo=1' : this._free ? '?free=1' : ''
+        const q = this._demo ? '?demo=1' : this._free ? '?free=1' : ''
         const res = await fetch(this.recv + '/graph' + q)
         if (!res.ok) throw new Error('HTTP ' + res.status)
         const g = await res.json()
@@ -576,20 +571,17 @@
           edges: Array.isArray(g.edges) ? g.edges : [],
           demo: !!g.demo,
           free: !!g.free,
-          tutorial: !!g.tutorial,
           updatedAt: g.updatedAt || 0,
         }
         this._demo = this.graph.demo
         this._free = this.graph.free
-        this._source = this._tutorial ? 'tutorial' : (g.source || (this._demo ? 'demo' : this._free ? 'free' : 'file'))
+        this._source = g.source || (this._demo ? 'demo' : this._free ? 'free' : 'file')
         this._updateSourceBadge()
         this.buildRun()
         this._renderBookLegend()
         this._setLoading('')
         if (this.run.nodes.length === 0) {
-          this._setEmpty(true, this._tutorial
-            ? '教程样例图没读到：扩展里那份 tutorial/graph-seed.json 可能没进包。'
-            : '会意图中暂无节点：尚无讨论收口固化。\n可先「载入演示拓扑」预览交互与命中高亮。')
+          this._setEmpty(true, '会意图中暂无节点：尚无讨论收口固化。\n可先「载入演示拓扑」预览交互与命中高亮。')
           this.closeDetail()   // 空态时收起可能残留的详情面板
         }
         else this._setEmpty(false)
@@ -731,6 +723,34 @@
       if (!chains || chains.length <= 1) return
       const ci = chains.findIndex((c) => c.hits.includes(id) || c.nodes.includes(id))
       if (ci >= 0 && ci !== this._focusChain) this.focusChain(ci)
+    }
+
+    /**
+     * 外部（侧栏）让图**指出某个点**：等图加载完 → 选中它。
+     *
+     * 为什么不能用上面的 focusNodeChain：它在"当前没有多链高亮"时是**空操作**
+     *（`chains.length <= 1` 直接 return）。而"刚收口出来的第一个知识点"打开图时
+     * 根本没有命中链——用它等于什么都不发生（2026-10-21 复查时发现的：卡片上写着
+     * "这个点会被圈出来"，而代码并没有做到，属于**界面在说空话**）。
+     *
+     * 为什么复用 selectNode 而不是自己算相机：`selectNode` 已经把该做的都做了——
+     * 高亮这个点的来路（root→recent）、把相机对准它、打开右侧详情面板。
+     *
+     * @param {string} id 节点 id
+     * @param {number} [waitMs] 等图加载的上限（图是异步拉的）
+     * @returns {Promise<boolean>} 图里确实有这个点并已选中 → true
+     */
+    async revealNode(id, waitMs = 8000) {
+      if (!id) return false
+      const end = Date.now() + Math.max(1000, Number(waitMs) || 8000)
+      while (Date.now() < end) {
+        if (this.run && this.run.byId && this.run.byId.has(id)) break
+        await new Promise((r) => setTimeout(r, 200))
+      }
+      if (!this._open) return false
+      if (!this.run || !this.run.byId || !this.run.byId.has(id)) return false
+      this.selectNode(id)
+      return true
     }
 
     // 多链轮播（自动弹出动画）：全部 → 逐条 → 回到全部，然后渐隐关闭。
@@ -2105,11 +2125,11 @@
       this._setBannerLines([text], kind)
     }
     // 没有书的节点为什么是灰的？——只有**正式图**里"没有书"才等于"自由对话的节点"
-    //（2026-11 用户定调：只有自由对话的节点才是灰的）。教程图 / 演示图 / 测试图里的
+    //（2026-11 用户定调：只有自由对话的节点才是灰的）。演示图 / 测试图里的
     // 节点本来就没有真实书籍归属，不能把它们的空当成"自由对话"。
     _booklessMeansFree() {
       const s = this._source
-      return s !== 'tutorial' && s !== 'demo' && s !== 'results' && s !== 'free'
+      return s !== 'demo' && s !== 'results' && s !== 'free'
     }
     // 书籍图例（AI-025）：按书名分组列出 书籍 → 颜色，随图数据更新
     _renderBookLegend() {
@@ -2137,27 +2157,10 @@
       const badge = this.container && this.container.querySelector('#gv-demo-badge')
       if (!badge) return
       const s = this._source
-      if (s === 'tutorial') {
-        // 教程图必须**明说**它不是用户的图，否则用户会以为自己的知识网里凭空多了东西
-        badge.hidden = false
-        badge.textContent = '教程样例'
-        badge.title = '教程样例图：扩展自带（tutorial/graph-seed.json），只在教程里显示，不进你的会意图'
-      } else if (s === 'demo') { badge.hidden = false; badge.textContent = '演示数据'; badge.title = '演示图：由 knowledge-graph-demo.json 重建' }
+      if (s === 'demo') { badge.hidden = false; badge.textContent = '演示数据'; badge.title = '演示图：由 knowledge-graph-demo.json 重建' }
       else if (s === 'results') { badge.hidden = false; badge.textContent = '测试数据'; badge.title = '测试图：由冒烟 / 派生脚本产出（knowledge-graph-results.json）' }
       else if (s === 'free') { badge.hidden = false; badge.textContent = '自由模式'; badge.title = '自由模式沙盒图：测试对话的固化产物，不写入正式会意图' }
       else { badge.hidden = true }
-    }
-    /**
-     * 切到/退出"教程模式"（2026-11）。
-     * 由侧栏在打开图之前调用——只有侧栏知道"当前这本书是不是那本手册"。
-     * 切换时**丢掉已加载的图**，否则会拿上一次那种图去渲染（教程图 ↔ 用户图 互串）。
-     */
-    setTutorialMode(on) {
-      const next = !!on
-      if (next === !!this._tutorial) return
-      this._tutorial = next
-      this.graph = null
-      this.run = null
     }
     _setLoading(text) {
       if (!text) {

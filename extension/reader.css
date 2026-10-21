@@ -17,6 +17,10 @@
   --rd-accent-border: #bfe3cd;
   --rd-mark: rgba(122, 205, 150, 0.5);   /* 原文高亮 */
   --rd-mark-active: rgba(255, 196, 92, 0.6);
+  /* 「这一段已经设成引用」的下划线（2026-11 修：划词设引用后书页上什么都没画）。
+     只给线、不给底色：底色已经用来表达"这段翻过 / 正在对照"，再加一层会把
+     那两种状态的颜色搅浑（实测：叠在 active 的橙底上会变成橄榄色）。 */
+  --rd-ref-line: #0a7d43;
 }
 
 * { box-sizing: border-box; }
@@ -330,6 +334,12 @@ body { display: flex; flex-direction: column; }
   cursor: pointer;
 }
 .rd-tip button:hover { background: rgba(255, 255, 255, .16); }
+/* 键盘焦点：这是深色浮层，用白圈（规格里的深绿焦点环是给浅底算的，在 #23262b 上看不见） */
+.rd-tip button:focus-visible {
+  outline: none;
+  background: rgba(255, 255, 255, .16);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, .85);
+}
 
 /* ── 提示条 ───────────────────────────────────────────────────────────────── */
 .rd-toast {
@@ -351,7 +361,19 @@ body { display: flex; flex-direction: column; }
 ::highlight(rd-src) { background-color: var(--rd-mark); }
 ::highlight(rd-src-active) { background-color: var(--rd-mark-active); }
 
-/* ── 框选翻译（扫描件 / 图片）────────────────────────────────────────────── */
+/* 「这一段已经设成引用了」：只画一道绿线，不加底色。
+   为什么不给底色：底色已经用来表达"这段翻过"（rd-src）与"正在对照"（rd-src-active），
+   再叠一层会把那两种颜色搅浑（实测 10% 绿叠在橙底上变成橄榄色，active 就看不出来了）。
+   绿线与微读页面上的共读段落标记（content.js 的 #07c160 下划线）是同一种语言，
+   搬到 PDF 上仍然认得出是"引用"；2px 也与那边一致。 */
+::highlight(rd-ref) {
+  text-decoration: underline;
+  text-decoration-color: var(--rd-ref-line);
+  text-decoration-thickness: 2px;
+  text-decoration-skip-ink: none;
+}
+
+/* ── 框选识别 / 翻译（扫描件 / 图片）──────────────────────────────────────── */
 /* 图片页没有文字节点，没法用 Range 或 Custom Highlight，所以用页面上的方块标记。
    位置按「页内比例」存，缩放时重新算，因此跟着页面一起缩放。 */
 .rd-mark {
@@ -368,7 +390,9 @@ body { display: flex; flex-direction: column; }
   background: rgba(122, 205, 150, .28);
 }
 
-/* 框选过程中的橡皮筋 */
+/* 框选过程中的选框（橡皮筋）。
+   2026-11 起它**不只在拖拽时出现**：松手后动作条等待「翻译 / 设为引用」的那段时间里也留着，
+   让人看得见自己框的是哪一块；选完动作或取消时才由 hideBoxTip 收掉。 */
 .rd-marquee {
   position: absolute;
   z-index: 3;

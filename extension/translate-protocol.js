@@ -62,7 +62,9 @@ export const STORE_KEYS = {
 }
 
 /** prompt 版本号。prompt 或输出协议改动时加一，便于排查历史缓存差异。 */
-export const PROMPT_VERSION = 3   // 3：请求体加了 JSON 模式与"关思考"（见 buildChatBody）
+export const PROMPT_VERSION = 4
+// 4：新增框选「只识别原文、不翻译」（RECOGNIZE_PROMPT）
+// 3：请求体加了 JSON 模式与"关思考"（见 buildChatBody）
 
 export const IMAGE_PROMPT = [
   '你是屏幕截图翻译器。用户框选了屏幕的一块区域，图片就是这块区域。',
@@ -72,6 +74,24 @@ export const IMAGE_PROMPT = [
   '4. 只输出一个 JSON 对象，格式为 {"original":"…","translation":"…"}。',
   '不要输出解释、前后缀、Markdown 代码块或任何 JSON 之外的内容。',
   '5. 图中没有可翻译的文字时，original 与 translation 都填空字符串。',
+].join('\n')
+
+/**
+ * 框选后的「只识别原文」：**不翻译**，只把图里的字誊出来。
+ *
+ * 谁在用它（2026-11）：阅读器的框选菜单里选「设为引用」时。图片页没有文字层，
+ * 引用的身份（原文）必须先由模型识别出来；这一步不该顺手翻译 —— 用户明确选的是
+ * "设为引用"，多花一次翻译的钱、多等一次，还可能把识别结果盖掉。
+ *
+ * 输出协议刻意比 IMAGE_PROMPT 少一个字段：只有 original，调用方不会误拿到译文。
+ */
+export const RECOGNIZE_PROMPT = [
+  '你要做的是**原文识别**，不是翻译。用户框选了屏幕的一块区域，图片就是这块区域。',
+  '1. 逐字誊写图片中的正文，不改写、不补全、不总结。按自然段输出：段落之间空一行；段落内不要把一句话按截图的行宽切成多行。',
+  '2. 截图里可能混有按钮、菜单、图标、状态栏或截断的半行文字。只处理正文，忽略明显的界面噪声。',
+  '3. 只输出一个 JSON 对象，格式为 {"original":"…"}。',
+  '不要输出解释、前后缀、Markdown 代码块或任何 JSON 之外的内容。',
+  '4. 图中没有可识别的文字时，original 填空字符串。',
 ].join('\n')
 
 export const RETRANSLATE_PROMPT = [
@@ -91,6 +111,12 @@ export const SELECTION_PROMPT = [
 /** 首次解析失败后的补救 prompt：把模型上一次的输出贴回去，要求只吐 JSON。 */
 export const RETRY_PROMPT = [
   '你上一次的输出不是合法 JSON。请把它整理成合法的 JSON 对象，字段为 original 与 translation。',
+  '只输出 JSON，不要任何其他文字。以下是上一次的输出：',
+].join('\n')
+
+/** 原文识别那一步的补救 prompt（与 RETRY_PROMPT 的差别只在字段：这里只要 original）。 */
+export const RETRY_RECOGNIZE_PROMPT = [
+  '你上一次的输出不是合法 JSON。请把其中的原文整理成合法的 JSON 对象，字段为 original。',
   '只输出 JSON，不要任何其他文字。以下是上一次的输出：',
 ].join('\n')
 
@@ -270,12 +296,10 @@ export function stripCodeFence(text) {
 }
 
 /**
- * 解析模型返回的译文 JSON。
- * 容忍代码块包裹、JSON 前后有多余文字；字段缺失时返回空串。
- * @returns {{original: string, translation: string}}
- * @throws {Error} 解析不出对象或 translation 为空时抛出，code 为 PARSE_ERROR
+ * 从模型回复里取出那个 JSON 对象（容忍代码块包裹与前后多余文字）。
+ * 各解析器共用这一份：格式容忍度只该有一处，否则"翻译能过、识别过不了"迟早出现。
  */
-export function parseTranslation(raw) {
+function jsonObjectFromReply(raw) {
   const text = stripCodeFence(raw)
   const start = text.indexOf('{')
   const end = text.lastIndexOf('}')
@@ -291,9 +315,35 @@ export function parseTranslation(raw) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
     throw makeError('PARSE_ERROR', '模型返回的 JSON 不是对象')
   }
+  return obj
+}
+
+/**
+ * 解析模型返回的译文 JSON。
+ * 容忍代码块包裹、JSON 前后有多余文字；字段缺失时返回空串。
+ * @returns {{original: string, translation: string}}
+ * @throws {Error} 解析不出对象或 translation 为空时抛出，code 为 PARSE_ERROR
+ */
+export function parseTranslation(raw) {
+  const obj = jsonObjectFromReply(raw)
   const translation = String(obj.translation ?? '').trim()
   if (!translation) throw makeError('PARSE_ERROR', '模型返回的 JSON 缺少 translation 字段')
   return { original: String(obj.original ?? '').trim(), translation }
+}
+
+/**
+ * 解析「只识别原文」那一步的回复（RECOGNIZE_PROMPT 的 output）。
+ *
+ * 与 parseTranslation 的差别只有一个：**没有 translation 也算成功** —— 这一步本来就
+ * 不翻译。空原文仍算失败：一条没有任何文字的引用没有身份，设了也没用。
+ * @returns {string} 识别出的原文
+ * @throws {Error} 解析不出对象或 original 为空时抛出，code 为 PARSE_ERROR
+ */
+export function parseRecognized(raw) {
+  const obj = jsonObjectFromReply(raw)
+  const original = String(obj.original ?? '').trim()
+  if (!original) throw makeError('PARSE_ERROR', '模型返回的 JSON 缺少 original 字段（图里没有可识别的文字）')
+  return original
 }
 
 export function makeError(code, message, detail = '') {
