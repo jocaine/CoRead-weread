@@ -104,8 +104,7 @@ export function buildDraftBrief() {
     '',
     '[本轮草稿] 把这一轮**打算怎么答**写出来：只写判断，不写论证。',
     '· 用最直白的说法：谁、做了什么、因为什么、结果怎样；判断越具体越好，人名、书名、例子、数字直接写；',
-    '· 一个判断写一条，一条一行；它为什么成立、有没有反例、例子怎么讲开——这些留给终稿，草稿不写；',
-    '· 全篇 600 字上下，最多 800 字。草稿一长，下一步就分不清哪一处是真缺口了。',
+    '· 一个判断写一条，一条一行；它为什么成立、有没有反例、例子怎么讲开——这些留给终稿，草稿不写。',
   ].join('\n')
 }
 
@@ -514,7 +513,9 @@ export function buildAggregateMessage({ draft, reports = [] }) {
   ]
   if (!reports.length) lines.push('（这一轮没登记到史料：按骨架写，别假装记得旧讨论）')
   for (const r of reports) {
-    lines.push(`· ${r.kid}｜题：${r.task || '（没给题）'}`)
+    // 有题才印「｜题：…」。终稿拿到的多半是"整枝合并后的中转记录"，不对应单一题——
+    // 空着印「（没给题）」只会让提示词读起来像没做完（2026-10-26 改）。
+    lines.push(r.task ? `· ${r.kid}｜题：${r.task}` : `· ${r.kid}`)
     if (r.body) lines.push(`  ${r.body}`)
   }
   lines.push(
@@ -694,6 +695,9 @@ export async function* runTasksPipeline(deps = {}) {
   const mismatches = []
   const refusals = []
   const expanded = new Set(points.map((p) => p.id))
+  // 顶层判为「用不上」的命中节点：这一轮既不当命中、也不能再当别人的父节点（已在 expanded）。
+  // 2026-10-26 先只记日志、不改行为——先看这种屏蔽有多频繁，再决定要不要放开结构。
+  const unusedHits = new Set()
   const kidSeq = new Map()
   let full = ''
 
@@ -862,7 +866,12 @@ export async function* runTasksPipeline(deps = {}) {
 
     const candidates = []
     for (const pid of (parentsOf(id) || [])) {
-      if (!pid || expanded.has(pid)) continue
+      if (!pid) continue
+      if (expanded.has(pid)) {
+        // 顶层判「用不上」的命中节点被整轮屏蔽：材料一个字都没读。只记日志，不改行为。
+        if (unusedHits.has(pid)) log(`${kid} 的候选 ${pid} 因顶层「用不上」被整轮屏蔽（材料没读）`)
+        continue
+      }
       const n = nodeOf(pid)
       if (!n) continue
       candidates.push({ kid: nextKid(kid), id: pid, point: String(n.point || '').trim(), aliases: (n.aliases || []).filter(Boolean), depth: depth + 1, askedBy: kid })
@@ -898,6 +907,7 @@ export async function* runTasksPipeline(deps = {}) {
   for (const p of points) {
     const t = firstT.get(p.kid)
     if (!t) {
+      unusedHits.add(p.id)
       emit({ type: 'ask', kid: p.kid, depth: 0, skipped: '用不上' })
       continue
     }

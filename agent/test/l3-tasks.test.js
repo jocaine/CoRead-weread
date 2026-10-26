@@ -28,6 +28,7 @@ import { l3Path } from '../lib/l3-driver.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const SRC = fs.readFileSync(path.join(HERE, '..', 'index.js'), 'utf8')
+const LIB_SRC = fs.readFileSync(path.join(HERE, '..', 'lib', 'l3-tasks.js'), 'utf8')
 
 const NODE = (id, point) => ({
   id, point,
@@ -200,6 +201,10 @@ test('buildAggregateMessage：按条列出记录；新的推进归这一轮，�
   assert.match(out, /缺一让另外两个退化/)
   assert.match(out, /新的推进由你来做/)
   assert.match(out, /不许把新判断说成"我们当时说过"/)
+  // 没有题就别印「｜题：（没给题）」——终稿拿到的多半是整枝合并后的中转记录，不对应单一题
+  const noTask = buildAggregateMessage({ draft: { raw: 'x' }, reports: [{ kid: 'K-2', task: '', body: '那段话' }] })
+  assert.match(noTask, /· K-2\n/)
+  assert.doesNotMatch(noTask, /没给题/)
 })
 
 test('coverageRatio / checkCoverage：照抄 → 1；拒绝的不算丢弃', () => {
@@ -491,4 +496,9 @@ test('源码：跨轮继承的接线（判栈提前 → 同栈才继承 → 累�
   // 图上亮的 = 本轮真正交给模型的（命中 ∪ 继承）；不再只记本轮引用命中
   assert.match(SRC, /appendGraphHit\(hitsThisRound, reason, key, msg\.timestamp\)/)
   assert.doesNotMatch(SRC, /appendGraphHit\(valid,/)
+  // 判栈失败要清继承记录（说不清有没有换话题时，不带旧来路跨话题）
+  assert.match(SRC, /判栈失败 → 继承记录已清/)
+  // 顶层「用不上」被整轮屏蔽的节点要留日志（先只观察，不改行为）——这段在流水线里
+  assert.match(LIB_SRC, /因顶层「用不上」被整轮屏蔽/)
+  assert.match(LIB_SRC, /unusedHits\.add\(p\.id\)/)
 })

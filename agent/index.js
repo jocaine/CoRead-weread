@@ -1839,7 +1839,13 @@ async function judgeStackTurn(bookKey, unit, cites) {
 
 /** 落盘：用判好的结果 + 本轮回复，写栈、必要时收口固化。 */
 async function applyStackTurn(bookKey, unit, reply, decision) {
-  if (!decision) return
+  if (!decision) {
+    // 判栈失败：这一轮说不清有没有换话题（可能是"换了但判不出来"）。宁可丢一次继承，
+    // 也不带着不确定的来路节点跨话题用；栈本身也不动（和以前一样，这一轮不入栈）。
+    clearLive(bookKey)
+    console.log('  [l3] 判栈失败 → 继承记录已清（这一轮不继承，下一轮从零开始）')
+    return
+  }
   const { action, stack, closed, citesList, isFree, freeTag } = decision
   try {
     const lastUserIdx = stack.reduce((acc, e, i) => (e.role === 'user' ? i : acc), -1)
