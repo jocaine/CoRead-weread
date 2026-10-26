@@ -241,7 +241,9 @@ function fakeModel({ draft, reports = {}, ask = '请说清关于这一面当时�
     if (o.kind === '课题草稿') return draft
     if (o.kind === '课题报告') {
       // 新提示词里不再出现节点编号（那是内部信息），按材料内容认这一枝是谁
-      const kid = text.includes('更早的方向P') ? 'K-1.1' : (text.includes('方向B') ? 'K-2' : 'K-1')
+      const kid = text.includes('再早的方向G') ? 'K-1.1.1'
+        : text.includes('更早的方向P') ? 'K-1.1'
+          : (text.includes('方向B') ? 'K-2' : 'K-1')
       const r = reports[kid]
       if (r === undefined) throw new Error(`假模型没有 ${kid} 的登记`)
       return r
@@ -384,6 +386,39 @@ test('流水线：maxDepth=0 时只跑命中层', async () => {
   let r = await it.next()
   while (!r.done) r = await it.next()
   assert.deepEqual(model.calls.map((c) => c.kind), ['课题草稿', '课题派题', '课题报告', 'R4'])
+})
+
+test('流水线：maxDepth=2（默认）→ 命中、父、祖父都读，祖父不再往下派', async () => {
+  // A（命中）→ P（父，1 层）→ G（祖父，2 层）；G 到上限就停，不再去找它的更早讨论。
+  const nodes = {
+    A: NODE('A', '方向A'), B: NODE('B', '方向B'),
+    P: NODE('P', '更早的方向P'), G: NODE('G', '再早的方向G'),
+  }
+  const parents = { A: ['P'], P: ['G'] }
+  const model = fakeModel({
+    draft: '【方向：甲】\n- 要点',
+    reports: {
+      'K-1': REP(),
+      'K-1.1': REP('父那一段说的是承载三条件当时怎么被拆开，缺一会让另外两个退化。'),
+      'K-1.1.1': REP('祖父那一段更早，讲的是这套结构最早在什么场合被提出来，以及当时争的是什么。'),
+    },
+  })
+  const it = runTasksPipeline({
+    hist: [], persona: 'P', anchored: 'A', question: 'q', hits: ['A'],
+    nodeOf: (id) => nodes[id] || null, parentsOf: (id) => parents[id] || [],
+    complete: model.complete, stream: model.stream, log: () => {},
+  })
+  let r = await it.next()
+  while (!r.done) r = await it.next()
+  assert.deepEqual(model.calls.map((c) => c.kind), [
+    '课题草稿', '课题派题', '课题报告',        // 草稿 → 命中 A
+    '课题派题', '课题报告',                    // A → 父 P
+    '课题派题', '课题报告',                    // P → 祖父 G
+    '课题汇总', '课题汇总',                    // G 回来并进 P、P 回来并进 A
+    'R4',
+  ])
+  assert.match(model.calls[6].text, /再早的方向G/)   // 第三次交付读的是祖父
+  assert.equal(r.value, '终稿正文')
 })
 
 test('流水线：没有兜底闸——命中几个就跑几个，不由程序数着花销喊停', async () => {
