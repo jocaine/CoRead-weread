@@ -15,7 +15,6 @@
 import fs from 'fs'
 import net from 'net'
 import path from 'path'
-import readline from 'readline'
 import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { processStackMessage, makeStackEntry, collectStackCites } from './lib/topic-stack.js'
@@ -1514,7 +1513,6 @@ function saveGraph() {
 
 // 从收口组 entries（user/assistant 轮次）提取交锋轮次 {q, a}（lib/graph-consolidate.js 导出）
 
-
 // 会话中引用解析：发言 → 命中节点 id[] + L3 块。图空 / 异常 → 空，不影响主回复。
 // 命中只取上下文 + 暂存引用；**不建边**（建边在固化时，2026-08-27 定调命中与建边解耦）。
 // 2026-11 输入口径修复：判定材料只留用户自己的话（note），**剥掉引文块**（[引用] 头 +
@@ -1873,11 +1871,6 @@ async function applyStackTurn(bookKey, unit, reply, decision) {
   }
 }
 
-/** 一次跑完（判 + 落盘）：给不需要提前拿决策的调用点用。 */
-async function driveTopicStack(bookKey, unit, reply, cites) {
-  const decision = await judgeStackTurn(bookKey, unit, cites)
-  await applyStackTurn(bookKey, unit, reply, decision)
-}
 // ── 自由对话归档（2026-11 用户定调）──────────────────────────────────────────
 // 侧栏归档弹窗两项**默认都勾上**（可取消，取消的选择会被记住），随归档请求一并送到：
 //   · 保存记忆 memory：把这场对话（histories[key] 的完整轮次）交给 profile 合并
@@ -2385,12 +2378,9 @@ function enrichChatMessage(msg) {
 // data\profile\portrait.md。
 // 删掉的只是"开局从微信读书拉一份初稿"这一步，新用户从零开始积累。
 
-// ── 当前划线（书归属锚点）────────────────────────────────────────────────────
-// 2026-10-17：processNewAnnotations 整段删除（"划线即讨论"的入口与实现，见上方说明）。
-// currentAnn 留着：书绑定提问时由 processChat 赋值，REPL 的普通回复靠它把讨论归到当前书。
-let currentAnn = null
-
-// ── REPL ─────────────────────────────────────────────────────────────────────
+// ── 主循环（每 300ms 轮询侧栏消息）──────────────────────────────────────────
+// 2026-10-26：终端 REPL 那条入口已删（托盘模式下 stdin 不是终端，那个 `> ` 提示符从未可用）。
+// 现在进程只做一件事：读库里 status IN ('pending','failed') 的提问 → 逐条 say() → 写回答。
 async function main() {
   console.log('📖 CoRead 共读 agent 已启动')
   console.log(`   ${layoutSummary()}`)
@@ -2410,9 +2400,6 @@ async function main() {
     console.log(`     ${scriptCommand('migrate-data-layout.mjs')} --apply`)
     console.log('   （先不加 --apply 跑一遍是演练，只打印计划、不动文件）\n')
   }
-  console.log('   输入 /exit 退出\n')
-
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '> ' })
 
   // 强杀/断电兜底：上次会话未固化的对话在启动时恢复合并
   await recoverUnmergedMemory()
@@ -2447,8 +2434,6 @@ async function main() {
   topicStacks = readTopicStacks()
   lastReplyByBook = lastAssistantByBookFromJournal()
 
-  rl.prompt()
-
   let busy = false
   // 致命故障（401/402/403：余额不足 / 鉴权失败）后暂停队列的截止时间戳。逐条重试只会把同一句
   // 错误刷满整本书的历史（2026-09-28：重放的 213 条各写一个 ⚠️ 气泡），所以识别到这类错误就
@@ -2470,7 +2455,7 @@ async function main() {
     }
   } catch {}   // 文件不存在 = 正常情况（绝大多数启动都是这样）
 
-  // 每 3 秒轮询新标注 + 侧栏用户消息
+  // 每 300ms 轮询：读库里 status IN ('pending','failed') 的提问（侧栏发来的），逐条作答
   const poller = setInterval(async () => {
     if (busy) return
 
@@ -2478,7 +2463,6 @@ async function main() {
     // 放在 busy 判断之后：若正在调 LLM，等这条回复收尾才保存，避免并发写。
     if (fs.existsSync(STOP_FILE)) {
       clearInterval(poller)
-      rl.pause()
       console.log('\n🛑 收到停止请求，正在保存记忆，请稍候…')
       try { await saveSessionMemory({ minMsgs: 2 }) } catch (e) { console.log(`⚠️ 记忆固化失败: ${e.message}`) }
       // 关闭不做收口固化：进行中的讨论留在栈里（topic_stack.json 已实时保存），下次恢复
@@ -2498,7 +2482,6 @@ async function main() {
     const pending = readPendingMessages()
     if (!pending.length) return
     busy = true
-    rl.pause()
     try {
       for (const msg of pending) {
         // AI-001：消息归属当前书——有 bookId 用其书（自由消息也带书签，见 sidebar submit），
@@ -2573,19 +2556,7 @@ async function main() {
         // 自由对话（任意自由 key）不改变"正在读的书"：对话结束后，后续无 bookId 的
         // 自由消息仍应归属真实阅读的书，而不是滞留在自由模式
         if (msg.bookId && key !== currentBookKey && !isFreeKey(key)) {
-          // 切书：旧书的讨论周期结束，避免 currentAnn 残留污染新书
           currentBookKey = key
-          currentAnn = null
-        }
-        // 带书籍元数据的消息：绑定到该书讨论（补全书上下文）。
-        // 不带 selectedText 的自由消息不绑定书级讨论，但仍进入该书的会话上下文。
-        const bookScoped = msg.bookId && msg.selectedText
-        if (bookScoped) {
-          currentAnn = {
-            bookId: msg.bookId, bookTitle: msg.bookTitle,
-            chapter: msg.chapter, chapterUid: msg.chapterUid,
-            selectedText: msg.selectedText, userNote: msg.content,
-          }
         }
         // 引用解析（会话中）：命中 → L3 图路径上下文注入；引用挂消息（固化后按组建边）。
         // 自由模式（2026-09）：引用以侧栏窗体为准——msg.refs = 语义命中自动并入 +
@@ -2656,52 +2627,7 @@ async function main() {
       }
     } catch (e) { console.log(`⚠️ ${e.message}\n`) }
     busy = false
-    rl.resume()
-    rl.prompt()
   }, 300)
-
-  rl.on('line', async (raw) => {
-    const line = raw.trim()
-    if (!line) { rl.prompt(); return }
-    if (busy) return
-
-    if (line === '/exit' || line === '/quit') { rl.close(); return }
-
-    busy = true
-    rl.pause()
-    try {
-      if (line.startsWith('/l3')) {
-        // REPL 里也能切（开发时不用去翻文件）；回执直接打终端
-        const r = handleL3Command(line.replace(/^\/l3\s*/, ''), {
-          modeFile: L3_MODE_FILE, debugFile: L3_DEBUG_FILE,
-          log: (m) => console.log(`  [l3] ${m}`),
-        })
-        console.log('\n' + r.reply + '\n')
-      } else if (line.startsWith('【章节完成】')) {
-        // AI-001：章节总结归属当前讨论的书，否则进通用上下文
-        const reply = await say(line, { bookKey: currentBookKey || '_common' })
-        console.log('\n' + stripCodeBlocks(reply) + '\n')
-      } else {
-        // 普通用户回复
-        // AI-001：有当前书讨论锚点归该书，否则归"正在读的书"或通用上下文
-        const key = currentAnn ? baseBookId(currentAnn.bookId) : (currentBookKey || '_common')
-        // 引用解析（会话中）：命中 → L3 图路径上下文注入；引用挂消息（固化后按组建边）；
-        // 命中事件带书归属（key），侧栏按当前上下文过滤显示
-        const citesR = await resolveCitations(line, key)
-        const reply = await say(line, { bookKey: key, l3: citesR.l3, l3Hits: citesR.hits })
-        console.log('\n' + stripCodeBlocks(reply) + '\n')
-        // 会意栈（按书隔离）：REPL 输入也是用户追问，喂进该书（key）的栈；REPL 无划线，selected 恒缺省
-        const lastR = lastReplyByBook[key]
-        await driveTopicStack(key, buildTopicUnit({ content: line }, lastR ? lastR.content : null, lastR ? lastR.selected : undefined), reply, citesR.hits)
-        lastReplyByBook[key] = { content: stripCodeBlocks(reply), selected: undefined }
-      }
-    } catch (e) {
-      console.log(`⚠️ ${e.message}\n`)
-    }
-    busy = false
-    rl.resume()
-    rl.prompt()
-  })
 
   async function shutdown() {
     clearInterval(poller)
@@ -2715,7 +2641,6 @@ async function main() {
     process.exit(0)
   }
 
-  rl.on('close', shutdown)
   process.on('SIGINT', shutdown)
   process.on('SIGTERM', shutdown)
 }
