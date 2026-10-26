@@ -535,6 +535,9 @@ test('源码：跨轮继承的接线（判栈提前 → 同栈才继承 → 累�
   assert.doesNotMatch(SRC, /appendGraphHit\(valid,/)
   // 判栈失败要清继承记录（说不清有没有换话题时，不带旧来路跨话题）
   assert.match(SRC, /判栈失败 → 继承记录已清/)
+  // both 模式要把 B 那份也显示出来：单独一条 assistant 行 + 只显示不进历史的标记
+  assert.match(SRC, /〔B · 新路径〕/)
+  assert.match(SRC, /payload: \{ l3variant: 'B' \}/)
   // 顶层「用不上」被整轮屏蔽的节点要留日志（先只观察，不改行为）——这段在流水线里
   assert.match(LIB_SRC, /因顶层「用不上」被整轮屏蔽/)
   assert.match(LIB_SRC, /unusedHits\.add\(p\.id\)/)

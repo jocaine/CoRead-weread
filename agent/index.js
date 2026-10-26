@@ -276,6 +276,8 @@ function appendChatOutput(role, content, bookKey, opts = {}) {
     replyTo: opts.replyTo,
     bookId: opts.bookId, bookTitle: opts.bookTitle, chapter: opts.chapter,
     chapterUid: opts.chapterUid, selectedText: opts.selectedText,
+    // payload：只在 `l3 both` 的 B 答案上用（{ l3variant:'B' } 标"只给看、不进历史"）
+    ...(opts.payload ? { payload: opts.payload } : {}),
   }
   try {
     return chatStore().insertMessage(row)
@@ -1266,14 +1268,16 @@ async function say(userText, options = {}) {
         } catch {}
       },
       opts: {
-        // both：B 的终稿不是用户看到的那份，记录里必须标清楚（否则两份终稿分不出谁是谁）
-        ...(path === 'both' ? { finalLabel: 'B 新路径（这次没给用户看）', finalShown: false } : {}),
+        // both：B 的终稿现在也**显示给用户**（2026-10-26 用户定：边用边评估两份），
+        // 所以记录里标"已显示"，并且它会以一条 assistant 行落库、正文不参与历史。
+        ...(path === 'both' ? { finalLabel: 'B 新路径（也显示在侧栏）', finalShown: true } : {}),
       },
     }
     const fullHist = () => assembleCallHist({ hist, persona, l3: options.l3, anchored, mode: 'full' })
-    // both：两条同时跑。**给用户看的仍然是旧路径（A）**——debug 模式不该把阅读体验换掉；
-    // 新路径（B）在后台跑，跑完并排画进脑图。用户要是觉得 B 更好，再 /l3 tasks 把它扶正。
+    // both：两条同时跑。A（旧路径）流式先说；B（新路径）跑完后**再补一条气泡**，
+    // 两份并排给你评估。B 那条带 payload { l3variant:'B' }——只显示，不进历史（见 chat-store.pairReplies）。
     let altTask = null
+    let altAnswer = ''
     if (path === 'both') {
       altTask = (async () => {
         let text = ''
@@ -1324,9 +1328,9 @@ async function say(userText, options = {}) {
     if (altTask) {
       const ALT_WAIT_MS = 120_000
       const alt = await Promise.race([altTask, sleep(ALT_WAIT_MS).then(() => '')])
-      if (tree) tree.write({ type: 'final', label: 'A 旧路径（用户看到的就是这段）', text: displayContent, coverage: [], shown: true })
-      console.log(`  [l3] A/B 同输入：旧路径 ${displayContent.length} 字｜新路径 ${alt ? `${alt.length} 字` : '没跑完（超时）'}｜两份都在 data\\runtime\\l3-trace\\`)
-      if (!tree) console.log('  [l3] 注意：both 模式下没开调试（/l3 debug on），新路径那份没地方看——只在上面这行日志里')
+      altAnswer = String(alt || '').trim()
+      if (tree) tree.write({ type: 'final', label: 'A 旧路径（先说的那份）', text: displayContent, coverage: [], shown: true })
+      console.log(`  [l3] A/B 同输入：旧路径 ${displayContent.length} 字｜新路径 ${altAnswer ? `${altAnswer.length} 字` : '没跑完（超时）'}`)
     }
     if (tree && tree.file) openInBrowser(tree.file)
 
@@ -1362,6 +1366,17 @@ async function say(userText, options = {}) {
       // 本来就只承诺"每次共读结束合并重写一遍"，实时这条从来没写进对用户的话里。
       appendChatOutputStreamEnd(key, options.replyToTs)
       replyRowId = appendChatOutput('assistant', displayContent, key, { replyTo: options.replyTo })
+      // both：A 先落库，B 紧跟其后补一条**只显示、不进历史**的气泡（payload l3variant:'B'）。
+      // 两句话分别是谁，靠正文第一行标出来——用户要一眼能分。
+      if (altAnswer) {
+        try {
+          appendChatOutput('assistant', '〔B · 新路径〕\n\n' + altAnswer, key, {
+            replyTo: options.replyTo, payload: { l3variant: 'B' },
+          })
+        } catch (e) {
+          console.log(`  [l3] B 那份没写成气泡（不影响 A 的回答）：${e.message}`)
+        }
+      }
     }
   } catch (e) {
     // 用户停止（2026-02 用户定调"当没问过"）：不写失败气泡、不加 ⚠️、不标作废入库，

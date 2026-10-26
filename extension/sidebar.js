@@ -2965,6 +2965,9 @@ function addBubble(role, content, extra, note, bookId) {
     }
     hideThinking()
     el.className = 'msg-assistant'
+    // `l3 both`：同一问题的第二份答案（新路径 B）单独一条气泡，左边加一道色边区分。
+    // 标记只认正文第一行那个前缀——落库时就写在里面，历史回放也认得出。
+    if (String(content || '').startsWith('〔B · 新路径〕')) el.classList.add('alt-b')
     el.innerHTML = mdBubble(content)
   }
 

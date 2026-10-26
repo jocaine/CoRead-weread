@@ -1248,6 +1248,12 @@
       border-bottom-color: rgba(255, 255, 255, 0.85);
     }
     .msg-user .bubble .uq-body { white-space: pre-wrap; }
+    /* `l3 both` 的第二份答案（新路径 B）：同一问题并排看两份，靠左色边区分，
+       不做成另一种气泡——读的时候该注意的是回答本身，不是版本标签。 */
+    .msg-assistant.alt-b .bubble {
+      border-left: 3px solid #7c9cbf;
+      background: #fbfcfe;
+    }
     .msg-assistant .bubble {
       background: #fff;
       border: 1px solid #ececec;

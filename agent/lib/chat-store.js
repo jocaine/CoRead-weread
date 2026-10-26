@@ -306,6 +306,9 @@ export class ChatStore {
     const pairs = new Map()   // user message id → reply（已转成消息对象，字段名与旧 JSONL 一致）
     for (const r of rows) {
       if (r.role === 'user') continue
+      // `l3 both` 的 B 答案只给用户"同时看两份"用，**不进历史**：它和 A 指向同一条提问，
+      // 放进来会把 A 顶掉（pairs 是 Map，后写覆盖先写），下一轮上下文就变成 B 那份。
+      if (rowVariant(r) === 'B') continue
       if (r.reply_to != null && byId.has(Number(r.reply_to))) { pairs.set(Number(r.reply_to), r); continue }
       if (r.status === 'failed' && !includeFailedReplies) continue
       if (String(r.content || '').startsWith('⚠️') && !includeFailedReplies) continue
@@ -481,6 +484,17 @@ export class ChatStore {
       return { ok: false, error: e.message }
     }
   }
+}
+
+/**
+ * 这一行是不是 `l3 both` 模式下那份"只给看、不进历史"的 B 答案。
+ * 标记写在 payload 里（`{ l3variant: 'B' }`），不写进正文——正文要原样给人读。
+ */
+function rowVariant(r) {
+  try {
+    const p = JSON.parse(r && r.payload ? r.payload : 'null')
+    return p && typeof p === 'object' ? p.l3variant : undefined
+  } catch { return undefined }
 }
 
 /** DB 行 → 消息对象（字段名与旧 JSONL 保持一致，消费者尽量不用改）。 */

@@ -76,6 +76,25 @@ test('loadTurns：按对话重建轮次，无回答的不成轮', () => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('loadTurns：`l3 both` 的 B 答案只显示、不进历史（不能把 A 顶掉）', () => {
+  const dir = tmpDir()
+  const store = openChatStore(path.join(dir, 'chat.db'))
+  const q = store.insertMessage({ conv: 'x', role: 'user', content: 'Q1', ts: 100, status: 'ok' })
+  store.insertMessage({ conv: 'x', role: 'assistant', content: 'A 旧路径的答案', ts: 150, replyTo: q })
+  store.insertMessage({
+    conv: 'x', role: 'assistant', content: '〔B · 新路径〕\n\nB 新路径的答案', ts: 160,
+    replyTo: q, payload: { l3variant: 'B' },
+  })
+  const turns = store.loadTurns('x')
+  assert.equal(turns.length, 1, '同一提问仍然只成一轮')
+  assert.equal(turns[0].assistant.content, 'A 旧路径的答案', '历史里必须是 A（B 和 A 指向同一条提问，B 放进来会顶掉 A）')
+  // 但两条都在库里、都会被 receiver 推给侧栏显示
+  const all = store.listMessages({ conv: 'x' })
+  assert.equal(all.filter((m) => m.role === 'assistant').length, 2)
+  store.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('loadTurns：范围由 afterId 决定，不是"固定取最近 N 条"', () => {
   // 回归背景（2026-11）：旧实现 `ORDER BY id DESC LIMIT 60`——LIMIT 数的是消息行（60 行 = 30 轮），
   // 而恢复调用方拿这个结果再 `Math.min(游标, list.length)` 跳过开头。游标是"累计切掉条数"
