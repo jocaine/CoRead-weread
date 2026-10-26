@@ -274,3 +274,15 @@ test('补拉失败不记账：下次切回会重试，成功后才算拉过', as
   assert.equal(hits, 2, '失败那次 + 重试那次')
   assert.equal(X.state().users, 2, '重试成功后气泡出来了')
 })
+
+// ── 静态闸门：SSE 补渲染的 assistant 气泡必须带书标记 ─────────────────────────
+// 2026-10-26 `l3 both` 的第二份答案就是这么"消失"的：库里有、屏上没有。
+// applyBookFilter 的规则是 `el.dataset.book === 当前书 ? 显示 : none`，
+// 所以任何走 addBubble('assistant', …) 却没传 bookId 的路径，在读书模式下都会被整条藏掉。
+test('SSE 补渲染的 assistant 气泡必须带书标记（否则被 applyBookFilter 藏掉）', () => {
+  const src = fs.readFileSync(JS, 'utf8')
+  // 规则本身没变：没书签就 hidden
+  assert.match(src, /const b = el\.dataset\.book \|\| ''/)
+  // 补渲染那条路必须把 d.bookKey 带进去（bookId 是 addBubble 的第 5 个参数）
+  assert.match(src, /addBubble\('assistant', d\.content, null, null, d\.bookKey\)/)
+})

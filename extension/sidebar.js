@@ -3370,7 +3370,10 @@ function connect() {
         return
       }
       if (d.role === 'assistant') {
-        addBubble('assistant', d.content)
+        // 必须带上这本书的标记：applyBookFilter 的规则是"没有 dataset.book 就 display:none"，
+        // 不传 bookId 的气泡在读书模式下会被整条藏起来（`l3 both` 的第二份答案正是走这条路，
+        // 2026-10-26 实测：库里写进去了、屏上没有）。
+        addBubble('assistant', d.content, null, null, d.bookKey)
         finishWaiting()   // 没有流式气泡可补、答案直接落库到了 = 这一轮结束
       } else if (d.role === 'user-popup') {
         // 来自共读弹窗的用户消息（AI-001：引用回复绑定该书）
