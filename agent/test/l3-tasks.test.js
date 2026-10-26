@@ -386,16 +386,17 @@ test('流水线：maxDepth=0 时只跑命中层', async () => {
   assert.deepEqual(model.calls.map((c) => c.kind), ['课题草稿', '课题派题', '课题报告', 'R4'])
 })
 
-test('流水线：兜底闸到顶 → 不再发探索调用，但 R4 照跑', async () => {
+test('流水线：没有兜底闸——命中几个就跑几个，不由程序数着花销喊停', async () => {
+  // 2026-10-26 用户定：删掉那三道闸（调用数/材料 token/墙钟）。这里钉住"两个命中都真的跑到了"。
   const model = fakeModel({ draft: '【方向：甲】\n- 要点', reports: { 'K-1': REP(), 'K-2': REP() } })
   const it = runTasksPipeline({
     hist: [], persona: 'P', anchored: 'A', question: 'q', hits: ['A', 'B'], ...graphDeps(),
-    complete: model.complete, stream: model.stream, log: () => {}, opts: { maxCalls: 1 },
+    complete: model.complete, stream: model.stream, log: () => {},
   })
   let r = await it.next()
   while (!r.done) r = await it.next()
   const kinds = model.calls.map((c) => c.kind)
-  assert.ok(kinds.filter((k) => k === '课题报告').length <= 1, '闸到顶后不该再多跑')
+  assert.equal(kinds.filter((k) => k === '课题报告').length, 3, '两个命中 + A 的父 P 都要读，不许被闸掐掉')
   assert.equal(kinds.at(-1), 'R4')
 })
 

@@ -21,16 +21,13 @@
  */
 
 /**
- * 兜底闸与取回粒度（设计 §4/§5）。语义上的"该不该再追"由派题判，这里只防跑飞。
- * maxCalls 只数探索阶段（逐块交付 + 派题），草稿和终稿是每轮固定的一次，不计入。
+ * 取回粒度与各类预算（设计 §4/§5）。
+ *
+ * 2026-10-26 用户定：**不要兜底闸**。原来那三道（探索调用数 10、材料约 6 万 token、墙钟 120 秒）
+ * 一律删掉——"该不该再追"只由派题判，不由程序数着花销替你喊停。
+ * 保留下来的是每次调用各自的 maxTokens（那是单次生成的预算，不是整轮的上限）。
  */
 export const TASK_LIMITS = {
-  maxCalls: 10,            // 探索阶段调用总数（2 命中 + 2 层来路 ≈ 4~6 次，留余量）
-  maxTokens: 60000,        // 材料估算 token 合计上限（**这才是该紧的闸**，单节点不该单独抠）
-  maxMs: 120000,           // 探索阶段墙钟上限（不含草稿/终稿的等待）。
-                            // 原来写 20 秒是拍脑袋的：实测一次交付（8k 字材料 + 推理模型的思考）
-                            // 就要 9~20 秒，20 秒的闸在第一枝上就触发，等于整条流水线永远跑不完。
-                            // 真正防跑飞的是调用数（10 次）和材料 token，时间是最后的兜底。
   maxDepth: 1,             // 来路最多追几层（命中 = 0 层）；每层一次汇总
   // 2026-10-25 用户定：**材料绝不截取**——截了模型就真看不见，问它“当时谈过什么”就变成猜。
   maxExcerptChars: Infinity,
@@ -606,14 +603,8 @@ export async function* runTasksPipeline(deps = {}) {
 
   const lim = { ...TASK_LIMITS, ...(opts || {}) }
   const t0 = Date.now()
+  // 只用来记账（stats 里报"探索调用 N 次 / 材料约 N token"），不参与任何拦截
   const spent = { calls: 0, chars: 0 }
-  /** 兜底闸：返回空串 = 还能花；返回原因 = 到顶了（先到先停）。 */
-  const budget = () => {
-    if (spent.calls >= lim.maxCalls) return `调用数 ${spent.calls}/${lim.maxCalls}`
-    if (spent.chars * lim.tokenPerChar >= lim.maxTokens) return `材料约 ${Math.round(spent.chars * lim.tokenPerChar)}/${lim.maxTokens} token`
-    if (Date.now() - t0 >= lim.maxMs) return `耗时 ${Date.now() - t0}/${lim.maxMs}ms`
-    return ''
-  }
 
   /** 把一次流式调用原样转发出去（R4 / 无命中的普通回复共用）。 */
   async function* relay(messages) {
@@ -701,14 +692,9 @@ export async function* runTasksPipeline(deps = {}) {
   const kidSeq = new Map()
   let full = ''
 
-  let gateEmitted = false
-  let tripped = ''
+  // 2026-10-26：兜底闸已删（用户定：该不该再追只由派题判，不由程序数着花销喊停）。
+  // callOnce 现在只做两件事：记一笔调用数（stats 用）、把调用发出去。
   const callOnce = async (o) => {
-    tripped = budget()
-    if (tripped) {
-      if (!gateEmitted) { gateEmitted = true; emit({ type: 'gate', reason: tripped }) }
-      return null
-    }
     spent.calls++
     return complete(o)
   }
@@ -730,7 +716,6 @@ export async function* runTasksPipeline(deps = {}) {
         log(`R2 ${kid} 调用失败：${e.message}`)
         return { reason: `调用失败：${e.message}` }
       }
-      if (out == null) return { reason: `兜底闸：${tripped || '到顶了'}` }
       const rep = parseReport(out, kid)
       if (rep) return { report: rep }
       log(`R2 ${kid} 输出不是合法登记（第 ${attempt} 次）：${String(out).replace(/\s+/g, ' ').slice(0, 80)}`)
@@ -766,7 +751,6 @@ export async function* runTasksPipeline(deps = {}) {
         maxTokens: lim.askTokens,
         temperature: 0,
       })
-      if (out == null) { log(`${kid} 派题：兜底闸（${tripped}）`); return new Map() }
       const tasks = parseDraftTasks(out, candidates.map((c) => c.kid))
       const brief = [...tasks].map(([k, v]) => k + ':' + (v ? '有题' : '用不上')).join('、')
       log(`${kid} 派题 → ${tasks.size}/${candidates.length}${tasks.size ? '（' + brief + '）' : '（没派出来）'}｜${((Date.now() - t) / 1000).toFixed(1)}s`)
@@ -927,8 +911,6 @@ export async function* runTasksPipeline(deps = {}) {
   ])
   log(`终稿 ${full.length} 字（草稿 + ${finalReports.length} 份回归汇总）`)
   emit({ type: 'final', text: full, coverage: [], ...(lim.finalLabel ? { label: lim.finalLabel } : {}), ...(lim.finalShown === false ? { shown: false } : {}) })
-
-  if (tripped) log(`探索阶段触发兜底闸：${tripped}（还有枝想问下去也停了，属正常保护）`)
 
   // 这一轮的继承增量交出去（index.js 会「并上 nodes、去掉 failed」写下一轮可继承的清单）。
   //   nodes  = 成功上报的来路节点（depth ≥ 1）：命中节点本身每轮由引用解析重新决定要不要跑
