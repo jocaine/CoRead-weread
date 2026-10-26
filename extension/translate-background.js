@@ -14,7 +14,7 @@
  *   { action: 'captureScreen' }               → { ok, dataUrl }  仅 overlay 内部用
  *   { action: 'translateImage', dataUrl }     → { ok, data: { original, translation } }
  *   { action: 'recognizeImage', dataUrl }     → { ok, data: { original } }  只识别、不翻译（框选设引用）
- *   { action: 'translateText', text, source } → { ok, data: { original, translation } }
+ *   { action: 'translateText', text, source, fromOcr, bookTitle, precise } → { ok, data: { original, translation } }
  *   { action: 'testConnection' }              → { ok, text }
  */
 
@@ -23,15 +23,16 @@ import {
   IMAGE_PROMPT,
   RECEIVER_URL,
   RECOGNIZE_PROMPT,
-  RETRANSLATE_PROMPT,
   RETRY_PROMPT,
   RETRY_RECOGNIZE_PROMPT,
-  SELECTION_PROMPT,
   STORE_KEYS,
+  TRANSLATE_SYSTEM_PROMPT,
+  TRANSLATE_SYSTEM_PROMPT_OCR,
   buildChatBody,
   buildImageContent,
   buildRelocatePrompt,
   buildTextContent,
+  buildTranslateContent,
   chatCompletionsUrl,
   classifyFetchError,
   classifyHttpError,
@@ -40,16 +41,29 @@ import {
   parseRecognized,
   parseRelocateReply,
   parseTranslation,
+  planChatAttempts,
   relocateSnippet,
 } from './translate-protocol.js'
 
 const UPSTREAM_TIMEOUT_MS = 60_000
 const MAX_TEXT_CHARS = 6000
+/**
+ * 「精译」的输出额度（2026-10-24）。
+ *
+ * 精译 = 不关思考，让模型先读懂句法再译（见 translateText 的 precise）。实测一段
+ * 1929 字德文：思考 3621 + 输出 3937 = 7558，已经贴着默认的 8192；再长一点就会被截断成
+ * 「额度用完」。上游实测接受 16384/32768（HTTP 200），这里取 16384：够 6000 字输入用，
+ * 又不至于让一次请求无限期地跑下去。
+ */
+const PRECISE_MAX_TOKENS = 16384
 const ACTION_TITLE = 'CoRead'
 const OVERLAY_FILE = 'translate-overlay.js'
 
-// 连通性探测用的地址：一个只回 204 空响应的公共端点，用来回答「是网络整体不通，还是只有模型地址不通」。
-const PROBE_URL = 'https://www.gstatic.com/generate_204'
+// 连通性探测用的地址：用来回答「是浏览器整体上不了网，还是只有这个模型地址不通」。
+// 2026-10-24 从 www.gstatic.com 换成百度：gstatic 是 Google 域名，国内本来就不一定通，
+// 通不了时结论会变成"本机外网整体不通"——把真正的原因（系统代理/VPN 指向了一个没在跑
+// 的端口）盖掉。百度是国内的，通不了才更可能真的是浏览器上不了网。
+const PROBE_URL = 'https://www.baidu.com/robots.txt'
 const PROBE_TIMEOUT_MS = 5000
 
 const HANDLERS = {
@@ -186,6 +200,15 @@ function readSelectionInPage() {
   return { text, rect }
 }
 
+/**
+ * 网页这条路没有「书名」这个字段，退回标签页标题。
+ * 微读的标题是「书名 - 微信读书」，去掉后缀；取不到就给空串——
+ * 少一条语境不影响翻译，总比把「微信读书」四个字当书名递过去好。
+ */
+function bookTitleOfTab(tab) {
+  return String(tab?.title || '').trim().replace(/\s*[-–—|]\s*微信读书\s*$/, '')
+}
+
 /** 划词翻译：读选区 → 纯文本请求 → 在选区旁出气泡。不截图，不需要图像能力。 */
 async function translateSelection() {
   const off = await requireEnabled()
@@ -216,7 +239,10 @@ async function translateSelection() {
     return fail('TOO_LARGE', '选中文字超过 ' + MAX_TEXT_CHARS + ' 字，请缩小选区后重试')
   }
 
-  const r = await chat({ content: buildTextContent(SELECTION_PROMPT, text) })
+  const r = await chat({
+    content: buildTranslateContent({ text, bookTitle: bookTitleOfTab(tab) }),
+    system: TRANSLATE_SYSTEM_PROMPT,
+  })
   if (!r.ok) {
     flashBadge('✕', r.error?.message || '翻译失败')
     return r
@@ -423,11 +449,11 @@ async function probeInternet() {
   const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS)
   try {
     await fetch(PROBE_URL, { method: 'GET', signal: controller.signal, cache: 'no-store' })
-    return '但本机访问其它外网是通的，问题只在这个模型地址'
+    return '但浏览器访问其它网站是通的：问题在这个模型地址，或代理规则把它拦了'
   } catch (e) {
     const nm = String(e?.name ?? '')
-    if (nm === 'AbortError') return '另一项连通性探测也超时，本机当前访问外网很可能整体不通'
-    return '另一项连通性探测也失败，本机当前访问外网很可能整体不通'
+    if (nm === 'AbortError') return '浏览器访问其它网站也超时：当前很可能整体上不了网（看下系统代理/VPN 指向的端口是否在运行）'
+    return '浏览器访问其它网站也失败：当前很可能整体上不了网（看下系统代理/VPN 指向的端口是否在运行）'
   } finally {
     clearTimeout(timer)
   }
@@ -468,8 +494,13 @@ async function postChat(target, apiKey, opts) {
  *
  * @param {boolean} jsonMode 这次调用要不要开 JSON 模式。连通性探测那种"只回两个字"的
  *   请求必须关掉（prompt 里没有 JSON 字样，开了反而可能被判格式不符）。
+ * @param {string} system 文本翻译的角色与规则（2026-10-24 起与正文分开）。图片那几条路
+ *   不传：图片块只能出现在 user 消息里，见 buildImageContent。
+ * @param {boolean} noThinking 要不要显式关思考。默认 true（快、稳、便宜）——2026-10-24
+ *   的实测里，关思考对难句会**不稳定**（同一段两次跑出一对一错）；false 时省略 thinking
+ *   字段，模型会先推一遍再答，短段约 5 秒、1900 字长段约 25 秒。只有「精译」传 false。
  */
-async function chat({ content, maxTokens = 8192, jsonMode = true }) {
+async function chat({ content, system = '', maxTokens = 8192, jsonMode = true, noThinking = true }) {
   const cfg = await readConfig()
   if (!cfg.apiBase || !cfg.apiKey) {
     return fail('NOT_CONFIGURED', '尚未配置模型 API。请在侧栏「⋯ → 🔑 模型 API 配置」中填写地址与 Key')
@@ -488,10 +519,10 @@ async function chat({ content, maxTokens = 8192, jsonMode = true }) {
   } catch {}
 
   const target = chatCompletionsUrl(cfg.apiBase)
-  const wantJson = jsonMode && !jsonModeRejected
-  const attempts = [{ jsonMode: wantJson, noThinking: !thinkingRejected }]
-  if (!thinkingRejected) attempts.push({ jsonMode: wantJson, noThinking: false })
-  if (wantJson) attempts.push({ jsonMode: false, noThinking: false })
+  // 降级顺序见 translate-protocol.js 的 planChatAttempts（纯函数、有单测）：
+  // 第一发按调用方的要求（精译要的就是 noThinking:false = 不传 thinking 字段）；
+  // 本来关着思考的，才需要第二发去试"开思考"。
+  const attempts = planChatAttempts({ jsonMode, noThinking, jsonModeRejected, thinkingRejected })
 
   let resp
   let body = ''
@@ -499,7 +530,7 @@ async function chat({ content, maxTokens = 8192, jsonMode = true }) {
   for (let i = 0; i < attempts.length; i++) {
     const opt = attempts[i]
     try {
-      resp = await postChat(target, cfg.apiKey, { model: cfg.model, content, maxTokens, ...opt })
+      resp = await postChat(target, cfg.apiKey, { model: cfg.model, content, system, maxTokens, ...opt })
     } catch (e) {
       // 带上 target：浏览器对 DNS 失败 / 端口不通 / 地址缺协议头 / 被系统代理挡住都只回一句
       // Failed to fetch，没有这个地址与这次探测，就无法区分是「配置写错了」还是「网络到不了」。
@@ -596,6 +627,27 @@ async function recognizeImage(msg) {
   }
 }
 
+/**
+ * 文本翻译（划词 / 重译共用）。
+ *
+ * 2026-10-24 改了两处：
+ *   · 规则挪进 system，user 消息只放书名与【待译文字】正文（见 buildTranslateContent）；
+ *   · 提示词按**原文来源**选，而不是按"是不是 selection"二分。
+ *
+ * 为什么第二条要改：划词那个分支的提示词里原来只要求"译成简体中文、保留段落与换行"，
+ * 而其余一律落到那版带 OCR 字样的重译提示词 —— 它第一句是"这段文字来自屏幕截图识别，可能有
+ * 错字与断行"。对扫描件（OCR 出来的）成立，对 PDF 文字层抽出来的原文是**假的**：模型会
+ * 去"纠正"人名、术语和旧拼法。现在由调用方显式传 fromOcr。
+ *
+ * 兼容：老调用方没有 fromOcr 字段，只有 source；source === 'retranslate' 的旧语义就是
+ * "OCR 那条"，按 true 处理，行为与改动前一致。
+ *
+ * 2026-10-24 加 precise（精译，卡片上的「精译」按钮走这里）：
+ *   · 关思考那一档对难句**不稳定**——同一段德文两次跑出一对一错（实测），这不是"差一点"；
+ *   · precise 时不传 thinking 字段，模型先推一遍再译：167 字短段约 5 秒、1929 字长段约 25 秒；
+ *   · 输出额度一并放宽到 PRECISE_MAX_TOKENS（思考 token 和答案共用额度，默认 8192 会贴顶）；
+ *   · 其余（规则、JSON 模式、JSON 解析失败时的补救）与普通翻译完全相同。
+ */
 async function translateText(msg) {
   const off = await requireEnabled()
   if (off) return off
@@ -604,17 +656,31 @@ async function translateText(msg) {
   if (text.length > MAX_TEXT_CHARS) {
     return fail('TOO_LARGE', '原文超过 ' + MAX_TEXT_CHARS + ' 字，请缩短后重试')
   }
-  const prompt = msg?.source === 'selection' ? SELECTION_PROMPT : RETRANSLATE_PROMPT
-  const r = await chat({ content: buildTextContent(prompt, text) })
+
+  const fromOcr = typeof msg?.fromOcr === 'boolean' ? msg.fromOcr : msg?.source === 'retranslate'
+  const precise = msg?.precise === true
+  const system = fromOcr ? TRANSLATE_SYSTEM_PROMPT_OCR : TRANSLATE_SYSTEM_PROMPT
+  const content = buildTranslateContent({ text, bookTitle: msg?.bookTitle })
+  const r = await chat({
+    content,
+    system,
+    noThinking: !precise,
+    maxTokens: precise ? PRECISE_MAX_TOKENS : 8192,
+  })
   if (!r.ok) return r
   try {
     return { ok: true, data: { original: text, translation: parseTranslation(r.text).translation } }
   } catch {}
 
-  // 解析失败补救一次：把同一段原文再要一遍，这次明确要求只吐 JSON。
+  // 解析失败补救一次：内容与规则都不变，只把"这次必须给 JSON"再说一遍。
   // 不把上一次的输出贴回去让它"整理" —— 万一那段是模型的思考过程，
   // 整理出来的就是一段**说得通但翻错了**的译文，比直接报错更糟。
-  const retry = await chat({ content: buildTextContent(prompt + '\n上一次没有按格式返回。这次只输出那一个 JSON 对象，不要任何解释、前缀或代码块。', text) })
+  const retry = await chat({
+    content,
+    system: system + '\n上一次没有按格式返回。这次只输出那一个 JSON 对象，不要任何解释、前缀或代码块。',
+    noThinking: !precise,
+    maxTokens: precise ? PRECISE_MAX_TOKENS : 8192,
+  })
   if (retry.ok) {
     try {
       return { ok: true, data: { original: text, translation: parseTranslation(retry.text).translation }, retried: true }
@@ -863,6 +929,8 @@ async function readerCommand(msg) {
     type: msg && msg.type,
     id: msg && msg.id,
     text: msg && msg.text,
+    // showTranslation 用：要显示哪一版。白名单式转发，新字段必须加进来（漏了就是"点了没反应"）
+    showPrecise: msg && msg.showPrecise,
     // quote = 用户在**译文里划出来的那一段**（2026-11，侧栏译文卡片的"划选共读"）。
     // 只有 reference 用得上；漏掉它的话阅读器只能退回"整卡"，表现是"划了半句、
     // 进引用的却是整页译文"——而且不报错。转发是白名单式的，所以新增字段必须加成这里。
@@ -1297,6 +1365,31 @@ export function refContextOf(msg) {
   return ''
 }
 
+/**
+ * 这条引用落在书里哪一处（2026-10-25）：阅读器设引用时报上来的「页号 + 页内偏移」。
+ *
+ * 为什么要存：侧栏点这条引用要跳回**划线那一处**，只按文字找会跳到同一句话的
+ * 另一个出现位置（用户实测《置身事内》第 56 页与第 58 页都有"全国预算收入"，
+ * 划的是 58，按文字找落到 56）。
+ *
+ * 整形规则：坏锚点直接丢掉（页号从 1 起、偏移非负、end > start）——宁可这条引用
+ * 没有位置（退回按文字找），也不能让阅读器拿着一个荒唐的页号去跳。最多留 8 段
+ * （一段跨页的引用最多也就几段；再多只可能是上游出错）。
+ *
+ * @param {{anchors?: Array}} msg 阅读器发来的消息
+ * @returns {Array<{page:number,start:number,end:number}>}
+ */
+export function refAnchorsOf(msg) {
+  return (Array.isArray(msg?.anchors) ? msg.anchors : [])
+    .map((a) => ({
+      page: Math.trunc(Number(a?.page)),
+      start: Math.trunc(Number(a?.start)),
+      end: Math.trunc(Number(a?.end)),
+    }))
+    .filter((a) => Number.isFinite(a.page) && a.page >= 1 && Number.isFinite(a.start) && a.start >= 0 && a.end > a.start)
+    .slice(0, 8)
+}
+
 async function setTranslationRef(msg) {
   const original = String(msg?.original || '').trim()
   const quote = String(msg?.quote || '').trim().slice(0, MAX_TRANSLATION_CHARS)
@@ -1307,6 +1400,8 @@ async function setTranslationRef(msg) {
   const context = refContextOf(msg)
   // 显示用的那半边：划选了就是那一段，否则整段译文
   const translation = (quote || String(msg?.translation || '').trim()).slice(0, MAX_TRANSLATION_CHARS)
+  // 这条引用落在书里哪一处（跳引用靠它回到划线那一处，见 refAnchorsOf）
+  const anchors = refAnchorsOf(msg)
 
   const tab = await activeTab()
   if (!tab) return fail('NO_TAB', '没有可用的标签页')
@@ -1330,6 +1425,8 @@ async function setTranslationRef(msg) {
         bookTitle: ctx.bookTitle || '',
         selectedText: selected,   // original || quote || translation（见函数头那段分工）
         ...(context ? { context } : {}),
+        // 这条引用落在书里的哪一处（跳引用靠它回到划线那一处，见上面的 anchors）
+        ...(anchors.length ? { anchors } : {}),
         // 译文（2026-11）：只有真的翻过才带。浮层那条（translate-overlay）也带它，
         // 但那份"原文"是 textarea 里可编辑的稿子，语义已在调用处说明。
         ...(translation ? { translation } : {}),

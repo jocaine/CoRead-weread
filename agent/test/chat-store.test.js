@@ -248,6 +248,32 @@ test('迁移：丢掉快照、回填状态、配对 answer→question、事件�
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('listMessagesForBook：整书会话 + 各章节会话一起取，不误伤相邻书', () => {
+  // 回归背景（2026-10-25）：/history 只回全库最近 500 条，旧书整本滑出窗口后
+  // 侧栏点开是空的。按书补拉要能取到"这本书的全部"，且不能把相邻书带进来
+  //（conv 用 base + 'k' + 哈希，`LIKE base || 'k%'` 会把 base 里的 `_` 当通配符）。
+  const dir = tmpDir()
+  const store = openChatStore(path.join(dir, 'chat.db'))
+  const base = 'mia_8a66411378a3f8d9116f'
+  store.insertMessage({ conv: base, role: 'user', content: '整书 Q', ts: 100 })
+  store.insertMessage({ conv: base, role: 'assistant', content: '整书 A', ts: 150 })
+  store.insertMessage({ conv: base + 'kc4c329b011c4ca4238a0201', role: 'user', content: '章节 Q', ts: 200 })
+  store.insertMessage({ conv: 'mia_8a66411378a3f8d9117f', role: 'user', content: '别的书', ts: 300 })
+  store.insertMessage({ conv: base + '2', role: 'user', content: '同前缀但不是 k 后缀', ts: 400 })
+
+  const all = store.listMessagesForBook(base)
+  assert.deepEqual(all.map((m) => m.content), ['整书 Q', '整书 A', '章节 Q'], '按 ts 升序，且只取这本书')
+  assert.equal(all[0].bookKey, base, '字段名与 listMessages 一致')
+
+  const tail = store.listMessagesForBook(base, { limit: 1 })
+  assert.deepEqual(tail.map((m) => m.content), ['章节 Q'], 'limit 取最近 N 条（从尾部）')
+
+  assert.deepEqual(store.listMessagesForBook(''), [], '空 base 不查库')
+  assert.deepEqual(store.listMessagesForBook('不存在的书'), [], '没有会话 → 空数组')
+  store.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('迁移：留下"从未被回答"的提问清单（默认不补答）；重放指纹可被检出', () => {
   const dir = tmpDir()
   const { inbox, users } = buildLegacyInbox(dir)

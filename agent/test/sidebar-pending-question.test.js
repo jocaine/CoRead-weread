@@ -219,7 +219,9 @@ const ANSWER = { role: 'assistant', content: '因为……', _ts: 1791690001000,
 // ── receiver 半边：在途提问必须回放 ─────────────────────────────────────────
 test('守卫：/history 不许把在途提问（pending 的 user 行）一起滤掉', () => {
   const src = fs.readFileSync(RECEIVER_SRC, 'utf8')
-  const at = src.indexOf("if (req.method === 'GET' && req.url === '/history')")
+  // 条件可能是 `req.url === '/history'` 或带参数的 `req.url.split('?')[0] === '/history'`
+  // （2026-10-25 加了 ?book= 单本补拉），两种形状都要能定位到这一段。
+  const at = src.search(/req\.method === 'GET' && req\.url(?:\.split\('\?'\)\[0\])? === '\/history'/)
   assert.ok(at > 0, '找不到 /history 分支')
   const block = src.slice(at, at + 8000)
   const line = block.split('\n').find((l) => l.includes("status === 'pending'"))

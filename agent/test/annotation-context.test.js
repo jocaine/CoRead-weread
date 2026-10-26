@@ -14,7 +14,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { annotationContextFor, findAnnotationContext, readAnnotationRows } from '../lib/annotation-context.js'
+import { annotationContextFor, findAnnotationContext, findAnnotationRef, readAnnotationRows } from '../lib/annotation-context.js'
 
 const BOOK = 'rd_6b45298ee60849ff025176dbd8f88b75d90a1c04057550e9f37719513e2c2473'
 const OTHER = 'rd_0562df5267e32a3fd43802e194cbd6bc8f3d099de90905700e0bffd207ad8aae'
@@ -75,6 +75,32 @@ test('老标注（没有 context 字段）与坏输入一律返回空串', () =>
   assert.equal(findAnnotationContext([row()], '', TEXT), '')
   assert.equal(findAnnotationContext([], BOOK, TEXT), '')
   assert.equal(findAnnotationContext(null, BOOK, TEXT), '')
+})
+
+// ── 整条记录（译文引用要拿它判断"有没有 translation"）───────────────────────
+test('findAnnotationRef 返回整条记录，不只是 context', () => {
+  const withTr = row({ translation: '译文片段' })
+  const hit = findAnnotationRef([withTr], BOOK, TEXT)
+  assert.equal(hit, withTr)
+  assert.equal(hit.translation, '译文片段')
+  assert.equal(findAnnotationRef([row({ bookId: OTHER })], BOOK, TEXT), null)
+  assert.equal(findAnnotationRef([], BOOK, TEXT), null)
+})
+
+test('findAnnotationRef：同一段有两条时，带 context 的优先（旧 findAnnotationContext 只认它）', () => {
+  // 真实来路：先设过一次引用（带 context），后来又设了一次（没有 context）。
+  // 上下文要取那条带 context 的；但"是不是译文"两条都说得出，取哪条都不影响判定。
+  const noCtx = { bookId: BOOK, selectedText: TEXT, translation: '译文' }
+  const rows = [noCtx, row({ context: '新的上下文', translation: '译文' })]
+  assert.equal(findAnnotationRef(rows, BOOK, TEXT).context, '新的上下文')
+  assert.equal(findAnnotationContext(rows, BOOK, TEXT), '新的上下文')
+})
+
+test('findAnnotationRef：只有"有译文没 context"的记录也要认得到', () => {
+  const noCtx = { bookId: BOOK, selectedText: TEXT, translation: '译文' }
+  assert.equal(findAnnotationRef([noCtx], BOOK, TEXT), noCtx)
+  // 上下文仍然空手（旧行为不变）
+  assert.equal(findAnnotationContext([noCtx], BOOK, TEXT), '')
 })
 
 // ── 读存档 ────────────────────────────────────────────────────────────────────

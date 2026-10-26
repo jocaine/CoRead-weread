@@ -26,13 +26,19 @@ import {
   contextForRef,
   // 页面还没渲染时（没有文字层）的切片：见 contextAround
   joinLines,
+  // 多页切片接成一段原文（页与页之间不留换行，见 reader-anchor.js）
+  joinSlices,
   linesFromItems,
   linesFromFixedItems,
+  // 「点这条引用该跳到哪一处」的挑选（锚点优先，见 reader.js 的 locateRef）
+  pickLocateAnchor,
 } from './reader-anchor.js'
 import { RECEIVER_URL } from './translate-protocol.js'   // 后台地址的真源，不另写一份
 // 「读到哪儿」的算术（第几页 + 页内比例）：纯函数，单测在 extension/test/reader-position.test.mjs
-// ⚠️ 只取这两个：`clamp01` 本文件里已经有一个（:1920，别处也在用），不要再导一个同名的进来
+// ⚠️ 只取这两个：`clamp01` 本文件里已经有一个（搜 `const clamp01`，别处也在用），不要再导一个同名的进来
 import { positionFromBoxes, deltaToPosition } from './reader-position.js'
+// PDF 里的超链接（注释 /Link）怎么铺、怎么命中：纯函数，单测在 extension/test/reader-links.test.mjs
+import { isLinkAnnotation, linkTarget, linkBoxes, linkAt, destTop } from './reader-links.js'
 
 // ── 运行环境 ──────────────────────────────────────────────────────────────────
 // 扩展页面里走 chrome.runtime.getURL；自测（普通页面）里退回相对路径，
@@ -54,6 +60,11 @@ const MAX_SCALE = 4
 const RENDER_MARGIN = '900px 0px'
 const MAX_CONCURRENT_RENDERS = 2
 const STORE_PREFIX = 'rd:book:'
+/**
+ * 需要"这条译文存在"才有意义的命令（多标签页路由用，见文件末尾 onMessage 里的 readerCommand）。
+ * 没有这条记录的阅读器页面**不响应**这些命令，免得先答一句「未找到」把真正干活的页面盖掉。
+ */
+const ENTRY_SCOPED_COMMANDS = new Set(['reveal', 'remove', 'reference', 'retranslate', 'precise', 'toggle', 'showTranslation'])
 /**
  * 参考线：滚动区顶端往下让 8px。
  *
@@ -133,17 +144,24 @@ const state = {
   name: '',
   scale: 1.25,
   fitWidth: true,
-  pages: [],            // {num, wrap, canvas, layer, page, viewport, renderTask, textLayer, rendered, spaceFix}
+  pages: [],            // {num, wrap, canvas, layer, page, viewport, renderTask, textLayer, links, linkLayer, rendered, spaceFix}
   library: [],          // 书库列表（来自 receiver）
   archived: false,      // 当前这本是不是已经在书库里
   entries: [],          // {id, anchors:[{page,start,end}], source, translation, at}
-  refsSeen: [],         // 已设成引用的段落 {selectedText, translation, at}（给译文面板画下划线）
+  refsSeen: [],         // 已设成引用的段落 {selectedText, translation, anchors, at}（给译文面板画下划线）
   /**
-   * 「这条引用落在书里哪一处」：`{ text, anchors:[{page,start,end}], at }`（2026-11 修）。
+   * 「这条引用落在书里哪一处」：`{ text, anchors:[{page,start,end}], at, guess? }`（2026-11 修）。
    *
-   * 为什么需要单独一份：接收端的引用存档只记文字（引用身份），**不记 PDF 的页内偏移**；
-   * 而书页上的标记必须靠偏移才能解析成 Range。于是设引用那一刻把锚点记在本地——
-   * 这是唯一知道"用户当时划的是哪一段"的地方（见 noteRefMark）。
+   * `guess: true` = 不是用户划的那一下，而是按文字在附近猜的（见 refRanges ③）——
+   * 画绿线可以，跳引用时排在精确锚点之后（见 noteRefMark / locateRef）。
+   *
+   * 为什么需要单独一份：书页上的标记必须靠偏移才能解析成 Range，而引用清单本身
+   * 原先只有文字。于是设引用那一刻把锚点记在本地——这是最靠得住的"用户当时划的是哪一段"
+   *（见 noteRefMark）。
+   *
+   * 2026-10-25 起接收端的存档也会带上锚点（setAsReference 报上去的 page/anchors，
+   * 随 refsSeen 回来），所以这份本地缓存**不再是唯一来源**：它仍优先（它是划的那一下），
+   * 掉了还有存档那份垫底（见 locateRef）。
    *
    * 真值仍在 refsSeen（接收端那份"这本书还有哪些引用"）：refreshRefs 成功后按文字
    * 裁掉已被删除的（见 pruneRefMarks）。这份只是"画在哪里"的缓存，随进度记录落盘。
@@ -152,6 +170,11 @@ const state = {
   refsAt: 0,            // 上一次从接收端拉这份清单的时刻（TTL 用，见 refreshRefs）
   refsFail: 0,          // 连续失败次数（退避重试用，见 scheduleRefsRetry）
   refsRetryTimer: null, // 排队中的那次重试
+  /**
+   * 跳引用时目标页还没渲染，位置先记在这儿（见 scrollToAnchor / renderPage）。
+   * `{page, start, end}`：文字层要等这一页画好才有，Range 才能解析出来。
+   */
+  pendingLocate: null,
   activeId: '',
   /**
    * 用户最后一次在**书页上**点了哪一条译文区域（2026-11）。
@@ -982,6 +1005,8 @@ function cancelRestore(why) {
 function onScroll() {
   updatePageInfo()
   syncTocPosition()
+  // 页跟着滚走了，上一处链接的高亮位置已经不对；等下一次 mousemove 再重新算
+  clearLinkHover()
   if (state.restore) applyPosition(state.restore.pos)
 }
 
@@ -1016,7 +1041,11 @@ async function loadDocument(bytes, name) {
     els.pages.appendChild(wrap)
     state.pages.push({
       num: n, wrap, canvas: null, layer: null, page: null, viewport: baseVp,
-      renderTask: null, textLayer: null, rendered: false,
+      renderTask: null, textLayer: null,
+      // 链接层：`links` 是这一页所有可点盒子的几何（页内百分比），`linkLayer` 是承载它们的 DOM。
+      // 两者都只在页面第一次渲染时建一次（见 buildLinkLayer）。
+      links: [], linkLayer: null,
+      rendered: false,
     })
   }
 
@@ -1038,6 +1067,9 @@ async function loadDocument(bytes, name) {
   if (saved) {
     if (saved.scale) state.scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, saved.scale))
     state.entries = Array.isArray(saved.entries) ? saved.entries : []
+    // 换了一本书：上一次"拒绝空写"的状态不能带过来（见 saveRecord 的防覆盖）
+    state.emptySaveBlocked = false
+    state.allowEmptySave = false
     /**
      * 旧记录里的「识别原文」可能是按截图视觉行硬换行的（2026-11 用户实测"一行一句"）。
      * 读回时按新规则整理一次：段内换行接回去、空行保留为分段。
@@ -1048,6 +1080,17 @@ async function loadDocument(bytes, name) {
         e.source = reflowOcrText(e.source)
         e.translation = reflowOcrText(e.translation)
       }
+      /**
+       * 精译双版本（2026-10-24）：旧记录只有 `precise` 一个布尔值——
+       * 那一版把"精译前那份"放在内存里、没落盘，所以读回来时已经找不到了。
+       * 这里把 `precise` 迁移成 `preciseText`，`fastText` 留空（没有可切换的另一半，
+       * 面板就不会显示切换按钮）；下次再走一遍普通翻译才有两份。
+       */
+      if (e && e.precise && !e.preciseText) {
+        e.preciseText = e.translation || ''
+        e.showPrecise = true
+      }
+      if (e && typeof e.showPrecise !== 'boolean') e.showPrecise = false
     }
     /**
      * 已设成引用的段落（画下划线用）。
@@ -1104,6 +1147,7 @@ async function loadDocument(bytes, name) {
 function closeDoc() {
   const hadBook = hasBook()
   cancelRestore('换书 / 关书')       // 换书时别让上一本的落位纠偏继续拽滚动条
+  clearLinkHover()                  // 上一本的链接高亮不能留给下一本
   // 换书 / 回书库时若还停在框选模式：退出来。
   // 不退出的话新书页仍是"框选中"（文字选不中、十字光标），用户会以为新书坏了；
   // 一次性模式框完弹出的动作条也要一并收起（它指的是上一本书里的那一块）。
@@ -1117,6 +1161,7 @@ function closeDoc() {
   state.refsSeen = []
   // 引用落在书里的锚点同理：那是**上一本**的页内偏移，留下来会把线画到新书的错页
   state.refMarks = []
+  state.pendingLocate = null   // 上一本书没画完的跳引用目标，换书后作废
   state.activeId = ''
   state.revealId = ''
   state.revealAt = 0
@@ -1375,6 +1420,16 @@ async function renderPage(num) {
     label.className = 'rd-page-num'
     label.textContent = String(num)
     p.wrap.appendChild(label)
+    /**
+     * 链接层（2026-11 补）：PDF 的超链接是页面上的**注释**，不是正文文字，pdf.js 画 canvas
+     * 时不会画它、文字层里也没有它。必须自己铺一层可点的盒子，否则那些蓝字只是像素。
+     * 先建空层再异步填：读注释不该拖慢正文首屏（见 buildLinkLayer）。
+     */
+    const links = document.createElement('div')
+    links.className = 'rd-links'
+    links.hidden = true
+    p.wrap.appendChild(links)
+    p.linkLayer = links
   }
 
   const scale = sizeCanvas(p, viewport)
@@ -1402,6 +1457,8 @@ async function renderPage(num) {
   }
 
   p.rendered = true
+  // 链接层不 await：注释是"有就更好"的一层，读它失败或慢都不该拖住正文
+  if (isFirstBuild) buildLinkLayer(p).catch((e) => console.warn('[阅读器] 链接层没铺成（不影响正文）', e))
   p.textChars = pageTextIndex(p.layer).total
   // 画布像素回读（GPU→CPU）不便宜，只在最前面几页做：状态行与"扫描件"判断只需要它
   if (num <= 3) {
@@ -1420,6 +1477,211 @@ async function renderPage(num) {
     state.pendingAnchorFlash = ''
     revealEntry(id)
   }
+  // 跳引用时这一页还没渲染（见 scrollToAnchor）：现在文字层有了，把那条引用落到精确位置
+  if (state.pendingLocate && Number(state.pendingLocate.page) === p.num) {
+    const a = state.pendingLocate
+    state.pendingLocate = null
+    const ok = scrollToAnchor(a)
+    postDebug({ stage: 'locate-after-render', page: p.num, ok })
+  }
+}
+
+// ── 超链接（PDF 注释 /Link）────────────────────────────────────────────────────
+//
+// 为什么单独有一节：PDF 里的链接**不在正文里**。正文里那段蓝字只是画上去的像素；
+// "点了往哪跳"写在页面的**注释**（annotation，PDF 的一种独立对象）里，子类型是 `/Link`。
+// pdf.js 画 canvas、抽文字层都不会碰注释 —— 所以这一层必须我们自己铺，
+// 否则链接的样子全在，就是点不动（2026-11 用户报的就是这个）。
+//
+// ⚠️ 这一层是 `pointer-events: none`（见 reader.css），**故意不接鼠标事件**：
+//    · 阅读器最主要的动作是划词翻译；链接若盖在文字上，从链接上按下去就选不中字了；
+//    · 所以点击改成"按坐标命中"（linkAtPoint），悬停也由 JS 自己算
+//      （pointer-events: none 的元素拿不到 :hover）。
+//    代价是没有浏览器原生的"右键复制链接地址 / 中键打开"，键盘 Tab + 回车仍然可用。
+const pctCss = (v) => (v * 100).toFixed(3) + '%'
+
+/**
+ * 把这一页的链接注释铺成可点盒子。**不 await**：注释是"有就更好"的一层，
+ * 读它慢或失败都不该拖住正文首屏。
+ */
+async function buildLinkLayer(p) {
+  if (!p || !p.page || !p.linkLayer) return
+  let annots = []
+  try {
+    annots = await p.page.getAnnotations()
+  } catch (e) {
+    // 只影响"能不能点链接"，正文照样读。不弹提示：坏注释多的 PDF 会每页弹一次
+    console.warn('[阅读器] 读第 ' + p.num + ' 页的链接注释失败（正文不受影响）', e)
+    return
+  }
+  // 读注释是异步的：期间用户可能已经换了书 / 关了书，这一页的 DOM 已不在文档里
+  if (!p.wrap.isConnected) return
+  // 缩放倍率不影响百分比（linkBoxes 里除的就是同一个视口的宽高），所以用哪个视口都行
+  const vp = p.viewport || p.page.getViewport({ scale: 1 })
+  const frag = document.createDocumentFragment()
+  for (const a of annots || []) {
+    if (!isLinkAnnotation(a)) continue
+    const target = linkTarget(a)
+    if (!target) continue          // 附件 / 表单之类：不铺"点了没反应"的死区
+    for (const box of linkBoxes(a, vp)) {
+      const el = document.createElement('a')
+      el.className = 'rd-link'
+      el.tabIndex = 0
+      el.setAttribute('role', 'link')
+      el.style.left = pctCss(box.x)
+      el.style.top = pctCss(box.y)
+      el.style.width = pctCss(box.w)
+      el.style.height = pctCss(box.h)
+      const item = { el, ...box, page: p.num, ...target }
+      const label = target.kind === 'url' ? target.url
+        : target.kind === 'dest' ? '跳到这份 PDF 里的另一处'
+        : 'PDF 内部动作：' + target.action
+      el.title = label
+      el.setAttribute('aria-label', label)
+      // 键盘：盒子拿不到鼠标事件，但 Tab 能聚焦，回车/空格要能触发
+      el.addEventListener('keydown', (ev) => {
+        if (ev.key !== 'Enter' && ev.key !== ' ') return
+        ev.preventDefault()
+        ev.stopPropagation()
+        activateLink(item)
+      })
+      p.links.push(item)
+      frag.appendChild(el)
+    }
+  }
+  if (!p.links.length) return
+  p.linkLayer.appendChild(frag)
+  p.linkLayer.hidden = false
+}
+
+/** 视口坐标 → 落在哪一条链接上（只用百分比算，不依赖 DOM 命中） */
+function linkAtPoint(clientX, clientY) {
+  for (const p of state.pages) {
+    const links = p.links
+    if (!links || !links.length) continue
+    const r = p.wrap.getBoundingClientRect()
+    if (!(r.width > 0) || !(r.height > 0)) continue
+    if (clientX < r.left || clientX > r.right || clientY < r.top || clientY > r.bottom) continue
+    const hit = linkAt(links, (clientX - r.left) / r.width, (clientY - r.top) / r.height)
+    if (hit) return hit
+  }
+  return null
+}
+
+let _linkHot = null           // 此刻高亮着的那个盒子
+let _linkHotRaf = 0
+const _linkPointer = { x: 0, y: 0 }
+
+function clearLinkHover() {
+  // 排着的那一帧也要撤掉：否则鼠标刚移开，它会把高亮又加回来
+  if (_linkHotRaf) {
+    cancelAnimationFrame(_linkHotRaf)
+    _linkHotRaf = 0
+  }
+  if (_linkHot) {
+    _linkHot.el.classList.remove('is-hot')
+    _linkHot = null
+  }
+  els.pages.classList.remove('is-link-hover')
+}
+
+/** 悬停：mousemove 一秒几十次，命中压到一帧一次；只在高亮目标变化时动 DOM */
+function onPageLinkHover(ev) {
+  if (state.boxMode || state.boxChoice) { clearLinkHover(); return }
+  _linkPointer.x = ev.clientX
+  _linkPointer.y = ev.clientY
+  if (_linkHotRaf) return
+  _linkHotRaf = requestAnimationFrame(() => {
+    _linkHotRaf = 0
+    const hit = linkAtPoint(_linkPointer.x, _linkPointer.y)
+    if (hit === _linkHot) return
+    if (_linkHot) _linkHot.el.classList.remove('is-hot')
+    _linkHot = hit
+    if (hit) hit.el.classList.add('is-hot')
+    els.pages.classList.toggle('is-link-hover', !!hit)
+  })
+}
+
+function onPageLinkClick(ev) {
+  if (state.boxMode || state.boxChoice) return
+  if (ev.button !== 0 || ev.detail > 1) return       // 双击的第二下不重复跳
+  const sel = window.getSelection()
+  // 这次是在划词（有选区）→ 不抢：链接可以再点一下
+  if (sel && !sel.isCollapsed && String(sel.toString() || '').trim()) return
+  const hit = linkAtPoint(ev.clientX, ev.clientY)
+  if (!hit) return
+  ev.preventDefault()
+  ev.stopPropagation()      // 别让 document 上"点已翻过的译文"那一下也跟着触发
+  clearLinkHover()
+  activateLink(hit)
+}
+
+function activateLink(link) {
+  if (!link) return
+  if (link.kind === 'url') { openExternalUrl(link.url); return }
+  if (link.kind === 'dest') {
+    jumpToPdfDest(link.dest).catch((e) => {
+      toast('这个链接跳不过去：' + ((e && e.message) || e), true)
+    })
+    return
+  }
+  if (link.kind === 'action' && !runPdfNamedAction(link.action)) {
+    toast('这个链接用的是 PDF 内部动作「' + link.action + '」，阅读器还不支持', true)
+  }
+}
+
+/**
+ * 跳到文档内目标（注释里的 `dest`）。目标可能是命名字符串，也可能是数组；
+ * 数组的第一项是**页对象的引用**，要用 `getPageIndex` 换算成页号。
+ * 纵向位置能算就算（见 reader-links.js 的 destTop），算不出就跳页顶。
+ */
+async function jumpToPdfDest(dest) {
+  let d = dest
+  if (typeof d === 'string') d = await state.doc.getDestination(d)
+  if (!Array.isArray(d) || !d.length) throw new Error('文档里没有这个目标')
+  let page = 0
+  try {
+    page = (await state.doc.getPageIndex(d[0])) + 1
+  } catch (e) {
+    page = 0
+  }
+  if (!(page >= 1 && page <= bookTotal())) throw new Error('目标页不在文档范围内')
+  let frac = 0
+  const top = destTop(d)
+  if (top !== null) {
+    try {
+      const pg = (state.pages[page - 1] && state.pages[page - 1].page) || await state.doc.getPage(page)
+      const vp = pg.getViewport({ scale: state.scale })
+      const y = vp.convertToViewportPoint(0, top)[1]
+      if (Number.isFinite(y) && vp.height > 0) frac = clamp01(y / vp.height)
+    } catch (e) {}
+  }
+  gotoPage(page, false)
+  if (frac > 0) applyPosition({ page, frac })
+}
+
+/** PDF 的"命名动作"里只有翻页几种是能就地执行的；其余（GoBack / Find…）如实说不行 */
+function runPdfNamedAction(name) {
+  switch (String(name || '')) {
+    case 'NextPage': gotoPage(currentPage() + 1); return true
+    case 'PrevPage': gotoPage(currentPage() - 1); return true
+    case 'FirstPage': gotoPage(1); return true
+    case 'LastPage': gotoPage(bookTotal()); return true
+    default: return false
+  }
+}
+
+/** 外部链接一律开新标签：在阅读器这一页里跳走，等于把正在读的书关掉 */
+function openExternalUrl(url) {
+  const tabs = (typeof chrome !== 'undefined' && chrome.tabs) ? chrome.tabs : null
+  if (tabs && typeof tabs.create === 'function') {
+    try {
+      const p = tabs.create({ url, active: true })
+      if (p && typeof p.catch === 'function') p.catch(() => window.open(url, '_blank', 'noopener'))
+      return
+    } catch (e) {}
+  }
+  window.open(url, '_blank', 'noopener')   // 自测页（没有 chrome.tabs）走这条
 }
 
 /**
@@ -1650,6 +1912,13 @@ function selectionAnchors() {
   return { anchors: usable, range }
 }
 
+/**
+ * 选区（可能横跨多页）→ 一段连续原文。
+ *
+ * 页与页之间**不留换行**（2026-11 用户实报：跨页引用之后，条目里的原文还带着换行）。
+ * 跨页的那一句本来就是一句话，接法与页内换行完全相同 —— 交给 joinSlices：
+ * 英文补一个空格、行尾连字符断词直接接、中文之间不加空格。
+ */
 function anchorsText(anchors) {
   const parts = []
   for (const a of anchors) {
@@ -1658,7 +1927,7 @@ function anchorsText(anchors) {
     const t = textFromOffsets(layer, a.start, a.end)
     if (t) parts.push(t)
   }
-  return parts.join('\n')
+  return joinSlices(parts)
 }
 
 /**
@@ -1713,7 +1982,8 @@ async function sourceText(anchors) {
       : textFromOffsets(p.layer, a.start, a.end)
     if (t) parts.push(t)
   }
-  return parts.join('\n') || raw
+  // 跨页同样是"接成一句"，不是"一行一页"（同 anchorsText）
+  return joinSlices(parts) || raw
 }
 
 /**
@@ -1871,7 +2141,10 @@ async function contextAround(anchors) {
       const text = src && src.slice(s.from, s.to)
       if (text) parts.push(text)
     }
-    return parts.join('\n').trim()
+    // 页与页之间不留换行，理由同 anchorsText：这份"附近原文"有时就是 agent 眼里的
+    // 这段原文（见 agent/lib/ref-source.js 的 refSourceOf），跨页处凭空多一个换行
+    // 会跟着它被引回来。
+    return joinSlices(parts)
   } catch (e) {
     console.warn('[阅读器] 组装划线附近原文失败（这条引用会不带上下文）', e)
     return ''
@@ -1937,6 +2210,20 @@ function clearSelection() {
 
 function hideTip() { els.tip.hidden = true }
 
+/**
+ * 送给模型的书名：去掉 .pdf 与下载站的尾巴。
+ *
+ * 书名只用来给模型一个"这是什么书"的先验（哲学 / 历史 / 小说），所以不该让
+ * 「-- b3976acf… -- Anna's Archive」这种文件名噪声占上下文 —— 模型还可能把哈希当成正文。
+ * 取不到书名就给空串，少了它不影响翻译。
+ */
+function bookNameForModel() {
+  return String(state.name || '')
+    .replace(/\.pdf$/i, '')
+    .replace(/\s*--\s*[0-9a-f]{16,}\s*--\s*.*$/i, '')
+    .trim()
+}
+
 async function translateSelection() {
   const hit = state.lastSelection || selectionAnchors()
   if (!hit) {
@@ -1966,7 +2253,13 @@ async function translateSelection() {
   else { entry.pending = true; entry.error = '' }
   renderEntries()
 
-  const res = await callBackground({ action: 'translateText', text: source, source: 'selection' })
+  const res = await callBackground({
+    action: 'translateText',
+    text: source,
+    source: 'selection',
+    fromOcr: false,               // PDF 文字层抽出来的原文，没有识别误差
+    bookTitle: bookNameForModel(),
+  })
   entry.pending = false
   if (!res || !res.ok) {
     entry.error = (res && res.error && res.error.message) || '翻译失败'
@@ -1976,6 +2269,10 @@ async function translateSelection() {
   }
   entry.source = source
   entry.translation = (res.data && res.data.translation) || ''
+  // 这一份是「快速版」的基线：之后精译时把它存进 fastText，两版就能来回切
+  entry.fastText = entry.translation
+  entry.preciseText = ''
+  entry.showPrecise = false
   entry.error = ''
   renderEntries()
   refreshHighlights()
@@ -2090,6 +2387,8 @@ function startBoxSelect(opts) {
   hideTip()
   if (state.boxMode) return
   state.boxMode = true
+  // 框选模式里不显示"这里有链接"的手型与高亮：这时鼠标是在选框，不是要点链接
+  clearLinkHover()
   applyBoxModeChrome()
   toast(state.boxOneShot
     ? '在页面上拖出选区，再选「识别原文」或「翻译」（完成后自动退出，Esc 取消）'
@@ -2463,12 +2762,21 @@ function notesSnapshot() {
       kind: e.kind || 'text',
       source: e.source || '',
       translation: e.translation || '',
-      pending: !!e.pending,
+      pending: !!(e.pending || e.precisionPending),
       // 框选「识别原文」这条路（2026-11）：条目只识别了原文、没有翻译。
       // 面板据此在正文上方标一句，并把「复制译文」改成「复制原文」。
       recognized: !!e.recognized,
       // 正在识别原文（与 pending 的"翻译中"区分开，面板显示"识别原文中…"）
       recognizing: !!e.recognizing,
+      // 精译（2026-10-24）：等待态要单独说"精译中…"；精译过要标出来；
+      // 两个版本都在时才给切换按钮（旧记录只有一份，切不了）
+      precisionPending: !!e.precisionPending,
+      showingPrecise: !!e.showPrecise,
+      canToggle: !!(e.fastText && e.preciseText),
+      // 两版全文也送过去（2026-10-24）：面板的"看原译/看精译"先在**本地**切、立刻可见，
+      // 再让阅读器落盘；只送一个"当前译文"的话，切换必须等一次消息往返，慢一拍就表现为"点了没反应"
+      fastText: e.fastText || '',
+      preciseText: e.preciseText || '',
       error: e.error || '',
       at: e.at || 0,
     })),
@@ -2518,6 +2826,12 @@ async function refreshRefs(reason, opts = {}) {
       .map((d) => ({
         selectedText: String(d.selectedText),
         translation: String(d.translation || ''),
+        /**
+         * 这条引用落在书里哪一处（2026-10-25）：设引用时阅读器随引用一起报上去的。
+         * 跳引用靠它回到**划线那一处**（见 locateRef）——没有它就只能按文字在正文里
+         * "找个最近的"，同一句话出现两次就会跳错（用户实测报的正是这个）。
+         */
+        anchors: Array.isArray(d.anchors) ? d.anchors : [],
         // 下面四样是**删除时精确匹配**用的（见 sidebar.js 的 deleteRefFromNotes / refMatches）：
         // 同一段文字在不同章节被引用两次时，光有 selectedText 分不清该删哪一条。
         bookId: String(d.bookId || ''),
@@ -2611,6 +2925,12 @@ function noteRefLocal(entry, quote) {
  *
  * 只在有锚点时记：图片条目（扫描件）没有文字层锚点，画不了文字下划线，它本来就有
  * `.rd-mark` 的虚线框；硬记一笔空锚点只会让裁剪逻辑以为"这条已经有位置了"。
+ *
+ * `entry.guess === true` = 这一笔不是"用户划的那一下"，而是按文字在附近**猜**出来的
+ *（见 refRanges ③）。两者必须分开记：猜出来的位置用来画绿线可以（画错了顶多一条线），
+ * 但它不能冒充"用户划线的那一处"——跳引用时它排在**精确锚点之后**（见 locateRef）。
+ * 2026-10-25 实测：一条老引用在第 54 页被猜成第 56 页（真正的划线在第 58 页），
+ * 猜完之后"精确"与"猜"就再也分不开了。
  */
 function noteRefMark(entry, quote) {
   const { selectedText } = refFieldsOf(entry, quote)
@@ -2623,6 +2943,7 @@ function noteRefMark(entry, quote) {
     text: selectedText,
     anchors: anchors.map((a) => ({ page: a.page, start: a.start, end: a.end })),
     at: Date.now(),
+    ...(entry && entry.guess === true ? { guess: true } : {}),
   })
   if (state.refMarks.length > REFS_SEEN_MAX) state.refMarks.length = REFS_SEEN_MAX
   return true
@@ -2827,6 +3148,7 @@ function clearHighlights() {
     CSS.highlights.delete('rd-src')
     CSS.highlights.delete('rd-src-active')
     CSS.highlights.delete('rd-ref')
+    CSS.highlights.delete('rd-locate')
   }
 }
 
@@ -2964,7 +3286,9 @@ function refRanges() {
     if (!curPage) curPage = Math.max(1, currentPage() || 1)
     const a = locateRefAnchorNear(String((r && r.selectedText) || ''), curPage)
     if (!a) continue
-    if (push(a)) located.push({ source: String(r.selectedText || ''), anchors: [a] })
+    // guess: 这是**按文字猜的**，不是用户划线那一刻记下的（见 noteRefMark）。
+    // 同一句话在书里出现两次时，这一猜就可能猜错（实测第 56 / 58 页各有"全国预算收入"）。
+    if (push(a)) located.push({ source: String(r.selectedText || ''), anchors: [a], guess: true })
     covered.add(t)
   }
   if (located.length) {
@@ -3205,6 +3529,18 @@ async function setAsReference(entry, quote) {
     ...(shown ? { translation: shown } : {}),
     ...(picked ? { quote: picked } : {}),
     ...(entry.kind === 'image' ? { image: true } : {}),
+    /**
+     * 这条引用落在书里哪一处（2026-10-25）：页号 + 页内字符偏移。
+     *
+     * 为什么要报上去：侧栏点这条引用要跳回**划线那一处**，而按文字找一定会有
+     * "跳到同一句话的另一个出现位置"的时候。实测《置身事内》"全国预算收入"在
+     * 第 56 页与第 58 页各一遍，用户划的是 58，按文字找落到 56。
+     * 存档里带着锚点，换浏览器 / 清缓存 / 本地记号超过上限（见 REFS_SEEN_MAX）之后
+     * 也还跳得准（见 refreshRefs 与 locateRef）。
+     */
+    ...(Array.isArray(entry.anchors) && entry.anchors.length
+      ? { anchors: entry.anchors.map((a) => ({ page: a.page, start: a.start, end: a.end })) }
+      : {}),
     context,
     url: 'reader://' + state.hash + (state.name ? '#' + state.name : ''),
     pageTitle: state.name,
@@ -3231,6 +3567,7 @@ async function onReaderCommand(msg) {
   if (type === 'remove') { removeEntry(msg.id); return { ok: true } }
   if (type === 'clear') {
     state.entries = []
+    state.allowEmptySave = true   // 用户明确清空：允许把空记录写回去（见 saveRecord）
     state.activeId = ''
     state.revealId = ''
     state.revealAt = 0
@@ -3246,6 +3583,10 @@ async function onReaderCommand(msg) {
     return await setAsReference(e, msg.quote)
   }
   if (type === 'retranslate') return await retranslateEntry(msg.id, msg.text)
+  // 精译（2026-10-24）：开思考重译，慢但更准；toggle 在快速版/精译版之间切换
+  if (type === 'precise') return await preciseTranslateEntry(msg.id)
+  if (type === 'toggle') return toggleTranslation(msg.id)
+  if (type === 'showTranslation') return setTranslationVersion(msg.id, msg.showPrecise === true)
   // 侧栏删了一条引用 → 把本地那份"已引用段落"里对应的那一条摘掉（书页绿线随之消失）
   if (type === 'forgetRef') {
     /**
@@ -3271,8 +3612,11 @@ async function onReaderCommand(msg) {
    *
    * 更根本的是：用户点"跳到原文"要的是**让我看见那句话在哪**，不是"把整本书重新打开一遍"。
    * 所以这里做同页定位：不重载、不丢阅读位置、找到就滚过去高亮一圈。
+   *
+   * 2026-10-25：改走 locateRef —— **先按锚点**（划线那一刻的位置）跳，不再一上来按文字找。
+   * 按文字找会把"同一句话的另一个出现位置"当成目标（详见 locateRef 的头注释）。
    */
-  if (type === 'locate') return locateText(String(msg.text || ''))
+  if (type === 'locate') return locateRef(String(msg.text || ''))
   // 快捷键由后台中继过来：侧栏有焦点时页面收不到按键，只能走这条路
   if (type === 'boxSelect') { startBoxSelect(); return { ok: true } }
   if (type === 'translateSelection') { await translateSelection(); return { ok: true } }
@@ -3282,6 +3626,8 @@ async function onReaderCommand(msg) {
 /** 删掉一条译文（侧栏里点「删除」） */
 function removeEntry(id) {
   state.entries = state.entries.filter((e) => e.id !== id)
+  // 用户把最后一条删掉了：这次的空记录是**明确的意图**，保存要放行（见 saveRecord 的防覆盖）
+  if (!state.entries.length) state.allowEmptySave = true
   if (state.activeId === id) state.activeId = ''
   // 把"页面点过哪一条"的标记也清掉：否则侧栏下次拿快照还会去找一个已经删掉的条目
   if (state.revealId === id) { state.revealId = ''; state.revealAt = 0 }
@@ -3293,7 +3639,7 @@ function removeEntry(id) {
 
 /**
  * 改原文并重译（侧栏里点「改原文重译」→ 这里执行）。
- * 只改这一条的原文，锚点不动 —— 用户是在修正识别的错字，位置没变。
+ * 只改这一条的原文，锚点不动 —— 用户是在修正原文（扫描件的识别错字，或文字层里抽坏的词），位置没变。
  */
 async function retranslateEntry(id, text) {
   const e = state.entries.find((x) => x.id === id)
@@ -3307,10 +3653,20 @@ async function retranslateEntry(id, text) {
   const next = String(text || '').trim()
   if (!next) return { ok: false, error: { message: '原文不能为空' } }
   e.source = next
+  // 原文换了：正在跑的"精译"对应的还是旧原文，回来时必须作废（见 preciseTranslateEntry）
+  e.sourceSeq = (e.sourceSeq || 0) + 1
   e.pending = true
   e.error = ''
   renderEntries()
-  const res = await callBackground({ action: 'translateText', text: next, source: 'retranslate' })
+  const res = await callBackground({
+    action: 'translateText',
+    text: next,
+    source: 'retranslate',
+    // 这条原文是不是扫描件 OCR 出来的？决定后台用不用「可能有错字」那套规则（2026-10-24）。
+    // 文字条目来自 PDF 文字层，说它有错字会让模型去改人名、术语和旧拼法。
+    fromOcr: e.kind === 'image',
+    bookTitle: bookNameForModel(),
+  })
   e.pending = false
   if (!res || !res.ok) {
     e.error = (res && res.error && res.error.message) || '翻译失败'
@@ -3322,7 +3678,136 @@ async function retranslateEntry(id, text) {
   // 原来是"只识别原文"的条目：现在有真译文了，面板的"未翻译"提示要撤掉
   e.recognized = false
   e.recognizing = false
+  // 重译出的是**新原文**的普通版：两版都作废（旧译文对应的原文已经变了），
+  // 从这一份重新开始；否则切换按钮会把一段旧原文的译文拿出来对照
+  e.fastText = e.translation
+  e.preciseText = ''
+  e.showPrecise = false
   toast(wasRecognized ? '已翻译' : '已重译')
+  renderEntries()
+  refreshHighlights()
+  scheduleSave()
+  return { ok: true }
+}
+
+/**
+ * 精译一条（2026-10-24 用户定调：默认快、按需慢）。
+ *
+ * 为什么单开一条命令，而不是给 retranslate 加参数：
+ *   · retranslate 的语义是"用户改了原文，用新原文换一份译文"；精译不改原文，只换翻法。
+ *   · 失败时的处理相反：retranslate 失败要报错占住卡片（原文已经变了），精译失败**必须
+ *     留着原来那份译文**——用户点精译是想更好，不该因此丢掉手里那版。
+ *
+ * 两个版本都留下（2026-10-24 用户要求"能两边切换"）：
+ *   fastText    普通翻译那一版（第一次精译时从当前译文里存下来）
+ *   preciseText 精译那一版
+ *   showPrecise 现在显示哪一版；translation 始终等于被选中的那版（落盘/引用都只读它）
+ * 两份都落盘：用户切换是随时的事，不能只在本次会话有效。条目上 unlimitedStorage 权限，
+ * 多存一份译文换"随时对照"是划算的。
+ *
+ * 思考模式一次要 5–25 秒（见 translate-background.js 的 precise 注释），pending 期间
+ * 卡片显示"精译中…"，当前译文继续显示在下面。
+ */
+async function preciseTranslateEntry(id) {
+  const e = state.entries.find((x) => x.id === id)
+  if (!e) return { ok: false, error: { message: '未找到该条目' } }
+  const source = String(e.source || '').trim()
+  if (!source) return { ok: false, error: { message: '这条没有原文，无法精译' } }
+  /**
+   * 只挡"同一条正在精译"（防止连点两次白花一次 25 秒的调用）。
+   *
+   * **不再挡 e.pending**（2026-10-24 用户报"点精译总说正在翻译"）：普通翻译/重译也占着
+   * 这个标记，于是精译会被一条其实已经在收尾的普通翻译挡住。现在两条可以并行——
+   * 普通版先回来、精译后回来覆盖，最终留下的是精译版，fastText 由普通翻译那条路自己写，
+   * 不会互相踩（见 translateSelection / retranslateEntry 里对 fastText 的赋值）。
+   */
+  if (e.precisionPending) return { ok: false, error: { code: 'BUSY', message: '这条正在精译，请稍等' } }
+
+  // 只动自己这个标记：普通翻译/重译用的是 e.pending，两条同时跑时不能互相清
+  e.precisionPending = true
+  e.error = ''
+  renderEntries()
+  const t0 = Date.now()
+  const seq = e.sourceSeq || 0
+  postDebug({ stage: 'precise-start', id, sourceLen: source.length, hasFast: !!e.fastText, hasPrecise: !!e.preciseText })
+
+  let res = null
+  try {
+    res = await callBackground({
+      action: 'translateText',
+      text: source,
+      source: 'retranslate',
+      fromOcr: e.kind === 'image',
+      bookTitle: bookNameForModel(),
+      precise: true,
+    })
+  } finally {
+    // 不管成功、失败、还是中途抛错，这个标记都必须落回去 ——
+    // 否则卡片会永远停在"精译中…"，之后每次点都只会得到"正在精译"
+    e.precisionPending = false
+  }
+  postDebug({ stage: 'precise-done', id, ok: !!(res && res.ok), ms: Date.now() - t0, err: (res && res.error && res.error.message) || '' })
+
+  // 20 多秒里用户可能删了这条、或换了本书（state.entries 整个换掉）：
+  // 这时手里这个 e 已经不在列表里，后面的成功提示与落盘都没有意义
+  if (!state.entries.includes(e)) return { ok: false, error: { message: '这条已被删除或换书了' } }
+  // 原文在这段时间里被改过（改原文重译）：这份精译对应的是旧原文，作废
+  if ((e.sourceSeq || 0) !== seq) {
+    toast('原文已修改，这次精译作废', true)
+    renderEntries()
+    return { ok: false, error: { message: '原文已修改，这次精译作废' } }
+  }
+  if (!res || !res.ok) {
+    // 不动两份译文：失败也要保住手里那版（见函数头）
+    toast('精译失败：' + ((res && res.error && res.error.message) || '原因未知'), true)
+    renderEntries()
+    return res || { ok: false }
+  }
+  // 第一次精译：把当前显示的普通译文存成 fastText；已经在显示精译版时不要
+  // 把精译文本误当成普通版（老记录迁移过来的那种：只有一份，没有可切换的另一半）
+  if (!e.fastText && !e.showPrecise) e.fastText = e.translation || ''
+  e.preciseText = (res.data && res.data.translation) || e.preciseText || e.translation || ''
+  e.showPrecise = true
+  e.translation = e.preciseText
+  toast(e.fastText ? '已精译（可切换两版对照）' : '已精译')
+  renderEntries()
+  refreshHighlights()
+  scheduleSave()
+  return { ok: true }
+}
+
+/**
+ * 设为指定的那一版（面板已经本地切过了，这里只负责"落到阅读器、并保持一致"）。
+ * 与 toggleTranslation 的差别：这里接收**目标状态**，重复调用不会来回翻——
+ * 面板先切、再发这条，网络/消息慢一拍也不会把状态切反。
+ */
+function setTranslationVersion(id, showPrecise) {
+  const e = state.entries.find((x) => x.id === id)
+  if (!e) return { ok: false, error: { message: '未找到该条目' } }
+  if (!e.fastText || !e.preciseText) {
+    return { ok: false, error: { message: '这条还没有两个版本可切换（先精译一次）' } }
+  }
+  e.showPrecise = !!showPrecise
+  e.translation = e.showPrecise ? e.preciseText : e.fastText
+  renderEntries()
+  refreshHighlights()
+  scheduleSave()
+  return { ok: true }
+}
+
+/**
+ * 在「快速版 / 精译版」之间切换（2026-10-24 用户要求：两版都留着，直接对照）。
+ * 不动原文、不重新翻译，只换显示；translation 跟着换，后续设引用用的是当前这一版。
+ */
+function toggleTranslation(id) {
+  const e = state.entries.find((x) => x.id === id)
+  if (!e) return { ok: false, error: { message: '未找到该条目' } }
+  if (!e.fastText || !e.preciseText) {
+    return { ok: false, error: { message: '这条还没有两个版本可切换（先精译一次）' } }
+  }
+  e.showPrecise = !e.showPrecise
+  e.translation = e.showPrecise ? e.preciseText : e.fastText
+  toast(e.showPrecise ? '正在看精译版' : '正在看快速版')
   renderEntries()
   refreshHighlights()
   scheduleSave()
@@ -3369,10 +3854,114 @@ function locateText(text) {
     p.wrap.classList.add('rd-flash')
     clearTimeout(p._flashTimer)
     p._flashTimer = setTimeout(() => p.wrap.classList.remove('rd-flash'), 1200)
-    if (window.CSS && CSS.highlights) CSS.highlights.set('rd-src-active', new Highlight(r))
+    if (window.CSS && CSS.highlights) CSS.highlights.set('rd-locate', new Highlight(r))
     return { ok: true, found: true, page: n }
   }
   return { ok: true, found: false }
+}
+
+/**
+ * 把某处原文滚到眼前、闪一圈、并圈出来。
+ *
+ * 页还没渲染时（没有文字层 → Range 解析不出来）**不能就地失败**：先把位置记进
+ * state.pendingLocate、把这一页排进渲染队列并滚过去，等它画好由 renderPage 接着定位。
+ * 否则"从第 51 页跳到第 58 页的引用"就是一次什么都没发生（用户实测踩到的正是这个：
+ * locate 在 ±3 页里找不到 → 退回按章打开 → 书重新加载后回到上次读到的第 51 页）。
+ *
+ * @param {{page:number,start:number,end:number}} anchor
+ * @returns {boolean} 是否受理（true = 已滚过去，或已排进"画好就定位"）
+ */
+function scrollToAnchor(anchor) {
+  const page = Math.trunc(Number(anchor && anchor.page))
+  const start = Math.trunc(Number(anchor && anchor.start))
+  const end = Math.trunc(Number(anchor && anchor.end))
+  if (!Number.isFinite(page) || page < 1 || state.pages.length < page) return false
+  if (!Number.isFinite(start) || start < 0 || !Number.isFinite(end) || end <= start) return false
+  const p = state.pages[page - 1]
+  if (!p) return false
+  const a = { page, start, end }
+  // 上一次跳引用留下的标记不留给这一次（否则屏幕上会同时有两条"你在这儿"）
+  if (window.CSS && CSS.highlights) CSS.highlights.delete('rd-locate')
+  if (!p.rendered || !p.layer) {
+    state.pendingLocate = a
+    // force：这是用户**明确要跳到这里**，不能被"布局沉降期只画附近页"的省电闸门挡掉
+    //（挡掉的表现是：滚到了那一页，但那一页一直空着，定位也永远不会发生）
+    enqueueRender(page, true)
+    gotoPage(page, false)   // 先瞬时到位（页高还是占位值，画好之后会再落一次精确位置）
+    postDebug({ stage: 'locate-wait-render', page, queued: state.renderQueue.includes(page) })
+    return true
+  }
+  const r = resolveAnchor(a)
+  const rects = r ? [...r.getClientRects()] : []
+  if (!rects.length) {
+    state.pendingLocate = null
+    return false
+  }
+  const c = els.scroll.getBoundingClientRect()
+  const rect = rects[0]
+  // 已经在视野里就不动（同 scrollToEntry）：用户要的是"看见它"，不是"滚一下"
+  const inSight = rect.top >= c.top + 40 && rect.bottom <= c.bottom - 40
+  if (!inSight) {
+    const delta = rect.top - (c.top + Math.min(140, c.height * 0.25))
+    // 跨得远就瞬时到位：平滑滚动横跨十几页会先走一段"看起来什么都没发生"的路
+    const far = Math.abs(delta) > c.height * 1.5
+    cancelRestore('跳到引用的原文')
+    els.scroll.scrollBy({ top: delta, behavior: far ? 'auto' : 'smooth' })
+  }
+  p.wrap.classList.add('rd-flash')
+  clearTimeout(p._flashTimer)
+  p._flashTimer = setTimeout(() => p.wrap.classList.remove('rd-flash'), 1200)
+  state.pendingLocate = null
+  // 用**自己的**高亮名（rd-locate）：复用 rd-src-active 的话，下一次 refreshHighlights
+  // 在没有选中条目时会把这条删掉 —— 实测"跳过去的高亮活不过一次重绘"。
+  if (window.CSS && CSS.highlights) CSS.highlights.set('rd-locate', new Highlight(r))
+  postDebug({ stage: 'locate-applied', page, inSight, scrollTop: Math.round(els.scroll.scrollTop) })
+  return true
+}
+
+/**
+ * 跳到一条引用的**原文那一处**（侧栏点引用 / 「跳到原文」）。
+ *
+ * 为什么不能只按文字找（旧版就是，2026-10-25 用户报的 bug）：同一句话在书里常常
+ * 出现不止一次。把《置身事内》的 PDF 抽成文本看，「全国预算收入」在第 56 页
+ * （"中央占全国预算收入的比重从改革前的22%…"）与第 58 页（"分税制改革之后，
+ * 全国预算收入占GDP的比重逐步上升…"）各一遍，只隔两页。用户划的是第 58 页，
+ * locateText 只在当前页 ±3 页里找、且每页取**第一个命中**——于是落在 56，
+ * 用户看到的就是"按内容跳到了最近的一处，不是我的划线"。
+ *
+ * 所以先按「从准到松」挑锚点（挑选逻辑是纯函数，见 reader-anchor.js 的
+ * pickLocateAnchor 与它的单测）：
+ *   ① refMarks（真的那笔）—— 设引用那一刻记下的位置（用户划的就是它）
+ *   ② entries  —— 这条引用出身的那张译文卡的位置
+ *   ③ refsSeen[].anchors —— 接收端存档随引用带回来的位置（活得过本地缓存上限）
+ *   ④ refMarks（guess=true）—— 早先按文字**猜**出来的位置：可能是别的出现处，
+ *      所以排在最后（它至少稳定，不随用户翻页而变）
+ * 都没有（老数据）才退回"从当前页 ±3 页里按文字找"，并如实回报。
+ */
+function locateRef(text) {
+  const want = String(text || '').trim()
+  if (!want) return { ok: true, found: false, reason: 'empty' }
+  const marks = Array.isArray(state.refMarks) ? state.refMarks : []
+  const a = pickLocateAnchor(want, [
+    // ① 用户划的那一下记下的位置（最准）
+    { from: 'mark', items: marks.filter((m) => !(m && m.guess)).map((m) => ({ text: m && m.text, anchors: m && m.anchors })) },
+    // ② 这条引用出身的那张译文卡（同一次划词的另一份记录，也是准的）
+    { from: 'entry', items: state.entries.map((e) => ({ text: e && e.source, anchors: e && e.anchors })) },
+    // ③ 接收端存档随引用带回来的位置（2026-10-25 起才有；活得过本地缓存上限）
+    { from: 'record', items: refsSeen().map((r) => ({ text: r && r.selectedText, anchors: r && r.anchors })) },
+    // ④ 按文字猜出来的位置（见 refRanges ③）：可能是同一句话的另一个出现位置，
+    //    所以排在最后 —— 但总比"从当前页 ±3 页里再猜一次"稳（它至少不随用户翻页而变）
+    { from: 'guess', items: marks.filter((m) => m && m.guess).map((m) => ({ text: m && m.text, anchors: m && m.anchors })) },
+  ])
+  if (a && scrollToAnchor(a)) {
+    postDebug({ stage: 'locate-anchor', from: a.from, page: a.page, text: want.slice(0, 16) })
+    return { ok: true, found: true, page: a.page, via: a.from }
+  }
+  // 老数据（本地与存档都没有锚点）：只能按文字在附近找。这条路上"找错"是可能的，
+  // 所以上面的锚点优先，且这里如实回报 found —— 找不到就交给调用方退回按章打开。
+  const r = locateText(want)
+  postDebug({ stage: 'locate-text', found: !!(r && r.found), page: (r && r.page) || 0, text: want.slice(0, 16) })
+  return r
 }
 
 /**
@@ -3591,6 +4180,16 @@ if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage)
     return true
   }
   if (msg.action === 'readerCommand') {
+    /**
+     * 多个阅读器标签页打开同一本书时，命令只能由**拥有这条记录**的页面响应。
+     *
+     * 为什么（2026-10-24 用户报"看快速版没用"）：后台是广播给所有扩展页面的，
+     * 原来的写法是"每个页面都答一句"——没有这条记录的那个标签页会先答
+     * 「未找到该条目」，于是调用方拿到的是这个错误，而真正切换成功的页面白做了。
+     * 没有这条记录就**不响应**（返回 undefined，让 Chrome 把机会留给别的页面）；
+     * 所有页面都没有时，后台会得到"阅读器未返回结果"，那是诚实的失败。
+     */
+    if (msg.id && ENTRY_SCOPED_COMMANDS.has(msg.type) && !state.entries.some((e) => e.id === msg.id)) return
     // ⚠️ 必须带 catch：onReaderCommand 里一旦抛错（不是 return ok:false），
     // Promise 会静默 reject，sendResponse 永不执行 —— 后台的 await 只能超时，
     // 面板看到的是「未返回结果」（表现为：设为引用失败，但接收端其实已经存了）。
@@ -3639,6 +4238,12 @@ async function saveRecord() {
       // 「只识别了原文、没有翻译」要跟着落盘：否则重启后那张卡会变回一张普通译文卡
       //（正文仍是识别结果，只是"未翻译"的说明没了）
       recognized: !!e.recognized,
+      // 精译双版本（2026-10-24 用户要求"两边切换"）：两份都落盘，重启后还能对照。
+      // translation 只存**当前显示的那一版**；没有精译版的条目不必再存一份 fastText，
+      // 否则每条译文都白占一倍空间（只有真走过精译的条目才存两份）
+      fastText: e.preciseText ? (e.fastText || '') : '',
+      preciseText: e.preciseText || '',
+      showPrecise: !!e.showPrecise,
       at: e.at,
     })),
     // 已设成引用的段落：落盘是为了"重启后立刻能画下划线"（见 loadDocument 里那段说明）。
@@ -3649,8 +4254,36 @@ async function saveRecord() {
     refMarks: (Array.isArray(state.refMarks) ? state.refMarks : []).slice(0, REFS_SEEN_MAX),
     updatedAt: Date.now(),
   }
+  /**
+   * 防"空记录覆盖有记录的存档"（2026-10-24 实测到的数据损坏）。
+   *
+   * 现场：同一本书开了两个阅读器标签页，一个里有 2 条译文、另一个是空的。空的那个
+   * 每次自动保存都往同一个 `rd:book:<hash>` 写 0 条，把好的那份冲掉；两个页面又各自
+   * 推快照给侧栏，于是卡片在"2 条 / 0 条"之间跳（正是用户报的"一会消失一会出现"）。
+   *
+   * 规则：要写 0 条、而盘上那份**有条目**时，拒绝覆盖 —— 除非这次是用户自己明确删空的
+   * （removeEntry / clear 会置 allowEmptySave）。宁可少存一次，不可把用户翻过的译文抹掉。
+   */
+  if (!record.entries.length && !state.allowEmptySave) {
+    if (!state.emptySaveBlocked) {
+      try {
+        const prev = await chrome.storage.local.get([key])
+        const old = prev && prev[key]
+        if (old && Array.isArray(old.entries) && old.entries.length) {
+          state.emptySaveBlocked = true
+          postDebug({ stage: 'save-empty-blocked', oldEntries: old.entries.length, key: key.slice(0, 40) })
+          return
+        }
+      } catch (e) {}
+    } else {
+      return
+    }
+  } else {
+    state.emptySaveBlocked = false
+  }
   try {
     await chrome.storage.local.set({ [key]: record })
+    state.allowEmptySave = false
   } catch (e) {
     console.warn('[阅读器] 保存失败', e)
   }
@@ -3718,6 +4351,11 @@ els.tocLast.addEventListener('click', () => gotoPage(bookTotal()))
 els.box.addEventListener('click', () => toggleBoxSelect())
 els.boxExit.addEventListener('click', () => endBoxSelect('toggle'))
 els.pages.addEventListener('mousedown', onBoxStart)
+// 链接层不接鼠标事件（pointer-events: none，理由见 buildLinkLayer 上方），
+// 所以点击与悬停都挂在页面容器上，按坐标算落在哪条链接上。
+els.pages.addEventListener('click', onPageLinkClick)
+els.pages.addEventListener('mousemove', onPageLinkHover)
+els.pages.addEventListener('mouseleave', clearLinkHover)
 els.notes.addEventListener('click', requestNotesOpen)
 els.tipTranslate.addEventListener('click', translateSelection)
 // 划词「设为引用」：不翻译，直接把选中的原文交给共读侧（2026-11）
@@ -3998,6 +4636,7 @@ window.__readerTest = {
       lastScaleCheap: state.lastScaleCheap,
       renderedPages: state.pages.filter((p) => p.rendered).length,
       stalePages: state.pages.filter((p) => p.needsRender).length,
+      linkCount: state.pages.reduce((n, p) => n + ((p.links && p.links.length) || 0), 0),
       canvasPixels: state.pages.filter((p) => p.canvas).map((p) => p.canvas.width * p.canvas.height),
       ioFired: state.ioFired,
       ioBlocked: state.ioBlocked,
@@ -4013,6 +4652,20 @@ window.__readerTest = {
       page: Number(d.closest('.rd-page').dataset.page),
       style: { left: d.style.left, top: d.style.top, width: d.style.width, height: d.style.height },
       rect: (() => { const r = d.getBoundingClientRect(); return [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] })(),
+    }))
+  },
+  /** 书页上的超链接（自检要验"注释真的被铺成了可点盒子"；见 buildLinkLayer） */
+  linkInfo() {
+    return state.pages.flatMap((p) => (p.links || []).map((l) => {
+      const r = l.el.getBoundingClientRect()
+      return {
+        page: p.num,
+        kind: l.kind,
+        url: l.url || '',
+        hasDest: !!l.dest,
+        action: l.action || '',
+        rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+      }
     }))
   },
   anchorRects() {

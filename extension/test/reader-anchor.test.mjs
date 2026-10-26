@@ -12,11 +12,15 @@ import {
   contextForRef,
   glyphTextFromOps,
   joinLines,
+  joinSlices,
   linesFromFixedItems,
   linesFromItems,
   linesFromOffsets,
   looksSpaceStarved,
+  offsetsAcrossPages,
+  offsetsFromRange,
   pageTextIndex,
+  pickLocateAnchor,
   planContextWindow,
   restoreItemSpaces,
   spacedPageFix,
@@ -50,6 +54,41 @@ test('joinLines 跳过空行、去掉首尾空白', () => {
   assert.equal(joinLines(['  first  ', '', '   ', 'second']), 'first second')
   assert.equal(joinLines([]), '')
   assert.equal(joinLines(null), '')
+})
+
+// ── 跨页切片接成一段（2026-11 用户实报：跨页引用后条目里还带着换行）───────────────
+test('joinSlices 跨页不留换行：英文补空格接着写', () => {
+  assert.equal(joinSlices(['kept short on purpose.', 'Reading foreign literature']),
+    'kept short on purpose. Reading foreign literature')
+})
+
+test('joinSlices 跨页行尾连字符断词照样接回去', () => {
+  // 一个词被页边界劈开：上一页末尾 "well-docu-"、下一页开头 "mented"
+  assert.equal(joinSlices(['a well-docu-', 'mented claim']), 'a well-documented claim')
+})
+
+test('joinSlices 跨页中文之间不加空格', () => {
+  assert.equal(joinSlices(['这是一句', '中文。']), '这是一句中文。')
+  assert.equal(joinSlices(['中文结尾', 'English follows']), '中文结尾 English follows')
+})
+
+test('joinSlices 切片内部残留的换行也一并接掉', () => {
+  // 个别 PDF 的 ToUnicode 会让一个 span 的 str 里带 \n —— 不能让它漏进引用原文
+  assert.equal(joinSlices(['first line\nsecond line', 'third']), 'first line second line third')
+  assert.equal(joinSlices(['第一行\n第二行', 'third']), '第一行第二行 third')   // 中文之间照旧不加空格
+})
+
+test('joinSlices 与页内换行同一套规则：切几段不影响结果', () => {
+  const lines = ['Reading foreign literature', 'means meeting sentences', 'that do not survive']
+  assert.equal(joinSlices([lines.join('\n')]), joinLines(lines))
+  assert.equal(joinSlices([lines[0], lines[1] + '\n' + lines[2]]), joinLines(lines))
+  assert.equal(joinSlices([lines.join(' ')]), joinLines(lines))   // 页内本来就是一行的情况
+})
+
+test('joinSlices 对空段 / 坏输入不炸', () => {
+  assert.equal(joinSlices([]), '')
+  assert.equal(joinSlices(null), '')
+  assert.equal(joinSlices(['', '   ', null, undefined, 'x']), 'x')
 })
 
 // ── 页内索引 ──────────────────────────────────────────────────────────────────
@@ -93,7 +132,121 @@ test('textFromOffsets 把跨行选区拼成正常句子（不是两行粘住）'
     'sentences that do not survive translation by themselves.')
 })
 
-// ── 锚点稳定性：同一对偏移在"重建过的"文字层上必须还指向同一段 ────────────────
+// ── 跨页选区（2026-11 用户实报：划线跨页时划词浮标不弹）───────────────────────
+/**
+ * 带节点的假文字层：每行一个 span、span 里一个文字节点 —— 与 pdf.js 的结构一致，
+ * Range 的端点就落在这两种节点上。`contains` 只认自己与自己的文字子节点。
+ */
+const pageWithNodes = (lines) => {
+  const layer = {
+    nodeType: 1,
+    tagName: 'DIV',
+    childNodes: [],
+    querySelectorAll: () => layer.childNodes,
+    contains: (n) => n === layer || layer.childNodes.some((s) => s === n || s.contains(n)),
+  }
+  layer.childNodes = lines.map((t) => {
+    const text = { nodeType: 3, parentNode: null }
+    const span = {
+      nodeType: 1,
+      tagName: 'SPAN',
+      textContent: t,
+      childNodes: [text],
+      contains: (n) => n === span || n === text,
+    }
+    text.parentNode = span
+    return span
+  })
+  return layer
+}
+
+/** 取第 i 行的文字节点（Range 端点最常落在它上面） */
+const textOf = (layer, i) => layer.childNodes[i].childNodes[0]
+
+/**
+ * 假 Range。`intersectsNode` 按页顺序判断：页面上下堆叠、互不重叠，所以
+ * "这一层在起止两页之间"与浏览器真 intersectsNode 的结论一致。
+ */
+const rangeAcross = (layers, startNode, startOffset, endNode, endOffset) => {
+  const layerOf = (node) => layers.findIndex((l) => l.contains(node))
+  const from = layerOf(startNode)
+  const to = layerOf(endNode)
+  return {
+    startContainer: startNode,
+    startOffset,
+    endContainer: endNode,
+    endOffset,
+    intersectsNode(layer) {
+      const i = layers.indexOf(layer)
+      return i >= Math.min(from, to) && i <= Math.max(from, to)
+    },
+  }
+}
+
+test('跨页选区：首页算到页尾、次页从页首算起（旧实现两页都给 null）', () => {
+  const p1 = pageWithNodes(['hello world', 'second line'])      // 11 + 11 = 22
+  const p2 = pageWithNodes(['third line here', 'last line'])    // 15 + 9 = 24
+  const layers = [p1, p2]
+  // 从第 1 页第二行第 3 个字，拖到第 2 页第一行第 4 个字
+  const range = rangeAcross(layers, textOf(p1, 1), 3, textOf(p2, 0), 4)
+  assert.deepEqual(offsetsAcrossPages(range, layers), [
+    { page: 1, start: 14, end: 22 },
+    { page: 2, start: 0, end: 4 },
+  ])
+})
+
+test('跨页选区穿过整页：中间那一页整页都要（否则长引用会丢一句话）', () => {
+  const p1 = pageWithNodes(['aaaa', 'bb'])          // 6
+  const p2 = pageWithNodes(['cccccc', 'dd'])        // 8
+  const p3 = pageWithNodes(['eeee', 'ff'])          // 6
+  const layers = [p1, p2, p3]
+  const range = rangeAcross(layers, textOf(p1, 1), 1, textOf(p3, 0), 3)
+  assert.deepEqual(offsetsAcrossPages(range, layers), [
+    { page: 1, start: 5, end: 6 },
+    { page: 2, start: 0, end: 8 },                  // 两端都不在这一页，但选区穿过了它
+    { page: 3, start: 0, end: 3 },
+  ])
+})
+
+test('没被选区碰到的页一条锚点都不给（不能把没翻到的页当成整页选中）', () => {
+  const p1 = pageWithNodes(['aaaa', 'bb'])
+  const p2 = pageWithNodes(['cccccc', 'dd'])
+  const p3 = pageWithNodes(['eeee', 'ff'])
+  const layers = [p1, p2, p3]
+  const range = rangeAcross(layers, textOf(p1, 0), 1, textOf(p1, 1), 1)
+  assert.deepEqual(offsetsAcrossPages(range, layers), [{ page: 1, start: 1, end: 5 }])
+})
+
+test('端点落在行间空白（层 + 子节点序号）时按行首折算，不当成整页', () => {
+  const p1 = pageWithNodes(['hello world', 'second line'])
+  const p2 = pageWithNodes(['aaa', 'bbb', 'ccc'])    // 3 + 3 + 3 = 9
+  const layers = [p1, p2]
+  // 从第 2 页第 2 行之前开始（层元素 + offset 1），选到第 3 行第 2 个字
+  const range = rangeAcross(layers, p2, 1, textOf(p2, 2), 2)
+  assert.deepEqual(offsetsAcrossPages(range, layers), [{ page: 2, start: 3, end: 8 }])
+  // 跨页：终点落在下一页的"第 2 行之前"
+  const cross = rangeAcross(layers, textOf(p1, 1), 2, p2, 1)
+  assert.deepEqual(offsetsAcrossPages(cross, layers), [
+    { page: 1, start: 13, end: 22 },
+    { page: 2, start: 0, end: 3 },
+  ])
+})
+
+test('端点是 span 元素时 offset 是子节点序号，不是字数', () => {
+  const p1 = pageWithNodes(['hello world', 'second line'])
+  // 端点在第 2 行的 span 上：offset 0 = 行首，offset 1 = 行尾（该 span 只有一个文字子节点）
+  const atStart = rangeAcross([p1], p1.childNodes[1], 0, p1.childNodes[1], 1)
+  assert.deepEqual(offsetsFromRange(p1, atStart), { start: 11, end: 22 })
+})
+
+test('单页区间：与改动前完全一致（跨页处理不能改变页内划选）', () => {
+  const p1 = pageWithNodes(['hello world', 'second line'])
+  const range = rangeAcross([p1], textOf(p1, 0), 6, textOf(p1, 1), 4)
+  assert.deepEqual(offsetsFromRange(p1, range), { start: 6, end: 15 })
+  assert.deepEqual(offsetsAcrossPages(range, [p1]), [{ page: 1, start: 6, end: 15 }])
+})
+
+
 test('同一对偏移在文字层重建后仍取到相同原文', () => {
   const lines = ['Reading foreign literature means meeting sentences', 'that do not survive translation by themselves.']
   const before = textFromOffsets(fakeLayer(lines), 0, 999)
@@ -361,4 +514,58 @@ test('contextForRef：文字条目取不到附近原文时**不**拿译文顶（
 test('contextForRef：什么都没有时返回空串（不假装有上下文）', () => {
   assert.equal(contextForRef('', null), '')
   assert.equal(contextForRef('', { kind: 'image', translation: '' }), '')
+})
+
+// ── pickLocateAnchor：点一条引用该跳到哪一处（2026-10-25 用户实测的"跳到最近一处"）──
+
+/** 一份"划在 page/start-end"的候选，写成来源表的形状 */
+const src = (from, text, ...anchors) => ({ from, items: [{ text, anchors }] })
+
+test('pickLocateAnchor：划那一刻记下的锚点压过同文的其它来源', () => {
+  // 现场：把《置身事内》的 PDF 抽成文本，"全国预算收入"在第 56 页与第 58 页各一遍。
+  // 用户划的是第 58 页那一处（"分税制改革之后，全国预算收入占GDP…"）。
+  const a = pickLocateAnchor('全国预算收入', [
+    src('mark', '全国预算收入', { page: 58, start: 251, end: 257 }),
+    src('record', '全国预算收入', { page: 56, start: 655, end: 661 }),
+  ])
+  assert.deepEqual(a, { page: 58, start: 251, end: 257, from: 'mark' })
+})
+
+test('pickLocateAnchor：前一个来源里没有这一条 → 落到下一个来源', () => {
+  const a = pickLocateAnchor('全国预算收入', [
+    src('mark', '另一段完全不同的文字', { page: 12, start: 0, end: 4 }),
+    src('entry', '全国预算收入', { page: 58, start: 251, end: 257 }),
+    src('record', '全国预算收入', { page: 56, start: 655, end: 661 }),
+  ])
+  assert.deepEqual(a, { page: 58, start: 251, end: 257, from: 'entry' })
+})
+
+test('pickLocateAnchor：文字按"去空白"口径对齐（PDF 行间空格与存下来的不一致）', () => {
+  const a = pickLocateAnchor('全国 预算\n收入', [src('mark', '全国预算收入', { page: 58, start: 251, end: 257 })])
+  assert.deepEqual(a, { page: 58, start: 251, end: 257, from: 'mark' })
+})
+
+test('pickLocateAnchor：跨页的引用取**第一段**（按阅读顺序落位）', () => {
+  const a = pickLocateAnchor('跨页的一段', [src('mark', '跨页的一段',
+    { page: 3, start: 10, end: 30 }, { page: 4, start: 0, end: 12 })])
+  assert.equal(a.page, 3)
+  assert.equal(a.start, 10)
+})
+
+test('pickLocateAnchor：坏锚点跳过，不因一个坏值就整条放弃', () => {
+  const a = pickLocateAnchor('全国预算收入', [src('mark', '全国预算收入',
+    { page: 0, start: 1, end: 2 },        // 页号从 1 起
+    { page: 58, start: 9, end: 9 },       // end <= start：框不住东西
+    { page: 58, start: 'x', end: 5 },     // 偏移不是数
+    { page: 58, start: 251, end: 257 })])
+  assert.deepEqual(a, { page: 58, start: 251, end: 257, from: 'mark' })
+})
+
+test('pickLocateAnchor：都没有 / 入参不完整时返回 null（调用方据此退回按文字找）', () => {
+  assert.equal(pickLocateAnchor('全国预算收入', []), null)
+  assert.equal(pickLocateAnchor('全国预算收入', [src('mark', '别的段落', { page: 1, start: 0, end: 4 })]), null)
+  assert.equal(pickLocateAnchor('全国预算收入', [{ from: 'mark' }]), null)
+  assert.equal(pickLocateAnchor('全国预算收入', [src('mark', '全国预算收入', null)]), null)
+  assert.equal(pickLocateAnchor('', [src('mark', '全国预算收入', { page: 1, start: 0, end: 4 })]), null)
+  assert.equal(pickLocateAnchor('全国预算收入', null), null)
 })

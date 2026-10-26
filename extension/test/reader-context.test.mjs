@@ -13,7 +13,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { activeTabKind, installTranslateBackground, refContextOf } from '../translate-background.js'
+import { activeTabKind, installTranslateBackground, refAnchorsOf, refContextOf } from '../translate-background.js'
 
 const WEREAD_BOOK_URL = 'https://weread.qq.com/web/reader/ce0321c0722b4a5d9f7b0c1e2d3f4a5b'
 const WEREAD_BOOK_K_URL = WEREAD_BOOK_URL + 'k06432b4029e064096632ab8'   // 带章节目录后缀（真实形态）
@@ -144,4 +144,49 @@ test('refContextOf：上限放宽到 4000，一张整页译文卡不被切掉', 
   assert.equal(refContextOf({ context: card, image: true }).length, 2500)
   // 超过 4000 才切
   assert.equal(refContextOf({ context: 'x'.repeat(5000) }).length, 4000)
+})
+
+// ── refAnchorsOf：这条引用落在书里哪一处（跳引用靠它，不是按文字猜）────────────
+// 现场：把《置身事内》的 PDF 抽成文本，「全国预算收入」在第 56 页与第 58 页各一遍。
+// 用户划的是第 58 页那一处；存档里带上锚点，跳回去才不会落到第 56 页。
+
+test('refAnchorsOf：阅读器报上来的锚点原样保留（转成整数）', () => {
+  assert.deepEqual(
+    refAnchorsOf({ anchors: [{ page: 58, start: 251, end: 257 }] }),
+    [{ page: 58, start: 251, end: 257 }],
+  )
+  // 跨页引用有多段，按顺序保留
+  assert.deepEqual(
+    refAnchorsOf({ anchors: [{ page: 3, start: 10, end: 30 }, { page: 4, start: 0, end: 12 }] }).map((a) => a.page),
+    [3, 4],
+  )
+  // 浮点 / 字符串也认（上游偶尔给 number 的字符串形态）
+  assert.deepEqual(refAnchorsOf({ anchors: [{ page: '58', start: 251.9, end: '257' }] }),
+    [{ page: 58, start: 251, end: 257 }])
+})
+
+test('refAnchorsOf：坏锚点丢掉，别让阅读器拿着荒唐页号去跳', () => {
+  const out = refAnchorsOf({
+    anchors: [
+      { page: 0, start: 1, end: 2 },       // 页号从 1 起
+      { page: 58, start: 9, end: 9 },      // end <= start：框不住东西
+      { page: 58, start: -1, end: 5 },     // 偏移为负
+      { page: 'x', start: 1, end: 2 },     // 页号不是数
+      null,
+      { page: 58, start: 251, end: 257 },  // 唯一好的那条
+    ],
+  })
+  assert.deepEqual(out, [{ page: 58, start: 251, end: 257 }])
+})
+
+test('refAnchorsOf：没有锚点（老数据 / 扫描件）→ 空数组，不补默认值', () => {
+  assert.deepEqual(refAnchorsOf({}), [])
+  assert.deepEqual(refAnchorsOf({ anchors: [] }), [])
+  assert.deepEqual(refAnchorsOf({ anchors: 'not-an-array' }), [])
+  assert.deepEqual(refAnchorsOf(null), [])
+})
+
+test('refAnchorsOf：最多留 8 段（再多只可能是上游出错）', () => {
+  const many = Array.from({ length: 20 }, (_, i) => ({ page: i + 1, start: 0, end: 4 }))
+  assert.equal(refAnchorsOf({ anchors: many }).length, 8)
 })

@@ -512,6 +512,31 @@ export function userAncestry(graph, targetIds, opts = {}) {
     .sort((a, b) => (b.hops - a.hops) || ((hitIdx.get(a.id) ?? -1) - (hitIdx.get(b.id) ?? -1)))
 }
 
+/**
+ * 取一个节点的**直接**来路（user 入边的 from）：这条讨论当时引用了哪些旧知识点。
+ *
+ * 与 userAncestry 的区别只有一层：那边递归取整条闭包（L3 旧路径一次全扒进来），
+ * 这边只给"上一层"——L3 新路径（lib/l3-tasks.js）要一层一层判"值不值得再追"，
+ * 一次只肯为下一层花一次调用。方向语义与 userAncestry 同一套（见那里的注释）：
+ * 只走 user 入边，不走 derived（同栈相邻段不是承接对象），不走 user 出边（去路会漂移）。
+ *
+ * @param {object} graph
+ * @param {string} nodeId
+ * @returns {string[]} 父节点 id（去重，按 edges 里的出现顺序）；节点不存在 → []
+ */
+export function userParents(graph, nodeId) {
+  const id = String(nodeId || '').trim()
+  if (!id) return []
+  const out = []
+  for (const e of graph.edges || []) {
+    if (e.kind !== 'user' || e.to !== id) continue
+    if (out.includes(e.from)) continue
+    if (!graph.nodes.some((n) => n.id === e.from)) continue
+    out.push(e.from)
+  }
+  return out
+}
+
 // ───────────────────────── 3. 派生 point / 能指（固化用） ─────────────────────────
 
 /**

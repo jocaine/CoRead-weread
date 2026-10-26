@@ -10,15 +10,16 @@ import {
   IMAGE_PROMPT,
   RECOGNIZE_PROMPT,
   RELOCATE_PROMPT,
-  RETRANSLATE_PROMPT,
   RETRY_PROMPT,
   RETRY_RECOGNIZE_PROMPT,
-  SELECTION_PROMPT,
   PROMPT_VERSION,
+  TRANSLATE_SYSTEM_PROMPT,
+  TRANSLATE_SYSTEM_PROMPT_OCR,
   buildChatBody,
   buildImageContent,
   buildRelocatePrompt,
   buildTextContent,
+  buildTranslateContent,
   chatCompletionsUrl,
   classifyFetchError,
   classifyHttpError,
@@ -31,6 +32,7 @@ import {
   RECEIVER_URL,
   reportExtensionToHost,
   parseTranslation,
+  planChatAttempts,
   relocateSnippet,
   stripCodeFence,
 } from '../translate-protocol.js'
@@ -45,7 +47,7 @@ test('IMAGE_PROMPT 要求 JSON 输出并锁定 original/translation 两个字段
 })
 
 test('所有 prompt 都是非空字符串', () => {
-  for (const p of [IMAGE_PROMPT, RECOGNIZE_PROMPT, RETRANSLATE_PROMPT, SELECTION_PROMPT, RETRY_PROMPT, RETRY_RECOGNIZE_PROMPT]) {
+  for (const p of [IMAGE_PROMPT, RECOGNIZE_PROMPT, TRANSLATE_SYSTEM_PROMPT, TRANSLATE_SYSTEM_PROMPT_OCR, RETRY_PROMPT, RETRY_RECOGNIZE_PROMPT]) {
     assert.equal(typeof p, 'string')
     assert.ok(p.trim().length > 20)
   }
@@ -63,13 +65,21 @@ test('RECOGNIZE_PROMPT 只要 original，且明确不是翻译', () => {
   assert.notEqual(RECOGNIZE_PROMPT, IMAGE_PROMPT)
 })
 
-test('SELECTION_PROMPT 只要求 translation，且不提截图识别误差', () => {
-  assert.match(SELECTION_PROMPT, /translation/)
-  assert.match(SELECTION_PROMPT, /简体中文/)
-  assert.doesNotMatch(SELECTION_PROMPT, /截图/)
-  // 划词来源是页面真实文本，与重译 prompt 必须是两个不同的常量
-  assert.notEqual(SELECTION_PROMPT, RETRANSLATE_PROMPT)
-  assert.match(RETRANSLATE_PROMPT, /截图/)
+test('文本翻译规则：要求自然中文、不保留英文句式，且不把 OCR 的错字提示带进去', () => {
+  for (const p of [TRANSLATE_SYSTEM_PROMPT, TRANSLATE_SYSTEM_PROMPT_OCR]) {
+    assert.match(p, /简体中文/)
+    assert.match(p, /translation/)
+    assert.match(p, /JSON/)
+    assert.match(p, /先读懂整句/)
+    assert.match(p, /不要保留英文的语序/)
+    assert.match(p, /术语/)
+    assert.match(p, /不增、不减/)
+  }
+  // 文字条目来自 PDF 文字层，没有识别误差：说"可能有错字"会让模型去改人名与术语
+  assert.doesNotMatch(TRANSLATE_SYSTEM_PROMPT, /截图识别/)
+  assert.match(TRANSLATE_SYSTEM_PROMPT_OCR, /截图识别/)
+  assert.ok(TRANSLATE_SYSTEM_PROMPT_OCR.length > TRANSLATE_SYSTEM_PROMPT.length)
+  assert.notEqual(TRANSLATE_SYSTEM_PROMPT, TRANSLATE_SYSTEM_PROMPT_OCR)
 })
 
 // ── 地址与请求体 ──────────────────────────────────────────────────────────────
@@ -111,6 +121,53 @@ test('buildChatBody 默认开 JSON 模式、关思考（2026-11 那个"格式不
   const probe = buildChatBody({ model: 'm', content: [], jsonMode: false, noThinking: false })
   assert.equal(probe.response_format, undefined)
   assert.equal(probe.thinking, undefined)
+})
+
+test('buildChatBody 支持单独的 system 消息（文本翻译的规则放这里）', () => {
+  const body = buildChatBody({ model: 'm', system: '规则', content: [{ type: 'text', text: 'hi' }] })
+  assert.equal(body.messages.length, 2)
+  assert.equal(body.messages[0].role, 'system')
+  assert.equal(body.messages[0].content, '规则')
+  assert.equal(body.messages[1].role, 'user')
+  // 空白 system 视为没给：图片那条路的消息形态必须与改动前逐字一致
+  assert.equal(buildChatBody({ model: 'm', system: '   ', content: [] }).messages.length, 1)
+})
+
+test('buildTranslateContent 把书名与待译正文分开，正文有边界标记', () => {
+  const c = buildTranslateContent({ text: 'hello', bookTitle: 'A Book' })
+  assert.equal(c.length, 1)
+  assert.match(c[0].text, /书名：A Book/)
+  assert.match(c[0].text, /【待译文字】\nhello\n【待译文字结束】/)
+  // 没有书名时不留下空的「书名：」行
+  const bare = buildTranslateContent({ text: 'hello' })
+  assert.doesNotMatch(bare[0].text, /书名/)
+  assert.match(bare[0].text, /【待译文字】/)
+})
+
+test('planChatAttempts：精译第一发就是不关思考，降级不会把它退成关思考', () => {
+  assert.deepEqual(
+    planChatAttempts({ jsonMode: true, noThinking: false }),
+    [{ jsonMode: true, noThinking: false }, { jsonMode: false, noThinking: false }],
+  )
+  // 普译保留三级降级：关思考+JSON → 开思考+JSON → 开思考+无JSON
+  assert.deepEqual(
+    planChatAttempts({ jsonMode: true, noThinking: true }),
+    [{ jsonMode: true, noThinking: true }, { jsonMode: true, noThinking: false }, { jsonMode: false, noThinking: false }],
+  )
+  // thinking 字段被上游拒过：直接从不关思考开始，不白发一次必 400 的请求
+  assert.deepEqual(
+    planChatAttempts({ jsonMode: true, noThinking: true, thinkingRejected: true }),
+    [{ jsonMode: true, noThinking: false }, { jsonMode: false, noThinking: false }],
+  )
+  // JSON 模式被拒过 / 本来就不开：只剩思考那一档
+  assert.deepEqual(
+    planChatAttempts({ jsonMode: true, jsonModeRejected: true }),
+    [{ jsonMode: false, noThinking: true }, { jsonMode: false, noThinking: false }],
+  )
+  assert.deepEqual(
+    planChatAttempts({ jsonMode: false }),
+    [{ jsonMode: false, noThinking: true }, { jsonMode: false, noThinking: false }],
+  )
 })
 
 test('buildImageContent 产出 text + image_url 两个块', () => {

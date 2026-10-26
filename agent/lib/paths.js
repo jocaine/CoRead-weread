@@ -146,6 +146,23 @@ export const DATA_BACKUPS_DIR = path.join(DATA_DIR, 'backups')
 export const API_CONFIG_FILE = path.join(CONFIG_DIR, 'api-config.json')
 export const ENV_FILE = path.join(CONFIG_DIR, 'env')
 
+// L3 装配模式（2026-10-24）：一行纯文本，取值 full / tasks / off / both。
+// 为什么放文件而不是 env：env 是**进程启动时**固定的，改完必须重启；放在这里每轮现读，
+// 改一行就生效。缺文件/读不懂一律按 full（= 今天的行为），见 lib/l3-driver.js。
+export const L3_MODE_FILE = path.join(CONFIG_DIR, 'l3-mode')
+
+// L3 A/B 抓取 + 全过程记录（2026-10-24）：
+// `l3-debug` 这个文件**存在**时（内容随便），say() 每轮做两件事：
+//   ① 把这一轮的真实输入（历史 / 画像 / 锚定 / 命中 / L3 块）原样存到 l3-dump.json，
+//      供 agent\scripts\l3-ab.mjs 离线重放。为什么非要抓：线上先后问同一个问题做不到
+//      "同一个输入"——第二轮的历史里已经有第一轮的回答了。
+//   ② 把命题递归的全过程写成 Markdown（RUNTIME_DIR\l3-trace\时间.md），一轮一份、边跑边写。
+// 不看内容只看存在：删掉文件就停止，不用重启。`l3-dump` 是早十几分钟的旧名字，等价。
+export const L3_DEBUG_FILE = path.join(CONFIG_DIR, 'l3-debug')
+export const L3_TRACE_DIR = path.join(RUNTIME_DIR, 'l3-trace')
+export const L3_DUMP_FILE = path.join(CONFIG_DIR, 'l3-dump')
+export const L3_DUMP_JSON = path.join(CONFIG_DIR, 'l3-dump.json')
+
 // profile\：对用户的长期理解
 export const GRAPH_FILE = path.join(PROFILE_DIR, 'knowledge-graph.json')
 // 2026-11：原 SELF_PORTRAIT_FILE（profile\self-portrait.md）随「用户情况与观念画像」功能一起删除
@@ -424,6 +441,7 @@ export const DATA_FILES = {  'knowledge-graph': GRAPH_FILE,
   'tool-history': TOOL_HISTORY_FILE,
   'api-config': API_CONFIG_FILE,
   env: ENV_FILE,
+  'l3-mode': L3_MODE_FILE,
   'debug-log': DEBUG_LOG,
 }
 

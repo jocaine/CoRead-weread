@@ -69,7 +69,59 @@ export function rangeFromOffsets(layerEl, start, end) {
 }
 
 /**
- * Range → 页内起止偏移。Range 不在这页文字层里时返回 null。
+ * 端点落在本层的**元素**节点上时（拖到行间空白、或落在 <br> 上），换算成页内偏移。
+ *
+ * Chrome 在这种位置给的是「元素 + 第几个子节点」，offset 是**子节点序号**，不是字数。
+ * 直接当字数用会算错（甚至把跨页选区判成"整页"），所以单独算：
+ *   · 元素就是文字层自己 → offset 就是子节点序号（0 = 页首之前，childNodes.length = 页尾之后）
+ *   · 元素是文字层的直接子节点（<br>）→ 取它前面那几个 span 的字数
+ * 前提与 `pageTextIndex` 相同：pdf.js 的行 span 是文字层的直接子节点（不嵌套）。
+ * 认不出来（别的元素、别的层）→ null，交给调用方按"这一页没被选中"处理。
+ */
+function offsetAtChild(layerEl, node, offset) {
+  if (!layerEl || !node || node.nodeType !== 1) return null
+  const kids = layerEl.childNodes || []
+  let before
+  if (node === layerEl) {
+    before = Math.max(0, Math.min(Number(offset) || 0, kids.length))
+  } else {
+    const idx = Array.prototype.indexOf.call(kids, node)
+    if (idx < 0) return null
+    before = idx
+  }
+  let sum = 0
+  for (let i = 0; i < before; i++) {
+    const kid = kids[i]
+    if (kid && kid.nodeType === 1 && String(kid.tagName || '').toUpperCase() === 'SPAN') {
+      sum += (kid.textContent || '').length
+    }
+  }
+  return sum
+}
+
+/** 这个 Range 有没有穿过这一层（老环境没有 intersectsNode 就当没穿过：宁可少一条锚点） */
+function intersectsLayer(range, layerEl) {
+  try {
+    return typeof range.intersectsNode === 'function' ? range.intersectsNode(layerEl) : false
+  } catch (e) {
+    return false
+  }
+}
+
+/**
+ * Range → 页内起止偏移。Range 与这页文字层没有交集时返回 null。
+ *
+ * ⚠️ 跨页划选（2026-11 修，用户实报"划线跨页时浮标不弹"）：
+ * 一个 Range 的起点与终点可以落在**两页**的文字层里。旧实现要求两个端点都在本层，
+ * 于是跨页选区在**每一页**上都拿到 null —— `offsetsAcrossPages` 返回空数组，
+ * `selectionAnchors()` 跟着返回 null，`onSelectionSettled` 走 `hideTip()`：
+ * 翻译 / 设为引用 / 复制那条浮标根本不出现，Alt+T 也只会提示"请先划选原文"。
+ *
+ * 现在按"选区盖住了这一页多少"来算：
+ *   · 起点在更前面的一页 → 本页从页首算起
+ *   · 终点在更后面的一页 → 本页算到页尾
+ *   · 两端都不在本层 → 只有 Range 真的穿过这一层（intersectsNode）才算整页；
+ *     否则一本 300 页的书里那些根本没碰到的页也会被当成"整页选中"。
  */
 export function offsetsFromRange(layerEl, range) {
   const { spans, offsets, total } = pageTextIndex(layerEl)
@@ -77,15 +129,29 @@ export function offsetsFromRange(layerEl, range) {
   const locate = (node, offset) => {
     for (let i = 0; i < spans.length; i++) {
       const span = spans[i]
-      if (span === node || span.contains(node)) {
+      if (span === node) {
+        // 端点是**元素**（span 自己）：offset 是"第几个子节点"，不是"第几个字"。
+        // 只有一个文字子节点的行 span 上，0 = 行首、≥1 = 行尾。
+        return offsets[i] + (offset > 0 ? (span.textContent || '').length : 0)
+      }
+      if (span.contains(node)) {
         return offsets[i] + Math.min(offset, (span.textContent || '').length)
       }
     }
-    return null
+    return offsetAtChild(layerEl, node, offset)
   }
-  const start = locate(range.startContainer, range.startOffset)
-  const end = locate(range.endContainer, range.endOffset)
-  if (start === null || end === null) return null
+  let start = locate(range.startContainer, range.startOffset)
+  let end = locate(range.endContainer, range.endOffset)
+  if (start === null && end === null) {
+    // 两端都不在这一层：整页被选区穿过（跨页划选），或者压根没碰到这一页
+    if (!intersectsLayer(range, layerEl)) return null
+    start = 0
+    end = total
+  } else if (start === null) {
+    start = 0          // 选区从更前面的一页开始：本页从页首被选中
+  } else if (end === null) {
+    end = total        // 选区到更后面的一页才结束：本页被选到页尾
+  }
   const a = Math.min(start, end)
   const b = Math.max(start, end)
   return { start: Math.max(0, Math.min(total, a)), end: Math.max(0, Math.min(total, b)) }
@@ -93,6 +159,10 @@ export function offsetsFromRange(layerEl, range) {
 
 /**
  * 取选区在各页里的偏移，按页分组。
+ *
+ * 跨页选区会得到**多条**：首页从划过的那一点到页尾、中间页整页、末页从页首到终点
+ *（把首尾夹进本页范围由 offsetsFromRange 负责）。
+ *
  * @param {Range} range
  * @param {Element[]} pageLayers 页面顺序排列的文字层
  * @returns {Array<{page: number, start: number, end: number}>} page 从 1 开始
@@ -102,7 +172,6 @@ export function offsetsAcrossPages(range, pageLayers) {
   for (let i = 0; i < pageLayers.length; i++) {
     const layer = pageLayers[i]
     if (!layer) continue
-    // 只统计与该页有交集的选区：把选区的头和尾夹到本页范围内，再看是否非空
     const hit = offsetsFromRange(layer, range)
     if (!hit) continue
     if (hit.end <= hit.start) continue
@@ -139,6 +208,28 @@ export function joinLines(lines) {
   return out
 }
 
+/**
+ * 多段切片（通常是"每页一段"）→ 一段连续原文。
+ *
+ * 为什么需要它（2026-11 用户实报：跨页引用之后，条目里的原文还带着换行）：
+ * 跨页划选会得到**多条**锚点（每页一条，见 offsetsAcrossPages），阅读器原先用 '\n'
+ * 把它们直接拼起来 —— 于是跨页的那一句在引用卡、译文条目、发给 agent 的原文里
+ * 断成了两行，而且和"同一页里换行会被接成一句"自相矛盾。
+ *
+ * 接法只有一套：**与页内换行完全相同**，交给 joinLines —— 英文补一个空格、
+ * 行尾连字符断词直接接、中文之间不加空格。切片内部若还残留 '\n'
+ *（个别 PDF 的 ToUnicode 会给出），也一并按行拆开，别让它漏进引用原文。
+ *
+ * @param {string[]} chunks 按阅读顺序的切片
+ * @returns {string}
+ */
+export function joinSlices(chunks) {
+  const lines = []
+  for (const c of Array.isArray(chunks) ? chunks : []) {
+    for (const line of String(c == null ? '' : c).split('\n')) lines.push(line)
+  }
+  return joinLines(lines)
+}
 /**
  * 取出一段偏移覆盖到的每一行文字（保留行结构）。
  *
@@ -502,5 +593,63 @@ export function contextForRef(near, entry) {
   // 扫描件：没有原文（source 为空）或明确标成图片条目
   if (kind !== 'image' && source) return ''
   return String((entry && entry.translation) || '').trim()
+}
+
+// ── 「点这条引用该跳到哪一处」（纯函数，与 DOM / pdf.js 无关）──────────────────
+/**
+ * 挑锚点用的文字口径：去掉所有空白。
+ * 与 reader.js 的 compactRefText 同源 —— PDF 抽出来的行间空格不总与存下来的一致。
+ */
+const locateCompact = (s) => String(s || '').replace(/\s+/g, '')
+
+/**
+ * 一个锚点是否可用。页号从 1 起；偏移必须是非负整数、且 end > start
+ * （end <= start 的 Range 什么都框不住，跳过去也看不见东西）。
+ * @returns {{page:number,start:number,end:number}|null}
+ */
+function cleanAnchor(a) {
+  if (!a) return null
+  const page = Math.trunc(Number(a.page))
+  const start = Math.trunc(Number(a.start))
+  const end = Math.trunc(Number(a.end))
+  if (!Number.isFinite(page) || page < 1) return null
+  if (!Number.isFinite(start) || start < 0) return null
+  if (!Number.isFinite(end) || end <= start) return null
+  return { page, start, end }
+}
+
+/**
+ * 「点这条引用，跳到书里哪一处」——从几个来源里挑一个**精确锚点**。
+ *
+ * 为什么需要它（而不是按文字搜）：同一句话在书里常常出现不止一次，按文字找一定
+ * 有落到隔壁去的时候。实测《置身事内》：第 56 页与第 58 页各有一个"全国预算收入"，
+ * 两处只隔两页 —— 按文字找会撞上"离当前页最近"的那一个，用户看到的就是
+ * "跳到了最近的地方，不是我的划线"。
+ *
+ * 来源按**从准到松**排序（调用方决定顺序，通常）：
+ *   ① 设引用那一刻记下的位置（阅读器本地 refMarks）—— 用户划的就是它
+ *   ② 这条引用出身的那张译文卡的位置（state.entries）—— 同一次划词的另一份记录
+ *   ③ 接收端存档随引用带回来的位置（refsSeen[].anchors）—— 能活过本地缓存上限
+ * 都命不中 → null，调用方退回按文字找（那是有歧义的老路，必须如实回报）。
+ *
+ * @param {string} text 引用原文
+ * @param {Array<{from?:string, items?:Array<{text?:string, anchors?:Array}>}>} sources
+ * @returns {{page:number,start:number,end:number,from:string}|null}
+ */
+export function pickLocateAnchor(text, sources = []) {
+  const want = locateCompact(text)
+  if (!want) return null
+  for (const src of Array.isArray(sources) ? sources : []) {
+    const items = (src && Array.isArray(src.items)) ? src.items : []
+    for (const it of items) {
+      if (locateCompact(it && it.text) !== want) continue
+      const list = Array.isArray(it && it.anchors) ? it.anchors : []
+      for (const raw of list) {
+        const a = cleanAnchor(raw)
+        if (a) return { ...a, from: String((src && src.from) || '') }
+      }
+    }
+  }
+  return null
 }
 

@@ -16,9 +16,10 @@ import fs from 'fs'
 import net from 'net'
 import path from 'path'
 import readline from 'readline'
+import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { processStackMessage, makeStackEntry, collectStackCites } from './lib/topic-stack.js'
-import { createGraph, userAncestry, resolveReferences, hotNodes, mergeNodeMetadata } from './lib/knowledge-graph.js'
+import { createGraph, userAncestry, userParents, resolveReferences, hotNodes, mergeNodeMetadata } from './lib/knowledge-graph.js'
 import { consolidateThreadQuestion } from './lib/thread-question.js'
 import { consolidateDiscussion, addDerivedEdge, addCitationEdges, pruneRedundantCitationEdges, groupExcerpts, segmentBook } from './lib/graph-consolidate.js'
 import { segmentStack } from './lib/segment-stack.js'
@@ -43,7 +44,10 @@ import { AGENT_PIPE_NAME, serveHello } from './lib/agent-identity.js'
 import { canRetryError, isNetworkError, networkErrorMessage, isFatalConfigError, fatalErrorMessage } from './lib/error-classify.js'
 // 引用自带的「划线附近原文」（PDF 阅读器那条路）：微读的书靠 chapters\ 正文取上下文，
 // PDF 没有正文，上下文随标注一起来 —— 认领规则见该模块头部注释。
-import { annotationContextFor } from './lib/annotation-context.js'
+import { annotationContextFor, annotationRefFor } from './lib/annotation-context.js'
+// 译文引用的原文块（2026-10-24）：判定这条引用是不是译文、该拿哪份原文做对照。
+// 纯函数，被 agent/test/ref-source.test.js 钉住。
+import { clipRefSource, isTranslatedRef, refSourceOf } from './lib/ref-source.js'
 // 停止信号的目标判定（2026-11）：信号只按对话分文件，必须再认"发给哪一轮"，否则过期信号
 // 会把下一条消息整轮吃掉。判定是纯函数，被 agent/test/session-stop.test.js 钉住。
 import { stopTargetsTurn, isStaleStop } from './lib/session-stop.js'
@@ -52,6 +56,24 @@ import { stopTargetsTurn, isStaleStop } from './lib/session-stop.js'
 // 丢掉了 —— 于是"缓存命中率低不低、低在哪一类调用上"只能看平台面板那个按小时的聚合数。
 // 记账点只有两个（callLLMOnce / callLLMStream），见 lib/usage-log.js 头部。
 import { recordUsage, readUsage, inferKind } from './lib/usage-log.js'
+// L3 装配（2026-10-24）：旧路径（全量来路，每轮重发）保留，新路径（课题组分包）并列加，
+// 用 data\config\l3-mode 切换——切换不需要重启，每轮现读。旧路径一行没删。
+import { readL3Mode, assembleCallHist, l3Path } from './lib/l3-driver.js'
+// L3 新路径（2026-10-24）：课题组分包 R1 草稿 → 派课题 → R3 判父 → R4 汇总。
+// 纯逻辑（材料渲染、提示词、报告解析、流水线），LLM 调用与图查询都由 say() 注入，
+// 所以能拿假模型跑整条链路（test/l3-tasks.test.js）。
+import { runTasksPipeline } from './lib/l3-tasks.js'
+// 「上一轮有效来路节点」的跨轮记忆（2026-10-26）：同一段讨论继续时，把它们并在本轮命中里重跑。
+import { readLive, writeLive, clearLive } from './lib/l3-live.js'
+// L3 全过程记录（2026-10-24，调试用）：把命题递归的每一步照实写成 Markdown，
+// 一轮一份、边跑边写（data\runtime\l3-trace\）。开关见 l3DebugWanted。
+import { openL3Trace, localStamp } from './lib/l3-trace.js'
+// 同一份事件的**脑图**版本（自包含 HTML + 内联 SVG，无外部依赖）：跑完自动在浏览器里打开。
+// 为什么要两份：脑图看形状（哪枝断了），Markdown 看细节（报告原文、R4 的输入全文）。
+import { openL3Tree } from './lib/l3-tree.js'
+// `/l3` 指令（2026-10-24）：切 full/tasks/both/off + 开关调试。开关本来是文件，
+// 但"找目录、写对、记住下一句生效"这套太麻烦——收进一条指令，回执还会念一遍当前状态。
+import { handleL3Command } from './lib/l3-cmd.js'
 // 收件箱去重台账 + 游标语义（2026-09-30 机制级修复）已随 SQLite 存储层退役：
 // "这条处理过没有"现在是 messages.status 一列，"到哪了"是自增 id——游标文件、指纹台账、
 // decideCursor 判定全部不再需要。lib/inbox-dedupe.js 仍留着（迁移脚本用），运行时不再引用。
@@ -65,6 +87,7 @@ import {
   AGENT_STATE_FILE, STOP_FILE, JOURNAL_FILE, TOPIC_STACK_FILE, GRAPH_FILE,
   BUILTIN_GRAPH_RESULTS_FILE, PROFILE_FILE, AGREEMENT_FILE,
   HIST_CURSOR_FILE, SESSIONS_DIR, LOGS_DIR, LAYOUT_KIND, layoutSummary,
+  L3_DUMP_FILE, L3_DUMP_JSON, L3_DEBUG_FILE, L3_TRACE_DIR, L3_MODE_FILE,
   ensureDirs, migrateRenamedFiles, detectUnmigrated, scriptCommand,
   sessionStopFile, listSessionStopFiles,
   PACKAGE_ROOT,
@@ -810,6 +833,10 @@ async function callLLMOnce(maxTokens = 8192, hist = [], opts = {}) {
       messages: [{ role: 'system', content: system }, ...apiMessages(hist)],
       max_tokens: budget,
       ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+      // 机械调用（课题报告/派题）关掉思考：实测同一份报告，思考占 93% 的输出、耗时从 1.5s 涨到 14s，
+      // 而正文长度几乎不变（235 → 232 字）。只有 `thinking.type=disabled` 有效，
+      // `reasoning_effort: low` 反而想得更多（见 docs §9.1）。
+      ...(opts.thinking === false ? { thinking: { type: 'disabled' } } : {}),
       tool_choice: 'none',
     })
 
@@ -866,7 +893,9 @@ async function callLLMOnce(maxTokens = 8192, hist = [], opts = {}) {
 
     // content 优先作为回复；若为空则回退到 reasoning_content（少数推理模型会把回复放这里）。
     // 注意：截断分支已提前返回——reasoning_content 只允许在**完整输出**时作回退。
-    const text = msg?.content?.trim() || msg?.reasoning_content?.trim()
+    // contentOnly：课题报告/判父这类"机器要解析"的调用不许拿思考链顶替（思考不是答案，
+    // 拿去解析只会得到"不是合法报告"，反而把真正的原因盖住）。
+    const text = msg?.content?.trim() || (opts.contentOnly ? '' : msg?.reasoning_content?.trim())
     if (!text) throw new Error('模型无回应：' + JSON.stringify(data).slice(0, 200))
     return text
   }
@@ -1045,6 +1074,53 @@ async function* callLLMStreamWithRetry(maxTokens, hist, opts = {}) {
   throw lastErr
 }
 
+/**
+ * L3 调试开关（2026-10-24）：`data\config\l3-debug` 存在 = 开（内容随便）。老名字 `l3-dump` 等价。
+ *
+ * 开了以后：
+ *   ① 有**新命中**的那一轮存一份真实输入 → data\config\l3-dump.json（供 scripts/l3-ab.mjs 重放）；
+ *   ② 走**命题递归**的那一轮写一份全过程 → data\runtime\l3-trace\<时间>.md（见 lib/l3-trace.js）。
+ * 为什么要抓输入：线上先后问同一个问题做不到"同一个输入"——第二轮的历史里已经有第一轮的回答了。
+ * 每轮现读，删文件即关，不用重启。
+ */
+function l3DebugWanted() {
+  try {
+    return fs.existsSync(L3_DEBUG_FILE) || fs.existsSync(L3_DUMP_FILE)
+  } catch { return false }
+}
+
+/**
+ * 存本轮输入（A/B 重放用）。只在该轮真的走 L3 时调用，由 l3DebugWanted 把关。
+ * 永不抛：抓取失败绝不影响这一轮对话。
+ */
+function dumpL3Input(payload) {
+  try {
+    fs.writeFileSync(L3_DUMP_JSON, JSON.stringify({ ...payload, ts: Date.now() }, null, 1))
+    console.log(`  [l3] 已存本轮输入 → ${L3_DUMP_JSON}（供 scripts/l3-ab.mjs 重放）`)
+  } catch (e) {
+    console.log(`  [l3] 抓取本轮输入失败（不影响本轮）：${e.message}`)
+  }
+}
+
+/**
+ * 用系统默认程序打开一个文件（这里只用它打开脑图 .html）。
+ * 失败只打一行日志：看不了图不该影响回答。
+ */
+function openInBrowser(file) {
+  try {
+    if (process.platform === 'win32') {
+      // `start` 是 cmd 的内置命令；第一个空参数是窗口标题占位（否则带空格的路径会被当标题）
+      const child = spawn('cmd', ['/c', 'start', '', file], { stdio: 'ignore', detached: true, windowsHide: true })
+      child.unref()
+    } else {
+      const child = spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [file], { stdio: 'ignore', detached: true })
+      child.unref()
+    }
+  } catch (e) {
+    console.log(`  [l3] 打开脑图失败（文件还在）：${e.message}`)
+  }
+}
+
 // 产出最终完整回复的流式入口：边收边把累计文本写进 chat_output（~100ms 节流），
 // 收尾写 -1 结束标记 + 最终完整记录。chat_output 的写入由本函数独占，
 // 调用方不再各自 appendChatOutput，保证每条回复只产生一组流记录 + 一条最终记录。
@@ -1088,19 +1164,124 @@ async function say(userText, options = {}) {
       : userText
     // L3 图路径上下文（可选）：独立成一条消息插在锚定消息**之前**——生成点前最后读到
     // 的永远是 anchored（本轮问题/划线本身），而不是一大段旧讨论（2026-10 定调）。
-    const l3Ctx = String(options.l3 || '').trim()
-    const callHist = [
-      ...hist,
-      { role: 'user', content: persona },
-      ...(l3Ctx ? [{ role: 'user', content: l3Ctx }] : []),
-      { role: 'user', content: anchored },
-    ]
+    // 2026-10-24：装配交给 lib/l3-driver.js 分流（full / tasks / bare / off 四条路）。
+    // **旧路径一行没删**：full 模式下产出的 messages 与改造前逐字节相同（回归测试钉着）。
+    // 模式每轮现读 data\config\l3-mode，改文件就生效，不用重启。
+    const l3Mode = readL3Mode()
+    const l3Hits = Array.isArray(options.l3Hits) ? options.l3Hits : []
+    const path = l3Path(l3Mode, l3Hits)
+    if (l3Mode === 'both') console.log('  [l3] both 模式尚未实现，本轮按 full 处理（开关文件：data\\config\\l3-mode）')
+    if (path === 'bare') console.log('  [l3] tasks：本轮没有新命中 → 不带 L3（栈里的旧引用不重跑课题，理由见 l3Path 注释）')
+    // 调试（data\config\l3-debug 存在时开）：
+    //   ① 本轮**有新命中**才存输入（供 scripts/l3-ab.mjs 重放）——否则随便一句追问就会把它
+    //     覆盖掉，A/B 抓到的就成了"没有命中的那一轮"；
+    //   ② 只在走命题递归时开全过程记录（一轮一份，不像 ① 会互相覆盖）。
+    const debugOn = l3DebugWanted()
+    let trace = null
+    let tree = null
+    if (debugOn) {
+      if (l3Hits.length) {
+        dumpL3Input({ conv: key, mode: l3Mode, path, hist, persona, anchored, l3: options.l3, hits: l3Hits })
+      }
+      if (path === 'tasks') {
+        // 编号必须与流水线里的课题号一致（命中顺序 → K-1、K-2），否则记录里的 K-1 对不上
+        const tracePoints = l3Hits
+          .map((id) => graph.nodes.find((n) => n.id === id))
+          .filter(Boolean)
+          .map((n, i) => ({ kid: `K-${i + 1}`, point: n.point }))
+        // 两份产物共用一个时间戳（脑图里那个"同名 .md"链接就是靠它指过去的）
+        const st = localStamp()
+        trace = openL3Trace({
+          dir: L3_TRACE_DIR, stamp: st.file,
+          meta: { ts: st.human, conv: key, mode: l3Mode, path, points: tracePoints, question: storeText },
+        })
+        tree = openL3Tree({ dir: L3_TRACE_DIR, stamp: st.file, meta: { conv: key, question: storeText } })
+        if (trace.file) console.log(`  [l3] 全过程记录 → ${trace.file}`)
+      } else {
+        console.log(`  [l3] 调试已开，但本轮不是命题递归（path=${path}）——只存输入，不写全过程`)
+      }
+    }
     // kind/conv 只进用量流水：_meta 是"记忆合并"这类元任务（同一入口，但报表里要分开看，
     // 否则画像重写那几笔大输入会被算进"读书问答"里，看不出是哪一类在花钱）
-    const stream = callLLMStreamWithRetry(options.maxTokens || 8192, callHist, {
-      kind: key === '_meta' ? '记忆固化' : '主回复',
-      conv: key,
-    })
+    const usageKind = key === '_meta' ? '记忆固化' : '主回复'
+    // 新路径的依赖（tasks / both 共用一份，保证两条路吃到的输入完全一样）
+    const tasksDeps = {
+      hist, persona, anchored,
+      // 当前提问（用户这一轮真的问的那句）：整套课题都锚在它上面，不是节点里的旧问题
+      question: storeText || userText,
+      hits: l3Hits,
+      // 图查询：节点在图上才派课题（命中 id 可能来自已删节点，这里再校验一次）
+      nodeOf: (id) => graph.nodes.find((n) => n.id === id) || null,
+      parentsOf: (id) => userParents(graph, id),
+      // 每次调用都必须自己报预算——这里**不给默认值**。
+      // 以前是 `o.maxTokens || 1024`：汇总那次没传，就静默拿到 1024，思考写掉 2,847 字、
+      // 正文一个字没出来（实测 2026-10-26）。忘了传参数就该当场报错，不该变成一个更小的预算。
+      complete: (o) => {
+        if (!Number.isFinite(o.maxTokens) || o.maxTokens <= 0) {
+          throw new Error(`流水线调用「${o.kind || '?'}」没给 maxTokens：预算必须由调用点自己定`)
+        }
+        return callLLM(o.maxTokens, o.messages, {
+          ...(o.system !== undefined ? { system: o.system } : {}),
+          ...(o.temperature !== undefined ? { temperature: o.temperature } : {}),
+          // 这两个开关由流水线按"这是哪种调用"传进来：机械调用不思考、只要正文
+          ...(o.contentOnly ? { contentOnly: true } : {}),
+          ...(o.thinking === false ? { thinking: false } : {}),
+          kind: o.kind, conv: key,
+        })
+      },
+      stream: (o) => callLLMStreamWithRetry(options.maxTokens || 8192, o.messages, {
+        // both 模式下 B 的终稿不是给用户看的那份，报表里分开放，才能算出"各花了多少"
+        kind: path === 'both' ? '课题汇总' : usageKind, conv: key,
+      }),
+      // 兜底：R1 起不来（网络/截断/空流）就退回旧路径的整段注入——引用轮不能没有答案
+      fallback: () => callLLMStreamWithRetry(options.maxTokens || 8192, assembleCallHist({
+        hist, persona, l3: options.l3, anchored, mode: 'full',
+      }), { kind: usageKind, conv: key }),
+      judgeSystem: JUDGE_SYSTEM,
+      checkStop: () => {
+        // both 模式下停止信号只给 A 用：信号是"读到即删"（见 consumeSessionStop），
+        // B 也来读的话会把 A 那份抢走——表现就是"点了停止，回答继续往下流"。
+        if (path === 'both') return
+        if (consumeSessionStop(key, options.replyToTs)) throw abortedError()
+      },
+      log: (m) => console.log(`  [l3] ${m}`),
+      // 全过程事件（调试开关打开时才有人接收，关着就是空操作）：Markdown 与脑图各收一份
+      onEvent: (e) => {
+        if (trace) trace.write(e); if (tree) tree.write(e)
+        // 这一轮「成功上报的来路节点」→ 记成下一轮可继承的清单（同栈继续时才会用到）
+        if (e && e.type === 'live') writeLive(key, e.nodes)
+      },
+      // 拒绝交付 = 这条旧讨论的 point/alias 与实际内容不符（用户后面去修图谱）。
+      // 单独落一个文件，攒够了一次性看哪些节点在吹牛。
+      onRefusal: (rec) => {
+        try {
+          fs.appendFileSync(path.join(path.dirname(L3_TRACE_DIR), 'l3-refusals.jsonl'), JSON.stringify({ ts: new Date().toISOString(), ...rec }) + '\n')
+        } catch {}
+      },
+      opts: {
+        // both：B 的终稿不是用户看到的那份，记录里必须标清楚（否则两份终稿分不出谁是谁）
+        ...(path === 'both' ? { finalLabel: 'B 新路径（这次没给用户看）', finalShown: false } : {}),
+      },
+    }
+    const fullHist = () => assembleCallHist({ hist, persona, l3: options.l3, anchored, mode: 'full' })
+    // both：两条同时跑。**给用户看的仍然是旧路径（A）**——debug 模式不该把阅读体验换掉；
+    // 新路径（B）在后台跑，跑完并排画进脑图。用户要是觉得 B 更好，再 /l3 tasks 把它扶正。
+    let altTask = null
+    if (path === 'both') {
+      altTask = (async () => {
+        let text = ''
+        for await (const piece of runTasksPipeline(tasksDeps)) if (piece && piece.accumulated) text = piece.accumulated
+        return text
+      })().catch((e) => {
+        console.log(`  [l3] A/B：新路径失败（不影响这一轮回答）：${e.message}`)
+        return ''
+      })
+    }
+    const stream = path === 'tasks'
+      ? runTasksPipeline(tasksDeps)
+      : callLLMStreamWithRetry(options.maxTokens || 8192,
+        path === 'full' || path === 'both' ? fullHist() : assembleCallHist({ hist, persona, l3: options.l3, anchored, mode: 'off' }),
+        { kind: usageKind, conv: key })
     let lastWrite = 0
     let result
     while (true) {
@@ -1130,6 +1311,17 @@ async function say(userText, options = {}) {
         lastWrite = now
       }
     }
+
+    // 调试：这一轮的命题递归已经跑完，脑图直接在浏览器里打开（只有 data\config\l3-debug 开着时才走到这里）
+    // both 模式要等后台那条新路径跑完再开图，否则图上只有一半
+    if (altTask) {
+      const ALT_WAIT_MS = 120_000
+      const alt = await Promise.race([altTask, sleep(ALT_WAIT_MS).then(() => '')])
+      if (tree) tree.write({ type: 'final', label: 'A 旧路径（用户看到的就是这段）', text: displayContent, coverage: [], shown: true })
+      console.log(`  [l3] A/B 同输入：旧路径 ${displayContent.length} 字｜新路径 ${alt ? `${alt.length} 字` : '没跑完（超时）'}｜两份都在 data\\runtime\\l3-trace\\`)
+      if (!tree) console.log('  [l3] 注意：both 模式下没开调试（/l3 debug on），新路径那份没地方看——只在上面这行日志里')
+    }
+    if (tree && tree.file) openInBrowser(tree.file)
 
     // 为什么不在这里再查一次停止：③ 就在上面几行，中间只有 `break` 和一次赋值 —— 纯同步代码，
     // 用户不可能在这个窗口里点停止。
@@ -1616,28 +1808,28 @@ async function forceConsolidate(bookKey) {
   }
 }
 
-async function driveTopicStack(bookKey, unit, reply, cites) {
+/**
+ * 判栈：**只判，不落盘**。
+ *
+ * 2026-10-26 用户定：这一步从"回答之后"提到"回答之前"——因为"这一问会不会弹栈"决定
+ * 要不要继承上一轮的有效来路节点（见 lib/l3-live.js）。判完不写盘、不做收口固化，
+ * 那些都留给 applyStackTurn（此时 reply 已经拿到）。
+ */
+async function judgeStackTurn(bookKey, unit, cites) {
+  const stack = topicStacks[bookKey] || []
+  const isFree = isFreeKey(bookKey)
+  const freeTag = isFree ? '[自由模式]' : ''
+  const logTag = freeTag || (bookKey ? `[${bookKey}]` : '')
+  const citesList = Array.isArray(cites) ? cites : []
   try {
-    const stack = topicStacks[bookKey] || []
-    // 自由对话（任意自由 key）：对话进行中**不做任何图固化**，只维护讨论栈
-    //（2026-11 用户定调）——收藏与否在归档时由用户勾选决定。这里把收口的固化分支
-    // 直接短路成"不固化"，弹栈的旧讨论就此结束，产物只可能在归档时生成。
-    const isFree = isFreeKey(bookKey)
-    const freeTag = isFree ? '[自由模式]' : ''
-    const logTag = freeTag || (bookKey ? `[${bookKey}]` : '')
     let r = await processStackMessage(stack, unit, {
       callLLM: judgeLLM,
       maxTokens: 2048,
       log: (m) => console.log(`  [会意栈]${logTag} ${m}`),
     })
-    // 引用挂消息条目：本消息的 cites 挂到本消息的 user 条目（随栈持久化，跨会话不丢）
-    const citesList = Array.isArray(cites) ? cites : []
+    // 引用命中（cites 非空）的消息直接入栈——引用是讨论线索，不随专题化判定丢弃
     if (r.action === 'ignored') {
-      // 2026-09 用户定调：引用解析命中（cites 非空）的消息直接入栈——引用是讨论线索，
-      // 不随专题化判定丢弃。空栈 → 新消息开单条栈；不同问题 → 旧栈弹栈收口 + 新消息
-      // 开新栈。下游同一性判定、收口分段逻辑不变（非专题化条目分段时跟随组、只贡献
-      // cites，不构成知识点）。
-      if (!citesList.length) return  // 无线索：维持忽略（栈不变，不写盘）
+      if (!citesList.length) return { action: 'ignored', stack: r.stack, closed: null, citesList, isFree, freeTag, logTag }
       if (r.stack.length === 0) {
         r = { action: 'pushed', stack: [makeStackEntry(unit)] }
         console.log('  [会意栈] 引用命中消息（非专题化）直接入栈开新栈（cites ×' + citesList.length + '）')
@@ -1646,21 +1838,34 @@ async function driveTopicStack(bookKey, unit, reply, cites) {
         console.log('  [会意栈] 引用命中消息（不同问题·非专题化）：旧栈弹栈收口 + 新消息开新栈（cites ×' + citesList.length + '）')
       }
     }
-    const lastUserIdx = r.stack.reduce((acc, e, i) => (e.role === 'user' ? i : acc), -1)
-    const savedStack = r.stack.map((e, i) => (i === lastUserIdx && citesList.length ? { ...e, cites: citesList } : e))
+    return { action: r.action, stack: r.stack, closed: r.closed || null, citesList, isFree, freeTag, logTag }
+  } catch (e) {
+    console.log(`  [会意栈] 本轮跳过（不影响主回复）: ${e.message}`)
+    return null
+  }
+}
+
+/** 落盘：用判好的结果 + 本轮回复，写栈、必要时收口固化。 */
+async function applyStackTurn(bookKey, unit, reply, decision) {
+  if (!decision) return
+  const { action, stack, closed, citesList, isFree, freeTag } = decision
+  try {
+    const lastUserIdx = stack.reduce((acc, e, i) => (e.role === 'user' ? i : acc), -1)
+    const savedStack = stack.map((e, i) => (i === lastUserIdx && citesList.length ? { ...e, cites: citesList } : e))
     let keptClosed = null  // 收口固化 0 节点产出时保留被收口讨论（压回栈顶，下次收口重试）
-    if (r.action === 'closed_and_pushed' && r.closed) {
-      // 自由对话：弹栈旧讨论不**当场**固化（产物只在归档时生成），但也不能丢——
-      // 暂存起来，归档勾了"收口进拓扑图"时逐段收口（2026-11 修：此前只打日志就丢，
-      // 长对话里被判"换了问题"的前半段永远进不了图）。
-      // 读书模式：弹栈即固化进正式图（行为不变）。
+    if (action === 'closed_and_pushed' && closed) {
+      // 自由对话：弹栈旧讨论不**当场**固化（产物只在归档时生成），但也不能丢——暂存起来
+      // 读书模式：弹栈即固化进正式图（行为不变）
       if (!isFree) {
-        keptClosed = (await consolidateClosed(r.closed, { isFree: false, targetGraph: graph, bookKey })).keptClosed
+        keptClosed = (await consolidateClosed(closed, { isFree: false, targetGraph: graph, bookKey })).keptClosed
       } else {
-        const n = stashFreeClosedStack(bookKey, r.closed.entries)
-        console.log(`  [会意栈]${freeTag} 旧讨论弹栈（${r.closed.entries.length} 轮）：暂存待归档收口（该对话已攒 ${n} 段）`)
+        const n = stashFreeClosedStack(bookKey, closed.entries)
+        console.log(`  [会意栈]${freeTag} 旧讨论弹栈（${closed.entries.length} 轮）：暂存待归档收口（该对话已攒 ${n} 段）`)
       }
     }
+    // 只有"同一段讨论继续"的轮次才配保留继承记忆：弹栈（那段讨论结束）或压根没入栈
+    // （这一问不属于任何讨论）都清掉，免得几小时之后的一场新讨论继承到旧的来路。
+    if (action !== 'pushed') clearLive(bookKey)
     topicStacks[bookKey] = [...(keptClosed || []), ...savedStack, { role: 'assistant', content: String(reply || '').trim(), ...(unit.selected ? { selected: unit.selected } : {}) }]
     saveTopicStacks(topicStacks)
   } catch (e) {
@@ -1668,6 +1873,11 @@ async function driveTopicStack(bookKey, unit, reply, cites) {
   }
 }
 
+/** 一次跑完（判 + 落盘）：给不需要提前拿决策的调用点用。 */
+async function driveTopicStack(bookKey, unit, reply, cites) {
+  const decision = await judgeStackTurn(bookKey, unit, cites)
+  await applyStackTurn(bookKey, unit, reply, decision)
+}
 // ── 自由对话归档（2026-11 用户定调）──────────────────────────────────────────
 // 侧栏归档弹窗两项**默认都勾上**（可取消，取消的选择会被记住），随归档请求一并送到：
 //   · 保存记忆 memory：把这场对话（histories[key] 的完整轮次）交给 profile 合并
@@ -2117,16 +2327,42 @@ function assembleBookContext(bookId, bookTitle, chapter, chapterUid, selectedTex
 //   ② 1500 字前文窗口整条删掉（不是只对提问关掉：它服务的"划线即讨论"已停用，见上方注释）；
 //   ③ 引文本身只留 `> "…"`，书名章节由 [正在共读] 那行交代，不重复。
 // 拆句见 lib/chat-input.js 的 splitQuotedQuestion（按空行分块，多行划线也拆得对）。
+//
+// 2026-10-24 译文引用（PDF 阅读器）：用户在译文卡片里划一句设成引用，引文块是**中文译文**，
+// 而原文（整张卡片的源文）躺在 msg.selectedText 里一直没用上。现在这类引用单独走一支：
+// 引文照旧是用户读到的那句，后面再挂一块【这段译文的原文】，并明说"只讨论引文对应的那句"。
+// 不做逐句对齐——卡片内没有字符锚点，硬切会切错；由模型自己把中文那句对到英文段上。
+// 判定与取哪份原文的纯逻辑在 lib/ref-source.js（有单测）。
+function translatedRefInfo(msg, material) {
+  const ref = annotationRefFor(msg.bookId, msg.selectedText, { normalizeBookId: baseBookId })
+  if (!isTranslatedRef({ ref, selectedText: msg.selectedText, material })) return null
+  return { source: clipRefSource(refSourceOf({ ref, selectedText: msg.selectedText })) }
+}
+
 function enrichChatMessage(msg) {
   if (!msg.bookId || !msg.selectedText) return msg.content
 
   const { bookId, bookTitle, chapter, chapterUid, selectedText } = msg
-  const ctx = assembleBookContext(bookId, bookTitle, chapter, chapterUid, selectedText)
   const { material, question } = splitQuotedQuestion(msg.content, selectedText)
+  const trans = translatedRefInfo(msg, material)
+
   const parts = [`[正在共读]《${bookTitle}》${chapter || ''}`]
   if (question) parts.push(`【我的提问】${question}`)
-  if (material) parts.push(`【我引用的原文】\n${material}`)
-  if (ctx.trim()) parts.push(`【引用处上下文】\n${ctx.trim()}`)
+
+  if (trans) {
+    if (material) parts.push(`【我引用的译文】\n${material}`)
+    if (trans.source) {
+      parts.push(`【这段译文的原文】\n${trans.source}`)
+      parts.push('【说明】引文是译文；请把讨论集中在引文对应的那一句上，原文块只用于对照（可能来自截图识别，个别字有误）。')
+    } else {
+      // 引用身份为空（极少见）：不能挂一块空的"原文"，也不能让说明指向不存在的块
+      parts.push('【说明】引文是译文；这次没拿到对应的原文，请按译文讨论。')
+    }
+  } else {
+    if (material) parts.push(`【我引用的原文】\n${material}`)
+    const ctx = assembleBookContext(bookId, bookTitle, chapter, chapterUid, selectedText)
+    if (ctx.trim()) parts.push(`【引用处上下文】\n${ctx.trim()}`)
+  }
   if (parts.length === 1) return msg.content
   return parts.join('\n\n')
 }
@@ -2158,6 +2394,9 @@ let currentAnn = null
 async function main() {
   console.log('📖 CoRead 共读 agent 已启动')
   console.log(`   ${layoutSummary()}`)
+  // L3 装配模式（2026-10-24）：每轮现读 data\config\l3-mode，这里只把"当前生效的是哪种"打出来，
+  // 免得改完文件不知道有没有生效。缺文件/写错按 full（= 今天的行为）。
+  console.log(`   L3 装配模式：${readL3Mode()}（data\\config\\l3-mode；full=旧路径整段注入，tasks=课题组分包，both=两条同跑，off=不发；侧栏发 /l3 切换）`)
   // 升级告警（2026-10 目录重构）：老用户的数据还在旧位置、还没迁移时，新库会**静默地空**——
   // 用户只会觉得"我的记录没了"。所以这里显式拦住并指路，别让人对着空历史猜。
   const unmigrated = detectUnmigrated()
@@ -2284,6 +2523,19 @@ async function main() {
           console.log('\n[侧栏] ' + cr.reply + '\n')
           continue
         }
+        // /l3：L3 装配模式与调试开关（2026-10-24）。指令不进历史、不进栈、不调模型，
+        // 回执用系统消息（侧栏按系统气泡渲染）——与 /相处 同一种通道。
+        if (/^\/l3(?:\s|$)/.test(String(msg.content || '').trim())) {
+          const arg = String(msg.content || '').trim().replace(/^\/l3\s*/, '')
+          const r = handleL3Command(arg, {
+            modeFile: L3_MODE_FILE, debugFile: L3_DEBUG_FILE,
+            log: (m) => console.log(`  [l3] ${m}`),
+          })
+          appendChatOutput('system', r.reply, key, { replyTo: msg.id })
+          markMessage(msg.id, { status: 'ok' })
+          console.log('\n[侧栏] ' + r.reply + '\n')
+          continue
+        }
         // /归档：归档一场自由对话（2026-11 用户定调）。侧栏归档弹窗发出——请求带
         // archive = { key, memory, graph }（勾选项，现在由「聊天库」承载在 payload 里，
         // 老版本是顶层 msg.archive，两个位置都认）。归档 = 这场对话结束并删除：默认勾选的
@@ -2355,10 +2607,20 @@ async function main() {
           ? `【划线】《${msg.bookTitle || ''}》${msg.chapter || ''}\n划线原文：${msg.selectedText}\n我的提问：${msg.content}`
           : msg.content
         appendAgentState('answer', key)
+        // 判栈提到**生成回答之前**（2026-10-26 用户定）：这一问会不会弹栈，决定要不要继承
+        // 上一轮的有效来路节点。判栈只判不落盘，落盘在回答之后（applyStackTurn）。
+        const lastR = lastReplyByBook[key]
+        const stackUnit = buildTopicUnit(msg, lastR ? lastR.content : null, lastR ? lastR.selected : undefined)
+        const stackDecision = await judgeStackTurn(key, stackUnit, citesFinal)
+        // 继承：同一段讨论继续（pushed）才继承；弹栈、或不入栈都不继承（见 lib/l3-live.js）
+        const inherited = stackDecision && stackDecision.action === 'pushed' ? readLive(key) : []
+        if (inherited.length) console.log(`  [l3] 继承上一轮有效来路 ${inherited.length} 个：${inherited.join('、')}`)
+        const hitsThisRound = [...new Set([...citesFinal, ...inherited])]
         // replyTo = 这条提问的 id：回答入库时直接挂上引用（配对从"时间序推断"变成"外键"）
         // replyToTs = 这条提问落库的 timestamp：侧栏用它当"哪一轮"的身份证（停止收尾后
         // 晚到的流式分片靠它认领，见 appendChatOutputStream 的注释）
-        const reply = await say(userMsg, { bookKey: key, storeText, assistantSelected: selectionFromMsg(msg), l3: citesR.l3, replyTo: msg.id, replyToTs: msg.timestamp })
+        // l3Hits = 本轮新命中 ∪ 同栈上一轮有效来路：tasks 路径拿它派课题。
+        const reply = await say(userMsg, { bookKey: key, storeText, assistantSelected: selectionFromMsg(msg), l3: citesR.l3, l3Hits: hitsThisRound, replyTo: msg.id, replyToTs: msg.timestamp })
         // 用户停止（2026-02 用户定调"当没问过"）：say() 已经把历史与流水账收干净了，
         // 这里再弃掉库里的提问行与命中事件，然后**直接进入下一条**——
         // 不标 ok、不标 failed、不入栈判同一、不记账。判同一根本轮不到被踩。
@@ -2388,8 +2650,8 @@ async function main() {
         console.log('\n[侧栏] ' + stripCodeBlocks(reply) + '\n')
         // 会意栈（按书隔离）：喂该消息所属书的栈；以上一轮**同书** AI 回复为降级上下文；
         // 入栈消息的引用暂存，**收口固化**（新专题化弹栈旧讨论）时建 user 边 + 段间无条件 derived 边。
-        const lastR = lastReplyByBook[key]
-        await driveTopicStack(key, buildTopicUnit(msg, lastR ? lastR.content : null, lastR ? lastR.selected : undefined), reply, citesFinal)
+        // 判已经在生成之前做完了（judgeStackTurn），这里只落盘 + 必要时收口。
+        await applyStackTurn(key, stackUnit, reply, stackDecision)
         lastReplyByBook[key] = { content: stripCodeBlocks(reply), selected: selectionFromMsg(msg) }
       }
     } catch (e) { console.log(`⚠️ ${e.message}\n`) }
@@ -2408,7 +2670,14 @@ async function main() {
     busy = true
     rl.pause()
     try {
-      if (line.startsWith('【章节完成】')) {
+      if (line.startsWith('/l3')) {
+        // REPL 里也能切（开发时不用去翻文件）；回执直接打终端
+        const r = handleL3Command(line.replace(/^\/l3\s*/, ''), {
+          modeFile: L3_MODE_FILE, debugFile: L3_DEBUG_FILE,
+          log: (m) => console.log(`  [l3] ${m}`),
+        })
+        console.log('\n' + r.reply + '\n')
+      } else if (line.startsWith('【章节完成】')) {
         // AI-001：章节总结归属当前讨论的书，否则进通用上下文
         const reply = await say(line, { bookKey: currentBookKey || '_common' })
         console.log('\n' + stripCodeBlocks(reply) + '\n')
@@ -2419,7 +2688,7 @@ async function main() {
         // 引用解析（会话中）：命中 → L3 图路径上下文注入；引用挂消息（固化后按组建边）；
         // 命中事件带书归属（key），侧栏按当前上下文过滤显示
         const citesR = await resolveCitations(line, key)
-        const reply = await say(line, { bookKey: key, l3: citesR.l3 })
+        const reply = await say(line, { bookKey: key, l3: citesR.l3, l3Hits: citesR.hits })
         console.log('\n' + stripCodeBlocks(reply) + '\n')
         // 会意栈（按书隔离）：REPL 输入也是用户追问，喂进该书（key）的栈；REPL 无划线，selected 恒缺省
         const lastR = lastReplyByBook[key]

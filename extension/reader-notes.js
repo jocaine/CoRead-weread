@@ -289,6 +289,24 @@
     const send = opts.send
     const toast = opts.toast || (() => {})
     let snapshot = { book: null, entries: [], activeId: '', page: 0, total: 0 }
+    /** 当前快照里的某一条（面板自己的状态；命令回执失败时用它核对真实结果） */
+    const entryNow = (id) => (snapshot.entries || []).find((x) => x.id === id) || null
+    /**
+     * 命令回执说失败之后，再等一小会儿看快照：这条是否其实已经在精译 / 已经出精译版了。
+     *
+     * 为什么需要（2026-10-24 用户实测）：精译要 10–25 秒，侧栏→后台→阅读器这条回执链路
+     * 在切标签页/后台休眠时可能丢；阅读器那边其实已经成功落盘、快照也会推回来，但侧栏
+     * 已经先弹了"精译失败"。这里用**真实状态**兜底：快照显示在跑或已出精译版，就不报失败。
+     */
+    async function preciseSettledOrRunning(id, ms = 2500) {
+      const t0 = Date.now()
+      while (Date.now() - t0 < ms) {
+        const now = entryNow(id)
+        if (now && (now.showingPrecise || now.precisionPending)) return true
+        await new Promise((r) => setTimeout(r, 150))
+      }
+      return false
+    }
     let editingId = ''
     /** 面板刚挂上（侧栏重启 / 第一次打开）：第一次渲染要**滚到最新那条**，见 render */
     let firstRender = true
@@ -885,8 +903,16 @@
         if (editing) item.classList.add('is-editing')
 
         const dst = el('div', 'rn-dst')
-        if (e.pending) dst.append(el('span', 'rn-pending', e.recognizing ? '识别原文中…' : '翻译中…'))
-        else if (e.error) dst.append(el('span', 'rn-err', '失败：' + e.error))
+        if (e.pending) {
+          if (e.recognizing) dst.append(el('span', 'rn-pending', '识别原文中…'))
+          else if (e.precisionPending) {
+            /**
+             * 精译进行中（2026-10-24 用户定调）：状态**直接写在按钮上**（见下面操作行的
+             * 「精译中…」），正文继续显示原来那版译文，不再顶一行"精译中…"让人以为译文没了。
+             */
+            dst.textContent = e.translation || ''
+          } else dst.append(el('span', 'rn-pending', '翻译中…'))
+        } else if (e.error) dst.append(el('span', 'rn-err', '失败：' + e.error))
         else if (e.recognized) {
           /**
            * 框选「识别原文」那条路（2026-11）：只识别了原文，没有翻译。
@@ -894,6 +920,9 @@
            * 免得把这段原文当成译文。后面的"改原文 → 重译"可以把它变成真译文。
            */
           dst.append(el('span', 'rn-note', '只识别了原文，未翻译'), document.createTextNode(e.translation || ''))
+        } else if (e.showingPrecise) {
+          // 精译版（2026-10-24）：标一句，免得用户不知道这版是慢工出的；两版可随时切换
+          dst.append(el('span', 'rn-note', '精译版'), document.createTextNode(e.translation || ''))
         } else dst.textContent = e.translation || ''
 
         if (editing) {
@@ -928,6 +957,78 @@
           // 提交必然被拦，等于摆了个按钮让人白点。
           if (String(e.source || '').trim()) {
             btns.push(mk('改原文', () => { editingId = e.id; render() }))
+          }
+          /**
+           * 精译 / 切换：**同一个位置、同一颗按钮**按状态换身份（2026-10-24 用户定调）。
+           *
+           *   只有一版       → 「精译（慢）」        点它开跑
+           *   正在精译       → 「精译中…」          禁用；状态就写在按钮上，不另占一行
+           *   两版都在       → 「看原译 / 看精译」  来回切，不重新翻译
+           *   改原文重译之后 → 两版作废，自动回到「精译（慢）」（见 reader.js 的 retranslateEntry）
+           *
+           * 为什么合并成一颗：以前完成精译后「精译（慢）」和「看快速版」会同时出现，
+           * 两颗按钮并排、语义还重叠——用户不知道该点哪个（2026-10-24 实测）。
+           */
+          const hasSource = !!String(e.source || '').trim()
+          if (e.precisionPending) {
+            const b = mk('精译中…', () => {})
+            b.disabled = true
+            b.title = '正在用思考模式重译这一条，完成后这个按钮会变成「看原译 / 看精译」'
+            btns.push(b)
+          } else if (e.canToggle && !e.pending) {
+            const b = mk(e.showingPrecise ? '看原译' : '看精译', () => {
+              /**
+               * **先在面板本地切，再让阅读器落盘**（2026-10-24 修"点看原译没反应"）。
+               *
+               * 原来是"发命令 → 等阅读器改状态 → 推快照回来 → 面板才变"。只要中间任何
+               * 一环慢/丢（切到别的标签页、消息没回应），用户看到的就是点了没反应、按钮
+               * 还被禁用。快照里已经带了 fastText/preciseText 两份全文，本地切是零延迟的。
+               */
+              const target = !e.showingPrecise
+              const text = target ? (e.preciseText || '') : (e.fastText || '')
+              if (!text) { toast('这条只有一版译文，切不了', true); return }
+              e.showingPrecise = target
+              e.translation = text
+              render()
+              // 阅读器落到同一状态；它推回来的快照会与这里一致，不一致时以阅读器为准
+              send({ action: 'readerCommand', type: 'showTranslation', id: e.id, showPrecise: target })
+                .then((r) => {
+                  if (!r || r.ok === false) {
+                    toast('切换未保存：' + ((r && r.error && r.error.message) || '原因未知'), true)
+                  }
+                })
+                .catch((err) => toast('切换未保存：' + String((err && err.message) || err), true))
+            })
+            b.title = e.showingPrecise ? '切回普通翻译那一版（原译）' : '切到思考模式出的精译版'
+            btns.push(b)
+          } else if (!e.recognized && !e.pending && e.translation && hasSource) {
+            const preciseBtn = mk('精译（慢）', async (ev) => {
+              const btn = ev && ev.currentTarget
+              if (btn) { btn.disabled = true; btn.textContent = '精译中…' }
+              let r = null
+              try {
+                r = await send({ action: 'readerCommand', type: 'precise', id: e.id })
+              } catch (err) {
+                r = { ok: false, error: { message: String((err && err.message) || err) } }
+              }
+              if (!r || r.ok === false) {
+                const err = (r && r.error) || {}
+                /**
+                 * 回执失败**不等于**精译失败（2026-10-24 实测）：
+                 * 精译本身跑完了、快照也推回来了，只是侧栏→后台→阅读器这条回执链路丢了，
+                 * 于是侧栏先弹一句"精译失败"，正好盖在成功结果上。以快照为准：
+                 * 在跑（precisionPending）或已经出精译版（showingPrecise）就不报失败。
+                 */
+                if (err.code === 'BUSY') {
+                  toast('这条正在精译，完成后按钮会变成「看原译 / 看精译」', false)
+                } else if (!(await preciseSettledOrRunning(e.id))) {
+                  toast('精译失败：' + (err.message || '原因未知'), true)
+                }
+                if (btn) { btn.disabled = false; btn.textContent = '精译（慢）' }
+              }
+            })
+            preciseBtn.title = '用更慢的思考模式重译这一条（约 5–25 秒，更准）'
+            btns.push(preciseBtn)
           }
           /**
            * 只识别原文的条目（框选「识别原文」出来的卡）：给一个「翻译」按钮。

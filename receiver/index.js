@@ -38,6 +38,15 @@ import {
 import { seedGuideBook, seedGuideConversation } from './guide-book.js'
 
 const PORT = parseInt(process.env.COREAD_PORT || '7239')
+/**
+ * /history 的两个窗口（条数）。
+ * - RECENT：不带 ?book= 时的首屏，全库按时间取最近这么多条。侧栏"等回答"时每 2 秒
+ *   重拉一次，所以不能把整库都塞给它（1623 条约几 MB）。
+ * - BOOK：带 ?book= 时的单本补拉。不设全局窗口，只防极端（一本书几千条会拖死 DOM）。
+ * 为什么是 1000：现役最大的书 264 条，留足余量；再多的书渲染本身也不适合一屏铺开。
+ */
+const HISTORY_RECENT_LIMIT = 500
+const HISTORY_BOOK_LIMIT = 1000
 // 兼容旧变量名：Inbox 以前指"标注/聊天文件所在目录"，现在是 data\reading\（标注落点）
 const INBOX_DIR = path.dirname(ANNOTATIONS_FILE)
 const TOOL_HISTORY = TOOL_HISTORY_FILE
@@ -782,10 +791,20 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  // 历史记录（GET /history）
-  if (req.method === 'GET' && req.url === '/history') {
+  // 历史记录（GET /history[?book=<base>]）
+  if (req.method === 'GET' && req.url.split('?')[0] === '/history') {
     // 来源限制：只允许扩展读历史，任意网页不可读走聊天/标注数据（评审 P1）
     if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
+    /**
+     * `?book=<base>`：只回这一本书（侧栏点开某本书时按需补拉）。
+     *
+     * 为什么有这一支（2026-10-25）：不带参数时只回「全库最近 500 条」（见下方
+     * chatWindow），旧书会被新消息挤出窗口 —— 侧栏按书过滤后一条不剩，用户看到的
+     * 是"我的聊天记录全没了"。实测两本 9 月的书（214 / 107 条）全在窗口外。
+     * 单本补拉不设全局窗口，只留一个防极端的上限（一本书几千条会拖死侧栏 DOM）。
+     */
+    const u = new URL(req.url, 'http://localhost')
+    const bookFilter = baseBookId(u.searchParams.get('book') || '')
     const readJsonl = (file) => {
       try {
         return fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l))
@@ -796,6 +815,8 @@ const server = http.createServer(async (req, res) => {
     // 不渲染消息气泡（见 sidebar loadHistory）。silent 概念已移除，这里不需要再透传。
     const annItems = []
     for (const d of readJsonl(path.join(INBOX_DIR, 'annotations.jsonl'))) {
+      // 单本模式只回这本书的引用：侧栏按书补拉时不需要别的书的划线
+      if (bookFilter && baseBookId(d.bookId) !== bookFilter) continue
       annItems.push({ role: 'annotation', content: `《${d.bookTitle}》${d.chapter || ''}`,
         selectedText: d.selectedText, userNote: d.userNote || '',
         // 译文（2026-11）：回放时也要带上，否则侧栏重开一次（本地引用被对账清理掉后
@@ -852,7 +873,10 @@ const server = http.createServer(async (req, res) => {
     // 所以：出错必须留痕。日志里这一行就是"侧栏空了"与"数据丢了"的分界线。
     let chatRows = []
     try {
-      chatRows = chatStore().listMessages({})
+      // 单本模式：这本书的全部消息（整书会话 + 各章节会话），不受全局窗口限制
+      chatRows = bookFilter
+        ? chatStore().listMessagesForBook(bookFilter, { limit: HISTORY_BOOK_LIMIT })
+        : chatStore().listMessages({})
     } catch (e) {
       console.error(`[history] 读聊天库失败，本次不返回任何对话：${e.message}`)
       console.error(`[history] 库=${CHAT_DB}` + (fs.existsSync(CHAT_DB + '-shm') ? '（-shm 存在：可能是 -shm/-wal 状态异常，先退出主程序再重启）' : ''))
@@ -895,13 +919,16 @@ const server = http.createServer(async (req, res) => {
         })
       }
     }
-    // 聊天消息先按时间戳混排、再取最近 500 条：user/assistant 交错后截取，
+    // 聊天消息先按时间戳混排、再截窗口：user/assistant 交错后截取，
     // 避免数组顺序里"全部 user 在前、assistant 在后"导致截尾把提问整个裁掉。
     // 200 太小——agent 回复数是提问的 2~3 倍，200 窗口把老提问挤没（修：AI-016）。
+    // ⚠️ 这个窗口是**全局**的：旧书的会话会被新消息整段挤出（2026-10-25 实测）。
+    // 单本模式（?book=）不截窗口 —— 它本来就是"把被挤出去的那本捞回来"。
     const chatSorted = chatItems.sort((a, b) => (a._ts || 0) - (b._ts || 0))
-    // 标注 + 最近 500 条聊天按时间戳交错排序：让标注与其自动回复相邻，
+    const chatWindow = bookFilter ? chatSorted : chatSorted.slice(-HISTORY_RECENT_LIMIT)
+    // 标注 + 聊天按时间戳交错排序：让标注与其自动回复相邻，
     // 侧栏既按时间顺序展示，也能据此为回复继承正确的书籍书签（AI-001）
-    const allItems = [...annItems, ...chatSorted.slice(-500)]
+    const allItems = [...annItems, ...chatWindow]
       .sort((a, b) => (a._ts || 0) - (b._ts || 0))
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify(allItems))
@@ -1173,6 +1200,13 @@ const server = http.createServer(async (req, res) => {
               // 译文（2026-11）：PDF 阅读器那条引用才有。侧栏靠它显示"你读到的那句"，
               // 与 SSE 推送（annotation-select）保持同一份字段，两条路各漏一处就会时有时无。
               ...(d.translation ? { translation: d.translation } : {}),
+              /**
+               * 这条引用落在书里哪一处（2026-10-25）：阅读器设引用时随引用报上来的
+               * 「页号 + 页内字符偏移」。阅读器靠它把"跳到原文"落到**划线那一处**
+               *（只按文字找会跳到同一句话的另一个出现位置，见 reader.js 的 locateRef）。
+               * 老记录没有这一格 —— 读取侧按"没有"处理，不要补默认值。
+               */
+              ...(Array.isArray(d.anchors) && d.anchors.length ? { anchors: d.anchors } : {}),
               chapter: d.chapter || '',
               chapterUid: d.chapterUid || '',
               chapterUidInt: d.chapterUidInt || 0,

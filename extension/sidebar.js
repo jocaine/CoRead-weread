@@ -1235,17 +1235,30 @@ function renderDrawer() {
         <button class="di-del-btn" title="删除这条引用">${ICON_TRASH}</button>
       </div>`
 
-    // 点击正文区域：选中并关闭（折叠时点概览，展开时点全文）
-    const selectOnClick = (e) => {
-      e.stopPropagation()
-      selectedAnn = ann
-      clearPendingSelect()  // 用户显式选择取代残留待办
-      saveState()
+    /**
+     * 整张卡片 = "选这条引用"的热区（2026-11 修用户报的"单击条目常常没反应"）。
+     *
+     * 原来只给 `.di-text` / `.di-full` 绑了处理器，而卡片上还有表头（#号 + 书名）、
+     * 章节行、8px 内边距、按钮行左边的空白——那些地方点下去什么都不发生；可整卡都是
+     * `cursor: pointer` + hover 绿框（sidebar.html 的 .drawer-item / :hover），
+     * 看起来哪儿都能点。一条引用的卡片里"正文"通常只占三分之一高度，于是表现为
+     * "时灵时不灵"，而不是"完全点不动"。
+     *
+     * 第二层原因（更隐蔽）：**按下与松开落在不同子元素上**时，click 的目标是两者的
+     * 最近公共祖先（本文件 bindMaskClose 的注释里已经踩过同一个机制）——也就是这张
+     * 卡片本身。手在正文上按下、松手时漂到上面那行章节，处理器挂在子元素上就接不到。
+     *
+     * 两件事挂在卡片上一起治掉；也顺带对上两处早有的约定：自检里的 `clickDrawerItem`
+     * 直接 `items[i].click()`，注释写的就是"走它自己的 click 处理器（pickReference +
+     * 关抽屉）"——那张卡上之前根本没有处理器，所以那条自检动作从来不可能生效。
+     */
+    item.addEventListener('click', (e) => {
+      // 展开/折叠、📍跳转、🗑删除各有各的动作（按钮自带 stopPropagation，这里再兜一层，
+      // 防止以后谁去掉那行 stopPropagation 就变成"删引用顺手把抽屉关了"）
+      if (e.target.closest('button, .di-toggle')) return
+      pickReference(ann)
       closeDrawer()
-      renderRefUI()
-    }
-    item.querySelector('.di-text')?.addEventListener('click', selectOnClick)
-    item.querySelector('.di-full')?.addEventListener('click', selectOnClick)
+    })
 
     // 点击展开/折叠按钮
     item.querySelector('.di-toggle')?.addEventListener('click', (e) => {
@@ -1489,6 +1502,9 @@ function onEffectiveContextChange() {
   renderCurrentRef()
   renderDrawer()
   applyBookFilter()
+  // 这本书的完整历史可能不在首屏窗口里（旧书）→ 按书补拉一趟。
+  // 放在 applyBookFilter 之后：补拉请求要按**当前**上下文取书，别在切书半路发错。
+  maybeLoadBookHistory()
   // 2026-09：切换/初始化后恢复新书的"当前讨论命中"高亮（实时栈 cites → /stack-hits）
   refreshStackHits()
 }
@@ -3010,6 +3026,16 @@ const _histKeys = new Set()   // 已渲染的历史条目 key（role|ts|内容�
  * 置真之后开场卡才允许出现（见 renderIntro）。
  */
 let _histLoaded = false
+/**
+ * 已经按书补拉过完整历史的书（base）。给 maybeLoadBookHistory 用。
+ *
+ * 背景（2026-10-25）：首屏 /history 只回**全库最近 500 条**，旧书会被新消息挤出
+ * 窗口（实测两本 9 月的书 214 / 107 条全在窗口外，点开就是开场卡）。点开一本书时
+ * 按书补拉一趟；拉过就记在这里，切来切去不重复请求。
+ * `_bookHistLoading` 防同一本书的并发重复请求（上下文切换会连着触发好几次）。
+ */
+const _bookHistLoaded = new Set()
+let _bookHistLoading = ''
 let _recoverTimer = 0         // 未回复提问的恢复轮询定时器
 let _recoverTicks = 0         // 已轮询趟数（上限保护）
 let _recoverTs = 0            // 这 60 趟是在等哪一条提问（落库时间戳；换了新一轮就重置预算）
@@ -4829,7 +4855,14 @@ function renderCompleteAssistant(content, bookId, histRef) {
   maybeAutoScroll(msgs)
 }
 
-async function loadHistory() {
+async function loadHistory(opts) {
+  /**
+   * 按书补拉（opts.book）：这一趟只要这一本书的历史。
+   * 启动链里 `.then(loadHistory)` 会把上一步的返回值当参数传进来（loadState 返回
+   * undefined），所以先认形状再取值——别把任意对象都当成 opts。
+   * 为什么需要它：见 maybeLoadBookHistory 的注释（首屏 500 条窗口会把旧书挤出去）。
+   */
+  const scopedBook = (opts && typeof opts === 'object' && typeof opts.book === 'string') ? opts.book : ''
   // 遍历结束时若 pendingUser 仍非空 = 最新一条提问还没有回复落库（AI 仍在回复中，
   // 或回复恰在「loadHistory 抓取」与「SSE 注册」之间落库、本趟没抓到）——据此恢复
   // "思考中"状态并挂轮询补渲染（见函数尾部）。
@@ -4838,7 +4871,11 @@ async function loadHistory() {
   let pendingUser = null
   let loadFailed = false  // /history 抓取失败（接收端暂不可用）：轮询不能停，等恢复
   try {
-    const items = await fetch(`${RECEIVER}/history`).then(r => r.json())
+    // 单本补拉只取这一本（receiver 侧不截全局窗口，见 receiver/index.js 的 /history）
+    const url = scopedBook
+      ? `${RECEIVER}/history?book=${encodeURIComponent(scopedBook)}`
+      : `${RECEIVER}/history`
+    const items = await fetch(url).then(r => r.json())
     // 引用列表已由 loadState() 从本地恢复；这里把历史里尚未加入的标注补进来
     // （例如侧栏关闭期间新增的标注）。addRecentAnn 内部按 bookId+selectedText 去重，
     // 已存在的引用不会重排/重新编号，select:false 也不会覆盖恢复的选中状态。
@@ -4923,7 +4960,9 @@ async function loadHistory() {
     // 已从存档移除、/history 不再返回，这里把本地列表里的幽灵引用清掉，避免重开侧栏又冒出来。
     // AI-018：走 removeAnns——被清掉的若是当前选中引用，一并清空选中态（此前只 splice，
     // 恢复的选中引用被清理后卡片仍显示陈旧内容直到下次重开）。
-    {
+    // ⚠️ 单本补拉（scopedBook）**不能**做这件事：它只带回这一本书的标注，拿它当全集
+    // 会把别的书的引用全当幽灵删掉。全局那趟永远带回全部标注，所以对账只在那边跑。
+    if (!scopedBook) {
       const histAnnKeys = new Set()
       for (const d of items) {
         if (d.role === 'annotation') {
@@ -4964,7 +5003,12 @@ async function loadHistory() {
   //      "提问存在但回复永远不来"的罕见情况下才触发；
   //   ② 除了思考气泡，把「停止」按钮一起恢复：重开后状态与关掉前一致，这条还在
   //      生成的回答能直接停掉（原先只有一颗思考气泡、按钮却是「发送」，自相矛盾）。
-  if (loadFailed) {
+  // 单本补拉不参与"在途提问恢复"：那套轮询与按钮态只属于首屏那一趟，
+  // 在这里跑会把旧书里一条早已答完的提问当成"在途"、弹出思考气泡并挂上轮询。
+  // 拉成功才记账；失败留在账外，下次切上下文会重试。
+  if (scopedBook) {
+    if (!loadFailed) _bookHistLoaded.add(scopedBook)
+  } else if (loadFailed) {
     // 抓取失败：接收端暂不可用，回答无法送达，保住轮询等它恢复
     scheduleRecoverPoll()
   } else if (pendingUser) {
@@ -5010,6 +5054,40 @@ async function loadHistory() {
   // renderCompleteAssistant 摘掉了，这里再兜一次）。放在函数尾部是因为卡上的引文
   // 要等本趟回放把 RECENT_ANNS 补齐、把"最新一条划线"选出来才算得准。
   syncIntro()
+  if (scopedBook) {
+    // 补拉回来的气泡按当前书过滤，并停在最新一条（打开一本书的默认位置）
+    applyBookFilter()
+    if (effectiveBookBase() === scopedBook) scrollMsgsToBottom()
+  } else {
+    // 首屏那趟跑完，才谈得上"当前这本书在不在窗口里"——不在就按书补拉。
+    // 旧书（以及被窗口切掉一半的书）就是靠这一步把记录拿回来的。
+    maybeLoadBookHistory()
+  }
+}
+
+/**
+ * 当前这本书的完整历史还没拿到 → 按书补拉一趟。
+ *
+ * ── 为什么需要（2026-10-25 实测）─────────────────────────────────────────────
+ * 首屏 /history 只回**全库最近 500 条**（见 receiver/index.js 的 HISTORY_RECENT_LIMIT）。
+ * 这个窗口会随新消息往前滑：10/17–10/25 八天新增 500 条后，9 月的两本书（214 / 107 条）
+ * 整本滑出窗口。侧栏拿到后按书过滤，一条不剩 → 画开场卡，用户看到的是"记录全没了"，
+ * 而库里 1623 条一条没少。
+ *
+ * ── 怎么补 ────────────────────────────────────────────────────────────────
+ * 点开一本书（上下文切换）时向 receiver 要 `?book=<base>`，只取这一本、不截全局窗口。
+ * `_bookHistLoaded` 记住拉过的书，切来切去不重复请求；`_bookHistLoading` 防并发重复。
+ * 只在首屏历史回放完成（_histLoaded）之后才允许——否则会在启动早期抢跑，
+ * 与首屏那趟撞车。
+ */
+function maybeLoadBookHistory() {
+  const base = effectiveBookBase()
+  if (!base || !_histLoaded) return
+  if (_bookHistLoaded.has(base) || _bookHistLoading === base) return
+  _bookHistLoading = base
+  loadHistory({ book: base })
+    .catch(() => {})   // 失败已由 loadHistory 内部置 loadFailed；这里只负责复位 loading
+    .finally(() => { if (_bookHistLoading === base) _bookHistLoading = '' })
 }
 
 /**
@@ -7213,7 +7291,43 @@ function closeNotes() {
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || !msg.action) return
   if (msg.action === 'readerUpdate') {
-    if (notesPanel && msg.snapshot) notesPanel.update(msg.snapshot)
+    /**
+     * 译文对照只认"当前这本书"的快照（2026-10-24 用户报"卡片一会消失一会出现"）。
+     *
+     * 根因：面板原先**谁推都收**（下面那行无条件 update）。而阅读器一变成可见就推一份
+     * 快照（refreshRefs('visible') → scheduleSync），所以只要开着**两个阅读器标签页**
+     * ——一个空白 reader.html、一个黑格尔——面板就会在"有卡片"和"0 条"之间来回跳。
+     *
+     * 过滤规则（不放宽）：
+     *   · notify（换书/关书）照收 —— 那是"切到另一本/关掉"的唯一可靠信号；
+     *   · 其余只收书 ID 相同（或任一方还没有书）的快照；
+     *   · 书对不上就忽略，并留一条诊断，下次一看日志就知道是谁在推。
+     *
+     * ⚠️ **不能**再按 `fromActive` 过滤（2026-10-24 踩到）：用户是"阅读器标签页 +
+     * 侧栏"一起用的，但也会切到别的标签页（比如聊天）再回来点侧栏上的按钮。那时
+     * 阅读器不是活动标签页，它的 pending/完成快照会被整个丢掉 —— 面板就卡在旧状态：
+     * 精译按钮一直显示"精译中…"、切换点了没反应。书 ID 已经足够挡住"另一个标签页
+     * 在推别的书/空白页"这一种情况了。
+     */
+    if (notesPanel && msg.snapshot) {
+      const cur = notesPanel.getSnapshot ? notesPanel.getSnapshot() : null
+      const curBook = String((cur && cur.book && cur.book.bookId) || '')
+      const next = msg.snapshot
+      const nextBook = String((next.book && next.book.bookId) || '')
+      const sameBook = !curBook || !nextBook || nextBook === curBook
+      if (next.notify || sameBook) {
+        notesPanel.update(next)
+      } else {
+        postSidebarDebug({
+          stage: 'reader-update-ignored',
+          curBook: curBook.slice(0, 20),
+          nextBook: nextBook.slice(0, 20),
+          entries: Array.isArray(next.entries) ? next.entries.length : -1,
+          fromActive: msg.fromActive,
+          why: '不是当前这本书推上来的（另一个阅读器标签页）',
+        })
+      }
+    }
     // 2026-11：换书（打开/切换/关掉 PDF）时阅读器会把 notify 置真 —— 那是"把侧栏切到
     // 这本书"的可靠信号，直接用，不再反过来问"哪个 tab 是活动的"。
     // 翻页 / 新译文这类同步不带 notify：不打扰用户当前翻看的书。

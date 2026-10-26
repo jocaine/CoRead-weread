@@ -17,10 +17,19 @@
   --rd-accent-border: #bfe3cd;
   --rd-mark: rgba(122, 205, 150, 0.5);   /* 原文高亮 */
   --rd-mark-active: rgba(255, 196, 92, 0.6);
+  /* 「点引用跳到这里」那一段的底色与下划线（2026-10-25）。
+     为什么单开一套：它要回答的是"我到底跳到哪儿了"，必须比上面两种底色更扎眼，
+     而且**不能**复用 rd-src-active —— 那个名字归译文条目管，refreshHighlights 在
+     "当前没有选中条目"时会把它删掉（实测：跳过去的高亮活不过一次重绘）。 */
+  --rd-locate-bg: rgba(255, 170, 30, 0.5);
+  --rd-locate-line: #b45309;
   /* 「这一段已经设成引用」的下划线（2026-11 修：划词设引用后书页上什么都没画）。
      只给线、不给底色：底色已经用来表达"这段翻过 / 正在对照"，再加一层会把
      那两种状态的颜色搅浑（实测：叠在 active 的橙底上会变成橄榄色）。 */
   --rd-ref-line: #0a7d43;
+  /* 悬停在链接上时盖在原文上的那层淡色。用半透明而不是 --rd-accent-soft：
+     后者是不透明的浅绿，会把下面的字糊掉。 */
+  --rd-link-hot: rgba(10, 125, 67, 0.12);
 }
 
 * { box-sizing: border-box; }
@@ -167,6 +176,32 @@ body { display: flex; flex-direction: column; }
 
 /* 还没渲染的页：占位，保持滚动条长度稳定 */
 .rd-page-idle { background: #fff; }
+
+/* ── 链接层（PDF 注释 /Link，2026-11 补）───────────────────────────────────── */
+/* 位置由 reader.js 按**页内百分比**写进 left/top/width/height，所以缩放时自动跟着页面走。
+   pointer-events: none 是**刻意的**：这一层绝不能挡住划词选区（从链接上按下去也要能选字）。
+   代价是它拿不到 :hover / 点击 —— 命中由 reader.js 按坐标算，悬停高亮由它加 .is-hot。 */
+.rd-links {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+.rd-link {
+  position: absolute;
+  display: block;
+  border-radius: 2px;
+  background: transparent;
+}
+.rd-link.is-hot { background: var(--rd-link-hot); }
+/* 键盘 Tab 到链接上要看得见落点：用规格里的焦点绿，不用浏览器默认蓝框 */
+.rd-link:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(10, 125, 67, 0.18);
+}
+/* 悬停在链接上时改成手型。文字层的 span 自带 cursor: text，必须压过它 */
+.rd-pages.is-link-hover .rd-page,
+.rd-pages.is-link-hover .textLayer :is(span, br) { cursor: pointer; }
 
 /* ── 空状态 / 书库 ─────────────────────────────────────────────────────────── */
 /* 空状态（2026-11 按 coread-visual-spec 重排）：
@@ -360,6 +395,16 @@ body { display: flex; flex-direction: column; }
 /* ── 原文高亮：用 CSS Custom Highlight，不改文字层 DOM ────────────────────── */
 ::highlight(rd-src) { background-color: var(--rd-mark); }
 ::highlight(rd-src-active) { background-color: var(--rd-mark-active); }
+/* 「点引用跳到这里」：跳过去的那一段（见 reader.js 的 scrollToAnchor）。
+   底色 + 下划线一起给：底色负责"在满页字里一眼找到"，下划线负责"边界清楚到能看出
+   划的是哪几个字"（只给底色时，短引用和相邻的绿线下划线会糊成一片）。 */
+::highlight(rd-locate) {
+  background-color: var(--rd-locate-bg);
+  text-decoration: underline;
+  text-decoration-color: var(--rd-locate-line);
+  text-decoration-thickness: 2px;
+  text-decoration-skip-ink: none;
+}
 
 /* 「这一段已经设成引用了」：只画一道绿线，不加底色。
    为什么不给底色：底色已经用来表达"这段翻过"（rd-src）与"正在对照"（rd-src-active），

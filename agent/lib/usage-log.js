@@ -49,7 +49,9 @@ export function readUsage(payload) {
     if (miss == null && hit != null) miss = Math.max(0, input - hit)
   }
   if (hit == null && miss == null && input == null && output == null) return null
-  return { input, output, hit, miss }
+  // 推理型模型的思考也算 output，但不该跟"正文有多长"混在一起看：单独记一格
+  const think = num(u.completion_tokens_details?.reasoning_tokens)
+  return { input, output, hit, miss, think }
 }
 
 // ── 调用类型标签 ─────────────────────────────────────────────────────────────
@@ -109,6 +111,7 @@ export function appendUsage(rec, file = USAGE_FILE) {
     hit: num(rec?.hit),
     miss: num(rec?.miss),
     output: num(rec?.output),
+    ...(num(rec?.think) != null ? { think: num(rec.think) } : {}),
   }
   try {
     fs.appendFileSync(file, JSON.stringify(row) + '\n')
@@ -144,6 +147,7 @@ export function recordUsage(rec, opts = {}) {
       output: rec?.output ?? u.output,
       hit: rec?.hit ?? u.hit,
       miss: rec?.miss ?? u.miss,
+      think: rec?.think ?? u.think,
     }, opts.file)
     if (!row) return null   // 写失败（appendUsage 已打过警告）
     try { console.log(`  [usage] ${row.kind} · ${describeUsage(row)}`) } catch {}
@@ -165,7 +169,10 @@ export function describeUsage(row) {
   } else {
     parts.push('该服务商未回报缓存命中数')
   }
-  if (row.output != null) parts.push(`输出 ${nf.format(row.output)}`)
+  if (row.output != null) {
+    // 推理型模型：输出里绝大多数是思考。分开报，否则"这份报告花了 1,660 token"会把人吓着
+    parts.push(row.think ? `输出 ${nf.format(row.output)}（其中思考 ${nf.format(row.think)}）` : `输出 ${nf.format(row.output)}`)
+  }
   if (row.ms != null) parts.push(secs(row.ms))
   return parts.join(' · ')
 }

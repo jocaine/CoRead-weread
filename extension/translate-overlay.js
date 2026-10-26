@@ -1446,7 +1446,9 @@
     b.refs.status.hidden = false
     b.refs.status.classList.remove('st-error')
     b.refs.status.textContent = '正在重译…'
-    const res = await send({ action: 'translateText', text })
+    // fromOcr 决定后台用哪套规则（2026-10-24）：框选翻译的气泡原文是 OCR 认出来的，
+    // 划词气泡的原文是页面真实文字，不能对后者说"可能有错字"。
+    const res = await send({ action: 'translateText', text, fromOcr: b.kind === 'image' })
     b.retranslating = false
     if (!b.alive) return
     if (!res || !res.ok) {

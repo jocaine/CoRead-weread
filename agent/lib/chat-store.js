@@ -250,6 +250,37 @@ export class ChatStore {
     return this.db.prepare(sql).all(...vals).map(rowToMessage)
   }
 
+  /**
+   * 按「书」取消息（整书会话 + 该书的各章节会话）。
+   *
+   * 为什么需要它（2026-10-25）：/history 首屏只回**全库最近 500 条**，旧书会被
+   * 后面的新消息挤出窗口 —— 侧栏按书过滤后一条不剩，点开就是开场卡，看起来像
+   * "记录没了"（实测两本 9 月的书 214 / 107 条，一条都不在窗口里）。
+   * 侧栏现在点开某本书时按书补拉一趟，这个方法给出"这本书的全部"。
+   *
+   * 书与会话的对应关系（messages.conv）：
+   *   <base>              整本书的会话
+   *   <base>k<章节哈希>    该书的章节会话（2026-08 起）
+   * 不能写成 `conv LIKE base || 'k%'`：base 里的 `_` 是 LIKE 的通配符，会多匹配
+   * 别的书（`mia_x` 会匹配 `miaXx`）。所以先按已有 conv 精确筛，再用 IN 查。
+   *
+   * @param {string} bookBase 基础书 ID（不含 k 后缀）
+   * @param {{limit?: number}} [opts] limit > 0 时只取最近这么多条（单本也无上限会撑爆侧栏）
+   * @returns {Array} 消息对象（字段同 listMessages，按 ts 升序）
+   */
+  listMessagesForBook(bookBase, { limit = 0 } = {}) {
+    const base = String(bookBase || '')
+    if (!base) return []
+    const keys = Object.keys(this.countByConv()).filter(
+      (k) => k === base || (k.startsWith(base) && k.charAt(base.length) === 'k'),
+    )
+    if (!keys.length) return []
+    const rows = this.db.prepare(
+      `SELECT * FROM messages WHERE conv IN (${keys.map(() => '?').join(',')}) ORDER BY ts ASC, id ASC`,
+    ).all(...keys).map(rowToMessage)
+    return limit > 0 && rows.length > limit ? rows.slice(-limit) : rows
+  }
+
   /** 全部消息里最大 id（接收端 SSE 增量推送的水位线）。 */
   lastMessageId() {
     const r = this.db.prepare('SELECT COALESCE(MAX(id), 0) AS n FROM messages').get()

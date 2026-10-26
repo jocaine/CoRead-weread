@@ -9,7 +9,7 @@
     "start": "bash -c \"node receiver/index.js & node --env-file-if-exists=data/config/env agent/index.js & wait\"",
     "test": "npm --prefix agent run test:once",
     "test:agent": "npm --prefix agent run test:once",
-    "test:ext": "node extension/test/translate-protocol.test.mjs && node extension/test/reader-anchor.test.mjs && node extension/test/reader-context.test.mjs && node extension/test/reader-position.test.mjs",
+    "test:ext": "node extension/test/translate-protocol.test.mjs && node extension/test/reader-anchor.test.mjs && node extension/test/reader-context.test.mjs && node extension/test/reader-position.test.mjs && node extension/test/reader-links.test.mjs",
     "backup:chat": "node agent/scripts/backup-chat.mjs",
     "diag:wal": "node agent/scripts/chat.db.diag-wal.mjs"
   }

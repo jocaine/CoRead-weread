@@ -62,7 +62,8 @@ export const STORE_KEYS = {
 }
 
 /** prompt 版本号。prompt 或输出协议改动时加一，便于排查历史缓存差异。 */
-export const PROMPT_VERSION = 4
+export const PROMPT_VERSION = 5
+// 5：文本翻译改成「system 放规则 + user 放书名与待译正文」；划词与 OCR 两套规则（2026-10-24）
 // 4：新增框选「只识别原文、不翻译」（RECOGNIZE_PROMPT）
 // 3：请求体加了 JSON 模式与"关思考"（见 buildChatBody）
 
@@ -94,19 +95,41 @@ export const RECOGNIZE_PROMPT = [
   '4. 图中没有可识别的文字时，original 填空字符串。',
 ].join('\n')
 
-export const RETRANSLATE_PROMPT = [
-  '把用户给出的文字译成简体中文。这段文字来自屏幕截图识别，可能有错字与断行。',
-  '保留段落与换行。',
-  '只输出一个 JSON 对象，格式为 {"translation":"…"}。',
-  '不要输出解释、前后缀或 Markdown 代码块。',
-].join('\n')
+/**
+ * 文本翻译的规则，放进 **system 消息**（与「待译正文」分开）。
+ *
+ * 2026-10-24 重写（用户反馈译文生硬）。旧版只有三句：「把用户选中的文字译成简体中文。
+ * 保留段落与换行。只输出 JSON。」——那等于要求照着英文的句子结构输出中文，再交给
+ * temperature 0.2 去逐字落地，读起来就是翻译腔。这一版把要求写全：
+ *   · 先读懂整句再下笔（不让模型一个词一个词对照）
+ *   · 按中文语序重组，不保留英文句式与破折号插入语
+ *   · 术语/人名/地名首次出现时括注原文，前后一致
+ *   · 不增不减，段落保留，段内不按原文行宽断行
+ *
+ * 为什么单独放 system（同一天定调）：旧版把这些要求和原文用 \n\n 粘在同一条 user 消息里，
+ * 模型分不清「要求」和「要译的内容」——哲学/政论原文里全是祈使句，容易被当成指令。
+ * 分开之后规则是稳定前缀，正文在 user 消息的【待译文字】区块里（见 buildTranslateContent）。
+ *
+ * 扫描件那条路（原文是 OCR 认出来的）另用 TRANSLATE_SYSTEM_PROMPT_OCR：多一条「可能有错字」。
+ * PDF 文字层抽出来的原文没有识别误差，**不能**带这句——否则模型会去"纠正"人名、术语和旧拼法
+ * （2026-10-24 修的就是这个：重译原先一律当 OCR 处理）。
+ */
+const TRANSLATE_RULES = [
+  '你是为中文读者翻译的译者，目标语言是简体中文。',
+  '用户消息里用【待译文字】和【待译文字结束】标出的是要翻译的正文；书名只用于理解语境，不要翻译书名。',
+  '1. 先读懂整句（必要时连同上文）再下笔；不要一个词一个词对照着译。原文本来就是中文时不要改写句子，只把繁体字转成简体。',
+  '2. 译成自然、通顺的现代汉语：按中文的语序和节奏重组句子，该拆的长句拆开，该提前的成分提前；',
+  '   不要保留英文的语序、从句嵌套和破折号插入语——原文用破折号插进来的补充说明，按中文习惯改成短句、括号或顺承。',
+  '3. 术语、人名、地名在同一段译文里首次出现时，可在译名后用括号注出原文，如「世俗现实（säkulare Wirklichkeit）」；前后译法保持一致。',
+  '4. 不增、不减、不改写原意：不要添加原文没有的判断、因果或评价，也不要漏掉信息；原文的论证、语气和修辞要保留。',
+  '5. 保持原文的段落划分；一段之内不要按原文的行宽断行。',
+]
+const TRANSLATE_OUTPUT_RULE = '6. 只输出一个 JSON 对象，格式为 {"translation":"…"}。不要输出解释、前后缀或 Markdown 代码块。'
+/** 原文是 OCR 认出来的才有这一条（扫描件 / 框选识别）。不编号：它说的是"输入从哪来"，不是第 6 条要求。 */
+const TRANSLATE_OCR_RULE = '另：这段原文来自截图识别，可能有错字、断行或漏字。明显的识别错误可以按上下文改正；但不要改动原文的用词和风格，也不要凭空补内容。'
 
-/** 划词翻译：来源是网页上的真实文本，没有识别误差。 */
-export const SELECTION_PROMPT = [
-  '把用户选中的文字译成简体中文。保留段落与换行。',
-  '只输出一个 JSON 对象，格式为 {"translation":"…"}。',
-  '不要输出解释、前后缀或 Markdown 代码块。',
-].join('\n')
+export const TRANSLATE_SYSTEM_PROMPT = [...TRANSLATE_RULES, TRANSLATE_OUTPUT_RULE].join('\n')
+export const TRANSLATE_SYSTEM_PROMPT_OCR = [...TRANSLATE_RULES, TRANSLATE_OCR_RULE, TRANSLATE_OUTPUT_RULE].join('\n')
 
 /** 首次解析失败后的补救 prompt：把模型上一次的输出贴回去，要求只吐 JSON。 */
 export const RETRY_PROMPT = [
@@ -218,6 +241,34 @@ export function originPattern(apiBase) {
 }
 
 /**
+ * 请求失败时"去掉什么再试一次"的顺序（纯函数，单测钉住）。
+ *
+ * 为什么会 400：thinking 是 DeepSeek 系写法、response_format 有些网关会拒。
+ * 顺序是既定的：
+ *   ① 调用方要的那一发（精译要 noThinking:false = 不传 thinking 字段）；
+ *   ② 本来关着思考 → 再试一次"开思考"（有些上游单纯不认 disabled 这个值）；
+ *   ③ 开了 JSON 模式 → 最后去掉它再试一次。
+ *
+ * 2026-10-24 加精译时把这套从 chat() 里抽出来：分支一多，"精译会不会被错误地降级成
+ * 关思考"这种事只看代码很难确认，单测里一行 deepEqual 就能钉住。
+ *
+ * @param {{jsonMode?: boolean, noThinking?: boolean, jsonModeRejected?: boolean, thinkingRejected?: boolean}} p
+ *   jsonMode/noThinking      本次调用想用什么
+ *   jsonModeRejected/thinkingRejected  本会话里这两样是否已被上游拒过
+ * @returns {Array<{jsonMode: boolean, noThinking: boolean}>}
+ */
+export function planChatAttempts({
+  jsonMode = true, noThinking = true, jsonModeRejected = false, thinkingRejected = false,
+} = {}) {
+  const wantJson = !!jsonMode && !jsonModeRejected
+  const startNoThinking = !!noThinking && !thinkingRejected
+  const attempts = [{ jsonMode: wantJson, noThinking: startNoThinking }]
+  if (startNoThinking) attempts.push({ jsonMode: wantJson, noThinking: false })
+  if (wantJson) attempts.push({ jsonMode: false, noThinking: false })
+  return attempts
+}
+
+/**
  * 组一次 chat/completions 的请求体。
  *
  * 两个默认开着的开关，都是 2026-11 为「重译结果格式不正确」这个报错加的
@@ -235,13 +286,20 @@ export function originPattern(apiBase) {
  * 会去掉这个字段重发一次，之后本会话都不再发。
  */
 export function buildChatBody({
-  model, content, maxTokens = 8192, temperature = 0.2, jsonMode = true, noThinking = true,
+  model, content, system = '', maxTokens = 8192, temperature = 0.2, jsonMode = true, noThinking = true,
 }) {
+  // system 只放**文字规则**：图片必须留在 user 消息里（见 buildImageContent），
+  // 所以图片翻译那条路永远不传 system。system 为空时消息形态与改动前逐字一致。
+  const messages = []
+  const sys = String(system ?? '').trim()
+  if (sys) messages.push({ role: 'system', content: sys })
+  messages.push({ role: 'user', content })
+
   const body = {
     model,
     temperature,
     max_tokens: maxTokens,
-    messages: [{ role: 'user', content }],
+    messages,
   }
   if (jsonMode) body.response_format = { type: 'json_object' }
   if (noThinking) body.thinking = { type: 'disabled' }
@@ -263,6 +321,23 @@ export function buildTextContent(prompt, text) {
   return [
     { type: 'text', text: prompt + '\n\n' + String(text ?? '') },
   ]
+}
+
+/**
+ * 组文本翻译的 user 消息：书名 + 用标记围起来的正文。
+ *
+ * 为什么带书名（2026-10-24 用户定调）：给模型一个"这是什么书"的先验（哲学 / 历史 / 小说），
+ * 对术语和语气有一点帮助。**刻意不带前后文** —— 用户明确只要书名，不想把上下文也塞进去。
+ *
+ * 为什么正文必须有边界标记：规则已经挪进 system，user 消息里只剩"书名 + 正文"。
+ * 不标边界时，书名那一行同样是一串英文，模型有可能把书名也当成待译的句子翻掉。
+ */
+export function buildTranslateContent({ text, bookTitle } = {}) {
+  const title = String(bookTitle ?? '').trim()
+  const body = String(text ?? '')
+  const user = (title ? '书名：' + title + '\n\n' : '')
+    + '【待译文字】\n' + body + '\n【待译文字结束】'
+  return [{ type: 'text', text: user }]
 }
 
 /** 从 OpenAI 兼容的 chat completions 响应里取出正文。 */
@@ -421,7 +496,8 @@ export function classifyFetchError(err, target = '', probeNote = '') {
     return {
       code: 'NETWORK',
       message: '无法连接模型服务' + where + note
-        + '。请检查或清空「自定义模型配置 → API 地址」，并确认网络能到达该地址',
+        + '。请检查「自定义模型配置 → API 地址」；如果浏览器开着系统代理/VPN，'
+        + '试试先关掉它，或把这个域名设为直连（浏览器走系统代理，很多「地址没错但连不上」都是代理造成的）',
       detail: name + ': ' + msg + (target ? ' | target=' + target : '') + (probeNote ? ' | probe=' + probeNote : ''),
     }
   }
