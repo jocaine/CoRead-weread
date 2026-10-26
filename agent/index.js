@@ -1177,14 +1177,17 @@ async function say(userText, options = {}) {
     //   ① 本轮**有新命中**才存输入（供 scripts/l3-ab.mjs 重放）——否则随便一句追问就会把它
     //     覆盖掉，A/B 抓到的就成了"没有命中的那一轮"；
     //   ② 只在走命题递归时开全过程记录（一轮一份，不像 ① 会互相覆盖）。
+    // 2026-10-26：`both` 本身就产出脑图（它本来就是对比用的调试模式），不必再开 debug；
+    // 区别只在**要不要每轮自动用浏览器打开**——那个仍然只由 debug 开关决定，免得弹窗打断阅读。
     const debugOn = l3DebugWanted()
+    const recordOn = debugOn || path === 'both'
     let trace = null
     let tree = null
-    if (debugOn) {
+    if (recordOn) {
       if (l3Hits.length) {
         dumpL3Input({ conv: key, mode: l3Mode, path, hist, persona, anchored, l3: options.l3, hits: l3Hits })
       }
-      if (path === 'tasks') {
+      if (path === 'tasks' || path === 'both') {
         // 编号必须与流水线里的课题号一致（命中顺序 → K-1、K-2），否则记录里的 K-1 对不上
         const tracePoints = l3Hits
           .map((id) => graph.nodes.find((n) => n.id === id))
@@ -1199,7 +1202,7 @@ async function say(userText, options = {}) {
         tree = openL3Tree({ dir: L3_TRACE_DIR, stamp: st.file, meta: { conv: key, question: storeText } })
         if (trace.file) console.log(`  [l3] 全过程记录 → ${trace.file}`)
       } else {
-        console.log(`  [l3] 调试已开，但本轮不是命题递归（path=${path}）——只存输入，不写全过程`)
+        console.log(`  [l3] 记录已开，但本轮不是命题递归（path=${path}）——只存输入，不写全过程`)
       }
     }
     // kind/conv 只进用量流水：_meta 是"记忆合并"这类元任务（同一入口，但报表里要分开看，
@@ -1332,7 +1335,9 @@ async function say(userText, options = {}) {
       if (tree) tree.write({ type: 'final', label: 'A 旧路径（先说的那份）', text: displayContent, coverage: [], shown: true })
       console.log(`  [l3] A/B 同输入：旧路径 ${displayContent.length} 字｜新路径 ${altAnswer ? `${altAnswer.length} 字` : '没跑完（超时）'}`)
     }
-    if (tree && tree.file) openInBrowser(tree.file)
+    // 自动打开只有 debug 开关说了算：`both` 每轮都写脑图，但每轮都弹一次浏览器会打断阅读。
+    if (tree && tree.file && debugOn) openInBrowser(tree.file)
+    else if (tree && tree.file) console.log(`  [l3] 脑图已写（未自动打开）：${tree.file}（想每轮自动打开就 /l3 debug on）`)
 
     // 为什么不在这里再查一次停止：③ 就在上面几行，中间只有 `break` 和一次赋值 —— 纯同步代码，
     // 用户不可能在这个窗口里点停止。

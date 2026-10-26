@@ -83,7 +83,7 @@ export function handleL3Command(arg, { modeFile, debugFile, log = () => {} } = {
     }
     log(`模式 ${mode0} → ${sub}`)
     const extra = sub === 'both'
-      ? '\n对比时建议一起开：`/l3 debug on`——两条终稿会并排画在脑图里。'
+      ? '\n脑图**每轮都会写**（data\\runtime\\l3-trace\\），但不自动弹窗；想每轮自动用浏览器打开，再开 `/l3 debug on`。'
       : (sub === 'off' ? '\n这一轮之后的提问都不再带 L3（用来量"关掉能省多少"）。' : '')
     return {
       reply: `已切到 \`${sub}\`：${MODE_DESC[sub]}\n下一句提问就生效（不用重启）。${extra}`,
