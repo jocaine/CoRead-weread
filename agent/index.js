@@ -1247,8 +1247,11 @@ async function say(userText, options = {}) {
       // 全过程事件（调试开关打开时才有人接收，关着就是空操作）：Markdown 与脑图各收一份
       onEvent: (e) => {
         if (trace) trace.write(e); if (tree) tree.write(e)
-        // 这一轮「成功上报的来路节点」→ 记成下一轮可继承的清单（同栈继续时才会用到）
-        if (e && e.type === 'live') writeLive(key, e.nodes)
+        // 这一轮「成功上报的来路节点」→ 记进这场讨论可继承的清单（同栈继续时才会用到）。
+        // **累积**（2026-10-26 用户定）：以前 live 过的节点都留着，不是只留上一轮那批——
+        // 否则讨论每往后走一轮，前一轮用过的那批就丢，越走越往回退。
+        // 清空只发生在弹栈/不入栈（applyStackTurn）。
+        if (e && e.type === 'live') writeLive(key, [...readLive(key), ...e.nodes])
       },
       // 拒绝交付 = 这条旧讨论的 point/alias 与实际内容不符（用户后面去修图谱）。
       // 单独落一个文件，攒够了一次性看哪些节点在吹牛。
@@ -1539,20 +1542,11 @@ async function resolveCitations(userText, bookKey, replyToTs) {
       log: (m) => console.log(`  [引用解析] ${m}`),
     })
     const valid = hits.filter((id) => graph.nodes.some((n) => n.id === id))
-    if (valid.length) {
-      // AI-020 命中事件：写 chat_output（role=graph-hit，不带 content/_stream——
-      // 不渲染为消息、不参与回复配对），receiver 按既有通道转发为 SSE，侧栏图视图
-      // 据此高亮命中节点的闭包。reason = 命中的知识点 point 列表；
-      // bookKey = 本次讨论归属书，侧栏按当前上下文过滤（命中脉络按书隔离）。
-      const reason = valid
-        .map((id) => { const n = graph.nodes.find((x) => x.id === id); return n ? `「${n.point}」` : id })
-        .join('、')
-      appendGraphHit(valid, reason, bookKey, replyToTs)
-    }
+    // AI-020 命中事件**不在这里写**（2026-10-26 用户定）：图上要显示的是"这一轮真正交给模型的"
+    // ——本轮引用命中 ∪ 同栈继承来的来路节点，而继承要等判栈之后才知道。统一由调用方写一次。
     // L3 种子 = 本轮命中 ∪ **本场实时栈已挂的全部引用**（2026-10 用户定调）。理由与前端图
     // 高亮同一条：实时栈收口**之前**它们同属一场讨论——固化时同一段消息的 cites 会一起变成
-    // 同一个节点的 user 边，所以不是两类东西。于是「图上亮的」与「模型拿到的」严格一致
-    // （前端 computeHitLayers 用同一组种子）。种子非空就注入：这场讨论有引用 → 每轮都带上它的来路。
+    // 同一个节点的 user 边，所以不是两类东西。种子非空就注入：这场讨论有引用 → 每轮都带上它的来路。
     const seeds = [...new Set([...valid, ...collectStackCites(topicStacks[bookKey || currentBookKey])])]
     const ancestry = seeds.length ? userAncestry(graph, seeds) : []
     return { hits: valid, l3: ancestry.length ? l3Block(ancestry) : '' }
@@ -2587,6 +2581,17 @@ async function main() {
         const inherited = stackDecision && stackDecision.action === 'pushed' ? readLive(key) : []
         if (inherited.length) console.log(`  [l3] 继承上一轮有效来路 ${inherited.length} 个：${inherited.join('、')}`)
         const hitsThisRound = [...new Set([...citesFinal, ...inherited])]
+        // 图上亮的 = 这一轮真正交给模型的：本轮引用命中 ∪ 同栈继承来的来路节点
+        // （2026-10-26 用户定：按当前轮的 live 显示，别让"用了什么"和"图上亮的"对不上）。
+        if (hitsThisRound.length) {
+          const inheritedOnly = new Set(inherited.filter((id) => !citesFinal.includes(id)))
+          const reason = hitsThisRound.map((id) => {
+            const n = graph.nodes.find((x) => x.id === id)
+            const label = n ? `「${n.point}」` : id
+            return inheritedOnly.has(id) ? label + '（上轮继承）' : label
+          }).join('、')
+          appendGraphHit(hitsThisRound, reason, key, msg.timestamp)
+        }
         // replyTo = 这条提问的 id：回答入库时直接挂上引用（配对从"时间序推断"变成"外键"）
         // replyToTs = 这条提问落库的 timestamp：侧栏用它当"哪一轮"的身份证（停止收尾后
         // 晚到的流式分片靠它认领，见 appendChatOutputStream 的注释）

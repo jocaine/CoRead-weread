@@ -20,31 +20,26 @@
  *   注入。所以它可以在测试里用假模型跑完整条流水线（见 test/l3-tasks.test.js）。
  */
 
-/** 登记里的「覆盖」三档：够 = 这一面有原话了；只沾边/没有 = 还要往更早的讨论找同一面的原话。 */
-export const REFUSAL_FIELDS = ['拒绝']
-
 /**
- * 兜底闸与取回粒度（设计 §4/§5）。语义上的"该不该再追"由 R3 判，这里只防跑飞。
- * maxCalls 只数探索阶段（R2+R3），R1/R4 是每轮固定的一次，不计入。
+ * 兜底闸与取回粒度（设计 §4/§5）。语义上的"该不该再追"由派题判，这里只防跑飞。
+ * maxCalls 只数探索阶段（逐块交付 + 派题），草稿和终稿是每轮固定的一次，不计入。
  */
 export const TASK_LIMITS = {
   maxCalls: 10,            // 探索阶段调用总数（2 命中 + 2 层来路 ≈ 4~6 次，留余量）
   maxTokens: 60000,        // 材料估算 token 合计上限（**这才是该紧的闸**，单节点不该单独抠）
-  maxMs: 120000,           // 探索阶段墙钟上限（不含 R1/R4 的等待）。
-                            // 原来写 20 秒是拍脑袋的：实测一次 R2（8k 字材料 + 推理模型的思考）
+  maxMs: 120000,           // 探索阶段墙钟上限（不含草稿/终稿的等待）。
+                            // 原来写 20 秒是拍脑袋的：实测一次交付（8k 字材料 + 推理模型的思考）
                             // 就要 9~20 秒，20 秒的闸在第一枝上就触发，等于整条流水线永远跑不完。
-                            // 真正防跑飞的是调用数（10 次）和材料 token（40k），时间是最后的兜底。
-  maxDepth: 1,             // 来路最多追几层（命中 = 0 层）；每层一次汇总，加一层就多一次 R4
-  forceAsk: false,         // 只为测试：无视「覆盖」直接往下派题（验证多节点/depth>1）
+                            // 真正防跑飞的是调用数（10 次）和材料 token，时间是最后的兜底。
+  maxDepth: 1,             // 来路最多追几层（命中 = 0 层）；每层一次汇总
   // 2026-10-25 用户定：**材料绝不截取**——截了模型就真看不见，问它“当时谈过什么”就变成猜。
   maxExcerptChars: Infinity,
-  maxDraftChars: 3000,     // 送进课题/判父的草稿上限（草稿本身就该短）
-  maxReports: 8,           // 进 R4 的报告条数上限
+  maxDraftChars: 3000,     // 送进派题的草稿/交付上限（草稿本身就该短）
   // 推理型模型的"思考"也算进 max_tokens：实测一次课题的思考能写到 3,000 字（≈2,300 token），
   // 给 1024 时正文一个字都出不来（还会以 finish=stop 收尾，看起来像成功了）
   draftTokens: 4096,
   reportTokens: 4096,
-  askTokens: 6144,         // 派题：要它读完几个候选的材料开头、再当场写问题，思考更长
+  askTokens: 6144,         // 派题：要它读完几个候选的标题+别名、再当场写题，思考更长
   tokenPerChar: 0.62,      // 与 index.js 的 TOKEN_PER_CHAR 同源（2026-09 实测校准）
   finalLabel: '',          // 「终稿」事件在记录里的标题（both 模式下用来区分 A/B）
   finalShown: true,        // 这份终稿有没有给用户看（both 模式下 B 的没给）
@@ -701,7 +696,6 @@ export async function* runTasksPipeline(deps = {}) {
   const expanded = new Set(points.map((p) => p.id))
   const kidSeq = new Map()
   let full = ''
-  let streamed = false
 
   let gateEmitted = false
   let tripped = ''
@@ -738,14 +732,6 @@ export async function* runTasksPipeline(deps = {}) {
       log(`R2 ${kid} 输出不是合法登记（第 ${attempt} 次）：${String(out).replace(/\s+/g, ' ').slice(0, 80)}`)
     }
     return { reason: '两次输出都不合格式（既没有一段正文，也没有「拒绝：」）' }
-  }
-
-  /** 回归汇总的输入：本节点交出的那段话 + 各父节点回来的一段话 */
-  const aggregateInput = (kid, own, kids, depth) => {
-    const reps = kids.filter((k) => k.summary).map((k) => ({ kid: k.kid, task: '（那一支回归上来的结果）', body: k.summary }))
-    const agg = buildAggregateMessage({ draft: { raw: own }, reports: reps })
-    emit({ type: 'aggregate', kid, depth, message: agg })
-    return [...hist, { role: 'user', content: persona }, { role: 'user', content: agg }, { role: 'user', content: anchored }]
   }
 
   const nextKid = (parentKid) => {
@@ -926,7 +912,6 @@ export async function* runTasksPipeline(deps = {}) {
     { role: 'user', content: buildAggregateMessage({ draft: { raw: initial }, reports: finalReports }) },
     { role: 'user', content: anchored },
   ])
-  streamed = true
   log(`终稿 ${full.length} 字（草稿 + ${finalReports.length} 份回归汇总）`)
   emit({ type: 'final', text: full, coverage: [], ...(lim.finalLabel ? { label: lim.finalLabel } : {}), ...(lim.finalShown === false ? { shown: false } : {}) })
 

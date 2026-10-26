@@ -479,12 +479,16 @@ test('源码：流水线的 complete 不再给默认预算——忘了传必须�
   assert.match(SRC, /没给 maxTokens/, '忘了传要报错，不是悄悄换成更小的预算')
 })
 
-test('源码：跨轮继承的接线（判栈提前 → 同栈才继承 → 弹栈清掉）', () => {
+test('源码：跨轮继承的接线（判栈提前 → 同栈才继承 → 累积 → 弹栈清掉）', () => {
   assert.match(SRC, /import \{ readLive, writeLive, clearLive \} from '\.\/lib\/l3-live\.js'/)
-  assert.match(SRC, /if \(e && e\.type === 'live'\) writeLive\(key, e\.nodes\)/, '每轮的有效来路要落盘')
+  // 累积：以前 live 过的都留着（不是只留上一轮那批），否则讨论越走越往回退
+  assert.match(SRC, /writeLive\(key, \[\.\.\.readLive\(key\), \.\.\.e\.nodes\]\)/, '每轮的有效来路要累积落盘')
   assert.match(SRC, /stackDecision\.action === 'pushed' \? readLive\(key\) : \[\]/, '只有同栈继续才继承')
   // 判栈必须在 say 之前（弹栈那一轮不许继承）
   assert.ok(SRC.indexOf('await judgeStackTurn(key, stackUnit, citesFinal)') < SRC.indexOf('await say(userMsg'),
     '判栈要提到生成回答之前')
   assert.match(SRC, /clearLive\(bookKey\)/, '弹栈要把这段讨论的继承记忆清掉')
+  // 图上亮的 = 本轮真正交给模型的（命中 ∪ 继承）；不再只记本轮引用命中
+  assert.match(SRC, /appendGraphHit\(hitsThisRound, reason, key, msg\.timestamp\)/)
+  assert.doesNotMatch(SRC, /appendGraphHit\(valid,/)
 })
