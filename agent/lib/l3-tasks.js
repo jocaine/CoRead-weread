@@ -932,10 +932,14 @@ export async function* runTasksPipeline(deps = {}) {
 
   // 这一轮的继承增量交出去（index.js 会「并上 nodes、去掉 failed」写下一轮可继承的清单）。
   //   nodes  = 成功上报的来路节点（depth ≥ 1）：命中节点本身每轮由引用解析重新决定要不要跑
-  //   failed = 这一轮交付被拒的节点（任意深度）：用户定"这一轮无效的不再继承"
+  //   failed = 这一轮**没起作用**的节点，两种都算（2026-10-26 用户定）：
+  //            · 读了材料、交付被拒（任意深度）
+  //            · 顶层派题判「用不上」——没读正文，但派题就是这一轮唯一有资格判它有没有用的地方
+  // 只要这一轮轮到它、而它没起作用，下一轮就不再继承；没轮到它的才留在集合里。
+  const deadNodes = new Set([...refusedNodes, ...unusedHits])
   if (liveUp.size) log(`本轮有效来路 ${liveUp.size} 个：${[...liveUp].join('、')}（下一轮同栈继续时可继承）`)
-  if (refusedNodes.size) log(`本轮被拒 ${refusedNodes.size} 个：${[...refusedNodes].join('、')}（从继承集合里去掉）`)
-  emit({ type: 'live', nodes: [...liveUp], failed: [...refusedNodes] })
+  if (deadNodes.size) log(`本轮没起作用 ${deadNodes.size} 个：${[...deadNodes].join('、')}（从继承集合里去掉）`)
+  emit({ type: 'live', nodes: [...liveUp], failed: [...deadNodes] })
 
   const kept = reports.filter((r) => !r.refused)
   const cov = checkCoverage(full, kept)

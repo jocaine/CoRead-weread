@@ -161,7 +161,7 @@ export function renderTraceEvent(evt) {
       const failed = Array.isArray(e.failed) ? e.failed : []
       const parts = []
       parts.push(nodes.length ? `本轮有效来路 ${nodes.length} 个（下一轮同栈继续时继承）：${nodes.join('、')}` : '本轮没有新成功上报的来路节点')
-      if (failed.length) parts.push(`本轮被拒 ${failed.length} 个（从继承集合里去掉）：${failed.join('、')}`)
+      if (failed.length) parts.push(`本轮没起作用 ${failed.length} 个（交付被拒或判「用不上」，从继承集合里去掉）：${failed.join('、')}`)
       return `\n> ${parts.join('；')}\n`
     }
 

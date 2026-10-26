@@ -502,7 +502,8 @@ test('源码：跨轮继承的接线（判栈提前 → 同栈才继承 → 累�
   // 顶层「用不上」被整轮屏蔽的节点要留日志（先只观察，不改行为）——这段在流水线里
   assert.match(LIB_SRC, /因顶层「用不上」被整轮屏蔽/)
   assert.match(LIB_SRC, /unusedHits\.add\(p\.id\)/)
-  // 被拒的节点要在 live 事件里交出来（否则集合只增不减）
+  // 被拒的、以及顶层判「用不上」的，都要在 live 事件里交出来（否则集合只增不减）
   assert.match(LIB_SRC, /refused: true/)
-  assert.match(LIB_SRC, /failed: \[\.\.\.refusedNodes\]/)
+  assert.match(LIB_SRC, /const deadNodes = new Set\(\[\.\.\.refusedNodes, \.\.\.unusedHits\]\)/)
+  assert.match(LIB_SRC, /failed: \[\.\.\.deadNodes\]/)
 })
