@@ -164,7 +164,11 @@ test('aggregate 事件：带 kid 的是每层回归汇总，不带 kid 的老事
 
 test('live 事件：本轮有效来路要写出来（下一轮继承的依据）', () => {
   assert.match(renderTraceEvent({ type: 'live', nodes: ['n_a', 'n_b'] }), /本轮有效来路 2 个.*n_a、n_b/)
-  assert.match(renderTraceEvent({ type: 'live', nodes: [] }), /本轮没有成功上报的来路节点/)
+  assert.match(renderTraceEvent({ type: 'live', nodes: [] }), /本轮没有新成功上报的来路节点/)
+  // 被拒的节点是从继承集合里**去掉**的那批，也要看得见
+  const both = renderTraceEvent({ type: 'live', nodes: ['n_a'], failed: ['n_x'] })
+  assert.match(both, /本轮有效来路 1 个/)
+  assert.match(both, /本轮被拒 1 个（从继承集合里去掉）：n_x/)
 })
 
 test('openL3Trace：建目录、写头、按顺序追加；返回可用的文件路径', () => {

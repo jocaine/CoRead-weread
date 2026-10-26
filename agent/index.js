@@ -1247,11 +1247,16 @@ async function say(userText, options = {}) {
       // 全过程事件（调试开关打开时才有人接收，关着就是空操作）：Markdown 与脑图各收一份
       onEvent: (e) => {
         if (trace) trace.write(e); if (tree) tree.write(e)
-        // 这一轮「成功上报的来路节点」→ 记进这场讨论可继承的清单（同栈继续时才会用到）。
-        // **累积**（2026-10-26 用户定）：以前 live 过的节点都留着，不是只留上一轮那批——
-        // 否则讨论每往后走一轮，前一轮用过的那批就丢，越走越往回退。
-        // 清空只发生在弹栈/不入栈（applyStackTurn）。
-        if (e && e.type === 'live') writeLive(key, [...readLive(key), ...e.nodes])
+        // 这一轮 live 事件 → 更新这场讨论可继承的清单（同栈继续时才会用到）：
+        //   **并上**这一轮成功上报的来路节点（以前 live 过的都留着，不然讨论每往后走一轮
+        //   就丢一批，越走越往回退）；
+        //   **去掉**这一轮交付被拒的节点（用户定：这一轮无效的不再继承——光并集不够，还得做减法）。
+        // 整个集合只在弹栈/不入栈时清空（applyStackTurn）。
+        if (e && e.type === 'live') {
+          const drop = new Set(Array.isArray(e.failed) ? e.failed : [])
+          const keep = [...readLive(key), ...(Array.isArray(e.nodes) ? e.nodes : [])].filter((id) => !drop.has(id))
+          writeLive(key, keep)
+        }
       },
       // 拒绝交付 = 这条旧讨论的 point/alias 与实际内容不符（用户后面去修图谱）。
       // 单独落一个文件，攒够了一次性看哪些节点在吹牛。

@@ -818,14 +818,17 @@ export async function* runTasksPipeline(deps = {}) {
    *   ② 到深度上限 / 拒绝 / 没有未访问的父节点 → 直接把交付交上去
    *   ③ 否则：派题给父节点 → 递归 → 回归汇总（自己的交付 + 父节点回来的结果）
    *
-   * visitInner 只负责跑；外面那层 `visit` 顺手记一件事：**哪些来路节点最终成功上报了**
-   * （summary 非空、depth ≥ 1）。这一组 id 会以 live 事件发出去，下一轮可能继承它们重跑
-   * ——见 lib/l3-live.js 的说明。
+   * visitInner 只负责跑；外面那层 `visit` 顺手记两件事（都以 live 事件发出去）：
+   *   · `nodes`  = **成功上报的来路节点**（summary 非空、depth ≥ 1）→ 下一轮可以继承
+   *   · `failed` = **这一轮交付被拒的节点**（任意深度）→ 从继承集合里去掉
+   * 用户定的规则是"这一轮无效的就不再继承"，所以光并集不够，还得做减法。
    */
   const liveUp = new Set()
+  const refusedNodes = new Set()
   const visit = async (args) => {
     const r = await visitInner(args)
     if ((args.depth || 0) >= 1 && r.summary) liveUp.add(args.id)
+    if (r.refused) refusedNodes.add(args.id)
     return r
   }
   const visitInner = async ({ kid, id, point, aliases, depth, askedBy, taskText }) => {
@@ -858,7 +861,7 @@ export async function* runTasksPipeline(deps = {}) {
       if (typeof onRefusal === 'function') { try { onRefusal(r) } catch {} }
       mismatches.push(kid)
       emit({ type: 'mismatch', kid, askedBy: askedBy || '', task: taskText, point: point || '', body: mine.body || '' })
-      return { kid, summary: '', reports: [mine] }
+      return { kid, summary: '', reports: [mine], refused: true }
     }
 
     const own = String(mine.body || '').trim()
@@ -927,10 +930,12 @@ export async function* runTasksPipeline(deps = {}) {
 
   if (tripped) log(`探索阶段触发兜底闸：${tripped}（还有枝想问下去也停了，属正常保护）`)
 
-  // 这一轮「成功上报的来路节点」交出去（index.js 会把它记成下一轮可继承的清单）。
-  // 只记 depth ≥ 1 的（父节点）：命中节点本身每轮都由引用解析重新决定要不要跑。
+  // 这一轮的继承增量交出去（index.js 会「并上 nodes、去掉 failed」写下一轮可继承的清单）。
+  //   nodes  = 成功上报的来路节点（depth ≥ 1）：命中节点本身每轮由引用解析重新决定要不要跑
+  //   failed = 这一轮交付被拒的节点（任意深度）：用户定"这一轮无效的不再继承"
   if (liveUp.size) log(`本轮有效来路 ${liveUp.size} 个：${[...liveUp].join('、')}（下一轮同栈继续时可继承）`)
-  emit({ type: 'live', nodes: [...liveUp] })
+  if (refusedNodes.size) log(`本轮被拒 ${refusedNodes.size} 个：${[...refusedNodes].join('、')}（从继承集合里去掉）`)
+  emit({ type: 'live', nodes: [...liveUp], failed: [...refusedNodes] })
 
   const kept = reports.filter((r) => !r.refused)
   const cov = checkCoverage(full, kept)

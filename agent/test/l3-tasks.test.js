@@ -484,10 +484,11 @@ test('源码：流水线的 complete 不再给默认预算——忘了传必须�
   assert.match(SRC, /没给 maxTokens/, '忘了传要报错，不是悄悄换成更小的预算')
 })
 
-test('源码：跨轮继承的接线（判栈提前 → 同栈才继承 → 累积 → 弹栈清掉）', () => {
+test('源码：跨轮继承的接线（判栈提前 → 同栈才继承 → 累积减拒绝 → 弹栈清掉）', () => {
   assert.match(SRC, /import \{ readLive, writeLive, clearLive \} from '\.\/lib\/l3-live\.js'/)
-  // 累积：以前 live 过的都留着（不是只留上一轮那批），否则讨论越走越往回退
-  assert.match(SRC, /writeLive\(key, \[\.\.\.readLive\(key\), \.\.\.e\.nodes\]\)/, '每轮的有效来路要累积落盘')
+  // 累积（以前 live 过的都留着）+ 减法（这一轮被拒的去掉）——用户定"这一轮无效的不再继承"
+  assert.match(SRC, /const drop = new Set\(Array\.isArray\(e\.failed\)/)
+  assert.match(SRC, /writeLive\(key, keep\)/)
   assert.match(SRC, /stackDecision\.action === 'pushed' \? readLive\(key\) : \[\]/, '只有同栈继续才继承')
   // 判栈必须在 say 之前（弹栈那一轮不许继承）
   assert.ok(SRC.indexOf('await judgeStackTurn(key, stackUnit, citesFinal)') < SRC.indexOf('await say(userMsg'),
@@ -501,4 +502,7 @@ test('源码：跨轮继承的接线（判栈提前 → 同栈才继承 → 累�
   // 顶层「用不上」被整轮屏蔽的节点要留日志（先只观察，不改行为）——这段在流水线里
   assert.match(LIB_SRC, /因顶层「用不上」被整轮屏蔽/)
   assert.match(LIB_SRC, /unusedHits\.add\(p\.id\)/)
+  // 被拒的节点要在 live 事件里交出来（否则集合只增不减）
+  assert.match(LIB_SRC, /refused: true/)
+  assert.match(LIB_SRC, /failed: \[\.\.\.refusedNodes\]/)
 })
