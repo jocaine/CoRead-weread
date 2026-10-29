@@ -42,17 +42,22 @@ test('traceHeader：没有命中/没有问题也不留空壳', () => {
   assert.doesNotMatch(md, /\*\*本轮提问\*\*\n\n```\n\n```/)
 })
 
-test('draft 事件：草稿全文 + 方向列表（草稿是最关键的一步，不能只报字数）', () => {
-  const md = renderTraceEvent({ type: 'draft', raw: '【方向：甲】\n- 要点一', chars: 12, directions: ['甲'], ms: 4200 })
+test('draft 事件：草稿全文 + 骨架（总 → 步 → 收）', () => {
+  const md = renderTraceEvent({
+    type: 'draft', raw: '总：甲\n第1步：乙\n   验：无\n收：丙', chars: 12,
+    spine: { thesis: '甲', steps: ['乙'], closing: '丙' }, ms: 4200,
+  })
   assert.match(md, /① R1 草稿/)
-  assert.match(md, /篇幅：12 字｜1 个方向｜耗时 4\.2s/)
-  assert.match(md, /方向：「甲」/)
-  assert.match(md, /【方向：甲】\n- 要点一/, '草稿全文要原样进记录')
+  assert.match(md, /篇幅：12 字｜耗时 4\.2s/)
+  assert.match(md, /骨架：总「甲」→ 1 步 → 收「丙」/)
+  assert.match(md, /总：甲\n第1步：乙\n   验：无\n收：丙/, '草稿全文要原样进记录')
 })
 
-test('draft 事件：没解析出方向也要说清（否则看的人以为是漏了）', () => {
+test('draft 事件：没骨架也要说清；旧的方向形状仍能显示（打开历史记录时不至于空白）', () => {
   const md = renderTraceEvent({ type: 'draft', raw: '一段没标记的草稿', chars: 8, directions: [] })
-  assert.match(md, /没解析出【方向：】标记/)
+  assert.match(md, /没解析出总\/步\/收/)
+  const legacy = renderTraceEvent({ type: 'draft', raw: '【方向：甲】\n- 要点', chars: 8, directions: ['甲'] })
+  assert.match(legacy, /方向：「甲」/)
 })
 
 test('report 事件：材料规模、派给它的题、正文都在', () => {
@@ -157,6 +162,15 @@ test('dispatch 事件：派题要看得见每条候选派了什么（不许渲�
   assert.match(md, /要它交出当时讲接住的那段/)
 })
 
+test('search 事件：联网查了几处、可用几条要写出来（"没查"和"查了没结果"是两回事）', () => {
+  const md = renderTraceEvent({ type: 'search', queries: 3, requests: 3, results: 15, kept: 7, chars: 2100, ms: 420, error: '' })
+  assert.doesNotMatch(md, /未知事件/)
+  assert.match(md, /联网验证：查 3 处 → 可用 7 条 \/ 原始 15 条/)
+  assert.match(md, /420ms/)
+  const bad = renderTraceEvent({ type: 'search', error: '搜索接口 HTTP 402: Insufficient Balance' })
+  assert.match(bad, /这一轮没成功（搜索接口 HTTP 402/)
+})
+
 test('aggregate 事件：带 kid 的是每层回归汇总，不带 kid 的老事件才是 R4 的输入', () => {
   assert.match(renderTraceEvent({ type: 'aggregate', kid: 'K-1', message: '中转记录' }), /回归汇总 · K-1/)
   assert.match(renderTraceEvent({ type: 'aggregate', message: '草稿+报告' }), /R4 的输入/)
@@ -169,6 +183,31 @@ test('live 事件：本轮有效来路要写出来（下一轮继承的依据）
   const both = renderTraceEvent({ type: 'live', nodes: ['n_a'], failed: ['n_x'] })
   assert.match(both, /本轮有效来路 1 个/)
   assert.match(both, /本轮没起作用 1 个（交付被拒或判「用不上」，从继承集合里去掉）：n_x/)
+})
+
+test('used 事件：图上亮的清单要写出来（只含这一轮读过且交上料的）', () => {
+  // 命中 1 个 + 往下追读到的父节点 1 个 → 图上亮 2 个
+  const md = renderTraceEvent({ type: 'used', nodes: ['n_a', 'n_p'], hits: ['n_a'] })
+  assert.match(md, /图命中只亮 2 个/)
+  assert.match(md, /n_a、n_p/)
+  assert.match(md, /其中本轮命中 1 个，其余是往下追读到的父节点/)
+  // 一个都没交上料：写"无"，不写一个空清单
+  assert.match(renderTraceEvent({ type: 'used', nodes: [], hits: [] }), /图命中只亮 0 个.*：无/)
+})
+
+test('sources 事件：材料条目要记下来（正文里的 [n] 点开看的就是它们）', () => {
+  const md = renderTraceEvent({
+    type: 'sources',
+    items: [
+      { n: 1, title: '部39号令详解', site: '自然资源部', url: 'https://www.mnr.gov.cn/x.html' },
+      { n: 2, title: '预算法', site: '江苏省人民政府', url: 'https://jtyst.jiangsu.gov.cn/y.html' },
+    ],
+  })
+  assert.match(md, /材料条目.*2 条/)
+  assert.match(md, /- \[1\] 部39号令详解（自然资源部） — https:\/\/www\.mnr\.gov\.cn\/x\.html/)
+  assert.match(md, /- \[2\] 预算法（江苏省人民政府）/)
+  // 一条都没有时整段不出现（没联网的回合不该多出一句空话）
+  assert.equal(renderTraceEvent({ type: 'sources', items: [] }), '')
 })
 
 test('openL3Trace：建目录、写头、按顺序追加；返回可用的文件路径', () => {

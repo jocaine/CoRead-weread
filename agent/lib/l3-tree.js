@@ -21,8 +21,11 @@ const C = {
   draft: { fill: '#f3eee3', stroke: '#b9ae97', text: '#3a352c', sub: '#6b6250' },
   ok: { fill: '#e8f2ea', stroke: '#4f8a5b', text: '#22402b', sub: '#4a6a52' },      // 补充
   fix: { fill: '#fdf0e0', stroke: '#c08a3e', text: '#4a3520', sub: '#7a6440' },     // 校正
-  none: { fill: '#f1f1ef', stroke: '#a8a8a2', text: '#4a4a45', sub: '#7d7d76' },    // 无
-  ghost: { fill: '#fafaf8', stroke: '#cfcfc8', text: '#8e8e86', sub: '#a8a8a0' },   // 未追
+  // 2026-10-27：辅助行的字号只有 10px，原来的 #7d7d76 在这张纸色上只有约 3.6:1，
+  // 10px 下基本是灰雾。压深到约 5.3:1——仍然比正文淡，但要读得清。
+  none: { fill: '#f1f1ef', stroke: '#a8a8a2', text: '#3f3f3a', sub: '#5c5c55' },    // 无
+  // 虚线节点（没往下追的那几枝）本来就该退后，但不能退到看不清：#a8a8a0 只有 2.4:1
+  ghost: { fill: '#fafaf8', stroke: '#cfcfc8', text: '#6f6f67', sub: '#7a7a72' },   // 未追
   answer: { fill: '#e9eefb', stroke: '#5b6fa8', text: '#1e2a44', sub: '#46557a' },
 }
 
@@ -32,7 +35,7 @@ const esc = (s) => String(s == null ? '' : s)
 const nf = new Intl.NumberFormat('en-US')
 const clip = (s, n) => { const t = String(s || ''); return t.length > n ? t.slice(0, n) + '…' : t }
 /** 视觉宽度：中日韩字符算 1，其余算 0.55（够用来折行，不需要真实字形度量） */
-const widthOf = (s) => [...String(s)].reduce((n, ch) => n + (/[\u2e80-\u9fff\uff00-\uffef]/.test(ch) ? 1 : 0.55), 0)
+export const widthOf = (s) => [...String(s)].reduce((n, ch) => n + (/[\u2e80-\u9fff\uff00-\uffef]/.test(ch) ? 1 : 0.55), 0)
 /** 按视觉宽度折行（SVG 不会自动换行，得自己折） */
 function wrap(text, maxUnits, maxLines = 99) {
   const out = []
@@ -61,7 +64,7 @@ function wrap(text, maxUnits, maxLines = 99) {
  * 也各生成一个 ghost 节点——**它们才是这张图的价值**：一眼看出哪一枝被剪掉、剪的是谁。
  */
 export function buildTraceTree(events = [], meta = {}) {
-  const draft = { type: 'draft', chars: 0, directions: [], raw: '' }
+  const draft = { type: 'draft', chars: 0, directions: [], spine: null, raw: '' }
   const nodes = new Map()          // kid → 节点
   const order = []                 // 根级课题（按命中顺序）
   const pendingKids = new Map()    // 判了"要追"、但报告还没来（撞闸/失败）的课题
@@ -89,6 +92,7 @@ export function buildTraceTree(events = [], meta = {}) {
       draft.raw = e.raw || ''
       draft.chars = e.chars || 0
       draft.directions = Array.isArray(e.directions) ? e.directions : []
+      draft.spine = e.spine && typeof e.spine === 'object' ? e.spine : null
       draft.ms = e.ms
     } else if (e.type === 'report') {
       // 父子关系靠"谁点的题"（askedBy）：K-1.1 是 K-1 点走的
@@ -107,7 +111,7 @@ export function buildTraceTree(events = [], meta = {}) {
       })
       pendingKids.delete(e.kid)   // 报告来了，"等报告"的标记撤掉
     } else if (e.type === 'ask') {
-      // 派题：有缺口的那个看过候选材料后，决定问谁、问什么
+      // 派题：有缺口的那个看过候选目录后，决定问谁、问什么
       const n = ensureNode(e.kid, '')
       // 命中层出现 skipped、而这个节点从没有过正文/拒绝 → 派题侧没给它派题（不是"问了没答"）
       if ((e.depth ?? 0) === 0 && e.skipped && !n.body && !n.refused) n.noTask = true
@@ -185,29 +189,54 @@ const LH = 17
 const COL = 440
 const GAP = 18
 
+/**
+ * 一行最多放几个"视觉单位"——**必须跟着字号算**（2026-10-27 修）。
+ *
+ * 原来这里全是写死的 30：13px 的字 30 字就是 390px，而框里只有 368px 可用，
+ * 于是每一行 point 都撑出节点框、压到边框上。实测一份真实树里 32 行有 3 行溢出。
+ * 现在按 (框宽 - 左右内边距 - 一点余量) / 字号 算，任何字号都不会溢出。
+ */
+const wrapUnits = (size) => Math.max(8, Math.floor((NODE_W - PAD * 2 - 6) / size))
+
 /** 一个节点要画哪几行（同时决定高度）。返回 [{text,size,bold,color}] */
 function linesOf(n) {
   const out = []
   const push = (text, size, color, bold = false) => out.push({ text, size, color, bold })
+  /** 这个字号的折行宽度（见 wrapUnits：写死 30 会撑破框） */
+  const W = wrapUnits
   if (n.kind === 'root') {
     push('本轮提问', 11, C.root.sub)
-    for (const l of wrap(n.text, 30)) push(l, 14, C.root.text, true)
+    // 提问可能很长：最多 4 行。根节点撑高会把整棵树往下拖
+    const q = wrap(n.text, W(14))
+    for (const l of q.slice(0, 4)) push(l, 14, C.root.text, true)
+    if (q.length > 4) push('…（全文见下方）', 10, C.root.sub)
     return out
   }
   if (n.kind === 'draft') {
+    const sp = n.spine && typeof n.spine === 'object' ? n.spine : {}
+    const steps = Array.isArray(sp.steps) ? sp.steps.filter(Boolean) : []
+    const hasSpine = Boolean(String(sp.thesis || '').trim() && steps.length)
+    if (hasSpine) {
+      // 2026-10-28：脑图先画骨架（总 → 几步 → 收），不再报"0 个方向"——
+      // 「方向」是旧形状，现在的草稿根本没有这个标记，报 0 会让人以为草稿没写。
+      push(`① R1 骨架 · ${nf.format(n.chars)} 字 · ${steps.length} 步`, 12, C.draft.sub, true)
+      const thesis = String(sp.thesis || '').trim()
+      for (const l of wrap(`总：${thesis}`, W(11), 2)) push(l, 11, C.draft.sub)
+      return out
+    }
     push(`① R1 草稿 · ${nf.format(n.chars)} 字 · ${n.directions.length} 个方向`, 12, C.draft.sub, true)
-    const dirs = n.directions.length ? n.directions.join('、') : '（没解析出方向标记）'
-    for (const l of wrap(dirs, 30, 2)) push(l, 11, C.draft.sub)
+    const dirs = n.directions.length ? n.directions.join('、') : '（没解析出骨架）'
+    for (const l of wrap(dirs, W(11), 2)) push(l, 11, C.draft.sub)
     return out
   }
   if (n.kind === 'direction') {
-    for (const l of wrap(n.text, 30, 3)) push(l, 12, C.draft.text)
+    for (const l of wrap(n.text, W(12), 3)) push(l, 12, C.draft.text)
     return out
   }
   if (n.kind === 'answer') {
     const head = n.label || '④ 终稿'
     push(`${head} · ${nf.format(n.chars)} 字`, 12, C.answer.sub, true)
-    const full = wrap(n.text, 30)
+    const full = wrap(n.text, W(11))
     for (const l of full.slice(0, n.shown ? 6 : 4)) push(l, 11, C.answer.sub)
     if (full.length > (n.shown ? 6 : 4)) push('（全文见下方「全文」区）', 10, C.answer.sub)
     if (n.coverage.length) push(`覆盖度 ${n.coverage.map((c) => `${c.kid} ${Math.round(c.ratio * 100)}%`).join(' · ')}`, 10, C.answer.sub)
@@ -220,24 +249,34 @@ function linesOf(n) {
   push(`${n.kid} 〔${tag}〕`, 11, n.ghost ? C.ghost.sub : C.none.sub, true)
   if (n.ghost) {
     // 被剪掉的枝只留一行：图上要的是"这里断了一枝 + 断的是谁"，不是它的全文
-    for (const l of wrap(n.point || '', 26)) push(l, 12, C.ghost.text)
+    for (const l of wrap(n.point || '', W(12))) push(l, 12, C.ghost.text)
     return out
   }
-  for (const l of wrap(n.point || '', 30)) push(l, 13, C.none.text, true)
+  for (const l of wrap(n.point || '', W(13))) push(l, 13, C.none.text, true)
   push(`材料 ${nf.format(n.materialChars)} 字${n.truncated ? '（已截断）' : ''}${n.ms != null ? ` · R2 ${(n.ms / 1000).toFixed(1)}s` : ''}`, 10, C.none.sub)
   // 派给它的**课题**：这是"这一枝在查什么"，没有它，图只能看出"查了哪个知识点"
   if (n.task) {
     // 每层都有一道题：命中层由 R1 派，更早的是子节点派的
-    const tLines = wrap(String(n.task).replace(/\*\*/g, ''), 28)
-    tLines[0] = `课题（${n.taskFrom || '上游'} 派）：` + tLines[0]
-    for (const l of tLines) push(l, 10, C.fix.sub)
+    // 前缀**参与折行**：先 wrap 再拼前缀的话，第一行会多出七八个字、直接撑破框（实测过）
+    const prefix = `课题（${n.taskFrom || '上游'} 派）：`
+    const full = wrap(prefix + String(n.task).replace(/\*\*/g, ''), W(10))
+    for (const l of full.slice(0, 5)) push(l, 10, C.fix.sub)
+    if (full.length > 5) push('…（全文见下方）', 10, C.fix.sub)
   }
   // 这一面：当前提问要的是哪一面、这段够不够
 
   if (n.refused) push(`🛑 拒绝交付：${n.refuseWhy || '这段没谈过这件事'}（point/alias 与实际内容不符，待修）`, 10, '#a8452f', true)
-  if (n.body) for (const l of wrap(n.body, 30)) push(l, 11, C.none.text)
+  // 正文最多 8 行（2026-10-27）：R2 的登记常有二三百字，整段铺开会把节点拉成一条竖条，
+  // 而这张图的用处是看结构；要看全在下面的「全文」区。
+  // 正文前面加一条发丝线：一个框里堆着标题/材料/课题/正文四种字号，不分开扫不出层次。
+  if (n.body) {
+    out.push({ rule: true })
+    const bLines = wrap(n.body, W(11))
+    for (const l of bLines.slice(0, 8)) push(l, 11, C.none.text)
+    if (bLines.length > 8) push('…（全文见下方「全文」区）', 10, C.none.sub)
+  }
   if (n.mismatch) {
-    for (const l of wrap(`⚠️ 概述与正文不一致：上一条照这里的标题来问「${n.mismatch.aspect}」，正文里没有`, 28)) {
+    for (const l of wrap(`⚠️ 概述与正文不一致：上一条照这里的标题来问「${n.mismatch.aspect}」，正文里没有`, W(10))) {
       push(l, 10, '#a8452f')
     }
   }
@@ -304,10 +343,22 @@ export function buildDisplayRoot(tree) {
   const t = tree || {}
   const root = { kind: 'root', text: t.question || '（没有抓到提问）', children: [] }
   const children = []
-  if (t.draft && (t.draft.chars || (t.draft.directions || []).length)) {
+  const sp = t.draft && t.draft.spine && typeof t.draft.spine === 'object' ? t.draft.spine : {}
+  const steps = Array.isArray(sp.steps) ? sp.steps.filter(Boolean) : []
+  const hasSpine = Boolean(String(sp.thesis || '').trim() && steps.length)
+  if (t.draft && (t.draft.chars || (t.draft.directions || []).length || hasSpine)) {
+    // 有骨架：把「总 → 第N步 → 收」画成子节点，脑图上一眼能看出这一轮的主线；
+    // 没有骨架（旧记录）：退回原来的方向列表。
+    const spineChildren = hasSpine
+      ? [
+        ...steps.map((s, i) => ({ kind: 'direction', text: `第${i + 1}步：${s}` })),
+        ...(String(sp.closing || '').trim() ? [{ kind: 'direction', text: `收：${String(sp.closing).trim()}` }] : []),
+      ]
+      : (t.draft.directions || []).map((d) => ({ kind: 'direction', text: d }))
     children.push({
       kind: 'draft', chars: t.draft.chars || 0, directions: t.draft.directions || [],
-      children: (t.draft.directions || []).map((d) => ({ kind: 'direction', text: d })),
+      spine: hasSpine ? { thesis: sp.thesis, steps, closing: sp.closing || '' } : null,
+      children: spineChildren,
     })
   }
   for (const n of t.tasks || []) children.push(n)
@@ -331,6 +382,12 @@ function drawNode(n, out) {
   out.push(`<g class="n"><rect x="${n.x}" y="${n.y}" width="${n.w}" height="${n.h}" rx="9" fill="${p.fill}" stroke="${p.stroke}" stroke-width="${n.kind === 'root' ? 0 : 1.2}"${dash}/>`)
   let y = n.y + PAD + 12
   for (const l of n.lines) {
+    // 发丝分隔线：把一个框里的"元信息 / 课题 / 正文"分开，扫的时候才有层次
+    if (l.rule) {
+      out.push(`<line x1="${n.x + PAD}" y1="${y - 11}" x2="${n.x + n.w - PAD}" y2="${y - 11}" stroke="#ddd7c9" stroke-width="1"/>`)
+      y += LH
+      continue
+    }
     out.push(`<text x="${n.x + PAD}" y="${y}" font-size="${l.size}" font-weight="${l.bold ? 600 : 400}" fill="${l.color}">${esc(l.text)}</text>`)
     y += LH
   }
@@ -441,7 +498,7 @@ export function renderTreeHtml({ tree, meta = {} } = {}) {
     ${badges}
   </div>
   ${t.stats ? `<div class="meta">${esc(t.stats)}</div>` : ''}
-  <p class="hint">节点是课题（虚线＝R3 判"不值得追"，这枝到此为止）。Ctrl+滚轮缩放，Ctrl+P 可打印。</p>
+  <p class="hint">节点是课题（虚线＝派题判"不值得追"，这枝到此为止）。Ctrl+滚轮缩放，Ctrl+P 可打印。</p>
 </header>
 <div class="wrap">
 <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="命题递归脑图">

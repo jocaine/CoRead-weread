@@ -16,7 +16,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildTraceTree, buildDisplayRoot, layoutTree, renderTreeHtml, openL3Tree } from '../lib/l3-tree.js'
+import { buildTraceTree, buildDisplayRoot, layoutTree, renderTreeHtml, openL3Tree, widthOf } from '../lib/l3-tree.js'
 
 const EV = [
   { type: 'draft', raw: '【方向：甲】\n- 要点', chars: 12, directions: ['甲', '乙'], ms: 4200 },
@@ -103,6 +103,23 @@ test('buildTraceTree：空事件流也不炸（页面先打开、事件还没来
   assert.equal(t.answer, null)
   const html = renderTreeHtml({ tree: t, meta: {} })
   assert.match(html, /没有走命题递归/)
+})
+
+test('buildDisplayRoot：有骨架时画"总 → 步 → 收"，不再报 0 个方向', () => {
+  const t = buildTraceTree([
+    {
+      type: 'draft', raw: '总：甲\n第1步：乙\n第2步：丙\n收：丁', chars: 20,
+      spine: { thesis: '甲', steps: ['乙', '丙'], closing: '丁' },
+    },
+  ], { question: '提问' })
+  const root = buildDisplayRoot(t)
+  const d = root.children.find((c) => c.kind === 'draft')
+  assert.ok(d, '骨架节点要在图上')
+  assert.deepEqual(d.children.map((c) => c.text), ['第1步：乙', '第2步：丙', '收：丁'])
+  const html = renderTreeHtml({ tree: t, meta: {} })
+  assert.match(html, /R1 骨架/)
+  assert.match(html, /总：甲/, '总判断要印在骨架节点上')
+  assert.doesNotMatch(html, /0 个方向/, '有骨架就不该再报旧形状的 0 个方向')
 })
 
 test('layoutTree：节点不重叠、子节点在父节点右边、坐标都是有限数', () => {
@@ -217,4 +234,50 @@ test('openL3Tree：目录不可用时静默降级（图画不出来，回答不�
   assert.equal(t.file, '')
   assert.doesNotThrow(() => t.write({ type: 'draft', chars: 1, directions: [] }))
   assert.doesNotThrow(() => t.render())
+})
+
+// ── 版式：字要装得进框里（2026-10-27 用户：脑图"看得挺难受"）────────────────────
+// 实测当时一份真实形状的树里，32 行有 3 行撑出节点框：提问行 420px、两个 13px 的 point 行
+// 390px，而框内只有 368px 可用。成因是 wrap() 的字数上限写死 30、跟字号无关。
+const LONG_EV = [
+  { type: 'draft', raw: 'x', chars: 802, directions: ['便利资本原始积累与政府自我积累是同一动作的两面'] },
+  {
+    type: 'report', kid: 'K-1', depth: 0, materialChars: 8035, truncated: true, ms: 6100,
+    point: '恩格斯列宁关于国家镇压特殊力量与无产阶级专政代替标准在中国既压资本又压劳动现实中因代替主体空缺而一半超额满足一半被抽空的适用机制',
+    task: '用「国家镇压的特殊力量」这个判据，量一量土地财政里地方政府的角色：它是在替资本积累开路，还是在自己的账本上算账？',
+    taskFrom: 'R1',
+    // 故意写长（远超 8 行）：要测的就是"长正文会被收住、并指向下面的全文区"
+    body: '那次讨论把土地财政拆成两头：一头把农民从土地上分出来，供给劳动力；一头把地便宜地供给资本，压低它的成本。并且指出成本最终落在被征地的一方，以及买房的城市劳动者身上。讨论还停在「这算不算国家替资本垫付」这一步，没有再往下问谁在桌上、谁只承担成本。'.repeat(4),
+  },
+  { type: 'final', text: '这是终稿'.repeat(80), coverage: [{ kid: 'K-1', ratio: 0.61 }] },
+]
+const longQuestion = '村集体和国有土地是并列的吗？政府怎么开始征收农民土地，靠土地市场化？这两件事在同一个环节上，我不太分得清'
+
+test('版式：任何一行文字都不许撑出节点框', () => {
+  const root = buildDisplayRoot(buildTraceTree(LONG_EV, { question: longQuestion }))
+  const { nodes } = layoutTree(root)
+  const PAD = 12
+  const bad = []
+  for (const n of nodes) {
+    for (const l of n.lines || []) {
+      const w = widthOf(l.text) * l.size
+      if (PAD + w > n.w) bad.push(`${n.kid || n.kind}：${l.size}px 的「${l.text.slice(0, 14)}…」占 ${Math.round(w)}px，框内只有 ${n.w - PAD}px`)
+    }
+  }
+  assert.deepEqual(bad, [], '这些行撑出了节点框：\n' + bad.join('\n'))
+})
+
+test('版式：长正文要收在 8 行以内，并指向下面的「全文」区', () => {
+  const root = buildDisplayRoot(buildTraceTree(LONG_EV, { question: longQuestion }))
+  const { nodes } = layoutTree(root)
+  const k1 = nodes.find((n) => n.kid === 'K-1')
+  assert.ok(k1, '要有 K-1 这个节点')
+  const bodyLines = k1.lines.filter((l) => l.size === 11 && l.color === '#3f3f3a')
+  assert.ok(bodyLines.length <= 8, `正文最多 8 行，现在是 ${bodyLines.length} 行`)
+  assert.ok(k1.lines.some((l) => /全文见下方/.test(l.text)), '收掉的部分要指向「全文」区，不能凭空消失')
+  assert.ok(k1.lines.some((l) => l.rule), '正文前要有分隔线：一个框里四种字号，不分开扫不出层次')
+  // 长提问同理：最多 4 行
+  const rootNode = nodes.find((n) => n.kind === 'root')
+  const qLines = rootNode.lines.filter((l) => l.size === 14)
+  assert.ok(qLines.length <= 4, `提问最多 4 行，现在是 ${qLines.length} 行`)
 })

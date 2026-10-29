@@ -8,10 +8,10 @@
  * 46k/轮，一天约 1.1M 全是它）。
  *
  * 这里把它拆成四步：
- *   R1 草稿：全历史 + 命中节点的**标题**（不给正文）→ 内部工作稿，用户看不到
+ *   R1 草稿：全历史 + 本轮问题 + 画像（不看命中标题）→ 内部工作稿（总判断 → 几步 → 收口），用户看不到
  *   R2 课题：一个节点一个课题，单独一次小调用读该节点原话 → 固定字段的报告
  *   R3 判父：每个分支每层一次，判"更早那层值不值得追"；判否 → 整枝结束，一次调用都不再花
- *   R4 汇总：草稿 + 全部报告 → 终稿，**流式**，是用户唯一看到的东西
+ *   R4 终稿：草稿 + 全部报告 → **一整篇回答**，流式，是用户唯一看到的东西（不是"把两块并起来"的汇总）
  *
  * 关键约束：
  * - 材料与报告只活在这一轮，**不进历史**（进了历史就又变成"每轮重发"的老毛病）。
@@ -90,22 +90,65 @@ export function buildMaterials(node, opts = {}) {
 // ── R1 草稿 ────────────────────────────────────────────────────────────────
 /**
  * R1 的说明块（插在 persona 之后、【本轮消息】之前）。
- * 只给命中节点的**标题**：正文交给 R2，草稿才不会被"一大段原文"牵着走。
+ * 2026-10-29 用户定：**不再列命中节点的标题**——派题那一步自己看候选目录；R1 只写骨架，
+ * 不提前知道"手边有哪些旧讨论"，免得草稿被候选标题带着走。
  *
  * 2026-10-26：**只写判断，不写论证**。实测草稿与终稿一样长（1,860 / 1,976 字），
  * 等于把整篇答案先写一遍再重写一遍；而它的实际用途只有两个——让派题看出缺哪一处、
  * 给终稿当底稿。所以压掉"为什么成立、例子怎么讲开"这部分（那本来就是终稿的活），
  * 判断、人名、书名、数字照留。
+ *
+ * 2026-10-28：**草稿要有骨架，不再是一张平铺的判断清单**。用户对比旧路径的回答后发现
+ * 新路径"整体的逻辑性框架性下降"（同一道题：旧路径写"四件事+三条折扣+一句收"，新路径
+ * 开头说"两类"、下面列出五类，五条还是并排的话题）。根因在 R1：它只列编号判断、明令
+ * "不写分节标题"，于是每条都是独立结论，终稿只能一条一段地平铺。现在 R1 先交一句总判断、
+ * 二到四步、一句收口，后一步从前一步的结论里长出来；R4 照这条线写。步骤仍然是判断，
+ * 不是论证——这一步"只写判断"的约定没有放宽。
+ *
+ * 2026-10-29 用户纠正：**长期议题不是用来"围绕"的**。它只是让 AI 参考使用者的逻辑偏好、
+ * 理论背景、思维习惯，不是可以直接被具体围绕的对象，也不能拿它替这一轮的题目。
+ * 所以上一版"先选线、写接的议题/位置"的改法整条撤回：R1 仍是总/步/收，画像只用来定
+ * **怎么搭**（从哪切入、先拆什么、哪些要解释、举什么例子），不决定**搭什么**。
  */
 export function buildDraftBrief() {
-  return [
-    '（这是内部工作稿，不是给用户的回复：没人会读它，所以不必顾虑措辞、体面、语气——',
-    '  写清楚比写好看重要得多；它唯一的读者是接下来要用它的程序。）',
+  const lines = [
+    '【要办的事】给下面这条提问搭一张内部草稿：一句总判断、几步、一句收口，末尾附一份待查清单。不是写回答。',
+    '（内部草稿，用户不会读，不必顾虑措辞。）',
     '',
-    '[本轮草稿] 把这一轮**打算怎么答**写出来：只写判断，不写论证。',
-    '· 用最直白的说法：谁、做了什么、因为什么、结果怎样；判断越具体越好，人名、书名、例子、数字直接写；',
-    '· 一个判断写一条，一条一行；它为什么成立、有没有反例、例子怎么讲开——这些留给终稿，草稿不写。',
-  ].join('\n')
+    '写草稿的规矩：',
+    '· 总判断一句，能被反驳；不是"这个问题很重要"，也不是"有几种做法"。',
+    '· 步数由这一问的转折数决定，不设目标：两步能说清就两步，需要几步写几步；不要照抄模板或例子的步数。',
+    '· 第1步从总判断里分出第一层；之后每一步只做一件事，后一步从前一步的结论往下走。把各步连起来读，要是一句推理，不是并列的几个方面；全篇只有一条主线。',
+    '· 写完删一遍：删掉后链条仍成立的步骤删掉；一步里塞了两个转折的拆开。',
+    '· 收口一句：总判断成立到什么程度，或者被材料改成了什么。',
+    '· 总、步、收都只写判断：不写评价、不写"为什么"、不写"比如"、不另加小标题；具体数据（年份、金额、法条号、机构名）都不写，留给待查。',
+    '· 末尾另起一块"待查"：只列具体事实（年份、文件、数字、机构），一条一行，用"验："开头；总、步、收里的事实都算，不限步数。没有具体事实就写"待查：无"，不要每一步都写无。前面这轮对话里已经落到具体出处的，不再列。',
+    '· "验"行要带年代：搜索读不懂"当时"。',
+    '· 写完对一遍提问：问到的每一面链上有没有位置？没有的，先看能不能并进现有某一步的一句里；只有真的多一个转折，才新开一步。链上每个具体事实待查里有没有一行？没有的补；待查里没有对应事实的行删掉。',
+    '· 上一块【背景档案】里的画像只用来定怎么搭（他的逻辑偏好、理论背景、思维习惯）：从哪切入、先拆什么、哪些要解释、举什么例子；长期议题只当背景，不要围绕它们写，也不要为了贴合它改判断；题目永远是下面这条提问。',
+    '· 用户说"继续说/然后/接着"时，第1步从上一轮停下的地方开始，已经讲过的不要再列；前面已经立住一条主线时，接着它往下走，不要每轮重新起头，只有换了问题才另起。',
+    '',
+    '--- 例子（内容无关，只看形状）---',
+    '提问：这道汤为什么这么鲜？',
+    '总：这锅汤鲜，不是某一种料下得多，是两路鲜味叠在一起。',
+    '第1步：把两路鲜味分开：火腿给肌苷酸，笋给鸟苷酸',
+    '第2步：把两路合起来看：叠在一起比单放一样更鲜，所以两样都得有',
+    '收：所以鲜不鲜看的是搭配，不是火腿放得多不多。',
+    '待查：',
+    '验：这两种物质叠在一起会不会放大鲜味（1980年代以来的食品化学研究）',
+    '验：火腿的现行国家标准对陈放期怎么规定（现行版本）',
+    '（例子结束：这个例子两步就够，第三步并进了第二步，因为它不是新的转折。）',
+    '',
+    '--- 输出 ---',
+    '只输出下面这些行，不要标题、不要解释：',
+    '总：',
+    '第1步：',
+    '第2步：',
+    '收：',
+    '待查：',
+    '验：',
+  ]
+  return lines.join('\n')
 }
 
 /**
@@ -151,7 +194,7 @@ export function buildDraftBrief() {
  *
  * 三条不可动摇的约定（2026-10-26 用户校准）：
  *   ① 缺口只按**原始提问**算；当前层的提问只是"本节点被要求交什么"，不能代替原始提问；
- *   ② 「能补」必须落在候选材料里**已有的那句话**上，不许要它推导、补写、拼合；
+ *   ② 「能补」必须落在候选目录里**已有的说法**上，不许要它推导、补写、拼合；
  *   ③ 补不上就写「无」，这一枝不派。
  */
 /**
@@ -221,12 +264,13 @@ export function buildDispatchBrief({ question = '', points = [], version = '', l
       '           材料有限，它必然不完整，也可能答偏：',
     )
   } else {
-    lines.push('【原始草稿】这是目前对【原始提问】的第一次回答；没有经过【候选材料】的补充，必然不完整，也可能答偏：')
+    lines.push('【原始草稿】这是目前对【原始提问】的第一次回答；没有经过【候选目录】的补充，必然不完整，也可能答偏：')
   }
   lines.push(
-    String(version || '').slice(0, TASK_LIMITS.maxDraftChars) || '（空）',
+    // 剥掉「验：」行：那是给联网验证的清单，不是派题要看的缺口（见 stripVerify 注释）
+    stripVerify(String(version || '')).slice(0, TASK_LIMITS.maxDraftChars) || '（空）',
     '',
-    '【候选材料】下面每一条是另一段对话的记录；编号列出的是那段对话里当时已经说过的话：',
+    '【候选目录】下面每一条是另一段对话的记录：一个标题，加几行它当时留下的说法（编号是索引，不是正文）：',
   )
   for (const p of points) {
     lines.push(`· ${p.kid}「${p.point}」`)
@@ -256,7 +300,7 @@ export function buildDispatchBrief({ question = '', points = [], version = '', l
     '',
     '--- 输出 ---',
     '',
-    `下面是这一轮的材料，每条材料占一行，顺序照上面，共 ${kids.length} 行，不要别的内容：`,
+    `下面是这一轮的候选，每条候选占一行，顺序照上面，共 ${kids.length} 行，不要别的内容：`,
     ...kids.map((k) => `${k}：`),
   )
   return lines.join('\n')
@@ -284,6 +328,10 @@ export function parseDraftTasks(text, kids = []) {
 /**
  * 解析草稿的方向分段。认不出【方向：】标记时 directions 为空，raw 仍然可用
  * （R4 直接整合 raw；报告只用于补内容，不会因为解析不出方向就丢）。
+ *
+ * 2026-10-28 起草稿的主形状是「总 / 第N步 / 收」，方向分段是旧形状，保留解析只为
+ * 兼容历史记录与旧测试。thesis / steps / closing 只用于**记录与日志**（trace 里能看见
+ * 这一轮有没有一条主线），R4 拿到的仍是 raw 全文，不另做拼装。
  */
 export function parseDraft(text) {
   const raw = String(text || '').trim()
@@ -294,7 +342,46 @@ export function parseDraft(text) {
     const end = i + 1 < marks.length ? marks[i + 1].index : raw.length
     return { name: m[1].trim(), body: raw.slice(start, end).trim() }
   })
-  return { raw, directions }
+  const one = (re2) => {
+    const m = raw.match(re2)
+    return m ? m[1].trim() : ''
+  }
+  const thesis = one(/^(?:总判断|总)\s*[:：]\s*(.+)$/m)
+  const closing = one(/^(?:收口|收)\s*[:：]\s*(.+)$/m)
+  const steps = [...raw.matchAll(/^第\s*[一二三四五六七八九十\d]+\s*步\s*[:：]\s*(.+)$/gm)]
+    .map((m) => m[1].trim())
+    .filter(Boolean)
+  return { raw, directions, thesis, closing, steps }
+}
+
+/**
+ * 剥掉大纲里的「待查」块和「验：…」行（2026-10-27，2026-10-29 加待查块）。
+ *
+ * 为什么必须剥：派题的输入就是草稿 raw，它的任务是"看这份草稿还差在哪一处"。
+ * 草稿里躺着一行「验：征地补偿标准要查」，派题会读成"缺口已经写明了"，于是不派题。
+ * 缺口归派题判，验什么归联网验证判——两件事，别让一边看见另一边的清单。
+ * 「待查：」只是那块的表头，一起剥；「待查：无」也一并去掉。
+ */
+export function stripVerify(text) {
+  return String(text || '')
+    .replace(/^[ \t]*待查[ \t]*[:：].*$/gm, '')     // 待查表头（含「待查：无」）
+    .replace(/^[ \t]*验[ \t]*[:：].*$/gm, '')       // 独占一行
+    .replace(/[ \t]*验[ \t]*[:：][^\n]*/g, '')       // 跟判断写在同一行
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+/**
+ * 抽大纲里的「验」行 = 这一轮要联网确认的几处（给搜索当查询种子）。
+ * 写「无」的不算。返回去重后的字符串数组，顺序照大纲。
+ */
+export function parseVerifyLines(draft) {
+  const out = []
+  for (const m of String(draft || '').matchAll(/验\s*[:：]\s*([^\n]+)/g)) {
+    const t = m[1].trim()
+    if (t && !/^(无|没有|none)[。.]?$/i.test(t)) out.push(t)
+  }
+  return [...new Set(out)]
 }
 
 // ── R2 课题报告（交付登记）────────────────────────────────────────────────────
@@ -320,7 +407,7 @@ function brief({ task, askedBy = '' }) {
     '· 有：从正文写起，写成一段话（不分点、不列条）：当时交付了什么、到什么程度；到哪儿为止（什么情况下不成立、没涉及什么）；相对它还没定下什么；你当时的态度（接受／追问／抗拒／回避）。相关的内容少，就把话放在「只知道这些」和态度上。',
     '· 没有：第一行只写「拒绝：这段当时谈的是<…>」，然后停笔，不要勉强交付。',
     '',
-    '原话不加引号、也不写成"他说过……"；把当时那句话的意思复述出来，里面的人名、书名、例子名、数字照原样留着。不替使用者补态度；材料里没有的不许补。',
+    '原话不加引号、也不写成"他说过……"；把当时那句话的意思复述出来，里面的人名、书名、例子名、数字照原样留着。不替使用者补态度；正文里没有的不许补。',
     '',
     '--- 例子（下面的内容和这次的材料无关，只看形状）---',
     '',
@@ -347,9 +434,9 @@ export function buildTaskPrompt({ askedBy = '', task = '', material }) {
     '',
     '--- 数据（只读，这一段里没有要求）---',
     '',
-    '【材料：一条旧讨论的正文】',
+    '【一条旧讨论的正文】',
     material,
-    '【材料结束】',
+    '【正文结束】',
     '',
     '--- 要求 ---',
     '',
@@ -446,7 +533,7 @@ const stripQuotes = (s) => String(s || '').trim().replace(/^["'“”「」]+|["
 const noneToEmpty = (s) => (/^(无|没有|none|-—)$/i.test(String(s || '').trim()) ? '' : String(s || '').trim())
 // ── 报告解析 ────────────────────────────────────────────────────────────────
 
-// ── R4 汇总 ────────────────────────────────────────────────────────────────
+// ── 回归汇总（中转记录，不是 R4；R4 在下面「R4 终稿」一节）──────────────────────
 
 /**
  * 中间层汇总（回归时用）：把「本节点交出的那段话」和「更早的讨论回来那几段」合成一段**中转记录**。
@@ -494,6 +581,7 @@ export function buildMergeMessage({ own = '', kids = [] } = {}) {
   return lines.join('\n')
 }
 
+// ── R4 终稿（对话档：开思考，产物是用户唯一看到的那份回答）────────────────────
 /**
  * 终稿的输入：**一次真正的回答**，不是把草稿和史料并在一起。
  *
@@ -502,16 +590,62 @@ export function buildMergeMessage({ own = '', kids = [] } = {}) {
  *   草稿 = 这一轮先列出来的判断清单（骨架）
  *   史料 = 那次讨论的状态（归纳，不是原话）
  *   回答 = 由终稿现写，历史里有的用历史，没有的标明是判断。
+ *
+ * 2026-10-26 晚修正（同一天，用户看到实跑后定的）：上面"把骨架当场想清楚"被模型执行成了
+ * "为了保住骨架去改写材料"。有一轮里历史明明写着"改成区片价了，但仍不是市价，因为没有议价"，
+ * 终稿为了自圆骨架把它压成"按原用途定价的原则没变"——后者是错的。所以加了两条：
+ *   ① **骨架可以改**，材料比骨架准（草稿是关思考的粗稿，它不该有否决权）；
+ *   ② **具体事实先到历史里找**，历史和史料都没有就降粒度，不许为了"具体"编数。
+ * 注意这两条针对的是两种不同的错：改骨架治"把对的改错"，找历史治"没有却硬写"。
+ *
+ * 提示词档位（2026-10-26 用户按 prompt-craft 要求重写）：这是**对话档**——R4 开思考，产物是
+ * 给用户看的回答。所以规则写成"结果标准"，不写成编号禁令：机械档那六条（任务句打头、数据/要求
+ * 分隔、换话题的形状例子、打头输出模板）只适用于 thinking:false 的调用；搬到推理模型上会变成
+ * 一堆它不会照做的 MUST。对话档只管三件事：结果标准是什么、新的推进归谁、不用字数管长度。
+ *
+ * 2026-10-27 用户定：事实的来源按可信度排三级——**搜索结果 > 前面这轮对话 > 自己的知识**。
+ * 所以多了一块可选的【搜索结果】（联网查到的，附出处）：这一轮没查就整块不出现，规则照样读得通。
+ * TC（联网验证）接上时只需把结果填进 search，不用再改这段提示词。
+ *
+ * 2026-10-27 晚（用户看到 A/B 实跑后定）：终稿里材料占的篇幅打断了阅读连续性，"材料 → 判断"
+ * 那一层反而太薄。改成——正文按主干逻辑写，材料只当**凭据**：用到了就在该处打一个 `[编号]`，
+ * 原话、条文、出处名留在编号后面，由侧栏点开看（默认折叠）。核对照做，只是核对的过程不进正文。
+ * 配套：材料块每条带编号（web-search.js 的 pickSearchItems），条目随消息落库（payload.sources）。
+ *
+ * 2026-10-28：**"按主干逻辑写"这句太虚，实跑落成了话题并排**。用户拿同一道题的两份答案对比：
+ * 旧路径写"四件事 + 三条折扣 + 一句收"，新路径开头说"两类"、下面列出五类（五条还是并排的
+ * 话题）。所以这里不再只说"围着主干走"，而是点名草稿的形状（总 / 第N步 / 收），并要求每一步
+ * 接住上一步、结尾回到总判断。另加两条实测踩到的边界：一条主线（说了几类就只有几类）、
+ * 接着上一轮说时不要重头再讲。
+ *
+ * 2026-10-29 用户纠正：画像里的长期议题只是参考（逻辑偏好 / 理论背景 / 思维习惯），
+ * 不是可以直接被具体围绕的对象，也不能替这一轮的题目。所以上一版「接的议题 / 这一问的位置」
+ * 整条撤回；R4 只是不要为了贴合画像改判断——题目永远是用户这一问。
+ *
+ * 2026-10-29 用户定：**R1 的链只是假设，不是判决**。R4 先按它串联，但逐步在材料面前检验：
+ * 哪一环站不住改哪一环，总判断被事实推翻就换总判断；材料是证据不是清单，不用逐条用上；
+ * 事实与推理冲突时先信事实，不许把事实压小来保住原结论；正文不写"原来/我改了"的过程话。
  */
-export function buildAggregateMessage({ draft, reports = [] }) {
+export function buildAggregateMessage({ draft, reports = [], search = '' }) {
   const raw = String(draft?.raw || '').trim()
-  const lines = [
-    '【草稿骨架】（这一轮内部先列出来的判断清单：只有判断，没有论证、没有展开；用户看不到它，也不会读它）',
+  const searchText = String(search || '').trim()
+  const lines = []
+  // 搜索结果排最前：它是最新查证的，优先于草稿和旧讨论（2026-10-27 用户定）。
+  // 这一轮没查就整块不出现——规则写的是"上面有【搜索结果】才先按它来"，所以照样读得通。
+  if (searchText) {
+    // 2026-10-27 实测：接口有两块文本——summary 是它自己写的二手转述，snippet 是网页里原样摘的
+    // 那一两句（中间用「...」省略）。正文取的是 snippet，所以这里说的是"别把省略补上"，
+    // 不是"别当原话引"：党章那句原文就直接在 snippet 里。
+    // 2026-10-27 晚：每条前面带编号（[1]、[2]…），终稿正文引用材料时写的就是这个编号。
+    lines.push('【搜索结果】（这一轮联网查到的。每条前面有编号 [1]、[2]…，正文引用材料时写这个编号；原话中间的「...」是省略，不要补上）', searchText, '')
+  }
+  lines.push(
+    '【原始草稿】（这一轮先搭出来的骨架：一句总判断、从它往下走的几步、一句收口；末尾可能带一块「待查」，那是这一轮要查的清单，不是正文；只有判断、没有论证，也没经过材料核对；用户看不到它。**它是出发点，不是判决——材料推翻它，是正常的**）',
     raw || '（无草稿）',
     '',
     '【史料记录】（每条都是一段话，写那次讨论的**状态**：得出了什么、到哪儿为止、还没定什么、你当时什么态度；都是归纳，不是口头原话）',
-  ]
-  if (!reports.length) lines.push('（这一轮没登记到史料：按骨架写，别假装记得旧讨论）')
+  )
+  if (!reports.length) lines.push('（这一轮没登记到史料：按草稿写，具体事实到前面这轮对话里找；别假装记得旧讨论）')
   for (const r of reports) {
     // 有题才印「｜题：…」。终稿拿到的多半是"整枝合并后的中转记录"，不对应单一题——
     // 空着印「（没给题）」只会让提示词读起来像没做完（2026-10-26 改）。
@@ -521,11 +655,45 @@ export function buildAggregateMessage({ draft, reports = [] }) {
   lines.push(
     '',
     '【这次要写的是回答，不是汇总】',
-    '① 骨架上的每一条判断，你都要当场想清楚它凭什么成立、落在哪个具体的人／书／例子／数字上——历史里有的用历史，没有的用你自己知道的写，但要让人听得出那是判断，不是旧讨论说过的；',
-    '② 用户问到的每一面，只要史料支撑得住，就要在回答里出现；但**不要写成栏目或清单**——按【相处规则】的说话方式把它讲出来；',
-    '③ 史料记录是归纳，引用它的内容可以，但**不许加引号当成他说过的原话**；记录里没有的旧讨论内容，一个字都不许补；',
-    '④ 旧讨论的推进停在哪，你要接着往前走——**新的推进由你来做**；但要说得出哪句是旧讨论里的说法（已归纳）、哪句是你现在的判断，不许把新判断说成"我们当时说过"；',
-    '⑤ 直接输出正文，不要写"根据史料记录""综合以上"，不要输出 JSON、也不要写"以下是回答"；**说话方式以【相处规则】为准**（直接给判断、例子落地、结尾别强行延伸、代词说清是谁）。',
+    '要交出去的是一份回答，不是把上面几块拼起来。标准只有一条：用户读完，对这个问题的判断比他问之前更准。',
+    '',
+    '【草稿的链是假设，不是判决】草稿的「总 / 第N步 / 收」是这一轮先立的一条假设。先按它走一遍：每一步在材料面前还站得住吗？站得住就顺着写（开头立判断、每一步接住上一步、结尾回到判断）；哪一环站不住就改哪一环，缺一环就补一环；总判断被事实推翻就换总判断，不要为了保住原链的形状去改事实。改完仍只能有一条主线——开头说分几类，下面就只有那几类，不许说"两类"列五类，也不许把步骤写成"市场那一头""企业那一头"。草稿没写成总/步/收的，先替它把这条线理出来再写。',
+    '',
+    '【材料是证据，不是清单】搜索到的材料和史料不是必须逐条用上的清单：只用在支撑或推翻某一步的地方，跟这条链无关的不写，用了才打 [编号]。事实跟原来的推理冲突时，先信事实再改推理——年份、条文、数字、谁做的，材料里明确写了的按材料，不许为了保住原结论把事实说小；反过来，材料只是补充/旁证、不足以推翻判断时，不要因为"搜到了"就改结论。标准是这条链在事实面前站不站得住，不是材料用了几条。',
+    '',
+    '【正文只写改后的论证】不写"草稿/原来/我改了"这类过程话；直接把改后的判断写出来。草稿上的每一条判断你都要当场想清楚它凭什么站得住，但**想清楚不等于写出来**——原话、条文、因素清单、逐年数字留在原处，不搬进正文。草稿末尾的「待查」是查询清单，不是正文。',
+    '',
+    '画像只用来定详略和切入，不是这一轮的题目；不要为了贴合它把判断改成它想听的。',
+    '',
+    '如果用户这一轮是在要求接着上一轮说（"继续说""然后呢""接着"），上一轮已经说过的只当已完成的步骤：从它停下的那一句往下走，不要重新开头，也不要把同一段再讲一遍。',
+    '',
+    '草稿和【史料记录】对不上时，记录是对的；记录和搜索里明确的事实对不上时，以事实为准。但记录是归纳、搜索是材料：别拿一条旁证推翻整条判断，也别拿"记录里没写"去否定明确的事实。',
+    '',
+    '年份、文件号、金额、倍数这类具体的东西，【史料记录】里和前面这轮对话里都没有的，就说得笼统些，别凭印象补一个数。',
+    '',
+  )
+  // 下面三段只在**这一轮真的联了网**时出现。
+  // 2026-10-27 修：它们原来无条件打印，于是没联网的回合里也写"【搜索结果】不是结论……"，
+  // 指向一块根本没印出来的材料；而且那行用方头括号起头，看着像第二个材料块（用户就问过"为啥有两处搜索结果"）。
+  // 现在开头改成句子（"开头那块搜索结果…"），并且整段跟着块一起出现或一起消失。
+  if (searchText) {
+    lines.push(
+      '开头那块搜索结果是**凭据**，不是要转述的内容。你打算写的那些具体东西——哪一年、哪份文件、多少、谁定的——先在这里对一遍：搜索里有确切说法的，就按它写，哪怕跟草稿上写的不一样。它不替你决定判断，但会改事实：事实跟你原来的推理冲突时，先信事实，再改推理；不要为了保住原结论把材料里的事实说小。两处都没有的，就用你自己知道的写，说清那是判断。',
+      '',
+      '用到了哪一条材料，就在那句话后面打一个 [编号]（材料前面那个数字，比如 [3]）。读者看不到材料内容，只看见这个编号：点开它才展开那一条的原话和链接。所以正文里不用替材料复述，也不用把出处名、机关名、年份写进去——那些留给编号后面那一条。**唯一的例外是出处本身就是论据**（比如"怎么分由国务院定、报人大备案"这句话里，报人大备案才是关键）。同一处判断只打一次；不同判断可以重复引同一条材料——同一份法条支撑两处不同的判断时，两处各打一次。同一个判断用了几条，就按顺序打几个。编号只能用开头那块里真有的。',
+      '',
+      '数字只留这个判断靠它成立的那一个（"19 倍"这种本身就是论据的留着）；同一件事的一串数字（起止年份、逐年增长、占比连乘）不在正文里报菜名，需要的时候用一句话说清往哪边变。',
+      '',
+      '同一件事在 1980 年代、2004 年、2019 年可能不是同一个答案。搜到的几条分属不同年代时，按这条判断问的是哪一年去挑，不要拿最近的那条顶上去，也不要拿一条去否定另一条。',
+      '',
+      '没查到的，写出来要像个判断：用"大致""我印象里""一般认为"这一类说法，不要写成跟查到的一样硬。前面这轮对话里已经这样落到底的具体说法，可以照用，不必因为这一轮没再查到就把它降成"据说"。',
+      '',
+    )
+  }
+  lines.push(
+    '用户问到的每一面，只要材料撑得住就要有回应。旧讨论只告诉你当时说到哪儿：从停下的地方往前走，不要把已经得出的结论再推一遍；引用它的内容可以，别加引号当成我们说过的话，记录里没有的旧讨论内容一个字都不许补。往前那一步是这一轮的——要说得出哪句是旧说法、哪句是你现在的判断。',
+    '',
+    '直接输出正文：不要写"根据史料记录""综合以上"，不要输出 JSON，也不要写"以下是回答"。按【相处规则】说话，不要写成一条条的栏目或清单——步骤之间要连成话，不是列条目。',
   )
   return lines.join('\n')
 }
@@ -569,6 +737,36 @@ export function checkCoverage(finalText, reports, { threshold = 0.2 } = {}) {
   return { ratios, dropped: ratios.filter((x) => x.ratio < threshold) }
 }
 
+/**
+ * 正文里的编号按**出现先后**重排成 [1]、[2]…（2026-10-27 晚，用户实跑报的）。
+ *
+ * 为什么要动它：模型是按"在材料块里挑东西的顺序"写的，不是按读者读的顺序。实测那一轮第一句
+ * 就写 `[2]`，`[1]` 出现在后面——读者看到第一个标记是 [2]，像引用错位，也让人怀疑编号只是
+ * 材料块的序号、并不对应正文。重排之后：正文第 1 个标记就是 [1]，重复出现的还是同一个号。
+ *
+ * 只改方括号里的数字，别的一个字不动；对不上材料的编号（模型自己编的）原样留着。
+ * 没被引用的材料不进返回的清单——一个编号都指不到它，带上只是让 payload 变胖。
+ *
+ * @returns {{text: string, items: Array}} items 已按新号排好（n 换成新号）
+ */
+export function renumberCitations(text, items = []) {
+  const byN = new Map()
+  for (const it of (Array.isArray(items) ? items : [])) {
+    const n = Number(it && it.n)
+    if (Number.isFinite(n) && n > 0 && !byN.has(n)) byN.set(n, it)
+  }
+  const order = []   // 老号，按第一次出现的先后
+  const out = String(text || '').replace(/\[(\d{1,2})\]/g, (m, d) => {
+    const n = Number(d)
+    if (!byN.has(n)) return m
+    const at = order.indexOf(n)
+    if (at >= 0) return `[${at + 1}]`
+    order.push(n)
+    return `[${order.length}]`
+  })
+  return { text: out, items: order.map((n, i) => ({ ...byN.get(n), n: i + 1 })) }
+}
+
 // ── 流水线 ─────────────────────────────────────────────────────────────────
 /**
  * 跑一轮：R1 → 派课题 → 逐层判父 + R2 → R4（流式）。
@@ -592,11 +790,19 @@ export function checkCoverage(finalText, reports, { threshold = 0.2 } = {}) {
 export async function* runTasksPipeline(deps = {}) {
   const {
     hist = [], persona = '', anchored = '',
+    // 相处规则（2026-10-27）：**只给终稿用，不给 R1**（用户明确定：大纲只管列判断）。
+    // 原来它被包在 persona 的【背景档案】里，那块的抬头写着"只用于理解背景、不得转述或引用"，
+    // 于是"照这个做"的要求被"这只是一份资料"的定性压掉了。现在单独一条、紧贴提问。
+    agreement = '',
     // 当前提问 = 用户这一轮真的问的那句（**不是**节点里那条旧问题）。整套课题都锚在它上面。
     question: curQuestion = '',
     hits = [], nodeOf = () => null, parentsOf = () => [],
     complete, stream, judgeSystem = '', checkStop = () => {}, log = () => ({}),
     fallback = null, onEvent = () => {}, onRefusal = null, opts = {},
+    // 联网搜索（2026-10-27 接上）：search(验行数组) → Promise<{text, stats}>。
+    // 传**函数**而不是字符串，是因为它必须在这里当场发出去，才能跟下面的派题递归同时跑。
+    // 不传 = 这一轮不联网，终稿提示词里那一块整块不出现。
+    search = null,
   } = deps
   if (typeof complete !== 'function') throw new TypeError('runTasksPipeline: 缺少 deps.complete')
   if (typeof stream !== 'function') throw new TypeError('runTasksPipeline: 缺少 deps.stream')
@@ -623,6 +829,8 @@ export async function* runTasksPipeline(deps = {}) {
   async function* degraded(reason) {
     if (typeof fallback !== 'function') throw new Error(`${reason}（且没有兜底可用）`)
     emit({ type: 'fallback', reason })
+    // 退回旧路径 = 这一轮没有逐节点判定（整条来路都注入了），图上只能把这一轮的命中都算作"用过"。
+    emit({ type: 'used', nodes: points.map((p) => p.id), hits: points.map((p) => p.id) })
     log(`${reason} → 退回旧的整段注入（这一轮照样有答案）`)
     let full = ''
     for await (const piece of fallback()) {
@@ -643,16 +851,16 @@ export async function* runTasksPipeline(deps = {}) {
     if (node) live.push({ id, point: String(node.point || '').trim(), aliases: (node.aliases || []).filter(Boolean) })
   }
   const points = live.map((h, i) => ({ ...h, kid: `K-${i + 1}` }))
-  if (!points.length) {
-    // 命中 id 全都不在图上了（节点被清理/手改图）：别为一件不存在的事跑两步，
-    // 也别退回"整段来路"——那会把栈里那 47k 又发一遍。直接一次普通回复。
-    log('命中节点都不在图上 → 按普通回复处理（不带 L3，不派课题）')
-    emit({ type: 'note', text: '命中节点都不在图上了 → 按普通回复处理（不带 L3，不派课题）' })
-    const plain = yield* relay([...hist, { role: 'user', content: persona }, { role: 'user', content: anchored }])
-    emit({ type: 'final', text: plain, coverage: [], note: '本轮没有可用的命中节点' })
-    return plain
+  // 没有命中节点：不派题，但**照样列大纲、照样联网**（2026-10-27 用户定）。
+  // 原来这里直接回一句普通答案，等于"你没读过的话题一律不查网"——而那正是最容易编的一类问题。
+  // 搜索不需要节点、只需要一句提问，所以不该被"有没有命中"拦住。
+  const noHits = points.length === 0
+  if (noHits) {
+    log('这一轮没有可派题的命中 → 不派题，但仍列大纲并联网验证')
+    emit({ type: 'note', text: '没有命中节点 → 不派题，但仍列大纲并联网验证' })
+  } else if (points.length > 3) {
+    log(`命中 ${points.length} 个（设计：超过 3 个只记日志，不做硬截断）`)
   }
-  if (points.length > 3) log(`命中 ${points.length} 个（设计：超过 3 个只记日志，不做硬截断）`)
 
   let draftRaw = ''
   const tDraft = Date.now()
@@ -676,12 +884,39 @@ export async function* runTasksPipeline(deps = {}) {
   }
   if (!String(draftRaw || '').trim()) return yield* degraded('R1 草稿是空的')
   const draft = parseDraft(draftRaw)
-  log(`R1 草稿 ${draft.raw.length} 字 / ${draft.directions.length} 个方向${draft.directions.length ? '：' + draft.directions.map((d) => d.name).join('、') : ''}`)
+  const hasSpine = Boolean(draft.thesis && draft.steps.length)
+  log(
+    `R1 草稿 ${draft.raw.length} 字｜`
+    + (hasSpine
+      ? `骨架：总「${draft.thesis.slice(0, 40)}」→ ${draft.steps.length} 步${draft.closing ? ` → 收「${draft.closing.slice(0, 30)}」` : ''}`
+      : `没解析出骨架（总/步/收），终稿只能按清单整合`),
+  )
+  // 待联网验证的几处：从「验：」行抽出来，跟派题是**并列**的两条路（2026-10-27 用户定）——
+  // 派题往下追旧讨论，验证去查外部事实，互不等待，最后都并进 R4。
+  const verifyPoints = parseVerifyLines(draft.raw)
+  if (verifyPoints.length) log(`R1 待联网验证 ${verifyPoints.length} 处（与派题并行）：${verifyPoints.map((v) => v.slice(0, 18)).join(' / ')}`)
+  // 当场发出去、**不 await**：这一句就是"并行"的全部实现。下面一路派题递归要跑十几秒，
+  // 而搜索实测 0.3–0.5 秒，等派题跑完时它早就回来了。
+  // 这里必须立刻 catch：派题那条路要是先抛错，这个 promise 就没人接了（unhandled rejection）。
+  const searchTask = (async () => {
+    if (typeof search !== 'function' || !verifyPoints.length) return { text: '', stats: null }
+    try {
+      const r = await search(verifyPoints)
+      return typeof r === 'string' ? { text: r, stats: null } : (r || { text: '', stats: null })
+    } catch (e) {
+      log(`联网搜索失败（不影响这一轮回答）：${e.message}`)
+      return { text: '', stats: { error: e.message } }
+    }
+  })()
   emit({
     type: 'draft', raw: draft.raw, chars: draft.raw.length,
-    directions: draft.directions.map((d) => d.name), ms: Date.now() - tDraft,
+    directions: draft.directions.map((d) => d.name),
+    spine: { thesis: draft.thesis, steps: draft.steps, closing: draft.closing },
+    verify: verifyPoints, ms: Date.now() - tDraft,
   })
-  emit({ type: 'section', text: '② 命题递归（子节点点题 → 父节点作答）' })
+  // 一条命中都没有：没有题可派，但**大纲和联网照跑**（2026-10-27 用户定）。
+  // 原来是直接回一句普通答案——等于"你没读过的话题一律不查网"，而那正是最容易编的一类问题。
+  if (!noHits) emit({ type: 'section', text: '② 命题递归（子节点点题 → 父节点作答）' })
 
   // ── 递归：一个节点先交付，再给父节点派题，等父节点"回归"后逐层汇总往回交 ──────
   const initial = draft.raw
@@ -812,8 +1047,14 @@ export async function* runTasksPipeline(deps = {}) {
    */
   const liveUp = new Set()
   const refusedNodes = new Set()
+  // 这一轮**读过、并且交上了料**的节点（2026-10-27 用户定）。图上的命中高亮只画这一份：
+  // 顶层派题判「用不上」的、读了材料但交付被拒的都不在里面——它们这一轮没起作用，
+  // 画上去等于说"这一轮用了它"。顺序 = 交付完成的顺序（往深处追的父节点先完成）。
+  const usedNodes = []
+  const usedSeen = new Set()
   const visit = async (args) => {
     const r = await visitInner(args)
+    if (r.summary && !usedSeen.has(args.id)) { usedSeen.add(args.id); usedNodes.push(args.id) }
     if ((args.depth || 0) >= 1 && r.summary) liveUp.add(args.id)
     if (r.refused) refusedNodes.add(args.id)
     return r
@@ -892,7 +1133,10 @@ export async function* runTasksPipeline(deps = {}) {
   }
 
   // 顶层：草稿 → 派题（命中层）→ 每个命中递归 → 终稿汇总（草稿 + 各命中回来的汇总）
-  const firstT = await dispatchDown({ kid: '草稿', taskText: '', body: initial, candidates: points.map((p) => ({ ...p, depth: 0, askedBy: '' })), depth: 0 })
+  // 没有命中时这一整段跳过：不派题，但草稿和搜索结果照样进终稿。
+  const firstT = noHits
+    ? new Map()
+    : await dispatchDown({ kid: '草稿', taskText: '', body: initial, candidates: points.map((p) => ({ ...p, depth: 0, askedBy: '' })), depth: 0 })
   const tops = []
   for (const p of points) {
     const t = firstT.get(p.kid)
@@ -906,14 +1150,65 @@ export async function* runTasksPipeline(deps = {}) {
   }
 
   const finalReports = tops.filter((x) => x.summary).map((x) => ({ kid: x.kid, task: '', body: x.summary }))
+  // 图上亮哪些（2026-10-27 用户定）：**只亮这一轮读过、并且交上了料的节点**——顶层判「用不上」的、
+  // 读了材料但交付被拒的都不算（它们这一轮没起作用）。发出时机卡在终稿流式之前：终稿是最后一步，
+  // 此刻清单已经定下来了，用户开始读答案时图已经亮着（旧做法是提问后立刻亮，那时还没判，
+  // 只能把全部候选都画上去，图上亮的和实际用的对不上）。
+  //   nodes = 图上要亮的：本轮命中里真用上的在前，再跟上往下追读的父节点
+  //   hits  = 其中属于「本轮引用命中」的那几条（自由模式的引用窗体按它自动并入；
+  //           往下追读的父节点是模型自己读的、不是用户指认的，不进窗体）
+  const usedHits = points.filter((p) => usedSeen.has(p.id)).map((p) => p.id)
+  const usedHitSet = new Set(usedHits)
+  const usedIds = [...usedHits, ...usedNodes.filter((id) => !usedHitSet.has(id))]
+  if (usedIds.length) log(`本轮真读到 ${usedIds.length} 个：${usedIds.join('、')}（图命中只亮这些）`)
+  emit({ type: 'used', nodes: usedIds, hits: usedHits })
+  // 派题这条路走完了，回头收搜索那份——它多半在几秒前就回来了（实测 0.3–0.5 秒）。
+  const searched = await searchTask
+  const searchText = String(searched?.text || '')
+  if (searched?.stats) {
+    const s = searched.stats
+    if (s.error) log(`这一轮没联网：${s.error}`)
+    else log(`联网查了 ${s.queries} 处${s.requests > s.queries ? `（拆成 ${s.requests} 次）` : ''} → ${s.kept} 条可用（${s.ms}ms，${s.chars} 字进终稿）`)
+    emit({ type: 'search', queries: s.queries, requests: s.requests, results: s.results, kept: s.kept, chars: s.chars, ms: s.ms, split: s.split || 0, error: s.error || '' })
+  }
+  // 条目交给侧栏：终稿正文里那些 [编号] 点开要看的就是它们（标题 / 原话 / 链接）。
+  // 只交**真印进材料块**的这些——编号和材料块同源（pickSearchItems），不会各数一套。
+  // 注意它还要等终稿写完再发：终稿一出来就要按出现先后重排编号（见下面），那时才知道哪些用上了。
+  const searchItems = Array.isArray(searched?.items) ? searched.items : []
+  // 终稿这一块的输入要进记录（2026-10-27 补）：以前只有"每层回归汇总"进记录（带 kid），
+  // 终稿自己那次输入从来没落过。加了搜索之后这块里躺着一整块网页材料——出问题时
+  // 想说"它为什么这么答"，得能看见它当时看到的是什么。
+  const r4Message = buildAggregateMessage({ draft: { raw: initial }, reports: finalReports, search: searchText })
+  emit({ type: 'aggregate', message: r4Message })
+  const agree = String(agreement || '').trim()
   full = yield* relay([
     ...hist,
     { role: 'user', content: persona },
-    { role: 'user', content: buildAggregateMessage({ draft: { raw: initial }, reports: finalReports }) },
+    { role: 'user', content: r4Message },
+    // 相处规则紧贴提问：模型对末尾更敏感（prompt-craft），而这一块要的是"照这个说"，
+    // 不是"了解这个人"。夹在材料和提问之间，是它唯一该在的位置。
+    ...(agree ? [{ role: 'user', content: agree }] : []),
     { role: 'user', content: anchored },
   ])
   log(`终稿 ${full.length} 字（草稿 + ${finalReports.length} 份回归汇总）`)
+  // 编号两件事都在这儿做，顺序不能反（2026-10-27 晚，用户实跑报的）：
+  //   ① 对不上材料的编号（模型自己编的）只记日志，原样留在正文里——它是个信号，别悄悄抹掉；
+  //   ② 对得上的按**出现先后**重排成 [1]、[2]…。模型常常先写 [5] 再写 [2]（它按在材料块里
+  //      挑东西的顺序写，不是按读者读的顺序），读者看到第一个标记就是 [5]，像引用错位。
+  let roundItems = []
+  if (searchItems.length) {
+    const cited = new Set([...String(full).matchAll(/\[(\d+)\]/g)].map((m) => Number(m[1])))
+    const bad = [...cited].filter((n) => !searchItems.some((it) => it.n === n))
+    if (bad.length) log(`终稿里有 ${bad.length} 处编号对不上材料（${bad.join('、')}），原样留着、不改成链接`)
+    const re = renumberCitations(full, searchItems)
+    full = re.text
+    roundItems = re.items
+    if (roundItems.length) log(`终稿引到 ${roundItems.length} 条材料，已按出现先后重排为 [1]…[${roundItems.length}]（这一轮印了 ${searchItems.length} 条）`)
+    else log('终稿一处材料都没引（这一轮虽然查到了）')
+  }
   emit({ type: 'final', text: full, coverage: [], ...(lim.finalLabel ? { label: lim.finalLabel } : {}), ...(lim.finalShown === false ? { shown: false } : {}) })
+  // 条目必须等重排之后再发：n 已经换成正文里的新号，侧栏拿到的和读者看到的是同一套。
+  if (roundItems.length) emit({ type: 'sources', items: roundItems })
 
   // 这一轮的继承增量交出去（index.js 会「并上 nodes、去掉 failed」写下一轮可继承的清单）。
   //   nodes  = 成功上报的来路节点（depth ≥ 1）：命中节点本身每轮由引用解析重新决定要不要跑

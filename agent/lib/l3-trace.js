@@ -68,15 +68,40 @@ export function renderTraceEvent(evt) {
 
     case 'draft': {
       const dirs = Array.isArray(e.directions) ? e.directions : []
+      const verify = Array.isArray(e.verify) ? e.verify : []
+      // 2026-10-28 起草稿的主形状是「总 / 第N步 / 收」：记录里要看得出这一轮有没有一条主线，
+      // 不能只报字数。旧的「方向」形状保留显示，只为打开历史记录时不至于变成空白。
+      const sp = e.spine && typeof e.spine === 'object' ? e.spine : {}
+      const thesis = String(sp.thesis || '').trim()
+      const steps = Array.isArray(sp.steps) ? sp.steps.filter(Boolean) : []
+      const closing = String(sp.closing || '').trim()
+      const hasSpine = Boolean(thesis && steps.length)
+      const shapeLine = hasSpine
+        ? `- 骨架：总「${clip(thesis, 60)}」→ ${steps.length} 步${closing ? ` → 收「${clip(closing, 40)}」` : ''}`
+        : dirs.length
+          ? `- 方向：${dirs.map((d) => `「${d}」`).join('、')}`
+          : '- 骨架：没解析出总/步/收（终稿按清单整合）'
       return [
         `\n## ① R1 草稿（用户看不到，只给课题和汇总用）`,
         '',
-        `- 篇幅：${nf.format(Number(e.chars) || 0)} 字｜${dirs.length} 个方向${e.ms != null ? `｜耗时 ${(e.ms / 1000).toFixed(1)}s` : ''}`,
-        dirs.length ? `- 方向：${dirs.map((d) => `「${d}」`).join('、')}` : '- 方向：没解析出【方向：】标记（终稿照样能整合）',
+        `- 篇幅：${nf.format(Number(e.chars) || 0)} 字${e.ms != null ? `｜耗时 ${(e.ms / 1000).toFixed(1)}s` : ''}`,
+        shapeLine,
+        // 待联网验证的几处：跟派题并列的另一条路，看得出这一轮会不会去查
+        verify.length ? `- 待联网验证 ${verify.length} 处：${verify.map((v) => `「${clip(v, 60)}」`).join('、')}` : '- 待联网验证：0 处',
         '',
         fence(e.raw),
         '',
       ].join('\n')
+    }
+
+    case 'search': {
+      // 联网验证那一路的结果（2026-10-27）：跟派题并列跑，收齐后才并进终稿。
+      // 记一笔是为了事后能回答"这一轮到底查没查、查到几条"——没查和查了没结果是两回事。
+      if (e.error) return `\n- 联网验证：这一轮没成功（${clip(e.error, 80)}）\n`
+      const req = Number(e.requests) || 0
+      const q = Number(e.queries) || 0
+      return `\n- 联网验证：查 ${q} 处${req > q ? `（拆成 ${req} 次）` : ''} → 可用 ${Number(e.kept) || 0} 条 / 原始 ${Number(e.results) || 0} 条`
+        + `（${(Number(e.ms) || 0)}ms，${nf.format(Number(e.chars) || 0)} 字进终稿）\n`
     }
 
     case 'report': {
@@ -165,6 +190,17 @@ export function renderTraceEvent(evt) {
       return `\n> ${parts.join('；')}\n`
     }
 
+    // 图命中清单（2026-10-27）：图上亮的只有这一份——这一轮读过、并且交上了料的节点。
+    // 记下来是为了回答"刚才图上为什么只亮了这 2 个"（命中 3 个、判了 1 个用不上）。
+    case 'used': {
+      const nodes = Array.isArray(e.nodes) ? e.nodes : []
+      const hits = Array.isArray(e.hits) ? e.hits : []
+      const extra = nodes.length && hits.length !== nodes.length
+        ? `（其中本轮命中 ${hits.length} 个，其余是往下追读到的父节点）`
+        : ''
+      return `\n> 图命中只亮 ${nodes.length} 个（这一轮真读到、交了料的）：${nodes.length ? nodes.join('、') : '无'}${extra}\n`
+    }
+
     case 'gate':
       return `\n> ⛔ 兜底闸触发：${str(e.reason)}——探索到此为止（不是出错，是保护）。\n`
 
@@ -195,6 +231,16 @@ export function renderTraceEvent(evt) {
         lines.push('')
       }
       if (e.note) lines.push(`> ${str(e.note)}`)
+      return lines.join('\n') + '\n'
+    }
+
+    // 材料条目（2026-10-27）：终稿正文里的 [n] 点开看的就是这些。
+    // 记下来是为了能回答"它当时**能**引哪几条"——正文一个号都没打的时候先看这里有没有东西。
+    case 'sources': {
+      const items = Array.isArray(e.items) ? e.items : []
+      if (!items.length) return ''
+      const lines = ['', `**材料条目**（终稿可引用的 ${items.length} 条，正文里的 [n] 就是它们）`, '']
+      for (const it of items) lines.push(`- [${it.n}] ${str(it.title)}（${str(it.site)}）${it.url ? ' — ' + str(it.url) : ''}`)
       return lines.join('\n') + '\n'
     }
 
