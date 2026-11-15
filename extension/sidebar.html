@@ -1346,6 +1346,61 @@
     .bubble.md a:hover { border-bottom-color: #07c160; }
     .bubble.md strong { font-weight: 700; color: #111; }
     .bubble.md del { color: #999; }
+    /* 材料面板（2026-10-27）：正文里只留编号，点开才看到那一条的原话与链接。
+       开关是 label 包 checkbox，纯 CSS：无 JS、无 id，默认收起，点一下就地展开。 */
+    .bubble.md .cite { display: inline; }
+    /* 视觉上隐藏、但仍在 Tab 序列里：不用 display:none —— 那样键盘就点不开了 */
+    .bubble.md .cite-t { position: absolute; width: 0; height: 0; opacity: 0; pointer-events: none; }
+    .bubble.md .cite-k {
+      color: #07c160;
+      cursor: pointer;
+      font-size: 0.92em;
+      padding: 0 1px;
+      border-bottom: 1px solid rgba(7, 193, 96, 0.35);
+      user-select: none;
+    }
+    .bubble.md .cite-k:hover { background: rgba(7, 193, 96, 0.08); }
+    .bubble.md .cite-item { display: block; }
+    .bubble.md .cite-item + .cite-item {
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px dashed #e3efe8;
+    }
+    .bubble.md .cite-box { display: none; }
+    /* 面板：两种入口都用同一条规则（单条材料是 .cite，整句是 .vt），所以按 checkbox 认 */
+    .bubble.md input.cite-t:checked ~ .cite-box {
+      display: block;
+      margin: 4px 0 7px;
+      padding: 6px 9px;
+      border-left: 2px solid #cfe9db;
+      background: #fafdfb;
+      border-radius: 0 4px 4px 0;
+      font-size: 12px;
+      line-height: 1.55;
+      white-space: normal;
+      color: #333;           /* 整句是链接色，面板里的字要回到正文色 */
+      cursor: auto;
+    }
+    .bubble.md .cite-meta { display: block; font-weight: 600; color: #333; }
+    /* 原话可能有多段（搜索服务把网页里不相邻的几句拼成一条，中间用「...」隔着）：
+       服务端按「...」切开、一段一行，这里 pre-wrap 才看得见那些换行。 */
+    .bubble.md .cite-txt { display: block; color: #555; margin: 2px 0 3px; word-break: break-word; white-space: pre-wrap; }
+    .bubble.md .cite-url { display: block; font-size: 11px; }
+    /* 被材料核对过的那一句（2026-10-27 晚第五版）：
+       文字换成链接色、带下划线，并且**整句可点**——点哪儿都展开，不必对准句尾的 [n]。
+       颜色从 #07c160（界面的强调绿）压到深一档的 #1f7a55：整句都是这个颜色的字，
+       用界面上那个亮绿会刺眼（用户原话"看得太亮了闪眼睛"）。深绿仍然读得出"这是链接"。 */
+    .bubble.md .vt {
+      color: #1f7a55;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(31, 122, 85, 0.4);
+      padding-bottom: 1px;
+    }
+    .bubble.md .vt:hover { border-bottom-color: #1f7a55; }
+    /* 整句里的粗体和编号都跟着变：一变色就该整段一起变，别留几处亮绿扎眼 */
+    .bubble.md .vt strong,
+    .bubble.md .vt .cite-k { color: inherit; }
+    .bubble.md .vt input:focus-visible ~ .cite-box { outline: 2px solid #1f7a55; outline-offset: 2px; }
 
     .msg-thinking { display: flex; justify-content: flex-start; }
     .msg-thinking .bubble {

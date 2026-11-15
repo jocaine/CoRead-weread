@@ -188,7 +188,9 @@ test('buildDispatchBrief：派题要同时看到提问与草稿，按「补不�
   assert.match(out, /【原始草稿】这是目前对【原始提问】的第一次回答/)
   assert.match(out, /· K-1「方向甲」/)
   assert.match(out, /只许要它交自己已经说过的话|只许落在它已经说过的话上/, '题只许落在材料里已有的话上')
-  assert.match(out, /<那一处没答到的> —— <用它的第几条>，要它交出能补上的那部分/)
+  assert.match(out, /<那一处没答到的>，要它交出能补上的那部分/)
+  assert.doesNotMatch(out, /第几条/, '派题不再按编号点候选：题面里引「第几条」对旧讨论是空指针')
+  assert.match(out, /题里不要出现条目编号/, '题面本身也不许出现第几条：被问的那条讨论看不到目录')
   assert.match(out, /每条候选占一行，顺序照上面/)
 })
 
@@ -893,14 +895,14 @@ test('源码：元任务（_meta 记忆合并）不走 L3——"每轮都跑"别
   assert.match(SRC, /const path = key === '_meta' \? 'off' : l3Path\(l3Mode, l3Hits\)/)
 })
 
-test('源码：say() 真的走新路径，旧路径一行没删，拒绝有落盘统计', () => {
+test('源码：say() 真的走新路径，旧路径一行没删', () => {
   assert.match(SRC, /import \{ runTasksPipeline \} from '\.\/lib\/l3-tasks\.js'/)
   assert.match(SRC, /runTasksPipeline\(tasksDeps\)/)
   assert.match(SRC, /question: storeText \|\| userText/, '当前提问要传进去（不是节点里的旧问题）')
   assert.match(SRC, /userAncestry\(graph, seeds\)/, '旧路径的来路闭包必须保留（A/B 基线）')
   assert.match(SRC, /l3Block\(ancestry\)/)
-  assert.match(SRC, /onRefusal: \(rec\) =>/)
-  assert.match(SRC, /l3-refusals\.jsonl/, '拒绝要落成统计文件，用户后面去修图谱')
+  assert.doesNotMatch(SRC, /l3-refusals\.jsonl/, '拒绝结果现在不落盘')
+  assert.doesNotMatch(SRC, /onRefusal: \(rec\)/, '拒绝回调没有接线')
 })
 
 test('源码：流水线的 complete 不再给默认预算——忘了传必须当场报错', () => {

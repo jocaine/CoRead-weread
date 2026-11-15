@@ -62,6 +62,9 @@ import { readL3Mode, assembleCallHist, l3Path } from './lib/l3-driver.js'
 // 纯逻辑（材料渲染、提示词、报告解析、流水线），LLM 调用与图查询都由 say() 注入，
 // 所以能拿假模型跑整条链路（test/l3-tasks.test.js）。
 import { runTasksPipeline } from './lib/l3-tasks.js'
+// 联网搜索（2026-10-27）：R1 的「验：」行拿去查网页，结果与派题**并行**，最后一起交给终稿。
+// 走的是 DeepSeek 自己的 Search 接口（不是 function calling，见 lib/web-search.js 文件头）。
+import { searchVerifyPoints } from './lib/web-search.js'
 // 「上一轮有效来路节点」的跨轮记忆（2026-10-26）：同一段讨论继续时，把它们并在本轮命中里重跑。
 import { readLive, writeLive, clearLive } from './lib/l3-live.js'
 // L3 全过程记录（2026-10-24，调试用）：把命题递归的每一步照实写成 Markdown，
@@ -248,18 +251,38 @@ function buildSystemInstruction() {
 // 2026-09 防跑题（09-07 火星报段落教训）：整块以【背景档案】身份出现，明确"不是用户
 // 本轮发言"——此前画像原样拼在提问前，模型把"自述/自陈"式概括当成用户本轮原话，
 // 答非所问并编造"你自己说过…"。档案内容禁止被转述/引用为用户原话（AGENT.md 同款规则）。
+// 2026-10-27：**相处规则搬出去了**（见 agreementBlock）。它原来跟画像挤在同一块里，
+// 是 2026-09 搬家时顺带带进去的；但它要的是"照这个做"，不是"这是关于用户的资料"。
 function personaBlock() {
   const profile = readIfExists(PROFILE_FILE)
-  const agreement = readIfExists(AGREEMENT_FILE)
   const titles = userBookTitles()
   const bookSection = titles.length
     ? '\n\n【用户书籍足迹】（已添加引用/划线的书，用于跨书联想）\n' + titles.map((t) => `- 《${t}》`).join('\n')
     : ''
-  return '【背景档案】（用户画像 / 相处规则 / 书籍足迹的内容——不是用户本轮发言，' +
+  return '【背景档案】（用户画像 / 书籍足迹的内容——不是用户本轮发言，' +
     '只用于理解用户背景；即使出现"自述/自陈/你说过"式表述，也不得转述或引用为用户原话）\n\n' +
-    // 相处规则（2026-10）：它是**对 AI 的行为要求**，不是背景资料——块内定性写明"请遵守"，
-    // 否则模型会把它当"用户的兴趣描述"读过去（老版块名「你的自画像」正是这个毛病）。
-    `【用户画像】\n${profile}\n\n【相处规则】（用户对你（AI）的长期要求，请遵守）\n${agreement || '（暂无）'}${bookSection}`
+    `【用户画像】\n${profile || '（暂无）'}${bookSection}`
+}
+
+/**
+ * 相处规则（2026-10-27 拆出来，单独一条消息、紧贴本轮提问）。
+ *
+ * 为什么不放【背景档案】里：那一块的抬头是"不是用户本轮发言、只用于理解背景、
+ * 不得转述或引用"——那是给"关于用户的资料"的定性。相处规则是**对 AI 的行为要求**，
+ * 一个说"不要当真"，一个说"照这个做"，套同一个框，后者被压掉。
+ * 实测：只往里面加一条"多举例子"，下一轮的回答里 0 个"比如"。
+ *
+ * 为什么不放 system：system 是启动时构建一次、之后不重建的（buildSystemInstruction）。
+ * 放进去，用户 /相处 改完得重启才生效——跟"随时调整"直接矛盾。
+ *
+ * 也不给 R1（写大纲那一步）：用户 2026-10-27 明确不要。大纲只管列判断，
+ * 措辞类的要求在终稿那一步才用得上。
+ */
+function agreementBlock() {
+  const agreement = readIfExists(AGREEMENT_FILE)
+  const body = String(agreement || '').trim()
+  if (!body) return ''
+  return '【相处规则】（用户对你（AI）的长期要求，这一轮的回答按它来说）\n' + body
 }
 
 // ── 侧栏聊天 I/O（SQLite）────────────────────────────────────────────────────
@@ -344,14 +367,19 @@ function appendChatOutputStreamEnd(bookKey, replyToTs) {
 
 // 会意图命中事件（topic-library-design.md §5.4④）：引用解析命中旧知识点 → 记一条事件
 // （events 表，不进 messages——它没有正文，混在消息里会污染配对与 /history）。
-// bookKey = 命中所属书；侧栏图视图据此高亮命中节点的 root→recent 路径并集。
+// bookKey = 命中所属书；侧栏图视图据此高亮**这一轮真读过、交了料的节点**（2026-10-27 用户定：
+// 不再沿 user 边展开上游——新路径 L3 只按派题读那几个节点，画整条来路闭包等于说它读了没读的东西）。
 //
-// replyToTs（2026-11）= 这一轮提问落库的 timestamp。为什么要带：命中是在**生成回答之前**
-// 写出来的，而用户可能刚好在"引用判定"这几秒里点了停止 —— 事件照样被推到侧栏、把图点亮，
+// replyToTs（2026-11）= 这一轮提问落库的 timestamp。为什么要带：命中是在**回答生成期间**
+// 写出来的，而用户可能刚好点了停止 —— 事件照样被推到侧栏、把图点亮，
 // 而那一轮已经被弃掉了（提问行、栈里都没有它）。带上身份证，侧栏才认得出"这波命中属于
 // 已弃的那一轮"，直接不点亮（判定规则与流式分片同源，见 extension/sidebar.js 的 _discardedTurnTs）。
-function appendGraphHit(hits, reason, bookKey, replyToTs) {
+//
+// opts.cites（2026-10-27）：其中属于「本轮引用命中」的那几条。自由模式的引用窗体按它自动并入；
+// L3 往下追读到的父节点是模型自己读的、不是用户指认的，不进窗体（否则会变成下一轮的引用）。
+function appendGraphHit(hits, reason, bookKey, replyToTs, opts = {}) {
   try {
+    const cites = Array.isArray(opts.cites) ? opts.cites.filter(Boolean) : null
     chatStore().insertEvent({
       conv: String(bookKey || ''),
       kind: 'graph-hit',
@@ -360,6 +388,7 @@ function appendGraphHit(hits, reason, bookKey, replyToTs) {
         reason: String(reason || '').slice(0, 200),
         bookKey: String(bookKey || ''),
         ...(replyToTs ? { replyToTs: Number(replyToTs) } : {}),
+        ...(cites ? { cites } : {}),
       },
     })
   } catch {}
@@ -466,9 +495,11 @@ function hasReplyTo(id) {
  *   · 图谱命中事件：删（用户看不见的暗账，留着还会在断线重连时把高亮推回来）
  *   · 历史与 journal：由调用方与 say() 负责（它们在自己的作用域里）
  * 若发现该提问其实已经有完整回答（停止来晚了），就什么都不删——只把信号消费掉。
+ * @param {{conv: string, questionId: number, turnTs?: number}} p
+ *   turnTs = 这一轮提问落库的 timestamp（删命中事件时用它精确认回**这一轮**）
  * @returns {boolean} 是否真的弃掉了（false = 停止来晚了/找不到这条）
  */
-function discardStoppedTurn({ conv, questionId }) {
+function discardStoppedTurn({ conv, questionId, turnTs }) {
   try {
     const id = Number(questionId || 0)
     if (!id) return false
@@ -479,8 +510,10 @@ function discardStoppedTurn({ conv, questionId }) {
       return false
     }
     const del = chatStore().deleteMessages([id])
-    const ev = chatStore().deleteEvents({ conv: String(conv || ''), kind: 'graph-hit' })
-    console.log(`  ⏹ 本轮已停止：提问行与命中事件已删（messages ×${del} / events ×${ev}）`)
+    // 2026-10-27 修：这里原来删的是这场对话**全部** graph-hit 事件，等于"停一轮，清空整本书的
+    // 命中历史"。改成按 payload.replyToTs 只删本轮写的那条；认不出是哪一轮就一条都不删。
+    const ev = turnTs ? chatStore().deleteGraphHit(String(conv || ''), turnTs) : 0
+    console.log(`  ⏹ 本轮已停止：提问行已删（messages ×${del}），命中事件撤 ${ev} 条（只撤本轮）`)
     return true
   } catch (e) {
     console.log(`  ⚠️ 停止清理失败（不影响后续）: ${e.message}`)
@@ -1158,6 +1191,8 @@ async function say(userText, options = {}) {
     // 顺着旧主题代答、不得把档案/历史内容当成这轮的用户发言。_meta 记忆合并保持原状
     // （产物另有校验兜底，见 rewriteWithRetry）。
     const persona = personaBlock()
+    // 相处规则单独一条，紧贴本轮提问（2026-10-27 用户定）。空文件时是空串，插不进去。
+    const agreement = agreementBlock()
     // 2026-10-17：后半句原来写的是"若含引文+提问，先围绕引文本身回答"——那正是"重心放到引用上"
     // 的源头之一（用户反馈《国家与革命》#1312）。现在把顺序反过来：提问是题目，引文是材料。
     const anchored = key !== '_meta'
@@ -1170,17 +1205,22 @@ async function say(userText, options = {}) {
     // 模式每轮现读 data\config\l3-mode，改文件就生效，不用重启。
     const l3Mode = readL3Mode()
     const l3Hits = Array.isArray(options.l3Hits) ? options.l3Hits : []
-    const path = l3Path(l3Mode, l3Hits)
-    if (l3Mode === 'both') console.log('  [l3] both 模式尚未实现，本轮按 full 处理（开关文件：data\\config\\l3-mode）')
-    if (path === 'bare') console.log('  [l3] tasks：本轮没有新命中 → 不带 L3（栈里的旧引用不重跑课题，理由见 l3Path 注释）')
+    // 元任务（`_meta` = 会话结束的记忆合并）**不走 L3**，按 off 装配（2026-10-27 发现并修）。
+    // 起因是当天把 tasks/both 改成"每轮都跑"：`_meta` 也是 say() 的一次调用、也没有命中，
+    // 于是记忆合并被卷进了命题递归——data/runtime/l3-trace 里真的出现了 `_meta` 的全过程记录
+    //（19:44 那份），合并请求被当成一道提问去列大纲、联网、写终稿，既贵又答非所问。
+    // 记忆合并要的是"照提示词把整份合并结果写出来"，只有一次普通调用。
+    const path = key === '_meta' ? 'off' : l3Path(l3Mode, l3Hits)
     // 调试（data\config\l3-debug 存在时开）：
     //   ① 本轮**有新命中**才存输入（供 scripts/l3-ab.mjs 重放）——否则随便一句追问就会把它
     //     覆盖掉，A/B 抓到的就成了"没有命中的那一轮"；
     //   ② 只在走命题递归时开全过程记录（一轮一份，不像 ① 会互相覆盖）。
     // 2026-10-26：`both` 本身就产出脑图（它本来就是对比用的调试模式），不必再开 debug；
     // 区别只在**要不要每轮自动用浏览器打开**——那个仍然只由 debug 开关决定，免得弹窗打断阅读。
+    // 2026-10-27 晚：`tasks` 成了正式路径（旧路径关闭），所以它也每轮写记录——以前这份记录是
+    // `both` 顺手带来的，模式一关就会悄悄没有，事后想问"它当时看到什么"就没得查了。
     const debugOn = l3DebugWanted()
-    const recordOn = debugOn || path === 'both'
+    const recordOn = debugOn || path === 'both' || path === 'tasks'
     let trace = null
     let tree = null
     if (recordOn) {
@@ -1208,9 +1248,30 @@ async function say(userText, options = {}) {
     // kind/conv 只进用量流水：_meta 是"记忆合并"这类元任务（同一入口，但报表里要分开看，
     // 否则画像重写那几笔大输入会被算进"读书问答"里，看不出是哪一类在花钱）
     const usageKind = key === '_meta' ? '记忆固化' : '主回复'
+    // 图命中事件（2026-10-27 改口径）：**图上只亮这一轮真读过、交了料的节点**。
+    // 新路径（tasks/both）要等流水线判完才知道"哪几个真用上了"——事件由流水线发出（见下面
+    // onEvent 的 used 分支），写到终稿流式之前；这里只处理旧路径（full/off）：它没有逐节点判定，
+    // 这一轮交给模型的命中（含同栈继承）就是全部，照旧立刻写。
+    //   inheritedHits：同一段讨论继续时从上轮继承来的节点 → reason 里标「（上轮继承）」
+    //   citeHits     ：其中属于本轮引用命中的（自由模式引用窗体只并这些，不并追读到的父节点）
+    const inheritedHits = new Set(Array.isArray(options.inheritedHits) ? options.inheritedHits : [])
+    const citeHits = new Set(Array.isArray(options.citeHits) ? options.citeHits : [])
+    const hitLabel = (id) => {
+      const n = graph.nodes.find((x) => x.id === id)
+      const p = n ? `「${n.point}」` : id
+      return inheritedHits.has(id) ? p + '（上轮继承）' : p
+    }
+    if (l3Hits.length && (path === 'full' || path === 'off')) {
+      appendGraphHit(l3Hits, l3Hits.map(hitLabel).join('、'), key, options.replyToTs)
+      // 旧路径没有逐节点判定：交给模型的就是全部命中。也记一份给讨论栈（图关掉再打开还画这一份）。
+      options.turnUsed = l3Hits.slice()
+    }
+    // 这一轮联网查到的材料条目（终稿正文里的 [编号] 点开看的就是它们，2026-10-27）。
+    // 由流水线通过 sources 事件交出来；没联网就一直是空数组，消息上不带 payload。
+    let roundSources = []
     // 新路径的依赖（tasks / both 共用一份，保证两条路吃到的输入完全一样）
     const tasksDeps = {
-      hist, persona, anchored,
+      hist, persona, agreement, anchored,
       // 当前提问（用户这一轮真的问的那句）：整套课题都锚在它上面，不是节点里的旧问题
       question: storeText || userText,
       hits: l3Hits,
@@ -1234,18 +1295,29 @@ async function say(userText, options = {}) {
         })
       },
       stream: (o) => callLLMStreamWithRetry(options.maxTokens || 8192, o.messages, {
-        // both 模式下 B 的终稿不是给用户看的那份，报表里分开放，才能算出"各花了多少"
-        kind: path === 'both' ? '课题汇总' : usageKind, conv: key,
+        // both 模式下主路径（新的那条）给用户看，算「主回复」；对照的那条另记一档，
+        // 报表里才看得出"两份各花了多少"
+        kind: usageKind, conv: key,
       }),
       // 兜底：R1 起不来（网络/截断/空流）就退回旧路径的整段注入——引用轮不能没有答案
       fallback: () => callLLMStreamWithRetry(options.maxTokens || 8192, assembleCallHist({
-        hist, persona, l3: options.l3, anchored, mode: 'full',
+        hist, persona, agreement, l3: options.l3, anchored, mode: 'full',
       }), { kind: usageKind, conv: key }),
       judgeSystem: JUDGE_SYSTEM,
+      // 联网搜索（2026-10-27）：R1 的「验」行逐条查网页。它在流水线内部启动，与派题并行跑，
+      // 这里只负责把地址/Key 递进去。失败一律不抛——返回空串，终稿那块整块不出现，
+      // 退回原来的优先链（对话里说过的 → 自己知道的），这一轮照样有答案。
+      search: async (points) => {
+        const { apiBase, apiKey } = requireApiConfig()
+        return await searchVerifyPoints(points, {
+          apiBase, apiKey,
+          question: storeText || userText,
+          log: (m) => console.log(`  [l3] ${m}`),
+        })
+      },
       checkStop: () => {
-        // both 模式下停止信号只给 A 用：信号是"读到即删"（见 consumeSessionStop），
-        // B 也来读的话会把 A 那份抢走——表现就是"点了停止，回答继续往下流"。
-        if (path === 'both') return
+        // both 模式下停止信号归**主路径**（2026-10-27 起是新的那条）。信号是"读到即删"
+        // （见 consumeSessionStop），副路径那条是普通调用、根本不读它，所以这里不用再挡。
         if (consumeSessionStop(key, options.replyToTs)) throw abortedError()
       },
       log: (m) => console.log(`  [l3] ${m}`),
@@ -1262,39 +1334,57 @@ async function say(userText, options = {}) {
           const keep = [...readLive(key), ...(Array.isArray(e.nodes) ? e.nodes : [])].filter((id) => !drop.has(id))
           writeLive(key, keep)
         }
+        // 材料条目：落库时塞进这一行的 payload，侧栏拿它把 [编号] 渲染成可点开的折叠块
+        if (e && e.type === 'sources' && Array.isArray(e.items)) roundSources = e.items
+        // 图命中（2026-10-27）：新路径判完才知道"哪几个真用上了"——顶层派题判「用不上」的、
+        // 读了材料但交付被拒的都不在里面（它们这一轮没起作用，画上去等于说"这一轮用了它"）。
+        // 事件在终稿流式之前到达：此刻写库 → receiver 轮询 → 侧栏点亮，用户开始读答案时图已经亮着。
+        if (e && e.type === 'used' && (path === 'tasks' || path === 'both')) {
+          const ids = Array.isArray(e.nodes) ? e.nodes.filter(Boolean) : []
+          // 这一轮的「真用上」清单交给讨论栈（applyStackTurn 记在 user 条目上）：
+          // 回答结束后图关掉再打开、刷新、切书回来，都按这一份画，而不是按累积的 cites。
+          // 只在**这一轮确实有命中**时记：没命中的追问不写，图沿用上一轮那份。
+          if (l3Hits.length) options.turnUsed = ids.slice()
+          if (l3Hits.length) {
+            appendGraphHit(ids, ids.map(hitLabel).join('、'), key, options.replyToTs, {
+              cites: ids.filter((id) => citeHits.has(id)),
+            })
+          }
+        }
       },
-      // 拒绝交付 = 这条旧讨论的 point/alias 与实际内容不符（用户后面去修图谱）。
-      // 单独落一个文件，攒够了一次性看哪些节点在吹牛。
-      onRefusal: (rec) => {
-        try {
-          fs.appendFileSync(path.join(path.dirname(L3_TRACE_DIR), 'l3-refusals.jsonl'), JSON.stringify({ ts: new Date().toISOString(), ...rec }) + '\n')
-        } catch {}
-      },
+      // 拒绝结果先不落盘（2026-10-29 用户定）。原来这里往 data/runtime 下的拒绝日志
+      // 追加一条，但那份文件从来没生成过，也没有任何地方读它。等 R2 的判据改成
+      // "有没有能接上的材料"（拒绝只剩"一句都接不上"那一档）之后再定要不要留。
+      // 库里的 onRefusal 钩子还在（不传 = 空操作），要落盘时接回来即可。
       opts: {
-        // both：B 的终稿现在也**显示给用户**（2026-10-26 用户定：边用边评估两份），
-        // 所以记录里标"已显示"，并且它会以一条 assistant 行落库、正文不参与历史。
-        ...(path === 'both' ? { finalLabel: 'B 新路径（也显示在侧栏）', finalShown: true } : {}),
+        // both：主路径（新的那条）就是用户看到的那份，记录里标"已显示"；
+        // 副路径（旧的）在下面手动写一条 final，标明它只是对照。
+        ...(path === 'both' ? { finalLabel: 'B 新路径（用户看到的就是这段）', finalShown: true } : {}),
       },
     }
-    const fullHist = () => assembleCallHist({ hist, persona, l3: options.l3, anchored, mode: 'full' })
-    // both：两条同时跑。A（旧路径）流式先说；B（新路径）跑完后**再补一条气泡**，
-    // 两份并排给你评估。B 那条带 payload { l3variant:'B' }——只显示，不进历史（见 chat-store.pairReplies）。
+    const fullHist = () => assembleCallHist({ hist, persona, agreement, l3: options.l3, anchored, mode: 'full' })
     let altTask = null
     let altAnswer = ''
+    // both：**新路径为主、旧路径为副**（2026-10-27 用户定，之前是反过来的）。
+    //   主 = 流式给用户看的那份，落库、进历史、算作「主回复」；
+    //   副 = 跑完后另起一条气泡〔A · 旧路径〕，只显示、不进历史（payload l3variant:'A'）。
+    // 副那条不走流式：它没有用户在等，攒完一次性写就行。
     if (path === 'both') {
       altTask = (async () => {
         let text = ''
-        for await (const piece of runTasksPipeline(tasksDeps)) if (piece && piece.accumulated) text = piece.accumulated
+        for await (const piece of callLLMStreamWithRetry(options.maxTokens || 8192, fullHist(), { kind: '对照·旧路径', conv: key })) {
+          if (piece && piece.accumulated) text = piece.accumulated
+        }
         return text
       })().catch((e) => {
-        console.log(`  [l3] A/B：新路径失败（不影响这一轮回答）：${e.message}`)
+        console.log(`  [l3] A/B：旧路径那份失败（不影响这一轮回答）：${e.message}`)
         return ''
       })
     }
-    const stream = path === 'tasks'
+    const stream = path === 'tasks' || path === 'both'
       ? runTasksPipeline(tasksDeps)
       : callLLMStreamWithRetry(options.maxTokens || 8192,
-        path === 'full' || path === 'both' ? fullHist() : assembleCallHist({ hist, persona, l3: options.l3, anchored, mode: 'off' }),
+        path === 'full' ? fullHist() : assembleCallHist({ hist, persona, agreement, l3: options.l3, anchored, mode: 'off' }),
         { kind: usageKind, conv: key })
     let lastWrite = 0
     let result
@@ -1327,13 +1417,16 @@ async function say(userText, options = {}) {
     }
 
     // 调试：这一轮的命题递归已经跑完，脑图直接在浏览器里打开（只有 data\config\l3-debug 开着时才走到这里）
-    // both 模式要等后台那条新路径跑完再开图，否则图上只有一半
+    // both 模式要等后台那条（旧路径）跑完再开图，否则图上只有一半
     if (altTask) {
       const ALT_WAIT_MS = 120_000
       const alt = await Promise.race([altTask, sleep(ALT_WAIT_MS).then(() => '')])
       altAnswer = String(alt || '').trim()
-      if (tree) tree.write({ type: 'final', label: 'A 旧路径（先说的那份）', text: displayContent, coverage: [], shown: true })
-      console.log(`  [l3] A/B 同输入：旧路径 ${displayContent.length} 字｜新路径 ${altAnswer ? `${altAnswer.length} 字` : '没跑完（超时）'}`)
+      if (tree) tree.write({ type: 'final', label: 'A 旧路径（对照，另起一条气泡）', text: altAnswer || '（没跑完）', coverage: [], shown: !!altAnswer })
+      // 2026-10-27 修：这里原来用 displayContent，而它要到下面（落库前）才赋值——
+      // both 模式下这条日志永远报"0 字"，写进脑图的那份终稿也永远是空的。
+      // 此刻拿得到的是流式累积的 fullContent。
+      console.log(`  [l3] A/B 同输入：新路径（给用户）${String(fullContent || '').length} 字｜旧路径（对照）${altAnswer ? `${altAnswer.length} 字` : '没跑完（超时）'}`)
     }
     // 自动打开只有 debug 开关说了算：`both` 每轮都写脑图，但每轮都弹一次浏览器会打断阅读。
     if (tree && tree.file && debugOn) openInBrowser(tree.file)
@@ -1370,16 +1463,22 @@ async function say(userText, options = {}) {
       // ② 那段 await 在流式结束之后，这几秒里点停止抓不到；③ 产品说明（README / 教程）
       // 本来就只承诺"每次共读结束合并重写一遍"，实时这条从来没写进对用户的话里。
       appendChatOutputStreamEnd(key, options.replyToTs)
-      replyRowId = appendChatOutput('assistant', displayContent, key, { replyTo: options.replyTo })
-      // both：A 先落库，B 紧跟其后补一条**只显示、不进历史**的气泡（payload l3variant:'B'）。
+      // payload.sources：正文里的 [编号] 点开要看的那几条（标题/原话/链接）。
+      // 不带它，侧栏就只能把 [1] 当纯文字；历史回放同一条路（receiver 读 payload）。
+      replyRowId = appendChatOutput('assistant', displayContent, key, {
+        replyTo: options.replyTo,
+        ...(roundSources.length ? { payload: { sources: roundSources } } : {}),
+      })
+      // both：主路径（新的那条）已经落库；副路径（旧的）紧跟其后补一条**只显示、不进历史**的气泡。
+      // 2026-10-27 对调：以前是 A 旧路径先落库、B 新路径补一条，现在反过来。
       // 两句话分别是谁，靠正文第一行标出来——用户要一眼能分。
       if (altAnswer) {
         try {
-          appendChatOutput('assistant', '〔B · 新路径〕\n\n' + altAnswer, key, {
-            replyTo: options.replyTo, payload: { l3variant: 'B' },
+          appendChatOutput('assistant', '〔A · 旧路径〕\n\n' + altAnswer, key, {
+            replyTo: options.replyTo, payload: { l3variant: 'A' },
           })
         } catch (e) {
-          console.log(`  [l3] B 那份没写成气泡（不影响 A 的回答）：${e.message}`)
+          console.log(`  [l3] 旧路径那份没写成气泡（不影响回答）：${e.message}`)
         }
       }
     }
@@ -1863,8 +1962,15 @@ async function judgeStackTurn(bookKey, unit, cites) {
   }
 }
 
-/** 落盘：用判好的结果 + 本轮回复，写栈、必要时收口固化。 */
-async function applyStackTurn(bookKey, unit, reply, decision) {
+/**
+ * 落盘：用判好的结果 + 本轮回复，写栈、必要时收口固化。
+ *
+ * turnUsed（2026-10-27 第二次改，用户定）：这一轮**真读到、并且交上了料**的节点 id。
+ * 记在这一轮的 user 条目上（`used`），`/stack-hits` 取最近一轮拿去画图——于是不管什么时候
+ * 打开图，亮的都是"当前这一轮用了哪些旧知识点"，不会把前面几轮累积的 cites 一起堆上来。
+ * 没传 = 这一轮没有命中（不是"命中了但没用上"），条目上不写 used，图沿用上一轮那份。
+ */
+async function applyStackTurn(bookKey, unit, reply, decision, turnUsed) {
   if (!decision) {
     // 判栈失败：这一轮说不清有没有换话题（可能是"换了但判不出来"）。宁可丢一次继承，
     // 也不带着不确定的来路节点跨话题用；栈本身也不动（和以前一样，这一轮不入栈）。
@@ -1875,7 +1981,17 @@ async function applyStackTurn(bookKey, unit, reply, decision) {
   const { action, stack, closed, citesList, isFree, freeTag } = decision
   try {
     const lastUserIdx = stack.reduce((acc, e, i) => (e.role === 'user' ? i : acc), -1)
-    const savedStack = stack.map((e, i) => (i === lastUserIdx && citesList.length ? { ...e, cites: citesList } : e))
+    const used = Array.isArray(turnUsed) ? turnUsed.filter(Boolean) : null
+    const savedStack = stack.map((e, i) => {
+      if (i !== lastUserIdx) return e
+      // cites = 这一轮引用到的（收口建 user 边用，累积口径）；used = 这一轮真用上的（图命中用）。
+      // 两个都挂在同一条 user 条目上：前者回答"这场讨论引用了什么"，后者回答"这一轮用了什么"。
+      return {
+        ...e,
+        ...(citesList.length ? { cites: citesList } : {}),
+        ...(used ? { used } : {}),
+      }
+    })
     let keptClosed = null  // 收口固化 0 节点产出时保留被收口讨论（压回栈顶，下次收口重试）
     if (action === 'closed_and_pushed' && closed) {
       // 自由对话：弹栈旧讨论不**当场**固化（产物只在归档时生成），但也不能丢——暂存起来
@@ -2519,7 +2635,7 @@ async function main() {
         // 2026-11：只认发给**这一条**的信号（msg.timestamp 是它落库时的 timestamp）；
         // 否则上一条留下的过期信号会把这条消息原封不动地弃掉（连提问行一起删）。
         if (consumeSessionStop(key, msg.timestamp)) {
-          discardStoppedTurn({ conv: msg.conv, questionId: msg.id })
+          discardStoppedTurn({ conv: msg.conv, questionId: msg.id, turnTs: msg.timestamp })
           continue
         }
         // /收口：手动收口本书讨论（2026-09 用户定调——读完一本书时使用）。
@@ -2572,6 +2688,9 @@ async function main() {
           const arg = String(msg.content || '').trim().replace(/^\/相处\s*/, '')
           const sr = await handleAgreement(arg, AGREEMENT_FILE, {
             callLLM: judgeLLM,
+            // 预算显式给（prompt-craft 八问第 8 条）：这一次要吐回**整份清单** + 四个变化数组，
+            // 21 条时约 1,200 字；再叠上推理模型的思考，4096 兜不住，截断就会整次白整理。
+            maxTokens: 8192,
             log: (m) => console.log(`  [相处] ${m}`),
           })
           appendChatOutput('system', sr.reply, key, { replyTo: msg.id })
@@ -2613,27 +2732,28 @@ async function main() {
         const inherited = stackDecision && stackDecision.action === 'pushed' ? readLive(key) : []
         if (inherited.length) console.log(`  [l3] 继承上一轮有效来路 ${inherited.length} 个：${inherited.join('、')}`)
         const hitsThisRound = [...new Set([...citesFinal, ...inherited])]
-        // 图上亮的 = 这一轮真正交给模型的：本轮引用命中 ∪ 同栈继承来的来路节点
-        // （2026-10-26 用户定：按当前轮的 live 显示，别让"用了什么"和"图上亮的"对不上）。
-        if (hitsThisRound.length) {
-          const inheritedOnly = new Set(inherited.filter((id) => !citesFinal.includes(id)))
-          const reason = hitsThisRound.map((id) => {
-            const n = graph.nodes.find((x) => x.id === id)
-            const label = n ? `「${n.point}」` : id
-            return inheritedOnly.has(id) ? label + '（上轮继承）' : label
-          }).join('、')
-          appendGraphHit(hitsThisRound, reason, key, msg.timestamp)
-        }
+        // 图上亮哪些**不在这里定**（2026-10-27 改口径）：新路径要等流水线判完才知道哪几个
+        // 真用上了（判「用不上」的、交付被拒的都不算），所以命中事件由 say() 在流水线里写；
+        // 旧路径（full/off）没有逐节点判定，由 say() 立刻写。这里只把两样东西递进去：
+        //   inheritedHits = 同栈继承来的节点（reason 里标「（上轮继承）」）
+        //   citeHits      = 本轮引用命中（自由模式引用窗体只并这些，不并 L3 追读到的父节点）
         // replyTo = 这条提问的 id：回答入库时直接挂上引用（配对从"时间序推断"变成"外键"）
         // replyToTs = 这条提问落库的 timestamp：侧栏用它当"哪一轮"的身份证（停止收尾后
         // 晚到的流式分片靠它认领，见 appendChatOutputStream 的注释）
         // l3Hits = 本轮新命中 ∪ 同栈上一轮有效来路：tasks 路径拿它派课题。
-        const reply = await say(userMsg, { bookKey: key, storeText, assistantSelected: selectionFromMsg(msg), l3: citesR.l3, l3Hits: hitsThisRound, replyTo: msg.id, replyToTs: msg.timestamp })
+        // sayOpts 是一个可回填的袋子：say() 会把"这一轮真读到、交了料的节点"（如果有）写回
+        // `turnUsed`，下面 applyStackTurn 把它记进讨论栈——图关掉再开、刷新之后也按这一份画。
+        const sayOpts = {
+          bookKey: key, storeText, assistantSelected: selectionFromMsg(msg), l3: citesR.l3,
+          l3Hits: hitsThisRound, inheritedHits: inherited, citeHits: citesFinal,
+          replyTo: msg.id, replyToTs: msg.timestamp,
+        }
+        const reply = await say(userMsg, sayOpts)
         // 用户停止（2026-02 用户定调"当没问过"）：say() 已经把历史与流水账收干净了，
         // 这里再弃掉库里的提问行与命中事件，然后**直接进入下一条**——
         // 不标 ok、不标 failed、不入栈判同一、不记账。判同一根本轮不到被踩。
         if (isAbortedReply(reply)) {
-          discardStoppedTurn({ conv: msg.conv, questionId: msg.id })
+          discardStoppedTurn({ conv: msg.conv, questionId: msg.id, turnTs: msg.timestamp })
           continue   // 瞬态流的收尾由 say() 独占写（那里已补 -1），此处不再重复写
         }
         // 致命配置/额度错误（401/402/403）：中止本轮 + 暂停队列 + 只留一条 system 提示。
@@ -2659,7 +2779,8 @@ async function main() {
         // 会意栈（按书隔离）：喂该消息所属书的栈；以上一轮**同书** AI 回复为降级上下文；
         // 入栈消息的引用暂存，**收口固化**（新专题化弹栈旧讨论）时建 user 边 + 段间无条件 derived 边。
         // 判已经在生成之前做完了（judgeStackTurn），这里只落盘 + 必要时收口。
-        await applyStackTurn(key, stackUnit, reply, stackDecision)
+        // 第四个参数 = 本轮"真用上"的节点（没有命中时是 undefined，栈里不写 used）。
+        await applyStackTurn(key, stackUnit, reply, stackDecision, sayOpts.turnUsed)
         lastReplyByBook[key] = { content: stripCodeBlocks(reply), selected: selectionFromMsg(msg) }
       }
     } catch (e) { console.log(`⚠️ ${e.message}\n`) }

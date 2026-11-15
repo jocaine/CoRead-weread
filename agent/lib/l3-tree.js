@@ -281,6 +281,7 @@ function linesOf(n) {
     }
   }
   if (n.noTask) { push('用不上：这块料补不上这一处（未派题）', 11, C.ghost.sub, true); return out }
+  if (n.noTask) { push('用不上：这块料补不上这一处（未派题）', 11, C.ghost.sub, true); return out }
   if (!n.task && !n.body) push(n.reason ? `❌ 没拿到登记（${n.reason}）` : '❌ 没拿到登记', 11, C.none.text, true)
   return out
 }

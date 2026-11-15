@@ -155,6 +155,9 @@ setInterval(() => {
         pushSSE('message', {
           role: m.role, content: m.content, timestamp: m.timestamp, bookKey: m.conv,
           ...(m.status === 'failed' ? { failed: true } : {}),
+          // 终稿正文里的 [编号] 要能点开看原话（2026-10-27）：条目跟着消息一起走，
+          // 不另开一条通道——否则重连补发、历史回放两处都得再对齐一次。
+          ...(m.payload && Array.isArray(m.payload.sources) ? { sources: m.payload.sources } : {}),
         })
       }
     }
@@ -167,8 +170,11 @@ setInterval(() => {
         pushSSE('message', {
           role: 'graph-hit', hits: (e.payload && e.payload.hits) || [],
           reason: (e.payload && e.payload.reason) || '', timestamp: e.ts, bookKey: e.conv,
+          // 其中属于「本轮引用命中」的那几条（2026-10-27）：自由模式的引用窗体只并这些；
+          // L3 往下追读到的父节点是模型自己读的，不在窗体里出现。
+          ...(e.payload && Array.isArray(e.payload.cites) ? { cites: e.payload.cites } : {}),
           // 这一轮提问的身份证（2026-11）：侧栏据此丢弃"已被停止的那一轮"的命中事件，
-          // 不然图会在停止收尾之后又被点亮（命中是在生成回答**之前**写出来的）。
+          // 不然图会在停止收尾之后又被点亮（命中是在生成回答期间写出来的）。
           ...(e.payload && e.payload.replyToTs ? { replyToTs: Number(e.payload.replyToTs) } : {}),
         })
       }
@@ -916,6 +922,8 @@ const server = http.createServer(async (req, res) => {
         chatItems.push({
           role: m.role, content: m.content, _ts: m.timestamp || 0, bookKey: m.conv,
           ...(m.status === 'failed' ? { failed: true } : {}),
+          // 历史回放也要带条目：否则刷新一次面板，正文里的 [编号] 就退化成纯文字（2026-10-27）
+          ...(m.payload && Array.isArray(m.payload.sources) ? { sources: m.payload.sources } : {}),
         })
       }
     }
@@ -1044,22 +1052,41 @@ const server = http.createServer(async (req, res) => {
   // 图视图显示的"当前讨论命中" = 实时讨论栈（agent/topic_stack.json）里 user 条目
   // 挂的 cites（去重）。侧栏打开图 / 收到 stack-updated / 切书时重拉：非空恢复
   // 高亮 + 横幅；栈收口清空后为空 → 侧栏清除 hit 态高亮。
+  //
+  // 2026-10-27 加 `used`（用户定：图只亮"当前这一轮真读到、交了料"的节点）：
+  // 每个 user 条目上可能记着本轮真用上的节点（agent 的 applyStackTurn 写的），
+  // 取**最近一轮**那一份。`hits`（累积 cites）仍返回——自由模式的引用窗体用它。
+  // 没有 used（升级前写的栈、或最近这一轮没有命中）= null，侧栏按老规矩退回 hits。
   if (req.method === 'GET' && req.url.split('?')[0] === '/stack-hits') {
     if (!originAllowed(origin, req)) { res.writeHead(403); res.end('{}'); return }
     const u = new URL(req.url, 'http://localhost')
     const book = baseBookId(u.searchParams.get('book') || '')
     const hits = []
+    let used = null
     try {
       const stacks = JSON.parse(fs.readFileSync(TOPIC_STACK_FILE, 'utf8'))
       const stack = stacks[book] || []
       for (const e of stack) {
-        if (e && e.role === 'user' && Array.isArray(e.cites)) {
+        if (!e || e.role !== 'user') continue
+        if (Array.isArray(e.cites)) {
           for (const c of e.cites) if (c && !hits.includes(c)) hits.push(c)
+        }
+        // 顺序遍历：最后一条带 used 的 user 条目 = 最近这一轮的清单
+        if (Array.isArray(e.used)) used = e.used.filter(Boolean)
+      }
+      // 迁移兜底（2026-10-27）：老栈没写 used 时，用最近一条 graph-hit 里记的有效节点。
+      // 只认「它引用的节点全在当前这场讨论的 cites 里」那条——否则可能把上一场讨论的旧命中翻出来。
+      if (used === null && hits.length) {
+        const ev = chatStore().latestGraphHit(book)
+        const p = (ev && ev.payload) || null
+        const evCites = p && Array.isArray(p.cites) ? p.cites.filter(Boolean) : null
+        if (evCites && evCites.length && evCites.every((id) => hits.includes(id)) && Array.isArray(p.hits)) {
+          used = p.hits.filter(Boolean)
         }
       }
     } catch {}
     res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ hits }))
+    res.end(JSON.stringify({ hits, used }))
     return
   }
 

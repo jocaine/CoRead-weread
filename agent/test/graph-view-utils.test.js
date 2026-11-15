@@ -5,8 +5,9 @@
  *
  * 为什么放在 agent/test：`graph-view.js` 是普通 <script>（IIFE 挂 window/globalThis），
  * 无模块导出、扩展目录下也没有测试跑道；但它里面的 computePath / computeChains /
- * computeHitLayers 是纯函数，口径直接决定"用户在图上看到的"是否等于"AI 实际拿到的"。
- * 2026-10 的《大国大城》跑题就是因为两者不一致（图 46 节点 / L3 8 节点）而难以定位，
+ * computeExactSet 是纯函数，口径直接决定"用户在图上看到的"是否等于"AI 实际拿到的"。
+ * 2026-10 的《大国大城》跑题就是因为两者不一致（图 46 节点 / L3 8 节点）而难以定位；
+ * 2026-10-27 又因为"图上画整条 user 闭包、新路径只读几个节点"再改了一次口径（见 computeExactSet）。
  * 所以这里用最小 vm 沙箱把它加载进来单测。
  *
  * 注意：vm 沙箱里造出来的数组/Set 属于另一个 realm，`assert.deepStrictEqual` 比原型会
@@ -52,34 +53,32 @@ const EDGES = [
   { from: 'n_c', to: 'n_down', kind: 'user' },
 ]
 
-test('computeHitLayers：一场讨论一次闭包——种子并集，只沿 user 入边递归', () => {
-  // 种子 = 本轮命中 ∪ 本场栈已挂的引用（收口后会并进同一个节点的 user 边，所以一起取闭包）
-  const r = U.computeHitLayers(NODES, EDGES, ['n_c', 'n_d'])
-  assert.deepEqual(ids(r.ids), ['n_a', 'n_b', 'n_c', 'n_d'], '闭包 = 种子 + 沿 user 入边的上游')
-  assert.equal(r.ids.has('n_down'), false, 'user 出边（下游）不进')
-  assert.equal(r.ids.has('n_solo'), false, '没被指认也不是上游的节点不进')
-  assert.deepEqual(ids(r.recent), ['n_c', 'n_d'], 'recent = 种子里的引用节点（两个也是并集）')
-  assert.deepEqual(ids(r.roots), ['n_a', 'n_d'], 'roots = 闭包里没有 user 入边的起点')
+test('computeExactSet：只亮给的这些节点，**不再沿 user 入边展开上游**（2026-10-27 用户定）', () => {
+  // 为什么改：新路径 L3 只按派题读几个节点。实测 2026-10-27 16:13 那轮命中 3 个、真读 2 个，
+  // 旧口径（种子取 user 闭包）却亮了 36 个（全图 230 个）——图上亮的和实际用的差一个数量级。
+  const r = U.computeExactSet(NODES, EDGES, ['n_c', 'n_d'])
+  assert.deepEqual(ids(r.ids), ['n_c', 'n_d'], '只有给的这两个：n_a / n_b 是上游，不进来')
+  assert.equal(r.ids.has('n_down'), false, 'user 出边（下游）同样不进来')
+  assert.deepEqual(ids(r.recent), ['n_c', 'n_d'], '清单里每个都是"用到的"，没有引用/上游之分')
+  assert.equal(r.roots.length, 0, '不展开上游 → 没有"路径起点"这个概念，不画虚线起点环')
 })
 
-test('computeHitLayers：闭包内部的边全部可见（弱边档）——节点不能是无线孤点', () => {
-  // d 与 c 之间是 derived 边：不在强边档（不是 user 边），但两端都在闭包里 → 必须进弱边档，
+test('computeExactSet：清单内部的边照样全画（节点不能是无线孤点）', () => {
+  // d 与 c 之间是 derived 边：不在强边档（不是 user 边），但两端都在清单里 → 进弱边档，
   // 否则 d 会变成没有连线的孤点，图失去结构（2026-10 用户反馈"看不懂"）。
-  const r = U.computeHitLayers(NODES, EDGES, ['n_c', 'n_d'])
-  assert.deepEqual(Array.from(r.weakEdges, (e) => e.from + '>' + e.to), ['n_d>n_c'], '弱边 = 闭包内的 derived 边')
-  const strong = new Set(Array.from(r.pathEdges, (e) => e.from + '>' + e.to))
-  const weak = new Set(Array.from(r.weakEdges, (e) => e.from + '>' + e.to))
-  const inside = EDGES.filter((e) => r.ids.has(e.from) && r.ids.has(e.to)).map((e) => e.from + '>' + e.to)
-  assert.ok(inside.length > 0)
-  for (const k of inside) assert.ok(strong.has(k) || weak.has(k), `${k} 必须在两档之一`)
-  assert.equal(weak.has('n_c>n_down'), false, '跨出闭包的边不画')
+  const r = U.computeExactSet(NODES, EDGES, ['n_c', 'n_d'])
+  assert.deepEqual(Array.from(r.weakEdges, (e) => e.from + '>' + e.to), ['n_d>n_c'], '弱边 = 清单内的 derived 边')
+  assert.equal(r.pathEdges.length, 0, 'n_b→n_c 的起点不在清单里，不算清单内部的强调边')
+  // 两端都在清单里的 user 边 = 强调档
+  const r2 = U.computeExactSet(NODES, EDGES, ['n_b', 'n_c'])
+  assert.deepEqual(Array.from(r2.pathEdges, (e) => e.from + '>' + e.to), ['n_b>n_c'])
 })
 
-test('computeHitLayers：无命中 / 命中全不存在 → 空；单个无上游的引用只有它自己', () => {
-  assert.equal(U.computeHitLayers(NODES, EDGES, []).ordered.length, 0)
-  assert.equal(U.computeHitLayers(NODES, EDGES, ['n_missing']).ordered.length, 0)
-  const solo = U.computeHitLayers(NODES, EDGES, ['n_d'])
-  assert.deepEqual(ids(solo.ids), ['n_d'], 'n_d 没有 user 入边 → 闭包就它自己')
+test('computeExactSet：无命中 / 命中全不存在 → 空；单个节点不带任何上游', () => {
+  assert.equal(U.computeExactSet(NODES, EDGES, []).ordered.length, 0)
+  assert.equal(U.computeExactSet(NODES, EDGES, ['n_missing']).ordered.length, 0)
+  const solo = U.computeExactSet(NODES, EDGES, ['n_c'])
+  assert.deepEqual(ids(solo.ids), ['n_c'], 'n_c 有 user 入边也不带上游')
   assert.equal(solo.pathEdges.length, 0)
   assert.equal(solo.weakEdges.length, 0)
 })
@@ -121,7 +120,7 @@ test('回归守卫：render() 里不许直接读 hl.ids / hl.roots / hl.recent /
   // 仍直接读全量 hl.*，于是"观察某条脉络时其它脉络的节点也高亮/闪环"。
   // 纯函数单测盖不到渲染分支，所以这里做一次源码级守卫：render() 必须一律读激活集
   // （hlIds / hlEdges / hlWeakEdges / hlStackOnly / hlRoots / hlRecent）。
-  const src = fs.readFileSync(SRC, 'utf8')
+  const src = fs.readFileSync(SRC, 'utf8').replace(/\r\n/g, '\n')   // 工作树可能是 CRLF（编辑器的行尾），按 LF 切
   const start = src.indexOf('    render() {')
   assert.ok(start > 0, '找不到 render()')
   const end = src.indexOf('\n    }\n', start)          // 方法收尾的 4 空格缩进右花括号
@@ -218,7 +217,7 @@ test('labelShape：描述省略只由缩放决定（高亮与非高亮同一缩�
 })
 
 test('回归守卫：render() 里 labelShape 只传 ratio（高亮不得改变描述省略）', () => {
-  const src = fs.readFileSync(SRC, 'utf8')
+  const src = fs.readFileSync(SRC, 'utf8').replace(/\r\n/g, '\n')   // 工作树可能是 CRLF（编辑器的行尾），按 LF 切
   const start = src.indexOf('    render() {')
   const end = src.indexOf('\n    }\n', start)
   const code = src.slice(start, end)

@@ -5,7 +5,9 @@
  * 用户看到"界面跳回选书界面"（2026-11 反复踩过）。它们都是纯逻辑，能在 node 里直接跑：
  *
  *   ① `activeTabKind(url)`   —— 活动标签页属于哪一类页面（**只看 URL**，问不倒的事实）；
- *   ② `readerSync` 随附的 `fromActive` —— 这份阅读器快照是不是活动标签页推上来的。
+ *   ② `readerSync` 随附的 `fromActive` —— 这份阅读器快照是不是活动标签页推上来的；
+ *   ③ `pickLastTab` / `readerContextQuery.lastReader` —— 活动标签页是无关网页时，
+ *      后台带回"最后那个阅读器标签页"的书（2026-10-27）。
  *
  * 运行：node extension/test/reader-context.test.mjs
  *      （已挂进 package.json 的 `npm run test:ext`）
@@ -13,7 +15,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { activeTabKind, installTranslateBackground, refAnchorsOf, refContextOf } from '../translate-background.js'
+import { activeTabKind, installTranslateBackground, pickLastTab, refAnchorsOf, refContextOf } from '../translate-background.js'
 
 const WEREAD_BOOK_URL = 'https://weread.qq.com/web/reader/ce0321c0722b4a5d9f7b0c1e2d3f4a5b'
 const WEREAD_BOOK_K_URL = WEREAD_BOOK_URL + 'k06432b4029e064096632ab8'   // 带章节目录后缀（真实形态）
@@ -57,9 +59,19 @@ test('拿不到活动标签页时是 unknown —— 侧栏据此**什么都不�
 
 // ── ② 阅读器快照随附的 fromActive ────────────────────────────────────────────
 
+/** 活动标签页的默认替身：一个跟阅读无关的网页（用户去聊天窗口/查资料时的场景） */
+const NEWS_TAB = { id: 9, windowId: 1, url: 'https://news.qq.com/a/20261101' }
+
 /** 装一个够用的 chrome 替身，并把后台的消息监听器抓出来 */
-function setupBackground({ active = true, getThrows = false } = {}) {
-  const state = { broadcast: [], listener: null }
+function setupBackground({
+  active = true,
+  getThrows = false,
+  activeTab = NEWS_TAB,
+  readerTabs = [],
+  wereadTabs = [],
+  bookInfo = {},
+} = {}) {
+  const state = { broadcast: [], listener: null, queries: [], sent: [] }
   globalThis.chrome = {
     commands: { onCommand: { addListener() {} } },
     tabs: {
@@ -67,11 +79,31 @@ function setupBackground({ active = true, getThrows = false } = {}) {
         if (getThrows) throw new Error('标签页已经不在了')
         return { id, active }
       },
+      // 后台只会问这几类（见 translate-background.js）：
+      //   { active: true }      → 活动标签页
+      //   { url: reader.html* } → 开着的阅读器标签页
+      //   { url: weread book }  → 微读书页（只用来比"最后在读的是不是 PDF"）
+      query: async (q) => {
+        state.queries.push(q)
+        if (q && q.active) return activeTab ? [activeTab] : []
+        const u = String((q && q.url) || '')
+        if (u.includes('reader.html')) return readerTabs
+        if (u.includes('weread.qq.com/web/reader')) return wereadTabs
+        return []
+      },
+      sendMessage: async (id, msg) => {
+        state.sent.push({ id, msg })
+        if (!msg || msg.action !== 'readerBookInfo') return undefined
+        const v = bookInfo[id]
+        if (v instanceof Error) throw v
+        return v
+      },
     },
     runtime: {
       onMessage: { addListener: (fn) => { state.listener = fn } },
       // 后台广播（阅读器 → 侧栏）：替身把每条都记下来
       sendMessage: async (msg) => { state.broadcast.push(msg) },
+      getURL: (p) => 'chrome-extension://test/' + p,
     },
   }
   installTranslateBackground()
@@ -120,6 +152,134 @@ test('不是从标签页来的快照（扩展页面自己发的）→ fromActive
   const s = setupBackground()
   await tell(s, snapshotMsg, {})
   assert.equal(s.broadcast.find((m) => m.action === 'readerUpdate').fromActive, null)
+})
+
+// ── ③ 最后一个阅读器标签页（2026-10-27）────────────────────────────────────
+// 用户从 PDF 切到无关网页（聊天窗口/查资料）时，侧栏不再回首页，而是显示"最后那个
+// 阅读器标签页"的对话。后台只负责把事实带回去，用不用由侧栏决定。
+
+const READER_BOOK = { bookId: 'rd_0123456789abcdef', hash: '0123456789abcdef', name: '第一次共读' }
+
+test('pickLastTab：优先取最近用过的那一个（lastAccessed 压过标签栏位置）', () => {
+  assert.equal(pickLastTab([
+    { id: 1, index: 5, lastAccessed: 1000 },
+    { id: 2, index: 1, lastAccessed: 3000 },
+  ]).id, 2)
+})
+
+test('pickLastTab：老 Chrome 没有 lastAccessed → 取标签栏最右（index 最大）', () => {
+  assert.equal(pickLastTab([
+    { id: 1, index: 0 },
+    { id: 2, index: 4 },
+    { id: 3, index: 2 },
+  ]).id, 2)
+  assert.equal(pickLastTab([]), null)
+  assert.equal(pickLastTab(null), null)
+})
+
+test('活动标签页是无关网页：带回最后那个阅读器标签页的书，并且只问它', async () => {
+  const s = setupBackground({
+    readerTabs: [
+      { id: 3, windowId: 1, index: 2, lastAccessed: 1000 },
+      { id: 7, windowId: 1, index: 5, lastAccessed: 2000 },
+    ],
+    bookInfo: { 7: { ok: true, book: READER_BOOK } },
+  })
+  const r = await tell(s, { action: 'readerContextQuery', req: 'q1' })
+  assert.equal(r.req, 'q1')
+  assert.equal(r.activeKind, 'other')
+  assert.deepEqual(r.lastReader, { tabId: 7, book: READER_BOOK })
+  assert.deepEqual(s.sent.map((x) => x.id), [7], '只该问最后那个阅读器标签页')
+})
+
+test('"最后"取最近用过的那个，不是标签栏最右的', async () => {
+  const s = setupBackground({
+    readerTabs: [
+      { id: 3, windowId: 1, index: 5, lastAccessed: 1000 },  // 更靠右，但更久没碰
+      { id: 7, windowId: 1, index: 2, lastAccessed: 2000 },  // 最近用过
+    ],
+    bookInfo: { 7: { ok: true, book: READER_BOOK } },
+  })
+  const r = await tell(s, { action: 'readerContextQuery', req: 'q2' })
+  assert.equal(r.lastReader.tabId, 7)
+})
+
+test('阅读器标签页在别的窗口 → 不算（侧栏按窗口挂）', async () => {
+  const s = setupBackground({
+    readerTabs: [{ id: 7, windowId: 2, index: 5, lastAccessed: 3000 }],
+  })
+  const r = await tell(s, { action: 'readerContextQuery', req: 'q3' })
+  assert.equal(r.lastReader, undefined)
+  assert.equal(s.sent.length, 0)
+})
+
+test('最后在读的是微读书页 → 不回落 PDF（防后台 PDF 抢微读会话）', async () => {
+  const s = setupBackground({
+    readerTabs: [{ id: 7, windowId: 1, index: 5, lastAccessed: 1000 }],
+    wereadTabs: [{ id: 8, windowId: 1, index: 6, lastAccessed: 2000, url: WEREAD_BOOK_URL }],
+    bookInfo: { 7: { ok: true, book: READER_BOOK } },
+  })
+  const r = await tell(s, { action: 'readerContextQuery', req: 'q4' })
+  assert.equal(r.lastReader, undefined)
+  assert.equal(s.sent.length, 0, '微读更新时不该再去问 PDF')
+})
+
+test('微读书页比阅读器更旧 → 仍显示 PDF（只否定"最后在读的是微读"）', async () => {
+  const s = setupBackground({
+    readerTabs: [{ id: 7, windowId: 1, index: 5, lastAccessed: 2000 }],
+    wereadTabs: [{ id: 8, windowId: 1, index: 6, lastAccessed: 1000, url: WEREAD_BOOK_URL }],
+    bookInfo: { 7: { ok: true, book: READER_BOOK } },
+  })
+  const r = await tell(s, { action: 'readerContextQuery', req: 'q4b' })
+  assert.equal(r.lastReader.tabId, 7)
+})
+
+test('活动标签页是微读书页：走原规则，不探阅读器', async () => {
+  const s = setupBackground({
+    activeTab: { id: 9, windowId: 1, url: WEREAD_BOOK_URL },
+    readerTabs: [{ id: 7, windowId: 1, index: 5, lastAccessed: 9999 }],
+  })
+  const r = await tell(s, { action: 'readerContextQuery', req: 'q5' })
+  assert.equal(r.activeKind, 'weread-book')
+  assert.equal(r.lastReader, undefined)
+  assert.equal(s.sent.length, 0)
+})
+
+test('阅读器明确说没开书 → 不带 lastReader（侧栏照旧回首页）', async () => {
+  const s = setupBackground({
+    readerTabs: [{ id: 7, windowId: 1, index: 5, lastAccessed: 1000 }],
+    bookInfo: { 7: { ok: true, book: null } },
+  })
+  const r = await tell(s, { action: 'readerContextQuery', req: 'q6' })
+  assert.equal(r.lastReader, undefined)
+})
+
+test('阅读器答不上来（加载中 / 答非所问 / 消息失败）→ 带 unknown，侧栏保持当前书', async () => {
+  const cases = [
+    { ok: true, loading: true, book: null },
+    {},                              // 答非所问：没有 ok:true
+    new Error('页面已经不在了'),
+    undefined,
+  ]
+  for (const info of cases) {
+    const s = setupBackground({
+      readerTabs: [{ id: 7, windowId: 1, index: 5, lastAccessed: 1000 }],
+      bookInfo: { 7: info },
+    })
+    const r = await tell(s, { action: 'readerContextQuery', req: 'q6b' })
+    assert.deepEqual(r.lastReader, { tabId: 7, unknown: true })
+  }
+})
+
+test('阅读器 500ms 不应答（被冻结）→ 带 unknown，且不把侧栏的上下文刷新挂住', async () => {
+  const s = setupBackground({
+    readerTabs: [{ id: 7, windowId: 1, index: 5, lastAccessed: 1000 }],
+    bookInfo: { 7: new Promise(() => {}) },   // 永远不 resolve
+  })
+  const t0 = Date.now()
+  const r = await tell(s, { action: 'readerContextQuery', req: 'q6c' })
+  assert.deepEqual(r.lastReader, { tabId: 7, unknown: true })
+  assert.ok(Date.now() - t0 >= 450, '没等到超时就返回了，说明超时逻辑没生效')
 })
 
 // ── refContextOf：这次引用该带什么上下文（2026-11 扫描件带整卡译文）────────────

@@ -96,7 +96,145 @@ function escAttr(t) {
 // 支持：段落 / 软换行（单换行按 <br>）、# 标题、**粗**、*斜*、~~删除~~、`行内码`、
 //      ``` 围栏代码块 ```、> 引用、- / 1. 列表（更深的缩进做视觉下沉）、--- 分隔线、
 //      | 表格 |、[文本](链接) 与裸链接。
-function mdInline(s) {
+// 材料折叠块（2026-10-27 用户定）：终稿正文里只写 `[3]`，点开才看到那一条的原话和链接。
+//
+// 为什么用 label + checkbox 而不是 <details>：标记是**行内**的，而 <details> 是块级元素，
+// 插进 <p> 里浏览器会把段落拆开（正文后半句跑到段外）。label 包着 checkbox 是纯 CSS 开关，
+// 不需要 JS、不需要 id，点一下就地展开，默认收起。里面放链接也不怕：点 <a> 属于交互内容，
+// 浏览器不会顺带触发 label 的开关。
+//
+// 材料是从网页来的，一律 esc / escAttr；URL 只认 http(s)，别的一律退成纯文字。
+// 正文用 shown（服务端洗过的那一段，见 web-search.js 的 cleanSnippet）——snippet 原文常是
+// 几段不相邻的话用「...」缝起来的，模型读得，人读不了（2026-10-28 用户：看不懂材料里写的东西）。
+// 老数据没有 shown，退回 text。
+function citeItemHtml(it) {
+  const url = String(it.url || '')
+  const href = /^https?:\/\//i.test(url)
+    ? '<a class="cite-url" href="' + escAttr(url) + '" target="_blank" rel="noopener noreferrer">' + esc(url) + '</a>'
+    : (url ? '<span class="cite-url">' + esc(url) + '</span>' : '')
+  return '<span class="cite-item">'
+    + '<span class="cite-meta">' + esc(it.title || '（无标题）') + (it.site ? '（' + esc(it.site) + '）' : '') + '</span>'
+    + '<span class="cite-txt">' + esc(it.shown || it.text || '') + '</span>'
+    + href
+    + '</span>'
+}
+
+/**
+ * 一条材料：正文里是个 `[n]`，点开是这一条的原话和链接。
+ *
+ * 2026-10-27 晚第三次改：试过 `✓N` 徽标、试过整句浅绿底，用户都说"不对味"——
+ * 问题在于**这两样都是我们自己发明的符号**，读者得先学会才看得懂。所以回到约定俗成：
+ * 「脚注编号 + 下划线」是人人认识的"这句话有出处"。编号照旧，被它标住的那一句加下划线
+ * （见 verifiedInline），底色和 ✓N 都撤掉。
+ */
+function citeHtml(it) {
+  return '<label class="cite">'
+    + '<input type="checkbox" class="cite-t">'
+    + '<span class="cite-k">[' + Number(it.n) + ']</span>'
+    + '<span class="cite-box">' + citeItemHtml(it) + '</span>'
+    + '</label>'
+}
+
+/** 只画编号、不带面板：用在一整句已经是一个 label 的场合（见 verifiedInline）。 */
+function citeMarkHtml(it) {
+  return '<span class="cite-k">[' + Number(it.n) + ']</span>'
+}
+
+// 整句是一个 label（点哪儿都展开），所以有两个"点了不该照字面发生"的地方：
+//   ① 点**展开的面板内部**不该把它关掉——想选一段原文就点没了。面板这一层拦住，
+//      别让点击冒到 label 的默认激活上（捕获阶段拦，赶在 label 处理之前）；链接照旧能点。
+//   ② 点**别处**要把已经展开的收起来（2026-10-27 用户定）：一次只留一个开着，别让它占着屏。
+try {
+  document.addEventListener('click', (e) => {
+    const t = e.target
+    const near = t && typeof t.closest === 'function' ? t : null
+    if (near && near.closest('.cite-box')) { e.stopPropagation(); return }
+    const mine = near && near.closest('label.vt, label.cite')
+    for (const cb of document.querySelectorAll('input.cite-t:checked')) {
+      if (!mine || !mine.contains(cb)) cb.checked = false
+    }
+  }, true)
+} catch {}
+
+/**
+ * 把一行按句号类标点切句（2026-10-27 晚）：只有切到"句子"这个粒度，才能给被核对过的那一段
+ * 加标记、又不把后面没核对的那句一起带上。
+ *
+ * 不切的地方：`**粗体**` 里面（`**先说它量的是什么。**` 这种整行加粗的伪标题，句号在粗体里，
+ * 在这儿切会把 `**` 拆成两半）、`代码` 里面、`[文字](链接)` 里面。
+ */
+function splitSentences(line) {
+  const out = []
+  let buf = ''
+  let bold = false
+  let code = false
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]
+    if (code) { buf += c; if (c === '`') code = false; continue }
+    if (c === '`') { code = true; buf += c; continue }
+    if (c === '*' && line[i + 1] === '*') { bold = !bold; buf += '**'; i++; continue }
+    if (c === ']' && line[i + 1] === '(') {
+      const close = line.indexOf(')', i + 2)
+      const seg = close < 0 ? line.slice(i) : line.slice(i, close + 1)
+      buf += seg
+      i += seg.length - 1
+      continue
+    }
+    buf += c
+    if (!bold && '。！？；'.includes(c)) { out.push(buf); buf = '' }
+  }
+  if (buf) out.push(buf)
+  return out
+}
+
+/**
+ * 这一句里引到了哪几条材料（按出现先后，去重）。返回的是条目本身，用来拼展开面板。
+ * 门槛是 1 条（2026-10-27 晚用户定）：一条材料核对过的也算核对过——他举的例子
+ * （"新预算法实施以后，地方国有企业……举的债，法律上不属于政府债务"）只引了一条。
+ */
+function sentenceCiteItems(piece, cites) {
+  if (!cites || !cites.size) return []
+  const seen = new Set()
+  const out = []
+  for (const m of String(piece).matchAll(/\[(\d{1,2})\]/g)) {
+    const n = Number(m[1])
+    if (seen.has(n) || !cites.has(String(n))) continue
+    seen.add(n)
+    out.push(cites.get(String(n)))
+  }
+  return out
+}
+
+/**
+ * 一行 → HTML，"被材料核对过的那一句"整句套一层可点的 `.vt`。
+ *
+ * 2026-10-27 晚第四版（用户定稿）：**文字直接换成链接色，点这一句的任何地方都能展开**。
+ * 前三版都错在"标记"上：先只给句尾加东西，再给整句刷底色，都是我们自己发明的符号，
+ * 读者看不明白；而"蓝绿色的字 = 可以点"是现成的约定，所以干脆让这一段就长成链接的样子，
+ * 并且**整段真的可点**（label 包住整句 + checkbox，点哪儿都开，不必对准那个 [n]）。
+ *
+ * 句子边界必须在这一层切：过了 mdInline 就是 HTML 了，`<strong>` 会被切两半。
+ * 切完各自渲染（引用只画编号，不各带一个面板），再拼回去；换行仍然只由 `<br>` 负责。
+ */
+function verifiedInline(line, mdI, cites) {
+  const pieces = splitSentences(line)
+  const one = (p) => {
+    const items = sentenceCiteItems(p, cites)
+    const body = mdI(esc(p), items.length ? 'mark' : '')
+    if (!items.length) return body
+    return '<label class="vt" title="这一句对照过 ' + items.length + ' 条网上材料，点一下展开">'
+      + '<input type="checkbox" class="cite-t">'
+      + body
+      + '<span class="cite-box">' + items.map(citeItemHtml).join('') + '</span>'
+      + '</label>'
+  }
+  if (pieces.length < 2) return one(line)
+  let html = ''
+  for (const p of pieces) html += one(p)
+  return html
+}
+
+function mdInline(s, cites, citeMode) {
   // 行内代码先摘出来占位：里面的 * _ ~~ 不该被当成强调标记
   const codes = []
   let t = String(s == null ? '' : s).replace(/`([^`\n]+)`/g, (m, c) => {
@@ -117,6 +255,18 @@ function mdInline(s) {
   t = t.replace(/(^|[^\w*])\*([^*\n]+?)\*(?!\*)/g, '$1<em>$2</em>')
   t = t.replace(/(^|[^\w_])_([^_\n]+?)_(?!_)/g, '$1<em>$2</em>')
   t = t.replace(/~~([^\n]+?)~~/g, '<del>$1</del>')
+  // 引用编号 [n]（2026-10-27）：这一轮真带回了材料才展开成可点开的折叠块。
+  // 没有材料（历史消息、没联网的回合）时保持原样文字——宁可不认，也不猜它是引用。
+  // 放在最后一步：上面那些强调/链接规则不该再碰一遍刚生成的 HTML。
+  // 行内代码里的 [1] 此刻还是占位符（\u0001 包着），不会被误认。
+  if (cites && cites.size) {
+    t = t.replace(/\[(\d{1,2})\]/g, (m, d) => {
+      const it = cites.get(String(Number(d)))
+      if (!it) return m                       // 认不出的编号原样留着（能看见才查得了）
+      // mark：只画编号。整句外层已经是一个可点的 label，面板由外层统一给（见 verifiedInline）
+      return citeMode === 'mark' ? citeMarkHtml(it) : citeHtml(it)
+    })
+  }
   t = t.replace(/\u0001(\d+)\u0001/g, (m, i) => '<code class="md-code">' + codes[Number(i)] + '</code>')
   return t
 }
@@ -136,9 +286,17 @@ function mdColAlign(sepCell) {
   return ''
 }
 
-function mdToHtml(src) {
+function mdToHtml(src, sources) {
   const lines = String(src == null ? '' : src).replace(/\r\n?/g, '\n').split('\n')
   const out = []
+  // 材料编号 → 折叠块 HTML（2026-10-27）：一次渲染共用一张表，正文里的 [3] 换成第 3 条的块。
+  // 表里没有的编号保持原样文字（模型编了不存在的号，或者旧消息没带材料）——不猜、不藏。
+  const cites = new Map()
+  for (const it of (Array.isArray(sources) ? sources : [])) {
+    const n = Number(it && it.n)
+    if (Number.isFinite(n) && n > 0 && !cites.has(String(n))) cites.set(String(n), it)
+  }
+  const mdI = (s, mode) => mdInline(s, cites, mode)
   const para = []  // 段落缓冲：软换行渲染成 <br>
   const flushPara = () => {
     if (!para.length) return
@@ -174,7 +332,7 @@ function mdToHtml(src) {
     if (head) {
       flushPara()
       const lv = Math.min(head[1].length + 2, 6)
-      out.push('<h' + lv + '>' + mdInline(esc(head[2])) + '</h' + lv + '>')
+      out.push('<h' + lv + '>' + mdI(esc(head[2])) + '</h' + lv + '>')
       i++
       continue
     }
@@ -183,7 +341,7 @@ function mdToHtml(src) {
       flushPara()
       const buf = []
       while (i < lines.length && /^\s{0,3}>/.test(lines[i])) {
-        buf.push(mdInline(esc(lines[i].replace(/^\s{0,3}>\s?/, ''))))
+        buf.push(verifiedInline(lines[i].replace(/^\s{0,3}>\s?/, ''), mdI, cites))
         i++
       }
       out.push('<blockquote>' + buf.join('<br>') + '</blockquote>')
@@ -201,7 +359,7 @@ function mdToHtml(src) {
         let tr = ''
         for (let c = 0; c < headCells.length; c++) {
           tr += '<td' + (aligns[c] ? ' class="' + aligns[c] + '"' : '') + '>' +
-            mdInline(esc(cells[c] || '')) + '</td>'
+            mdI(esc(cells[c] || '')) + '</td>'
         }
         body += '<tr>' + tr + '</tr>'
         i++
@@ -209,7 +367,7 @@ function mdToHtml(src) {
       let hr = ''
       for (let c = 0; c < headCells.length; c++) {
         hr += '<th' + (aligns[c] ? ' class="' + aligns[c] + '"' : '') + '>' +
-          mdInline(esc(headCells[c] || '')) + '</th>'
+          mdI(esc(headCells[c] || '')) + '</th>'
       }
       out.push('<table class="md-table"><thead><tr>' + hr + '</tr></thead><tbody>' + body + '</tbody></table>')
       continue
@@ -228,13 +386,13 @@ function mdToHtml(src) {
         if (!m) break
         if (/\d/.test(m[2]) !== ordered) break  // 类型切换 → 结束本列表
         const indent = m[1].replace(/\t/g, '  ').length
-        html += '<li' + (indent > baseIndent ? ' class="md-sub"' : '') + '>' + mdInline(esc(m[3]))
+        html += '<li' + (indent > baseIndent ? ' class="md-sub"' : '') + '>' + verifiedInline(m[3], mdI, cites)
         // 续行：缩进的非列表行并入本项（markdown 的 lazy continuation）
         let k = j + 1
         const cont = []
         while (k < lines.length && lines[k].trim() &&
                !/^\s*(?:[-*+]|\d{1,9}[.)])\s+/.test(lines[k]) && /^\s+/.test(lines[k])) {
-          cont.push(mdInline(esc(lines[k].trim())))
+          cont.push(verifiedInline(lines[k].trim(), mdI, cites))
           k++
         }
         if (cont.length) html += '<br>' + cont.join('<br>')
@@ -247,7 +405,7 @@ function mdToHtml(src) {
       continue
     }
     // 普通段落行
-    para.push(mdInline(esc(line)))
+    para.push(verifiedInline(line, mdI, cites))
     i++
   }
   flushPara()
@@ -256,8 +414,8 @@ function mdToHtml(src) {
 
 // 助理气泡正文（markdown）。.md 类在 CSS 里关掉白空格保留，改由块级元素负责排版——
 // 生成 HTML 里没有多余空白，但 pre-wrap 仍会把源码换行当空白显示，直接关掉更稳。
-function mdBubble(content) {
-  return '<div class="bubble md">' + mdToHtml(content) + '</div>'
+function mdBubble(content, sources) {
+  return '<div class="bubble md">' + mdToHtml(content, sources) + '</div>'
 }
 
 // 可靠的删除图标（SVG 描边垃圾桶，避免 🗑 emoji 在 Windows 下渲染异常/模糊）
@@ -360,9 +518,11 @@ let _currentBook = null  // { base, bookTitle }
  * 页面还没起来之类）。与 `_currentBook` 的区别：这个是"阅读器说的"，
  * 那个是"侧栏当前认定的"，两者可能因为时序而不一致。
  *
- * ⚠️ 它**不等于**"用户在看这本书"（2026-11 二次改版）：阅读器标签页开着、但用户切到了
- * 别的标签页时，清空是**对的**（与微信读书那本书表现一致）。所以由"活动标签页身份"
- * 得出的清空会带 `authoritative` 绕过这道防线，见 applyBookContext。
+ * ⚠️ 它**不等于**"用户在看这本书"（2026-11 二次改版，2026-10-27 补充）：阅读器标签页
+ * 开着、但用户切到了**微读书架 / 别的阅读源**时，清空仍然是对的（与微信读书那本书
+ * 表现一致）。所以由"活动标签页身份"得出的清空会带 `authoritative` 绕过这道防线，
+ * 见 applyBookContext。但切到**跟阅读无关的网页**时不再清空：2026-10-27 起改为显示
+ * "最后那个阅读器标签页"的对话（见 refreshCurrentBook 的 lastReader 分支）。
  */
 let _readerReportsBook = false
 // 上面那个事实是"什么时候知道的"（2026-11）。日志里带上它，
@@ -1564,8 +1724,10 @@ function applyBookContext(ctx, why, opts) {
      * 这道防线不猜来源、不依赖时序，直接把最坏的结果挡住。
      *
      * ⚠️ 但它**只挡"猜出来的清空"**（2026-11 二次改版）：`authoritative` 的清空来自
-     * 活动标签页的身份（问不倒的事实），那类清空必须放行——否则用户切到别的标签页时，
-     * 侧栏会一直挂着阅读器里那本书的会话，正是本轮要修掉的现象。
+     * 活动标签页的身份（问不倒的事实），那类清空必须放行——否则用户切到微读书架 /
+     * 别的阅读源时，侧栏会一直挂着阅读器里那本书的会话，正是 2026-11 要修掉的现象。
+     *（2026-10-27 起，"切到跟阅读无关的网页"不再走清空这条路，而是显示 lastReader
+     * 那本书；所以这里的放行条件没有放宽，别把它误删。）
      */
     if (_readerReportsBook && !(opts && opts.authoritative)) {
       postSidebarDebug({
@@ -1621,14 +1783,24 @@ function applyBookContext(ctx, why, opts) {
 /**
  * 侧栏打开 / 切换标签页时，问后台"我现在该认哪本书"。
  *
- * ── 规则一句话（2026-11 二次改版，用户定调：与微信读书标签页一致）────────────
- *   **当前书 = 活动标签页所代表的那本书；活动标签页不是阅读源 → 无书（书单界面）。**
+ * ── 规则一句话（2026-11 二次改版 + 2026-10-27 补充）──────────────────────────
+ *   **当前书 = 活动标签页所代表的那本书；活动标签页不是阅读源时，看后台有没有
+ *   "最后一个还开着的阅读器标签页"——有就显示它的对话，没有才回书单界面。**
  *
  *     活动标签页 = 我们的阅读器   → 它开着的那本 PDF（它答不上来就保持原样，绝不清）
  *     活动标签页 = 微读的**书页** → 那本书（书 ID 从 URL 就能读出来，书名问页面）
- *     活动标签页 = 别的任何页面   → 无书：书单铺开，与微读那本书被切走时一模一样
+ *     活动标签页 = 别的任何网页   → 后台带回 `lastReader`（最后那个阅读器标签页）→ 显示它的对话；
+ *                                  没有 / 上次跟的是微读/网页书 → 无书；答不上来 → 保持当前书
  *
- * ── 为什么改（用户实测）─────────────────────────────────────────────────────
+ * ── 2026-10-27 为什么要补后半条（用户实测）──────────────────────────────────
+ * 2026-11 改成"只跟随当前标签页"后，从 PDF 切到另一个毫不相干的标签页（聊天窗口 /
+ * 查资料）侧栏会直接回首页，正在读的那场对话就从屏幕上消失了——而阅读器明明还开在
+ * 旁边。用户要求：这时显示**最后那个标签页对应的那个对话**。
+ * 注意这不是把 2026-11 整个退回去：微读书页 / 文库页仍是真正的阅读源，侧栏照旧跟随
+ * 它们；只有"跟阅读无关的网页"才回落到 lastReader（详见 translate-background.js 的
+ * lastReaderTab）。
+ *
+ * ── 2026-11 为什么改（旧现象，别忘）─────────────────────────────────────────
  * 改之前，只要标签栏里还开着那个 PDF 标签页，侧栏就一直挂着它的会话——哪怕用户正在
  * 看毫不相干的网页。两个原因叠加：
  *   ① 后台会"按 URL 在整条标签栏里找一个开着的阅读器标签页"顶上来（旧 readerBookInfo）；
@@ -1729,18 +1901,81 @@ async function refreshCurrentBook() {
    * ② 活动标签页不是阅读器 → 它在不在"读书"由**它的身份**决定（后台的 `activeKind`）。
    *
    * 这一类结论只查 URL、不问消息，所以可以放心执行——包括清空：
-   *   'weread'（书架/详情/搜索）、'other'（任何别的网页） → 没有书
+   *   'weread'（书架/详情/搜索） → 没有书（离开书页回书单，既有规矩不变）
+   *   'other'（任何别的网页）     → 先看后台带回的 `lastReader`：最后那个阅读器标签页
+   *                                 对应的对话还开着就显示它；没有才回无书界面
    *   'page'（文库网页） → 页面自己知道它被绑定到哪本书（binding 存在 chrome.storage.local，
    *                        见 source-mia.js）；已绑定就认那本，未绑定才回到无书界面
    *   'unknown'（拿不到活动标签页：没有窗口 / 查询失败） → 什么都不知道，**别动侧栏**
    */
   const kind = String(r.activeKind || 'unknown')
   if (kind === 'other' || kind === 'weread') {
+    /**
+     * 2026-10-27：**"别的网页"不再一律回首页**。
+     *
+     * 用户从 PDF 阅读器切到另一个网页（聊天窗口 / 查资料），侧栏原先会清成无书界面，
+     * 正在读的那场对话从屏幕上消失——而阅读器还开在旁边。现在后台会把"最后那个
+     * 阅读器标签页"连同它报的书一起带回来（`lastReader`，见 translate-background.js
+     * 的 lastReaderTab），这里直接显示那本书的对话。
+     *
+     * 用之前先看四条边界，都是防"抢上下文"：
+     *   · **只对 `'other'` 生效**。`'weread'`（书架/详情）不回落：微读那边的既有规矩是
+     *     "离开书页就回书单"，这次只动 PDF 这一种场景。
+     *   · **侧栏原来跟的是微读/网页书时不抢**。`_currentBook` 记着上一次真正认到的
+     *     上下文；如果它是微读/网页书（不是 `rd_`），说明用户最后在读的并不是 PDF，
+     *     这时把后台的 PDF 顶上来就正是 2026-11 修过的那个 bug。让它照旧回首页。
+     *     `_currentBook` 为空（侧栏刚打开、还没认过书）时才允许按 lastReader 认——
+     *     那正是"重开侧栏后接着显示刚才那场 PDF 对话"的场景。
+     *   · 用户手动选了一本书时不抢（`_manualBook`）：那是"我在翻历史记录"的明确意图，
+     *     不该被后台的 PDF 拽走；退出手动查看时 refreshCurrentBook 会重新算。
+     *   · 后台**答不上来**（阅读器正在加载 / 被冻结 / 消息失败）时带 `unknown:true` →
+     *     保持当前书，不回首页（问不到 ≠ 没有）；只有页面**明确说没开书**或阅读器
+     *     已经关掉时，才回无书界面。
+     */
+    const last = (kind === 'other' && r.lastReader) ? r.lastReader : null
+    const lb = last && last.book
+    const curBase = String((_currentBook && _currentBook.base) || '')
+    // 空 = 还没认过书（值得按 lastReader 认）；`rd_` = 上一次跟的就是这本 PDF
+    const wasReaderBook = !curBase || isReaderBook({ base: curBase })
+    if (last && last.unknown) {
+      postSidebarDebug({
+        stage: 'active-tab-last-reader-unknown',
+        kind,
+        readerTabId: last.tabId,
+        was: String(effectiveBookBase() || '(空)').slice(0, 20),
+        why: '阅读器标签页在，但一时答不上来（加载/被冻结/消息失败）→ 保持当前书，不回首页',
+      })
+      return
+    }
+    if (lb && lb.bookId && wasReaderBook && !_manualBook) {
+      // 阅读器回的 bookInfo 是 { bookId, hash, name, page, total }，书名取 `name`
+      //（没有 bookTitle 字段，踩过：读错字段会变成"书 ID 对、书名空"）。
+      const bTitle = String(lb.name || lb.bookTitle || '').trim()
+      postSidebarDebug({
+        stage: 'active-tab-last-reader',
+        kind,
+        readerTabId: last.tabId,
+        book: String(lb.bookId).slice(0, 20),
+        was: String(effectiveBookBase() || '(空)').slice(0, 20),
+        why: '活动标签页不是在读书，但还有一个阅读器标签页开着 → 显示最后那个标签页的对话',
+      })
+      applyBookContext({ bookId: lb.bookId, bookTitle: bTitle },
+        'active-tab:显示最后那个阅读器标签页的对话')
+      return
+    }
     postSidebarDebug({
       stage: 'active-tab-not-reading',
       kind,
       was: String(effectiveBookBase() || '(空)').slice(0, 20),
-      why: '活动标签页不是在读书的页面 → 与微读那本书被切走时一样，回到无书界面',
+      lastReader: !!(lb && lb.bookId),
+      lastReaderUnknown: !!(last && last.unknown),
+      wasReaderBook,
+      manual: !!_manualBook,
+      why: _manualBook
+        ? '活动标签页不是在读书，但用户手动选了一本书 → 保持手动查看，不回首页'
+        : (lb && lb.bookId
+          ? '活动标签页不是在读书，侧栏上一次跟的是微读/网页书 → 不拿后台 PDF 抢上下文'
+          : '活动标签页不是在读书，且没有可显示的阅读器标签页 → 回到无书界面'),
     })
     applyBookContext({ bookId: '' }, 'active-tab:活动标签页是「' + kind + '」，不是在读书', { authoritative: true })
     return
@@ -1839,7 +2074,9 @@ async function refreshCurrentBook() {
  * 现在改成两个来源：阅读器**自己推**上来的快照（最可靠）+ 第 ① 条路的回答。
  *
  * ⚠️ 2026-11 二次改版：这道防线**挡不住**来自"活动标签页身份"的清空 ——
- * 用户切到别的标签页时侧栏就该回到无书界面（见 applyBookContext 的 authoritative）。
+ * 用户切到微读书架 / 别的阅读源时侧栏就该回到无书界面（见 applyBookContext 的
+ * authoritative）。2026-10-27 起"切到无关网页"改走 lastReader、不再清空；
+ * 但微读/文库那几条 authoritative 清空原样保留。
  */
 function rememberReaderBook(has) {
   _readerReportsBook = !!has
@@ -2917,7 +3154,7 @@ function syncIntro() {
  * @returns {HTMLElement|null} 新建的气泡（被去重/就地升级吸收时返回 null）——
  *   调用方（submit）要靠它记住"本轮提问的气泡"，停止时才能精确删掉那一颗。
  */
-function addBubble(role, content, extra, note, bookId) {
+function addBubble(role, content, extra, note, bookId, sources) {
   // assistant 消息去重
   if (role === 'assistant') {
     const fp = (content || '').slice(0, 200)
@@ -2953,14 +3190,14 @@ function addBubble(role, content, extra, note, bookId) {
         // 流式已显示但最终记录走了兜底路径（-1 标记丢失等）：就地升级/补齐，
         // 避免在已显示的气泡旁再渲染一个重复气泡
         const entry = _pendingRefs.shift()
-        if (entry && entry.ref) upgradeStreamToRefReply(_streamEl, entry.ref, content)
-        else patchStreamedComplete(_streamEl, content)
+        if (entry && entry.ref) upgradeStreamToRefReply(_streamEl, entry.ref, content, sources)
+        else patchStreamedComplete(_streamEl, content, sources)
         _streamEl = null
         finishWaiting()   // 答案补齐进已显示的气泡 = 这一轮结束，按钮回「发送」
         return null
       }
       // 非流式的完整渲染（历史回放 / 兜底）：直接渲染
-      _renderRefReply(content)
+      _renderRefReply(content, sources)
       return null
     }
     hideThinking()
@@ -2968,7 +3205,7 @@ function addBubble(role, content, extra, note, bookId) {
     // `l3 both`：同一问题的第二份答案（新路径 B）单独一条气泡，左边加一道色边区分。
     // 标记只认正文第一行那个前缀——落库时就写在里面，历史回放也认得出。
     if (String(content || '').startsWith('〔B · 新路径〕')) el.classList.add('alt-b')
-    el.innerHTML = mdBubble(content)
+    el.innerHTML = mdBubble(content, sources)
   }
 
   msgs.appendChild(el)
@@ -3106,7 +3343,7 @@ function _handleStream(d) {
 }
 
 // 引用回复气泡的完整 HTML（引用条 + 引用原文预览 + 回复正文）
-function refReplyHTML(ref, content) {
+function refReplyHTML(ref, content, sources) {
   const book = esc(ref.bookTitle || '')
   // 竖排条 .ref-bar 只有 30–40px 宽：章节名截到 2 字（完整章节名在「当前引用」卡与
   // 引用抽屉里都是全的，这里只是个定位提示），配「章节」竖排标签 + 值横排，见 sidebar.html
@@ -3123,7 +3360,7 @@ function refReplyHTML(ref, content) {
     `</div>` +
     `<div class="bubble md">` +
       `<div class="ref-quote-preview" data-ref-num="${num}">"${snippet}${(ref.selectedText || '').length > 80 ? '…' : ''}"</div>` +
-      `${mdToHtml(content)}` +
+      `${mdToHtml(content, sources)}` +
     `</div>`
   )
 }
@@ -3136,7 +3373,7 @@ function bindRefReplyClicks(el, ref) {
 
 // 渲染一条队列条目对应的完整气泡（非流式路径 / 流式气泡缺失时的兜底）。
 // 队列条目统一为 { ref: 引用信息|null }；ref 非空渲染引用条气泡，null（自由提问）渲染普通气泡。
-function _renderEntry(entry, content) {
+function _renderEntry(entry, content, sources) {
   if (!entry) return
   hideThinking()
   const msgs = document.getElementById('msgs')
@@ -3146,11 +3383,11 @@ function _renderEntry(entry, content) {
     el.className = 'msg-assistant ref-reply'
     // AI-001：引用回复归属该书
     if (ref.bookId) el.dataset.book = baseBookId(ref.bookId)
-    el.innerHTML = refReplyHTML(ref, content)
+    el.innerHTML = refReplyHTML(ref, content, sources)
     bindRefReplyClicks(el, ref)
   } else {
     el.className = 'msg-assistant'
-    el.innerHTML = mdBubble(content)
+    el.innerHTML = mdBubble(content, sources)
   }
   msgs.appendChild(el)
   msgsRecord('entry:' + (ref ? 'quoted' : 'plain'), el)
@@ -3158,26 +3395,26 @@ function _renderEntry(entry, content) {
   maybeAutoScroll(msgs)
 }
 
-function _renderRefReply(content) {
-  _renderEntry(_pendingRefs.shift(), content)  // AI-006：按提交顺序 shift，避免串槽
+function _renderRefReply(content, sources) {
+  _renderEntry(_pendingRefs.shift(), content, sources)  // AI-006：按提交顺序 shift，避免串槽
 }
 
 // 流式路径收尾：引用回复把流式普通气泡就地升级成带引用条的气泡（引用条此时才显示）
-function upgradeStreamToRefReply(el, ref, content) {
+function upgradeStreamToRefReply(el, ref, content, sources) {
   if (!el) return
   hideThinking()
   el.classList.add('ref-reply')
-  el.innerHTML = refReplyHTML(ref, content)
+  el.innerHTML = refReplyHTML(ref, content, sources)
   bindRefReplyClicks(el, ref)
 }
 
 // 流式路径收尾：普通回复用最终完整记录补齐气泡（修复流式节流可能丢尾）
-function patchStreamedComplete(el, content) {
+function patchStreamedComplete(el, content, sources) {
   if (!el) return
   const b = el.querySelector('.bubble')
   if (!b) return
   b.classList.add('md')  // 上游若建的是纯文本气泡，这里一并升级成 markdown 排版
-  b.innerHTML = mdToHtml(content)
+  b.innerHTML = mdToHtml(content, sources)
 }
 
 // ── SSE ──────────────────────────────────────────────────────────────────────
@@ -3250,29 +3487,30 @@ function connect() {
       }
       if (d.type !== 'message') return
 
-      // 会意图命中（AI-020）：agent 引用解析命中旧知识点（L3 图路径上下文）→
-      // 图视图按两层高亮（2026-10）：① 命中节点 + 沿 user 入边的来路 = L3 真带进
-      // 本轮 context 的部分（绿）；② 实时栈累计命中的其余节点（橙环，它们的讨论已
-      // 在会话历史里）。旧的"混合边全祖先路径并集"已废弃——图和 L3 不一致会误导判断。
+      // 会意图命中（AI-020）：2026-10-27 起口径改成**只亮这一轮真读过、交了料的节点**
+      // （agent 的命题递归判完才发；判「用不上」/交付被拒的不在里面），图视图不再自己展开上游。
       // 图未打开时暂存，打开即应用。
       // 命中按书隔离（2026-09）：graph-hit 带 bookKey（命中所属书），只显示与当前
       // 上下文匹配的命中——自由模式只收 FREE_KEY 的命中（并入引用窗体），读书模式
       // 只收当前书的命中；其他书的命中忽略，避免串上下文
-      if (d.role === 'graph-hit' && Array.isArray(d.hits) && d.hits.length) {
+      if (d.role === 'graph-hit' && Array.isArray(d.hits)) {
         const hitBook = baseBookId(d.bookKey) || ''
         // 2026-10：命中按有效上下文隔离（手动选书时按手动选中的书）
         const ctxBook = effectiveBookBase()
         console.log('[CoRead] graph-hit', d.hits.length, 'hitBook=', hitBook, 'ctxBook=', ctxBook, 'open=', !!graphView && graphView.isOpen())
         if (hitBook !== ctxBook) return
-        // 已弃那一轮的命中（2026-11）：命中是在**生成回答之前**写出来的，用户完全可能在
-        // "引用判定"那几秒里点停止 —— 事件这时才到，一来就把图点亮，而那一轮已经没有提问、
-        // 也不在栈里（收口不会碰到它）。认出来源就整条丢掉，与流式分片同一套身份证。
+        // 已弃那一轮的命中（2026-11）：用户完全可能在流水线跑的过程中点停止 —— 事件这时才到，
+        // 一来就把图点亮，而那一轮已经没有提问、也不在栈里（收口不会碰到它）。
+        // 认出来源就整条丢掉，与流式分片同一套身份证。
         if (_discardedTurnTs && Number(d.replyToTs || 0) === _discardedTurnTs) return
-        graphView?.onHit(d.hits, d.reason || '')
+        graphView?.onHit(d.hits, d.reason || '', 'turn')
         _hitBook = hitBook
-        // 自由模式：语义命中自动并入引用窗体（可悬浮取消），随消息提交为 cites
+        // 自由模式：语义命中自动并入引用窗体（可悬浮取消），随消息提交为 cites。
+        // 2026-10-27：只并 cites（其中属于引用命中的）：hits 里还可能有 L3 往下追读到的父节点，
+        // 那是模型自己读的、不是用户指认的，进了窗体就会变成下一轮的引用。
         if (_freeMode) {
-          for (const id of d.hits) addFreeRef(id, '', true)   // auto：停止时要收回去
+          const refIds = Array.isArray(d.cites) ? d.cites : d.hits
+          for (const id of refIds) addFreeRef(id, '', true)   // auto：停止时要收回去
         }
         return
       }
@@ -3302,14 +3540,14 @@ function connect() {
         }
         const entry = _pendingRefs.shift()  // 队列非空才渲染引用气泡，内部按序 shift
         if (entry && entry.ref) {
-          if (_streamEl) upgradeStreamToRefReply(_streamEl, entry.ref, d.content)
-          else _renderEntry(entry, d.content)  // 空回复等无流式气泡时兜底
+          if (_streamEl) upgradeStreamToRefReply(_streamEl, entry.ref, d.content, d.sources)
+          else _renderEntry(entry, d.content, d.sources)  // 空回复等无流式气泡时兜底
         } else if (_streamEl) {
-          patchStreamedComplete(_streamEl, d.content)
+          patchStreamedComplete(_streamEl, d.content, d.sources)
         } else {
           // 流式分片全部错过（面板关闭期间落库 / loadHistory↔SSE 间隙）、只收到
           // -1 + 最终记录：没有气泡可补齐，直接按完整回复渲染，避免本次打开漏答案
-          addBubble('assistant', d.content)
+          addBubble('assistant', d.content, null, null, d.bookKey, d.sources)
         }
         _streamEl = null
         finishWaiting()   // 最终完整记录到齐 = 这一轮结束，按钮回「发送」
@@ -3373,7 +3611,8 @@ function connect() {
         // 必须带上这本书的标记：applyBookFilter 的规则是"没有 dataset.book 就 display:none"，
         // 不传 bookId 的气泡在读书模式下会被整条藏起来（`l3 both` 的第二份答案正是走这条路，
         // 2026-10-26 实测：库里写进去了、屏上没有）。
-        addBubble('assistant', d.content, null, null, d.bookKey)
+        // sources：终稿正文里 [编号] 点开要看的那几条（2026-10-27，跟着消息从 receiver 来）
+        addBubble('assistant', d.content, null, null, d.bookKey, d.sources)
         finishWaiting()   // 没有流式气泡可补、答案直接落库到了 = 这一轮结束
       } else if (d.role === 'user-popup') {
         // 来自共读弹窗的用户消息（AI-001：引用回复绑定该书）
@@ -3401,33 +3640,41 @@ function connect() {
   }
 }
 
-// ── 当前讨论命中（2026-09 用户定调）────────────────────────────────────────
-// 命中 = 当前实时栈（topic_stack）里 user 条目挂的 cites 对应的节点：
-// 打开图 / 收到 stack-updated / 切书时从 receiver 重拉 /stack-hits 恢复高亮；
-// 图视图据此渲染"第二层"（橙环，本场讨论已挂的知识点）+ 与本轮命中一起算 L3 来路层
-// （2026-10 两层口径，见 extension/graph-view.js computeHitLayers）。
-// 栈收口清空后 hits 为空 → 图视图清除 hit 态高亮（栈结束即命中结束）。
-async function refreshStackHits() {
+// ── 当前讨论命中（2026-09 用户定调；2026-10-27 第二次改口径）───────────────
+// 图上的命中高亮 = **当前这一轮真读到、交了料**的节点（用户 2026-10-27 定）：
+//   · 回答期间：graph-hit 事件里那份清单（_turnHits）；
+//   · 回答结束后 / 刷新 / 切书回来：/stack-hits 返回的 `used`（agent 记在最近一轮 user 条目上）。
+// `hits`（实时栈累积的 cites）只用于**自由模式引用窗体的锁定条目**，不再拿来画图——
+// 用它画会把前面几轮累积的引用一起堆上来（实测一轮用了 2 个，累积 5 个）。
+// 图视图亮的就是这几个节点本身，不沿 user 边展开上游（见 graph-view.js computeExactSet）。
+// 栈收口清空后没有可画的 → 图视图清除 hit 态高亮（栈结束即命中结束）。
+async function refreshStackHits({ revert = false } = {}) {
   const ctxBook = effectiveBookBase()
   if (!ctxBook) return
   // 图视图不可用时：读书模式不拉；自由模式仍拉——窗体锁定条目（栈命中并入）不依赖图
   if (!graphView && !_freeMode) return
   let hits = null
+  let used = null
   try {
     const r = await fetch(RECEIVER + '/stack-hits?book=' + encodeURIComponent(ctxBook))
     const d = await r.json()
     hits = Array.isArray(d.hits) ? d.hits : []
+    used = Array.isArray(d.used) ? d.used : null
   } catch {}
   // 自由模式（2026-10 用户定调）：同一份栈命中并入窗体为锁定条目（历史消息已提交的
-  // 引用，不可删，随栈自动更新）——图上栈命中高亮与窗体显示同源，保持两边一致。
+  // 引用，不可删，随栈自动更新）。
   // 栈收口/清空后 hits 为空 → 锁定条目清空、图按 applyStackHits 的空结果规则清除。
   if (_freeMode && hits) setFreeStackCites(hits)
   if (!graphView || !hits) return
+  // 停止收尾（2026-10-27）：**回退**到停之前的命中，不是清空。
+  // 这一轮没入栈，栈里的命中原样还在；把本轮命中作废、按栈重画即可。
+  if (revert) { graphView.revertToStackHits(hits, used); return }
   // 「本轮还在进行」交给图视图判空结果（2026-11）：这一轮还没走完（在等回答 / 正在流式
   // 渲染 / 等答案落库，见 isAnswerInFlight）时，本轮提问的 cites 还没由 agent 写进实时栈，
   // /stack-hits 必然是空的 —— 那不是"命中结束"，不能据此清高亮（用户报："命中动画一结束就
   // 打开会意图，刚命中的节点没被高亮，要等回答完成才补上"）。
-  graphView.applyStackHits(hits, { pending: isAnswerInFlight() })
+  // used：最近一轮"真用上"的节点（null = 没有这份数据 → 图视图退回按 hits 画）。
+  graphView.applyStackHits(hits, { pending: isAnswerInFlight(), used })
 }
 
 // ── 停止当前回答（2026-02 用户定调）─────────────────────────────────────────
@@ -3574,14 +3821,21 @@ function finishStoppedTurn({ content, bookKey, timestamp, force = false } = {}) 
     try { _awaitUserEl.remove() } catch {}
     _awaitUserEl = null
   }
-  // 命中高亮 + 自动弹出的拓扑图窗口。图不是这一轮自动弹的就不关（用户自己开着的窗口不关）。
+  // 命中高亮：**回退**到停之前的样子（2026-10-27 用户定），不是一键清空。
+  // 这一轮没入栈，会意栈还停在上一轮——前面几轮挂过的命中该原样亮着，
+  // 只有本轮那几条要作废。图的窗口是这一轮自动弹出的才关；用户自己开着的不关。
   try {
     const gv = graphView
     if (gv) {
       gv._cancelAutoDismiss()          // 先取消挂起的渐隐/轮播定时器
-      gv.clearHighlight()              // 高亮与"本轮命中"一起清（内置 _turnHits = null）
-      if (gv._autoOpened) gv.close()
-      gv._autoOpened = false
+      gv._turnHits = null              // 本轮命中作废（栈层由下面的重拉恢复）
+      if (gv._autoOpened) {
+        gv.close()
+        gv._autoOpened = false
+      } else {
+        // 用户自己开着图：按栈重画（空栈就清，绝不因为"刚闪过 4 秒"而留着本轮的命中）
+        void refreshStackHits({ revert: true })
+      }
     }
   } catch {}
   // 引用配对队列：本次请求那个占位条目出队，否则下一条真实回复的配对会挤偏一格。
@@ -4839,13 +5093,13 @@ function stopRecoverPoll() {
 // 若走 addBubble / _renderRefReply 会把历史里较早的回复错补到当前流式气泡上、
 // 或把实时队列里新提问的配对条目错误消费掉。引用条配对只接受本趟历史遍历内部
 // 的局部条目（histRef），绝不从全局队列取。指纹与实时流收尾渲染互斥。
-function renderCompleteAssistant(content, bookId, histRef) {
+function renderCompleteAssistant(content, bookId, histRef, sources) {
   const fp = String(content || '').slice(0, 200)
   if (_seenFingerprints.has(fp)) return  // 已被实时流/历史渲染过
   _seenFingerprints.add(fp)
   if (_seenFingerprints.size > 200) _seenFingerprints.clear()
   if (histRef) {
-    _renderEntry({ ref: histRef }, content)  // 本趟局部配对：历史里的引用回复带引用条
+    _renderEntry({ ref: histRef }, content, sources)  // 本趟局部配对：历史里的引用回复带引用条
     return
   }
   hideThinking()
@@ -4853,7 +5107,7 @@ function renderCompleteAssistant(content, bookId, histRef) {
   const el = document.createElement('div')
   el.className = 'msg-assistant'
   if (bookId) el.dataset.book = baseBookId(bookId)
-  el.innerHTML = mdBubble(content)
+  el.innerHTML = mdBubble(content, sources)
   msgs.appendChild(el)
   msgsRecord('assistant:complete', el, { via: histRef ? 'hist' : 'direct' })
   dropIntroIfReal(el)   // 历史/轮询补渲染出第一条回复 → 开场卡该摘了（限当前上下文）
@@ -4957,7 +5211,7 @@ async function loadHistory(opts) {
         const replyBook = (d.bookKey && d.bookKey !== '_common') ? baseBookId(d.bookKey) : histBook
         // 走 renderCompleteAssistant：历史渲染不碰实时流气泡与实时队列（见上），
         // 引用条配对只用本趟局部 histPendingRef；指纹与实时流收尾渲染互斥
-        renderCompleteAssistant(d.content, replyBook, histPendingRef)
+        renderCompleteAssistant(d.content, replyBook, histPendingRef, d.sources)
         histPendingRef = null
       }
     }
@@ -5479,8 +5733,9 @@ function freeDisplayIds() {
   const pendIds = _freeRefs.map((r) => r.id)
   return [...pendIds, ..._stackCiteIds.filter((id) => !pendIds.includes(id))]
 }
-// 手动选取高亮同步：窗体全集（待提交 + 锁定）→ 图视图高亮其讨论脉络（横幅 +
-// 隐藏/显示按钮，2026-09）。取消完待提交项后锁定命中仍高亮——窗体与图一致。
+// 手动选取高亮同步：窗体全集（待提交 + 锁定）→ 图视图高亮**这几个节点本身**（横幅 +
+// 隐藏/显示按钮，2026-09；2026-10-27 起不再沿 user 边展开上游）。取消完待提交项后锁定命中
+// 仍高亮——窗体与图一致。
 function syncPickHighlight() {
   if (!graphView) return
   graphView._cancelAutoDismiss()   // 用户手动操作：取消挂起的自动渐隐/轮播（图保持打开）
@@ -6118,8 +6373,7 @@ const graphView = typeof CoReadGraphView !== 'undefined'
       onPick: (node) => {
         if (!_freeMode || !node || !node.id) return
         addFreeRef(node.id, node.point || '')
-        syncPickHighlight()   // 图视图立即高亮已选引用的讨论脉络（横幅 + 隐藏/显示按钮）
-        graphView?.focusNodeChain(node.id)   // 新选节点所在链 → 聚焦过去（多链时）
+        syncPickHighlight()   // 图视图立即高亮已选节点（横幅 + 隐藏/显示按钮；不展开上游）
       },
     })
   : null

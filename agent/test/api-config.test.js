@@ -19,6 +19,7 @@ import {
   writeApiConfig,
   readApiConfigFile,
   resolveApiConfig,
+  resolveEmbedConfig,
   isConfigured,
 } from '../lib/api-config.js'
 
@@ -116,4 +117,38 @@ test('isConfigured：地址或 key 缺一即为未配置（model 有默认值）
   assert.equal(isConfigured({ apiBase: '', apiKey: 'k' }), false)
   assert.equal(isConfigured({ apiBase: 'https://x/v1', apiKey: '' }), false)
   assert.equal(isConfigured(null), false)
+})
+
+// ── 向量配置（2026-10-30）：与聊天配置同一份文件、不同三个字段 ────────────────
+
+test('writeApiConfig：不认识的字段（embedding 配置）原样保留——侧栏保存一次不能把它们抹掉', () => {
+  const file = tmpConfigFile()
+  fs.writeFileSync(file, JSON.stringify({
+    apiBase: 'https://old/v1', apiKey: 'old', model: 'old',
+    embedBase: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    embedKey: 'sk-embed', embedModel: 'text-embedding-v4',
+  }, null, 2))
+  writeApiConfig({ apiBase: 'https://new/v1', apiKey: 'new', model: 'new' }, file)
+  const back = readApiConfigFile(file)
+  assert.equal(back.apiBase, 'https://new/v1', '三个聊天字段照旧被覆盖')
+  assert.equal(back.embedKey, 'sk-embed', 'embedKey 不被抹掉（这正是这个测试要守住的东西）')
+  assert.equal(back.embedModel, 'text-embedding-v4')
+})
+
+test('resolveEmbedConfig：三个字段齐了才算已配置；文件优先于环境变量；没有默认地址', () => {
+  const file = tmpConfigFile()
+  fs.writeFileSync(file, JSON.stringify({
+    embedBase: 'https://dashscope.aliyuncs.com/compatible-mode/v1/',
+    embedKey: 'sk-embed', embedModel: 'text-embedding-v4',
+  }, null, 2))
+  const cfg = resolveEmbedConfig(
+    { COREAD_EMBED_API_BASE: 'https://env.example/v1', COREAD_EMBED_API_KEY: 'env', COREAD_EMBED_MODEL: 'env-m' },
+    file, path.join(path.dirname(file), 'no-such.env'))
+  assert.deepEqual(cfg, {
+    embedBase: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    embedKey: 'sk-embed', embedModel: 'text-embedding-v4', configured: true,
+  })
+  // 什么都没有 → 未配置，且**不给默认地址**（给默认值会让人以为配好了却调不通）
+  const empty = resolveEmbedConfig({}, tmpConfigFile(), path.join(path.dirname(file), 'no-such.env'))
+  assert.deepEqual(empty, { embedBase: '', embedKey: '', embedModel: '', configured: false })
 })

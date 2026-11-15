@@ -50,6 +50,15 @@ function loadView() {
 }
 const GraphView = loadView()
 
+test('本轮全部拒绝的空通知清除旧高亮，滞后的上一轮栈不能重新点亮', () => {
+  const v = fakeView({ hl: { mode: 'hit', at: Date.now() }, _turnHits: ['old'] })
+  v.onHit([], '', 'turn')
+  assert.equal(v.calls.cleared, 1)
+  v.applyStackHits(['old'], { pending: true, used: ['old'] })
+  assert.equal(v.calls.hit, 0)
+  assert.deepEqual([...v._turnHits], [])
+})
+
 /** 造一个"只有状态、没有 DOM"的实例（渲染/避让打桩，量的是物理有没有推进） */
 function fakeView(over = {}) {
   const v = Object.create(GraphView.prototype)
@@ -118,12 +127,33 @@ test('图没开着时不偷偷加载：补命中只在图已经打开的场合�
   assert.equal(v.calls.hit, 0, '图关着就别拉图（applyHit 会触发 loadGraph）')
 })
 
-test('栈给了真数据：按老规矩应用高亮，并收起宽限窗口', () => {
-  const v = fakeView({ _turnHits: ['n_turn'], _stackLagUntil: Date.now() + 5000 })
-  v.applyStackHits(['n_stack'])
+test('栈给了 used（最近一轮真用上的）→ 图只亮这一份，不按累积 cites 画', () => {
+  // 2026-10-27 实况：一轮用了 2 个，讨论栈累积了 5 条 cites；按 cites 画会堆出 5 个。
+  const v = fakeView({ _turnHits: ['n_last'], _stackLagUntil: Date.now() + 5000 })
+  v.applyStackHits(['n_cite_1', 'n_cite_2', 'n_cite_3'], { used: ['n_used_1', 'n_used_2'] })
   assert.equal(v.calls.hit, 1)
-  assert.deepEqual([...v.calls.seeded], ['n_turn'], '种子优先用本轮命中（栈数据可能滞后）')
+  assert.deepEqual([...v.calls.seeded], ['n_used_1', 'n_used_2'], '画的是 used，不是累积 cites')
   assert.equal(v._stackLagUntil, 0, '真数据到了，宽限窗口作废')
+})
+
+test('回答期间（pending）栈给了真数据：仍优先本轮命中——那一轮的 cites 还没落栈', () => {
+  const v = fakeView({ _turnHits: ['n_turn'] })
+  v.applyStackHits(['n_stack'], { pending: true, used: ['n_prev'] })
+  assert.deepEqual([...v.calls.seeded], ['n_turn'],
+    '栈里此刻是上一轮的数据，不能拿它顶替刚命中的那一轮')
+})
+
+test('老栈没有 used（升级前的记录）→ 退回按累积 cites 画（别把已有的高亮弄丢）', () => {
+  const v = fakeView({ _turnHits: null })
+  v.applyStackHits(['n_cite_1', 'n_cite_2'], {})
+  assert.deepEqual([...v.calls.seeded], ['n_cite_1', 'n_cite_2'])
+})
+
+test('used 是空数组（这一轮命中了但一个都没用上）→ 清掉上一轮的高亮', () => {
+  const v = fakeView({ hl: { mode: 'hit', at: Date.now() - 60000 } })
+  v.applyStackHits(['n_cite_1'], { used: [] })
+  assert.equal(v.calls.hit, 0, '没有可画的节点')
+  assert.equal(v.calls.cleared, 1, '上一轮的高亮要清掉，不能留着冒充这一轮')
 })
 
 test('打开图（图还没加载）时：非空命中要挂起收敛后的链聚焦校准', () => {

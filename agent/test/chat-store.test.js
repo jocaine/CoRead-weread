@@ -95,6 +95,29 @@ test('loadTurns：`l3 both` 的 B 答案只显示、不进历史（不能把 A �
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('loadTurns：A/B 对调之后（主 = 新路径、副 = 旧路径）只认主答案进历史', () => {
+  // 2026-10-27 的排列：主答案是新路径 B（不带 l3variant），副是旧路径 A（带 l3variant:'A'）。
+  // 副那份后写，pairReplies 若只认 'B' 当对照，就会让 A 顶掉 B —— 下一轮接着聊的是用户没在看的那份。
+  const dir = tmpDir()
+  const store = openChatStore(path.join(dir, 'chat.db'))
+  const q = store.insertMessage({ conv: 'x', role: 'user', content: 'Q1', ts: 100, status: 'ok' })
+  store.insertMessage({
+    conv: 'x', role: 'assistant', content: 'B 新路径的答案[1]', ts: 150,
+    replyTo: q, payload: { sources: [{ n: 1, title: '某文件', site: '某站', text: '原文', url: 'https://e.com/a' }] },
+  })
+  store.insertMessage({
+    conv: 'x', role: 'assistant', content: '〔A · 旧路径〕\n\nA 旧路径的答案', ts: 160,
+    replyTo: q, payload: { l3variant: 'A' },
+  })
+  const turns = store.loadTurns('x')
+  assert.equal(turns.length, 1, '同一提问仍然只成一轮')
+  assert.equal(turns[0].assistant.content, 'B 新路径的答案[1]', '进历史的必须是用户在看的那一份')
+  assert.deepEqual(turns[0].assistant.payload.sources.map((s) => s.n), [1], '材料条目跟着消息一起回来')
+  assert.equal(store.listMessages({ conv: 'x' }).filter((m) => m.role === 'assistant').length, 2, '两条都在库里、都会被推给侧栏')
+  store.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('loadTurns：范围由 afterId 决定，不是"固定取最近 N 条"', () => {
   // 回归背景（2026-11）：旧实现 `ORDER BY id DESC LIMIT 60`——LIMIT 数的是消息行（60 行 = 30 轮），
   // 而恢复调用方拿这个结果再 `Math.min(游标, list.length)` 跳过开头。游标是"累计切掉条数"
@@ -204,6 +227,26 @@ test('事件与增量水位线：SSE 推送只需 id > 水位线', () => {
   store.insertEvent({ conv: 'c', kind: 'graph-hit', payload: { hits: ['n_seed'] } })
   assert.equal(store.lastEventId(), 1)
   assert.equal(store.listEvents({ sinceId: 0 })[0].payload.hits[0], 'n_seed')
+  store.close()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('latestGraphHit：取某场对话最近一条图命中（/stack-hits 迁移兜底用）', () => {
+  // 为什么需要它：图命中只画"当前这一轮真用上的节点"。讨论栈的新条目自带 used，
+  // 但升级前写的老栈没有——这时退回最近一条 graph-hit 里的 hits（它记的正是那一轮的有效节点），
+  // 用户不必等再问一轮才看到正确的高亮。
+  const dir = tmpDir()
+  const store = openChatStore(path.join(dir, 'chat.db'))
+  assert.equal(store.latestGraphHit('bookA'), null, '没有事件时返回 null，不是抛错')
+  store.insertEvent({ conv: 'bookA', kind: 'graph-hit', payload: { hits: ['n_old'], cites: ['n_old'] } })
+  store.insertEvent({ conv: 'bookA', kind: 'graph-hit', payload: { hits: ['n_new', 'n_parent'], cites: ['n_new'] } })
+  store.insertEvent({ conv: 'bookB', kind: 'graph-hit', payload: { hits: ['n_b'], cites: ['n_b'] } })
+  const ev = store.latestGraphHit('bookA')
+  assert.ok(ev && ev.payload, '要能读回 payload')
+  assert.deepEqual(ev.payload.hits, ['n_new', 'n_parent'], '同一场对话取**最近**一条，不是第一条')
+  assert.deepEqual(ev.payload.cites, ['n_new'], 'cites 也一并带回来（调用方用它判断是不是这场讨论的）')
+  assert.equal(store.latestGraphHit('bookB').payload.hits[0], 'n_b', '按对话隔离')
+  assert.equal(store.latestGraphHit('bookC'), null)
   store.close()
   fs.rmSync(dir, { recursive: true, force: true })
 })
@@ -356,4 +399,28 @@ test('rowToMessage：字段名与旧 JSONL 对齐（消费者尽量少改）', (
   assert.equal(m.bookKey, 'bookX')
   assert.deepEqual(m.refs, ['n1'])
   assert.deepEqual(m.payload, { archive: { memory: true } })
+})
+
+test('deleteGraphHit：只撤本轮，不碰同一场对话里别的轮次（2026-10-27 修）', () => {
+  const dir = tmpDir()
+  const store = openChatStore(path.join(dir, 'chat.db'))
+  // 同一场对话里三轮各写了一条命中事件（payload 里带着各自的 replyToTs）
+  store.insertEvent({ conv: 'bookA', kind: 'graph-hit', payload: { hits: ['n1'], replyToTs: 100 } })
+  store.insertEvent({ conv: 'bookA', kind: 'graph-hit', payload: { hits: ['n2'], replyToTs: 200 } })
+  store.insertEvent({ conv: 'bookA', kind: 'graph-hit', payload: { hits: ['n3'], replyToTs: 300 } })
+  // 另一场对话的同类事件不许被牵连
+  store.insertEvent({ conv: 'bookB', kind: 'graph-hit', payload: { hits: ['n9'], replyToTs: 200 } })
+  assert.equal(store.stats().events, 4)
+
+  const n = store.deleteGraphHit('bookA', 200)
+  assert.equal(n, 1, '只删这一轮那一条')
+  assert.equal(store.stats().events, 3)
+  // 别的轮次与别的对话都还在——这正是"停一轮不该清空整本书命中历史"的判据
+  const left = store.listEvents({ sinceId: 0, limit: 50, kind: 'graph-hit' })
+  assert.deepEqual(left.map((e) => e.payload.hits[0]), ['n1', 'n3', 'n9'])
+
+  // 认不出是哪一轮（没给 ts / 对不上）→ 一条都不删，绝不退化成"全删"
+  assert.equal(store.deleteGraphHit('bookA', 0), 0)
+  assert.equal(store.deleteGraphHit('bookA', 999), 0)
+  assert.equal(store.stats().events, 3)
 })

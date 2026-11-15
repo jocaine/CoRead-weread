@@ -283,6 +283,7 @@ test('SSE 补渲染的 assistant 气泡必须带书标记（否则被 applyBookF
   const src = fs.readFileSync(JS, 'utf8')
   // 规则本身没变：没书签就 hidden
   assert.match(src, /const b = el\.dataset\.book \|\| ''/)
-  // 补渲染那条路必须把 d.bookKey 带进去（bookId 是 addBubble 的第 5 个参数）
-  assert.match(src, /addBubble\('assistant', d\.content, null, null, d\.bookKey\)/)
+  // 补渲染那条路必须把 d.bookKey 带进去（bookId 是 addBubble 的第 5 个参数；
+  // 第 6 个是材料条目 sources——2026-10-27 加的，正文里 [编号] 点开要看它）
+  assert.match(src, /addBubble\('assistant', d\.content, null, null, d\.bookKey, d\.sources\)/)
 })

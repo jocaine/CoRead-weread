@@ -87,6 +87,37 @@ test('assembleCallHist：off 模式完全不发 L3（第 0 步验证用）', () 
   ])
 })
 
+test('assembleCallHist：相处规则排在 L3 之后、本轮问题之前（2026-10-27 用户定）', () => {
+  // 它要的是"照这个说"，不是"了解这个人"——所以不能留在【背景档案】里，
+  // 而且要贴着问题（模型对末尾更敏感）。
+  const out = assembleCallHist({
+    hist: [{ role: 'user', content: 'q1' }],
+    persona: '【背景档案】…',
+    l3: '[图路径上下文]…',
+    agreement: '【相处规则】…1. 直接给判断…',
+    anchored: '【本轮消息】…问题…',
+    mode: 'full',
+  })
+  assert.deepEqual(out.map((m) => m.content), [
+    'q1',
+    '【背景档案】…',
+    '[图路径上下文]…',
+    '【相处规则】…1. 直接给判断…',
+    '【本轮消息】…问题…',
+  ])
+  assert.equal(out.at(-1).content, '【本轮消息】…问题…', '问题永远在最后一条')
+})
+
+test('assembleCallHist：相处规则为空就不插空消息', () => {
+  const base = { hist: [], persona: 'P', anchored: 'A', mode: 'full' }
+  for (const agreement of ['', '   ', undefined]) {
+    assert.deepEqual(assembleCallHist({ ...base, agreement }), [
+      { role: 'user', content: 'P' },
+      { role: 'user', content: 'A' },
+    ])
+  }
+})
+
 test('assembleCallHist：默认 mode 视为 full（调用方忘了传也不能丢 L3）', () => {
   const out = assembleCallHist({ hist: [], persona: 'P', l3: 'L', anchored: 'A' })
   assert.equal(out.length, 3)

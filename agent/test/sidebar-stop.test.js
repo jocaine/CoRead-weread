@@ -52,7 +52,7 @@ function makeEl(id = '') {
   return el
 }
 
-function loadSidebar({ graphViewStub = null } = {}) {
+function loadSidebar({ graphViewStub = null, stackHits = [], stackUsed = null } = {}) {
   const html = fs.readFileSync(HTML, 'utf8')
   const ids = new Set([...html.matchAll(/id="([A-Za-z0-9_-]+)"/g)].map((m) => m[1]))
   const cache = new Map()
@@ -81,7 +81,7 @@ function loadSidebar({ graphViewStub = null } = {}) {
     if (u.endsWith('/ping')) return json({ ok: true })
     if (u.endsWith('/chat')) { const ts = 1770000000000 + (++chatSeq) * 1000; chatStamps.push(ts); return json({ ok: true, timestamp: ts }) }
     if (u.endsWith('/session-stop')) return json({ ok: true })
-    if (u.includes('/stack-hits')) return json({ hits: [] })
+    if (u.includes('/stack-hits')) return json({ hits: stackHits, used: stackUsed })
     if (u.endsWith('/graph')) return json({ nodes: [], edges: [] })
     if (u.endsWith('/history')) return json([])
     if (u.endsWith('/free-conversations')) return json({ current: null, active: [], archived: [] })
@@ -307,6 +307,33 @@ test('回归：已弃那一轮的命中事件不得把图点亮', async () => {
   assert.equal(hits.length, 2, '正常命中照常点亮')
 })
 
+// ── 契约（2026-10-27）：命中清单与「引用窗体」只共 cites，来源标 'turn' ─────────────
+// hits 里可能混着 L3 往下追读到的父节点（模型自己读的，不是用户指认的）。窗体按 hits 全并的话，
+// 那些父节点会变成下一条提问的引用，收口时还会长出 user 边。
+test('契约：命中事件带 cites 时，引用窗体只并 cites（追读到的父节点不进）', async () => {
+  const got = []
+  class GV {
+    constructor() {}
+    onHit(h, r, source) { got.push({ ids: [...h], source }) }
+    applyStackHits() {} applyHit() {} isOpen() { return false } reload() {}
+    clearHighlight() {} close() {} open() {} setMode() {} setPickMode() {}
+    setTutorialMode() {} _cancelAutoDismiss() {}
+  }
+  const { X } = loadSidebar({ graphViewStub: GV })
+  await flush()
+  await X.toggleFreeMode()
+  await flush()
+  const key = X.effectiveBookBase()   // 自由对话的 key（命中按上下文隔离，事件要带这个）
+  X.emit({ type: 'message', role: 'graph-hit', hits: ['n_hit', 'n_parent'], cites: ['n_hit'], reason: 'r', bookKey: key })
+  console.log('  [hit-cites] onHit=%o refs=%o', got.map((x) => x.ids), X.getState().freeRefs.map((r) => r.id))
+  assert.equal(got.length, 1)
+  assert.deepEqual(got[0].ids, ['n_hit', 'n_parent'], '图上亮整份清单（含 L3 追读到的父节点）')
+  assert.equal(got[0].source, 'turn', '来源标记：这一轮真用到的')
+  const refs = X.getState().freeRefs.map((r) => r.id)
+  assert.ok(refs.includes('n_hit'), '引用命中的那个进窗体')
+  assert.equal(refs.includes('n_parent'), false, '追读到的父节点不进窗体（它不是用户指认的）')
+})
+
 // ── 回归：停止后，那一轮自动并入的待提交引用要收回 ────────────────────────────
 // 自由模式下语义命中会自动并入"本次引用"窗体（随下一条消息作为 cites 提交）。那一轮被停掉
 // 之后，这些线索还留着的话会被**下一条提问**一起提交，等于把被弃那轮的命中挂到新提问名下；
@@ -372,4 +399,42 @@ test('回归：本地点停止（force）仍然会删掉本轮气泡', async () 
   console.log('  [stop] 停止前=%d 停止后=%d 输入框="%s"', before, after, getById('input').value)
   assert.ok(after < before, '本地停止要真的删掉气泡')
   assert.equal(getById('input').value, '要被停止的一问', '原文回填进输入框')
+})
+
+// ── 回归：停止是"回退"，不是"清空"（2026-10-27 用户定）────────────────────────
+// 停止的那一轮**没有入栈**，会意栈还停在上一轮 —— 前面几轮挂过的命中本来该原样亮着。
+// 原来这里是一刀 clearHighlight()，等于"停一轮顺手把这场讨论的痕迹也抹了"。
+// 正确行为：本轮命中作废，然后按栈重画；栈里没有命中才真清。
+test('回归：停止后高亮回退到停之前的栈命中，而不是清空', async () => {
+  const reverted = []
+  const cleared = []
+  class GV {
+    constructor() {}
+    onHit() {} applyStackHits() {} applyHit() {} isOpen() { return true } reload() {}
+    revertToStackHits(h, used) { reverted.push({ hits: h.slice(), used }); return null }
+    clearHighlight() { cleared.push(1) } close() {} open() {} setMode() {} setPickMode() {}
+    setTutorialMode() {} focusNodeChain() {} _cancelAutoDismiss() {}
+  }
+  // used = 栈里最近一轮"真用上"的节点（2026-10-27 第二次改：图按这一份画，不按累积 cites）
+  const { X, getById, chatStamps } = loadSidebar({
+    graphViewStub: GV, stackHits: ['prev-1', 'prev-2'], stackUsed: ['prev-2'],
+  })
+  await flush()
+  // refreshStackHits 要求"当前上下文有书"（否则它直接 return，图本来也不会显示）。
+  // 测试里用自由模式造出这个上下文，它同样走 effectiveBookBase()。
+  await X.toggleFreeMode()
+  await flush()
+  getById('input').value = '要被停掉的一问'
+  await X.submit()
+  await flush()
+  const stoppedTs = chatStamps[0]
+
+  X.finishStoppedTurn({ content: '要被停掉的一问', bookKey: '', timestamp: stoppedTs, force: true })
+  await flush(12)
+
+  console.log('  [revert] 回退调用=%j 清空调用=%d', reverted, cleared.length)
+  assert.equal(reverted.length, 1, '按栈命中回退，不是清零')
+  assert.deepEqual([...reverted[0].hits], ['prev-1', 'prev-2'], '累积 cites 也一并交回（老栈兜底用）')
+  assert.deepEqual([...reverted[0].used], ['prev-2'], '最近一轮真用上的那份也要交回（图按它画）')
+  assert.equal(cleared.length, 0, '栈里还有命中时不该调 clearHighlight')
 })

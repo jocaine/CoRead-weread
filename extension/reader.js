@@ -36,7 +36,7 @@ import {
 import { RECEIVER_URL } from './translate-protocol.js'   // 后台地址的真源，不另写一份
 // 「读到哪儿」的算术（第几页 + 页内比例）：纯函数，单测在 extension/test/reader-position.test.mjs
 // ⚠️ 只取这两个：`clamp01` 本文件里已经有一个（搜 `const clamp01`，别处也在用），不要再导一个同名的进来
-import { positionFromBoxes, deltaToPosition } from './reader-position.js'
+import { fracInBox, positionFromBoxes, deltaToPosition } from './reader-position.js'
 // PDF 里的超链接（注释 /Link）怎么铺、怎么命中：纯函数，单测在 extension/test/reader-links.test.mjs
 import { isLinkAnnotation, linkTarget, linkBoxes, linkAt, destTop } from './reader-links.js'
 
@@ -840,7 +840,7 @@ async function openBytes(bytes, name, opts = {}) {
 
 // ── 阅读位置：读到哪儿（量参考线）、回到哪儿（落位 + 纠偏）────────────────────
 //
-// 位置的**唯一定义**是"第几页 + 页内比例 frac"，算术全在 reader-position.js（有单测），
+// 位置的**唯一定义**是"第几页/章 + 页内比例 frac"，算术全在 reader-position.js（有单测），
 // 这里只做两件事：把 DOM 的矩形喂进去、把算出来的滚动量落下来。
 //
 // ⚠️ 两条不许分叉的规矩（agent/test/reader-position-wiring.test.js 盯着）：
@@ -863,26 +863,42 @@ function pageBoxes() {
   })
 }
 
-/** 当前在第几页 */
+/** 当前在第几页 / 第几章 */
 function currentPage() {
+  if (state.tutorialOpen) {
+    // 教程书的"第几章"只有 Tutorial 知道：state.pages 在教程书下是空的，
+    // 拿它量**永远是第 1 章**（教程书每次打开都回到第一章，就是这么来的）
+    const i = Tutorial.currentIndex()
+    return i >= 0 ? i + 1 : 1
+  }
   return currentPosition().page
 }
 
 /** 当前位置：{page, frac}（frac 0=页顶 1=页底） */
 function currentPosition() {
+  if (state.tutorialOpen) {
+    const i = Tutorial.currentIndex()
+    const ch = i >= 0 ? i + 1 : 1
+    const boxes = pageBoxes()
+    const b = boxes[ch - 1] || boxes[0]
+    // 一章就是一个滚动单位，章内位置同样按比例记
+    return { page: ch, frac: b ? fracInBox(scrollRefLine(), b.top, b.height) : 0 }
+  }
   return positionFromBoxes(scrollRefLine(), pageBoxes())
 }
 
-/** 状态栏的"第几页"（滚动时要跟着走） */
+/** 状态栏的"第几页 / 第几章"（滚动时要跟着走；教程书的章号来自 Tutorial） */
 function updatePageInfo() {
   if (!els.pageinfo || !hasBook()) return
-  const text = '第 ' + currentPage() + ' / ' + bookTotal() + ' 页'
+  const text = state.tutorialOpen
+    ? '第 ' + currentPage() + ' / ' + bookTotal() + ' 章'
+    : '第 ' + currentPage() + ' / ' + bookTotal() + ' 页'
   if (els.pageinfo.textContent !== text) els.pageinfo.textContent = text
 }
 
 /**
- * 跳到第 n 页。
- * @param {number} num 页号
+ * 跳到第 n 页/章。
+ * @param {number} num 页号（教程书是章号，但那条路该走 gotoChapter）
  * @param {boolean} [smooth] 平滑滚动；滑杆连发 input 时传 false（十几个平滑滚动会打架）
  */
 function gotoPage(num, smooth = true) {
@@ -912,9 +928,8 @@ function applyPosition(target) {
   if (!pos || !pos.page) return 'no-box'
   const p = state.pages[pos.page - 1]
   if (!p) return 'no-box'
-  const el = p.wrap
   const c = els.scroll.getBoundingClientRect()
-  const r = el.getBoundingClientRect()
+  const r = p.wrap.getBoundingClientRect()
   const delta = deltaToPosition(SCROLL_REF_PAD, r.top - c.top, r.height, pos.frac)
   if (Math.abs(delta) < 1) return 'in-place'
   const before = els.scroll.scrollTop
@@ -997,12 +1012,20 @@ function cancelRestore(why) {
 }
 
 /**
- * 滚动时做的事：把"当前在第几页"跟真实滚动位置对齐。
+ * 滚动时做的事：把"当前在第几章/页"跟真实滚动位置对齐。
+ *
+ * 教程书那条分支**必须**问 Tutorial：它的当前章只在 Tutorial.openChapter() 里更新，
+ * 而状态栏/目录/保存都读 state.tutorialPage。不对齐的表现是"滚过去了，状态栏还写着第 1 章"。
  *
  * ⚠️ 不在滚动里直接写 storage：滚动一秒能触发几十次，而写 storage 是每本书一整条记录。
  * 落定之后由 finishRestore / scheduleSave 存一次。
  */
 function onScroll() {
+  if (state.tutorialOpen) {
+    const i = Tutorial.currentIndex()
+    const ch = i >= 0 ? i + 1 : 1
+    if (ch !== state.tutorialPage) state.tutorialPage = ch
+  }
   updatePageInfo()
   syncTocPosition()
   // 页跟着滚走了，上一处链接的高亮位置已经不对；等下一次 mousemove 再重新算
@@ -3356,10 +3379,22 @@ function pointInSelection(x, y) {
   return false
 }
 
+/**
+ * 点页面上"已经翻过的那一块" → 打开译文对照并把那一条设为当前。
+ *
+ * 为什么要有它：译文高亮是 CSS Custom Highlight 画的（::highlight 不参与命中测试），
+ * 而文字层的字形是透明的 —— 所以"点高亮"这件事没有 DOM 事件可听，只能自己在
+ * document 的 click 上按坐标算（图片条目按页内比例、文字条目按锚点矩形，见 entryAtPoint）。
+ *
+ * 四种情况要让开，否则会跟正常阅读打架：
+ *   · 正在框选（那一模式里点击有别的含义）
+ *   · 框选动作条还开着（这一下要么落在动作条上、要么是在放弃它，
+ *     不该顺手当成"点了已翻过的区域"去改当前译文）
+ *   · 刚划完词还留着选区（用户是在选字，不是在点译文）
+ *   · 点在浮标/面板/按钮上（那些元素自己有事要做）
+ */
 function onReaderClick(ev) {
   if (state.boxMode) return
-  // 框选动作条还开着：这一下要么落在动作条上、要么是在放弃它，
-  // 不该顺手当成"点了已翻过的区域"去改当前译文
   if (state.boxChoice) return
   if (ev.button !== 0) return
   const el = ev.target

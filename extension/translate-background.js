@@ -48,6 +48,12 @@ import {
 const UPSTREAM_TIMEOUT_MS = 60_000
 const MAX_TEXT_CHARS = 6000
 /**
+ * 问"最后那个阅读器标签页开着哪本书"的上限（2026-10-27）。
+ * 正常答复是毫秒级；500ms 只是防它被冻结/丢弃时把侧栏的上下文刷新整条挂住
+ *（见 lastReaderTab 的注释）。超时就当"没有可显示的上一个会话"，不猜。
+ */
+const LAST_READER_PROBE_MS = 500
+/**
  * 「精译」的输出额度（2026-10-24）。
  *
  * 精译 = 不关思考，让模型先读懂句法再译（见 translateText 的 precise）。实测一段
@@ -808,6 +814,25 @@ async function readerGet() {
  * 注意"活动标签页是哪一类页面"只查 URL、**不依赖任何消息往返**（见 activeTabKind），
  * 所以侧栏据此清空是安全的：问不倒的事实才配决定"有没有书"。
  *
+ * ── ⚠️ 2026-10-27 补充：**最后那个阅读器标签页**例外 ─────────────────────────
+ * "别的任何页面 → 没书"在一种真实用法里太狠：用户拿 PDF 阅读器读书，切到另一个
+ * 毫不相干的标签页（聊天窗口 / 查资料 / 新闻）问一句，侧栏会直接回首页——正在读的
+ * 那场对话从屏幕上消失，可阅读器明明还开在旁边。用户要求：这时显示**最后那个阅读器
+ * 标签页**对应的对话。
+ *
+ * 所以 `activeKind === 'other'` 时，答复里多带一格 `lastReader: { tabId, book }`
+ * （见 lastReaderTab）。只带"事实"，用不用由侧栏决定：微读书页 / 文库页是真正的阅读源，
+ * 侧栏仍按原规则跟随它们，不会被后台的 PDF 抢走。微信读书的书架/详情页（`weread`）
+ * 也不带：那边的既有规矩是"离开书页就回书单"，这次只动 PDF 这一种场景。
+ *
+ * 三条边界（都不猜）：
+ *   · 只在**活动标签页所在窗口**里找：侧栏按窗口挂，别的窗口的书不该出现在这里；
+ *   · "最后"优先按 `lastAccessed`（Chrome 121+，最近真正被用过的那一个），拿不到就退回
+ *     标签栏最右（`index` 最大）；
+ *   · 阅读器页面**没开着书** → 不带 lastReader，侧栏照旧回首页；
+ *     **答不上来**（正在加载 / 被丢弃 / 消息失败）→ 带 `unknown:true`，侧栏保持当前书。
+ *     绝不拿缓存里一本旧书硬顶——那会显示一个已经不存在的会话。
+ *
  * ── 侧栏问"我现在该认哪本书" ─────────────────────────────────────────────────
  * ⚠️⚠️ 为什么不能让侧栏直接广播 `readerBookInfo`：
  * 那条消息**打开着的阅读器页面也会收到并作答**（reader.js 的 onMessage 就是为"后台点名问页面"
@@ -875,8 +900,167 @@ async function readerBookInfo() {
    *
    * `tabId` 一并带上：侧栏要问微读页面时，问的就是**这一个**标签页 ——
    * 不让它再自己去 `tabs.query` 一次（两次查询之间用户切了 tab，两个答案就会打架）。
+   *
+   * ⚠️ 2026-10-27：`other`（跟阅读无关的页面）多带一格 `lastReader`，让侧栏能继续
+   * 显示"最后那个阅读器标签页"的对话（见上面改版说明与 lastReaderTab）。
    */
-  return { ok: true, notReader: true, activeKind: activeTabKind(url), book: null, tabId: tab && tab.id, url }
+  const kind = activeTabKind(url)
+  const lastReader = kind === 'other' ? await lastReaderTab(tab) : null
+  return {
+    ok: true,
+    notReader: true,
+    activeKind: kind,
+    book: null,
+    tabId: tab && tab.id,
+    url,
+    ...(lastReader ? { lastReader } : {}),
+  }
+}
+
+/**
+ * 活动标签页不是阅读器时，去问"最后那个阅读器标签页"开着哪本书（2026-10-27）。
+ *
+ * 只在 `activeKind === 'other'` 时被调用（见 readerBookInfo）。它回答的是用户那句
+ * "改成就显示最后的标签页对应的那个对话"里的"最后的标签页"：
+ *
+ *   · **同一个窗口**里的阅读器标签页才算。侧栏是按窗口挂的，拿另一个窗口的书过来
+ *     会变成"我在这个窗口看新闻，侧栏却挂着另一个窗口的 PDF"——正是这轮要避免的。
+ *   · "最后"优先按 `lastAccessed`：用户心里的"最后一个"多半是**我刚才还在的那一个**，
+ *     不是"标签栏最右边的那一个"。老 Chrome 没有 `lastAccessed` 才退回 `index`。
+ *   · 直接问**页面**（`readerBookInfo`），不用缓存快照：扩展重载 / service worker
+ *     被回收后缓存是空的，而且缓存只有"最后推上来的那一份"，分不清是哪个标签页。
+ *   · **先确认最后在读的是不是 PDF**（见 wereadBookNewer）：微读书页那张标签页比
+ *     阅读器更新，就说明用户最后在读的是微读，不回落 PDF。
+ *   · 页面答不上来 / 没开着书 / 正在加载 → 分别回报：**没开书**才算"没有可显示的
+ *     上一场对话"（不带 lastReader，侧栏回首页）；**答不上来**（加载中 / 被冻结 /
+ *     消息失败）带 `unknown:true`，让侧栏**保持当前书**——问不到不等于没有，
+ *     这条规矩与活动标签页那条路一致。绝不拿一本缓存里的旧书硬顶：那会显示一个
+ *     已经不存在的会话。
+ *
+ * 加超时的理由：问的是**后台标签页**，它可能正忙着加载 PDF 或被浏览器冻结。
+ * `tabs.sendMessage` 在这种时候没有上限，不设超时会把整条 `refreshCurrentBook`
+ * 挂在这里——侧栏就一直停在上一本书上，用户看到的是"切走了但侧栏没反应"。
+ *
+ * @param {chrome.tabs.Tab|null} active 活动标签页（`activeTab()` 的结果）
+ * @returns {Promise<{tabId:number, book:object}|{tabId?:number, unknown:true}|null>}
+ */
+async function lastReaderTab(active) {
+  if (!active || typeof active.windowId !== 'number') return null
+  let opened = []
+  try {
+    opened = await chrome.tabs.query({ url: chrome.runtime.getURL('reader.html') + '*' })
+  } catch (e) {
+    // 连"有没有开着的阅读器"都问不到 → 别让侧栏据此清空
+    return { unknown: true }
+  }
+  const sameWindow = (Array.isArray(opened) ? opened : [])
+    .filter((t) => t && t.windowId === active.windowId)
+  const last = pickLastTab(sameWindow)
+  if (!last || typeof last.id !== 'number') return null
+  /**
+   * ⚠️ "最后在读的是不是 PDF"（2026-10-27）：
+   * 用户可能刚在微读的书页读了一会儿，再切到别的网页。这时若只看"最后一个阅读器
+   * 标签页"，就会把 PDF 顶上来——正是 2026-11 修过的"后台 PDF 抢走微读会话"。
+   * 所以把微读书页也拉进来比 `lastAccessed`：微读那张比阅读器更新，就当"最后在读的
+   * 不是 PDF"，不回落。只在两边都有 `lastAccessed` 时比；老 Chrome 没有这个字段，
+   * 退回"以阅读器为准"（跨两种 URL 比标签栏序号没有意义，而"答不上来就保持当前书"
+   * 的规矩已经足够保守）。
+   */
+  if (await wereadBookNewer(active, last)) return null
+  const noAnswer = { timeout: true }
+  let info = null
+  try {
+    info = await within(
+      chrome.tabs.sendMessage(last.id, { action: 'readerBookInfo' }),
+      LAST_READER_PROBE_MS,
+      noAnswer,
+    )
+  } catch (e) {
+    return { tabId: last.id, unknown: true }
+  }
+  // 超时 / 没应答 / 答非所问 / 正在加载 → 都是"问不到"，侧栏保持当前书。
+  if (info === noAnswer || !info || typeof info !== 'object' || info.ok !== true) {
+    return { tabId: last.id, unknown: true }
+  }
+  if (info.loading) return { tabId: last.id, unknown: true }
+  // 页面**明确**说"我这儿没开着书"（回到书库了）→ 这才是真的没有可显示的会话。
+  const book = info.book
+  if (!book || !book.bookId) return null
+  return { tabId: last.id, book }
+}
+
+/**
+ * 最后被用过的微读书页，是不是比那个阅读器标签页更新？（2026-10-27）
+ *
+ * 只回答"是/不是"，不返回书：侧栏在 `other` 上没有要跟随微读——按 2026-11 的规矩，
+ * 离开微读书页就回书单。这里只用它**否决** PDF 回落，防止后台 PDF 抢走微读会话。
+ *
+ * 没有 `lastAccessed`（老 Chrome）或两边不在同一窗口 → false（不否决）。
+ * 判定失败也一律 false：宁可多显示一次 PDF，也不要因为一次查询失败把用户正在读的
+ * PDF 会话吞掉。
+ */
+async function wereadBookNewer(active, readerTab) {
+  if (!active || typeof active.windowId !== 'number') return false
+  const seen = Number(readerTab && readerTab.lastAccessed) || 0
+  if (!seen) return false
+  let list = []
+  try {
+    // 只认书页（`/web/reader/<书 ID>`），书架/详情/搜索不算"在读"。
+    list = await chrome.tabs.query({ url: 'https://weread.qq.com/web/reader/*' })
+  } catch (e) {
+    return false
+  }
+  const last = pickLastTab((Array.isArray(list) ? list : [])
+    .filter((t) => t && t.windowId === active.windowId))
+  const newer = Number(last && last.lastAccessed) || 0
+  return !!(newer && newer > seen)
+}
+
+/**
+ * 从一组标签页里挑"最后一个"（纯函数，单测直接喂数据）。
+ *
+ *   · 有 `lastAccessed`（Chrome 121+）时取**最近被用过**的那一个；
+ *   · 没有这个字段（老 Chrome）就退回 `index` 最大的（标签栏最右）。新开的标签页本来
+ *     就落在最右，单标签页时两种判据完全一致。
+ *
+ * 全都没有 `lastAccessed` 时不要拿 0 当"最近"——统一落到 `index` 判据，
+ * 否则数组顺序会偷偷决定结果（那正是这类 bug 难查的原因）。
+ */
+export function pickLastTab(tabs) {
+  const list = (Array.isArray(tabs) ? tabs : []).filter(Boolean)
+  let best = null
+  for (const t of list) {
+    if (!best) { best = t; continue }
+    const seen = Number(t.lastAccessed) || 0
+    const bestSeen = Number(best.lastAccessed) || 0
+    if (seen !== bestSeen) {
+      if (seen > bestSeen) best = t
+      continue
+    }
+    if ((Number(t.index) || 0) > (Number(best.index) || 0)) best = t
+  }
+  return best
+}
+
+/**
+ * 给 Promise 加超时：到点 resolve 成 `fallback`，**不 reject**。
+ *
+ * 为什么不裸写 `Promise.race`：超时之后原来那个 Promise 还可能 reject，
+ * 没有接住的 rejection 会在 service worker 里变成 unhandledrejection。
+ * `tabs.sendMessage` 在页面被冻结/丢弃时确实会 reject，这里一并接住。
+ */
+function within(p, ms, fallback) {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (v) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(v)
+    }
+    const timer = setTimeout(() => done(fallback), ms)
+    Promise.resolve(p).then(done, () => done(fallback))
+  })
 }
 
 /**
@@ -889,7 +1073,8 @@ async function readerBookInfo() {
  *   'weread-book'   微信读书的**书页**（`/web/reader/<书 ID>`）→ 侧栏去问它要书名
  *   'weread'        微信读书的其它页（书架 / 详情 / 搜索…）→ 无书
  *   'page'          文库类网页阅读源（marxists / bilibili）→ 无书（绑定与否由页面自己报）
- *   'other'         跟阅读毫无关系的页面 → 无书
+ *   'other'         跟阅读毫无关系的页面 → 侧栏可回落"最后那个阅读器标签页"（见 readerBookInfo
+ *                   的 lastReader）；没有阅读器标签页时才是无书
  *   'unknown'       拿不到活动标签页（没有窗口 / 查询失败）→ **什么都不知道，别动侧栏**
  */
 export function activeTabKind(url) {

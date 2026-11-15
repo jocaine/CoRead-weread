@@ -25,6 +25,16 @@ export { API_CONFIG_FILE, ENV_FILE }
 // 留着 gpt-4o 会在"未配置"的弹窗里显示成一个看起来像已配置的值（用户报的就是这个）。
 export const DEFAULT_MODEL = 'deepseek-flash'
 export const CONFIG_KEYS = ['apiBase', 'apiKey', 'model']
+/**
+ * 向量（embedding）配置的三个字段（2026-10-30）。
+ *
+ * 为什么要单独一组：聊天模型和向量模型可以是两家服务商——目前确实就是（聊天 DeepSeek，
+ * 向量阿里云百炼；DeepSeek 没有 embedding 接口）。两者不能共用 apiBase/apiKey。
+ *
+ * 注意这里**故意不带默认值**：没配就是没配（`resolveEmbedConfig().configured === false`），
+ * 上层据此走"不做语义检索"的分支。给个看起来像已配置的默认地址，只会让人以为配好了却调不通。
+ */
+export const EMBED_KEYS = ['embedBase', 'embedKey', 'embedModel']
 
 /**
  * 读插件写入的配置文件；不存在/坏 JSON 都当空对象（调用方回退 .env）。
@@ -80,12 +90,20 @@ export function validateApiConfigInput(data) {
 /**
  * 落盘插件配置（apiBase/apiKey/model 三个字段整体覆盖）。
  * POSIX 下按 0600 写（只有本用户可读）；Windows 上 mode 基本被忽略。
+ *
+ * **本函数不认识的字段原样保留**（2026-10-30 修）：原来的写法只写三个字段，等于整份覆盖，
+ * 于是侧栏「模型 API 配置」只要点一次保存，同文件里的 embedBase/embedKey/embedModel
+ * 就会被无声抹掉——密钥丢了不报错、下次提问才失败。那三个字段的**读**语义不变
+ * （文件里有就优先，哪怕是空串），变的只是"写的时候别把别人的字段带走"。
  */
 export function writeApiConfig(value, file = API_CONFIG_FILE) {
   const payload = {
     apiBase: String(value?.apiBase ?? '').trim().replace(/\/+$/, ''),
     apiKey: String(value?.apiKey ?? '').trim(),
     model: String(value?.model ?? '').trim(),
+  }
+  for (const [k, v] of Object.entries(readApiConfigFile(file))) {
+    if (!Object.prototype.hasOwnProperty.call(payload, k)) payload[k] = v
   }
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.writeFileSync(file, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 })
@@ -116,6 +134,31 @@ export function resolveApiConfig(env = process.env, configFile = API_CONFIG_FILE
   const hasFileConfig = CONFIG_KEYS.some((k) => Object.prototype.hasOwnProperty.call(file, k))
   const source = hasFileConfig ? 'plugin' : ((apiKey || apiBase) ? 'env' : 'none')
   return { apiBase, apiKey, model, source }
+}
+
+/**
+ * 向量模型的生效配置（与 resolveApiConfig 同一条优先级链：配置文件 > 进程环境变量 > .env 文件）。
+ *
+ * 与聊天配置分开解析，因为可以是两家服务商。**不给默认值**——没配就是空，
+ * `configured === false` 时上层走"没有语义检索"的分支；宁可什么都不做，
+ * 也不要拿一个猜来的地址去请求（失败在用户那一轮才暴露，最难查）。
+ *
+ * @returns {{embedBase: string, embedKey: string, embedModel: string, configured: boolean}}
+ */
+export function resolveEmbedConfig(env = process.env, configFile = API_CONFIG_FILE, envFile = ENV_FILE) {
+  const file = readApiConfigFile(configFile)
+  const fileEnv = readEnvFile(envFile)
+  const from = (key, envKey) => {
+    if (Object.prototype.hasOwnProperty.call(file, key)) return String(file[key] ?? '').trim()
+    const fromProcess = env && env[envKey] != null ? String(env[envKey]).trim() : ''
+    if (fromProcess) return fromProcess
+    return String(fileEnv[envKey] ?? '').trim()
+  }
+
+  const embedBase = from('embedBase', 'COREAD_EMBED_API_BASE').replace(/\/+$/, '')
+  const embedKey = from('embedKey', 'COREAD_EMBED_API_KEY')
+  const embedModel = from('embedModel', 'COREAD_EMBED_MODEL')
+  return { embedBase, embedKey, embedModel, configured: !!(embedBase && embedKey && embedModel) }
 }
 
 /**

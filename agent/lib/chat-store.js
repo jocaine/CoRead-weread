@@ -306,9 +306,14 @@ export class ChatStore {
     const pairs = new Map()   // user message id → reply（已转成消息对象，字段名与旧 JSONL 一致）
     for (const r of rows) {
       if (r.role === 'user') continue
-      // `l3 both` 的 B 答案只给用户"同时看两份"用，**不进历史**：它和 A 指向同一条提问，
-      // 放进来会把 A 顶掉（pairs 是 Map，后写覆盖先写），下一轮上下文就变成 B 那份。
-      if (rowVariant(r) === 'B') continue
+      // `l3 both` 的**对照**那份答案只给用户"同时看两份"用，**不进历史**：它和主答案指向
+      // 同一条提问，放进来会把主答案顶掉（pairs 是 Map，后写覆盖先写），下一轮上下文就变成对照那份。
+      //
+      // 2026-10-27 修：判据从 `=== 'B'` 改成"带 l3variant 就算对照"。当天 A/B 对调过（主 = 新路径 B、
+      // 副 = 旧路径 A，标记 `l3variant:'A'`），认死 'B' 就等于把**副**那份当成了主答案——
+      // 实测同一轮里 pairs 先写入 B、再被 A 覆盖，下一轮接着聊的成了用户没在看的那一份。
+      // 主答案永远不带 l3variant（index.js 只给副的写 payload），所以这条判据两边都成立。
+      if (rowVariant(r)) continue
       if (r.reply_to != null && byId.has(Number(r.reply_to))) { pairs.set(Number(r.reply_to), r); continue }
       if (r.status === 'failed' && !includeFailedReplies) continue
       if (String(r.content || '').startsWith('⚠️') && !includeFailedReplies) continue
@@ -397,6 +402,25 @@ export class ChatStore {
     const r = this.db.prepare('SELECT COALESCE(MAX(id), 0) AS n FROM events').get()
     return Number(r ? r.n : 0)
   }
+  /**
+   * 某场对话**最近一条**图命中事件（2026-10-27 加，给 receiver 的 /stack-hits 用）。
+   *
+   * 用途：图命中只画"当前这一轮真用上的节点"。新写的讨论栈条目自带 `used`（agent 的
+   * applyStackTurn 记的），但升级前写的老栈没有——这时退回这条事件里的 hits（它记的正是
+   * 那一轮的有效节点），不必等用户再问一轮才修好显示。
+   *
+   * @param {string} conv 对话 key（= 讨论栈的 bookKey）
+   * @returns {{id:number, ts:number, conv:string, payload:object|null}|null}
+   */
+  latestGraphHit(conv) {
+    const row = this.db.prepare(
+      `SELECT id, ts, conv, payload FROM events WHERE conv = ? AND kind = 'graph-hit' ORDER BY id DESC LIMIT 1`
+    ).get(String(conv || ''))
+    if (!row) return null
+    let payload = null
+    try { payload = row.payload ? JSON.parse(row.payload) : null } catch {}
+    return { id: Number(row.id), ts: Number(row.ts) || 0, conv: String(row.conv || ''), payload }
+  }
 
   // ── 删除 ────────────────────────────────────────────────────────────────
   /** 删一场对话的全部消息与事件（事务内，不再整文件重写）。 */
@@ -419,9 +443,10 @@ export class ChatStore {
   }
 
   /**
-   * 删除事件（2026-02：用户停止一轮时，那一轮的图命中事件要一并删掉）。
-   * 为什么不留：命中事件是"给侧栏点亮节点"的一次性信号，不参与任何持久结构；
-   * 留着它只会在断线重连补发时把已清掉的高亮又推回来。
+   * 按对话与类型批量删事件（整场清空用）。
+   *
+   * ⚠️ 2026-10-27：**停止一轮不要用它**——它会把这整场对话的同类事件全删掉。
+   * 只撤某一轮请用 deleteGraphHit(conv, replyToTs)。
    * @param {{conv?: string, kind?: string}} f 按对话与类型过滤（都不给则删全部）
    * @returns {number} 删掉的行数
    */
@@ -433,6 +458,36 @@ export class ChatStore {
     if (!where.length) return 0
     const r = this.db.prepare(`DELETE FROM events WHERE ${where.join(' AND ')}`).run(...vals)
     return Number(r.changes || 0)
+  }
+
+  /**
+   * 只删**某一轮**写的图命中事件（2026-10-27 修）。
+   *
+   * 为什么单开一个：`deleteEvents({conv, kind})` 会把这场对话**所有**命中事件删掉——
+   * 停止一轮时用了它，等于把整本书的命中历史清空（用户点一次停止，图上亮过的全没了）。
+   * 而每条事件里本来就带着 `payload.replyToTs`（见 index.js 的 appendGraphHit），
+   * 够精确地认回"这是哪一轮写的"。
+   *
+   * 为什么不用 SQL 的 json_extract：那个要 SQLite 编译时带 JSON1，本机带了不代表
+   * 打包后的 node.exe 也带。事件数量很小（每轮一条），取出来在 JS 里筛最稳。
+   *
+   * @param {string} conv 对话 key
+   * @param {number} replyToTs 那一轮提问落库的 timestamp
+   * @returns {number} 删掉的行数（没有匹配就是 0，不要退化成"全删"）
+   */
+  deleteGraphHit(conv, replyToTs) {
+    const ts = Number(replyToTs) || 0
+    if (!ts) return 0
+    const rows = this.db.prepare(`SELECT id, payload FROM events WHERE conv = ? AND kind = 'graph-hit'`).all(String(conv))
+    const ids = []
+    for (const r of rows) {
+      let p = null
+      try { p = r.payload ? JSON.parse(r.payload) : null } catch {}
+      if (p && Number(p.replyToTs) === ts) ids.push(Number(r.id))
+    }
+    if (!ids.length) return 0
+    const del = this.db.prepare(`DELETE FROM events WHERE id IN (${ids.map(() => '?').join(',')})`).run(...ids)
+    return Number(del.changes || 0)
   }
 
   // ── 统计/维护 ───────────────────────────────────────────────────────────

@@ -160,6 +160,10 @@ function dbContextBefore(conv, ts, { limit = 8, maxChars = 8000 } = {}) {
   } catch { return [] }
 }
 
+
+
+
+
 function findUserOriginal(q) {
   const norm = (x) => String(x || '').replace(/\[引用\][\s\S]*?\n\n/, '').replace(/[\s\p{P}]/gu, '')
   const t = norm(q)
@@ -180,6 +184,16 @@ function findUserOriginal(q) {
   } catch {}
   return bestN >= 3 ? { ...best, score: bestN } : null
 }
+
+/**
+ * 图谱里的 q 是不是用户原话？用 8-字重合去 chat.db 里找那一条用户消息。
+ * 找不到就说明这个 q 是建谱时**从 AI 的回答反推出来的**（不是原话，别拿它当"原话"用）。
+ */
+
+/**
+ * 图谱里的 q 是不是用户原话？用 8-字重合去 chat.db 里找那一条用户消息。
+ * 找不到就说明这个 q 是建谱时**从 AI 的回答反推出来的**（不是原话，别拿它当"原话"用）。
+ */
 
 // ── 输入 ─────────────────────────────────────────────────────────────────────
 const graph = JSON.parse(fs.readFileSync(GRAPH_FILE, 'utf8'))
@@ -215,6 +229,7 @@ if (nodeArg && nodeArg.includes(',') && !has('--vs-history')) {
   }
   dump = JSON.parse(fs.readFileSync(dumpFile, 'utf8'))
 }
+
 // SYSTEM 必须是**同一份**：A/B 之间差别的只能是 L3 那一部分，不能连带把人格规则换掉。
 // 构造规则与 index.js 的 buildSystemInstruction 一致（改那边记得改这里）。
 const AGENT_RULES = fs.existsSync(path.join(AGENT_DIR, 'AGENT.md'))
@@ -229,7 +244,7 @@ const PERSONA_BLOCK = '【背景档案】（用户画像 / 相处规则 / 书籍
   `【用户画像】\n${PROFILE}\n\n【相处规则】（用户对你（AI）的长期要求，请遵守）\n${AGREEMENT || '（暂无）'}`
 // 与 index.js 的 JUDGE_SYSTEM 同一句（判定调用不带人格，避免记忆指令干扰格式）
 const JUDGE_SYSTEM = '你只负责按用户的指令输出要求格式的结果，不附加任何解释。'
-// 多命中/单节点两种输入都要带上画像与相处规则（与 App 的 personaBlock 同构）
+// 必须在 PERSONA_BLOCK 初始化后再补全输入。
 if (dump && !dump.persona) dump.persona = PERSONA_BLOCK
 
 // --vs-history：拿节点里**第一个提问的原话**当当前提问，只跑新路径，
@@ -344,11 +359,13 @@ async function walkTasks(complete, stream) {
   const it = runTasksPipeline({
     hist, persona: dump.persona, anchored: dump.anchored, hits,
     question: dump.question || '',
+    question: dump.question || '',
     nodeOf: (id) => graph.nodes.find((n) => n.id === id) || null,
     parentsOf: (id) => userParents(graph, id),
     complete, stream, judgeSystem: JUDGE_SYSTEM,
     log: (m) => console.log(`  [B] ${m}`),
     onEvent: emitBoth,
+    onRefusal: (rec) => console.log(`  [B] 🛑 ${rec.kid} 拒绝交付：${rec.why}｜节点 ${rec.nodeId}`),
     onRefusal: (rec) => console.log(`  [B] 🛑 ${rec.kid} 拒绝交付：${rec.why}｜节点 ${rec.nodeId}`),
     opts: {
       // 对拍时 B 的终稿不是"给用户看的那份"（A 才是），图上要标清楚

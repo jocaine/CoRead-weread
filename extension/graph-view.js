@@ -8,27 +8,30 @@
  * - 观察态（一般情况）：浏览整张拓扑图——滚轮缩放、拖拽空白平移、拖节点微调布局、
  *   悬停高亮邻接子图、点选节点看详情（point / 相关说法 / 节点讨论 / 元信息）、
  *   搜索定位（point / aliases / 讨论问题）、图例（边种类、root、recent）。
- * - 命中态（对话命中，2026-10 用户定调）：SSE graph-hit（agent 引用解析命中旧知识点）→
- *   高亮 = **一场讨论取一次 user 闭包**：种子 = 本轮命中 ∪ 本场实时栈已挂的引用（收口前它们
- *   同属一场讨论——固化时同一段消息的 cites 会并进同一个节点的 user 边），再从种子沿 **user
- *   入边**反向递归取全部上游。与 `agent/lib/knowledge-graph.js userAncestry` 同规则（只走 user，
- *   不走 derived —— derived 连的是判同一性判出来"不是同一个问题"的同栈相邻段）。
- *   图上亮的就是：这场讨论若收口成一个节点，那个节点的 L3 来路闭包。**一种圈、一个含义。**
- *   图例只列两条：路径起点（无入边）/ 引用到的知识点（2026-10 用户定调：不要那两行术语）。
- *   高亮分档（2026-10 修正：只画强边会让节点变成无线孤点，图失去结构）：
- *   闭包内部的边分"强（user 边，accent）/弱（其余，按边色画满）"两档，只有一端在闭包里的边
- *   半亮（交代这些圈连到哪去了），两端都不在的边压暗但保留可见。
- *   标识环每个节点每类只画一道（引用节点 r+3 深蓝 3px 满不透明 + 动画期外扩脉冲 ／ 上游节点
- *   r+2.5 靛 2px ／ 路径起点 r+6 浅蓝虚线 2px）。
- *   多脉络（讨论的引用落在多条互不相交的链上）：右下角「全部 / 脉络 N」——点「脉络 N」**只亮
- *   那一条**，点「全部」回到全部（2026-10 用户定调：切换必须真隔离）。
- *   搜索与单击预览仍走混合边路径（"浏览这张网"语义，不是"这场讨论引用了什么"）。
+ * - 命中态（对话命中，2026-10-27 用户定调，画法见 computeExactSet）：SSE graph-hit →
+ *   **只亮清单里的这些节点，不展开上游**。清单永远是"**当前这一轮真读过、交了料**"的那几个：
+ *     · 这一轮：agent 的命题递归判完才发（判「用不上」的、交付被拒的都不在里面）；
+ *     · 回答结束后 / 刷新 / 切书回来：/stack-hits 返回的 `used`（agent 记在最近一轮 user
+ *       条目上）。**不用累积的 cites** —— 那会把前面几轮的引用一起堆上来（实测一轮用 2 个、
+ *       累积 5 个）。老栈没有 used 时才退回 cites 兜底。
+ *   以前的口径是"一场讨论取一次 user 闭包"（种子沿 user 入边反向递归取全部上游）——那时旧路径
+ *   L3 把整条来路全量注入，闭包 ≈ 模型真拿到的东西；换成新路径后它只按派题读几个节点，实测
+ *   一轮命中 3 个、真读 2 个而闭包 36 个，图上亮的和实际用的差一个数量级（用户定：改掉）。
+ *   图例只列两条：路径起点（无入边，manual 路径预览仍会画）/ 引用到的知识点。
+ *   高亮分档（只画强边会让节点变成无线孤点，图失去结构）：清单内部的边分"强（user 边，accent）
+ *   / 弱（其余，按边色画满）"两档，只有一端在清单里的边半亮，两端都不在的边压暗但保留可见。
+ *   标识环：清单里的节点画引用环（r+3 深蓝 3px 满不透明 + 动画期外扩脉冲）；没有上游节点、
+ *   也不再有"路径起点"环（roots 恒空）。
+ *   多脉络（「全部 / 脉络 N」）只剩单击预览的路径模式还生成；命中态没有路径可分，不出现。
+ *   搜索与单击预览仍走混合边路径（"浏览这张网"语义，不是"这一轮用了什么"）。
  *   曾经废弃的口径：① user＋derived 混合全祖先路径并集（图 46 节点 / L3 实际 8 节点，误导）；
- *   ② 把"本轮命中"与"本场已挂"画成两层两色（同一场讨论被拆成两类，用户看不懂）。
+ *   ② 把"本轮命中"与"本场已挂"画成两层两色（同一场讨论被拆成两类，用户看不懂）；
+ *   ③ 种子取 user 闭包（新路径下闭包远大于实际读到的节点，2026-10-27 废弃）。
  *
  * 数据：GET {receiver}/graph[?demo=1]（receiver 转发 agent/data/knowledge-graph.json；
  * ?demo=1 载入演示拓扑，真实图为空时可预览交互与命中高亮）。
- * 协议：SSE message 事件 role='graph-hit' → { hits: [nodeId...], reason? }，客户端算路径。
+ * 协议：SSE message 事件 role='graph-hit' → { hits: [nodeId...], cites?: [...], reason? }。
+ *   hits 是要亮的那批节点（客户端不再自己扩路径）；cites 是其中属于引用命中的（自由模式窗体用）。
  *
  * 无依赖、无构建：普通 <script> 加载，挂 window.CoReadGraphView。
  * 物理：自写力导向布局（斥力 + 弹簧 + 重心 + 阻尼 + 冷却），节点量级 <200，O(n²) 足够。
@@ -195,13 +198,12 @@
     return { ordered, roots, recent: targets, pathEdges }
   }
 
-  // 命中按"链"分组（2026-09 用户定调）：链 = 一个命中节点的 root→recent 路径；
-  // 路径节点集有交集的命中合并为同一条链（一个命中在另一命中的路径上、或共享
-  // root/中间节点），互不相交的命中各自成链。返回
-  // [{ hits: [被命中的节点 id...], nodes: [链上全部节点 id，拓扑序], pathEdges: [链内边] }]
-  // 2026-10：命中态传 kinds=['user'] —— 链按"user 引用的来路"分组，与 L3 取数同口径
-  //（derived 邻段不再算同一条链，所以命中常常各成一条链 → 轮播分组变多，这是对的：
-  //  本轮命中的确实是几条互相独立的问题脉络）。
+  // 按"链"分组（2026-09 用户定调）：链 = 一个目标节点的 root→recent 路径；
+  // 路径节点集有交集的合并为同一条链（一个目标在另一目标的路径上、或共享
+  // root/中间节点），互不相交的各自成链。返回
+  // [{ hits: [目标节点 id...], nodes: [链上全部节点 id，拓扑序], pathEdges: [链内边] }]
+  // 2026-10-27：命中态不再展开上游、也不再分链，这个函数只剩单击预览（manual）在用，
+  // 传的是混合边路径（不传 kinds）。
   function computeChains(nodes, edges, targetIds, kinds) {
     const byId = new Map(nodes.map((n) => [n.id, n]))
     const targets = (Array.isArray(targetIds) ? targetIds : [targetIds])
@@ -229,41 +231,32 @@
     return chains
   }
 
-  // 命中高亮（2026-10 用户定调，最终口径）：**一场讨论取一次闭包，一种圈、一个含义**。
-  // 种子 = 本轮命中 ∪ 本场实时栈已挂的引用 —— 收口前它们同属一场讨论：固化时同一段消息的
-  // cites 会一起变成**同一个节点的 user 边**，所以它们不是两类东西，不该画成两层两种圈。
-  // 从种子沿 **user 入边** 反向递归取全部"上游"（该讨论引用过的旧知识点，以及它们各自引用过
-  // 的更早知识点）——与 agent/lib/knowledge-graph.js userAncestry 同规则：只走 user 入边，
-  // 不走 derived（derived 连的是判同一性判出来"不是同一个问题"的同栈相邻段）。
-  // 于是图上亮的就是：**这场讨论若收口成一个节点，那个节点的 L3 来路闭包**。
-  // 曾经废弃的口径：① user＋derived 混合全祖先路径并集（图 46 节点 / L3 实际 8 节点，误导）；
-  // ② 把"本轮命中"与"本场已挂"画成两层两色（同一场讨论被拆成两类，用户反馈看不懂）。
-  function computeHitLayers(nodes, edges, seedIds) {
+  // 命中高亮（2026-10-27 用户定调，最终口径）：**只亮给定节点，不再展开上游**。
+  //
+  // 为什么改：旧口径是"一场讨论取一次闭包"——种子沿 user 入边反向递归取全部上游，
+  // 图上亮的是"**这场讨论若收口成一个节点，那个节点的 L3 来路闭包**"。那时旧路径 L3 把整条
+  // 来路全量注入，闭包 ≈ 模型真拿到的东西，所以画出来不失真。换成新路径（命题递归）之后，
+  // 它只按派题读几个节点——实测 2026-10-27 16:13 那轮命中 3 个、真读到 2 个，闭包却有
+  // 36 个节点（全图 230 个），图上亮的和实际用的差了一个数量级。用户定：
+  // **图只回答"这一轮用了哪些旧知识点"**，于是命中态直接画给它的这份清单。
+  //
+  // 返回形状与 computePath 兼容（setHighlight / render 只认这几个字段）：
+  //   ordered   = 这批节点（拓扑序）
+  //   recent    = 全部（它们都是"被用到的"，不再分"引用 / 上游"两类圈）
+  //   roots     = 空（没有"路径起点"这个概念了，不画虚线起点环）
+  //   pathEdges = 这批节点之间的 user 边（强调档）；weakEdges = 其间其余边
+  //（只画强边会让节点变成"没有线的孤点"，2026-10 的教训）
+  function computeExactSet(nodes, edges, seedIds) {
     const byId = new Map(nodes.map((n) => [n.id, n]))
-    const seeds = [...new Set((Array.isArray(seedIds) ? seedIds : [seedIds])
+    const ids = new Set((Array.isArray(seedIds) ? seedIds : [seedIds])
       .map((id) => String(id || '').trim())
-      .filter((id) => id && byId.has(id)))]
-    if (!seeds.length) return { ordered: [], roots: [], recent: [], pathEdges: [], weakEdges: [], ids: new Set() }
-    const ids = new Set(seeds)
-    const q = [...seeds]
-    while (q.length) {
-      const cur = q.pop()
-      for (const e of edges) {
-        if (e.kind !== 'user' || e.to !== cur) continue
-        if (ids.has(e.from) || !byId.has(e.from)) continue
-        ids.add(e.from)
-        q.push(e.from)
-      }
-    }
-    // 边分两档画（2026-10 修正：只画强边会让节点变成"没有线的孤点"，图看不懂）：
-    //   strongEdges（accent）：闭包内部的 user 边；weakEdges（按边色画满）：闭包内部的其余边。
-    // 两者都只表示"图里本来就有这条边"，不宣称进了上下文。
-    const strongEdges = edges.filter((e) => e.kind === 'user' && ids.has(e.from) && ids.has(e.to))
-    const strongSet = new Set(strongEdges)
-    const weakEdges = edges.filter((e) => ids.has(e.from) && ids.has(e.to) && !strongSet.has(e))
+      .filter((id) => id && byId.has(id)))
+    if (!ids.size) return { ordered: [], roots: [], recent: [], pathEdges: [], weakEdges: [], ids }
     const ordered = topoSort([...ids], edges)
-    const roots = ordered.filter((id) => !edges.some((e) => e.kind === 'user' && e.to === id && ids.has(e.from)))
-    return { ordered, roots, recent: seeds, pathEdges: strongEdges, weakEdges, ids }
+    const pathEdges = edges.filter((e) => e.kind === 'user' && ids.has(e.from) && ids.has(e.to))
+    const strongSet = new Set(pathEdges)
+    const weakEdges = edges.filter((e) => ids.has(e.from) && ids.has(e.to) && !strongSet.has(e))
+    return { ordered, roots: [], recent: [...ids], pathEdges, weakEdges, ids }
   }
 
   // 单链隔离的激活集（纯函数，2026-10）：多链命中时"只看第 N 条"用。
@@ -471,33 +464,41 @@
 
     /**
      * SSE graph-hit 命中（无论自由模式还是读书模式，行为一致）：
-     * - 图未打开 → 自动弹出拓扑图 → 播放命中路径动画（横幅 + 高亮 + 相机适配，
+     * - 图未打开 → 自动弹出拓扑图 → 播放命中动画（横幅 + 高亮 + 相机适配，
      *   横幅即命中通知）→ 停留后渐隐关闭（.gv-fading，0.7s opacity）。
      * - 图已打开（用户正在浏览）→ 直接应用命中高亮，不自动关闭。
+     * @param {string} [source] 'turn'（这一轮真用到的，2026-10-27 起由 agent 判完后才发）|
+     *   'stack'（本场讨论引用到的）。只影响横幅那句话，不影响画哪些节点。
      */
-    onHit(hits, reason) {
+    onHit(hits, reason, source) {
       const ids = (Array.isArray(hits) ? hits : []).filter(Boolean)
-      if (!ids.length) return
+      if (!ids.length) {
+        this.clearHighlight()
+        this._turnHits = []
+        return
+      }
       console.log('[CoRead][gv] onHit', ids.length, String(reason || '').slice(0, 24), 'open=', this._open)
-      this._turnHits = ids.slice()   // 本轮命中：合并进种子用（栈数据滞后时防止高亮闪回本场旧值）
+      this._turnHits = ids.slice()   // 本轮命中：回答期间优先于滞后的栈数据（见 applyStackHits）
+      this._turnSource = source === 'stack' ? 'stack' : 'turn'
       this._cancelAutoDismiss()   // 新命中取消挂起的自动渐隐（旧动画让位）
       if (!this._open) {
         this._autoShowHit(ids, reason || '')
         return
       }
-      this.applyHit(ids, reason || '', 'hit')
+      this.applyHit(ids, reason || '', 'hit', false, this._turnSource)
     }
 
-    // 命中自动弹出 + 渐隐关闭：打开遮罩 → 等图加载并应用命中（root→recent 路径
-    // 高亮 + 横幅通知 + 相机适配）→ 按链展示：单链停留后渐隐关闭；多链轮播
-    // （每条链横幅 + 聚焦，全部播完再渐隐关闭）。
+    // 命中自动弹出 + 渐隐关闭：打开遮罩 → 等图加载并应用命中（高亮 + 横幅通知 +
+    // 相机适配）→ 停留后渐隐关闭。
+    // 多链轮播（每条链横幅 + 聚焦）现在只剩单击预览那类路径（manual）；命中态不展开上游、
+    // 也不再有"一条脉络"可分，所以走的是单段 3.2 秒渐隐。
     //
     // _autoOpened（2026-02）：标记"这个窗口是命中自动弹出来的"。用户停止一轮时，
     // 侧栏据此决定要不要连窗口一起收 —— 用户自己开着图在看的话不能关。
     async _autoShowHit(hits, reason) {
       this._autoOpened = true
       this._openOverlay()
-      await this.applyHit(hits, reason, 'hit')
+      await this.applyHit(hits, reason, 'hit', false, this._turnSource)
       if (!this.graph) { this.close(); return }   // 图加载失败：不演动画，直接收起
       const chains = this.hl && this.hl.chains
       if (chains && chains.length > 1) {
@@ -604,58 +605,85 @@
       }
     }
 
-    /** 命中应用：算高亮（一场讨论一次 user 闭包）→ 高亮 + 横幅 + 适配相机
+    /** 命中应用：算高亮（**就画给的这些节点**，不展开上游）→ 高亮 + 横幅 + 适配相机
      *  （手动高亮不动相机）。
      *  noFit=true：不播聚焦动画（打开图场景用——物理未收敛时动画目标基于环形
      *  初始布局的瞬时坐标，位置不对；聚焦交给物理收敛后的 _pendingChainFit 落位）
-     *  stackIds：本场实时栈累计命中的引用；命中态会与 hits 合并成同一组种子 */
-    async applyHit(hits, reason, mode, noFit, stackIds) {
+     *  source：'turn'（这一轮用到的）| 'stack'（本场讨论引用到的）——只影响横幅措辞。
+     *
+     *  2026-10-27 用户定：命中态不再把"本轮命中 ∪ 栈引用"合并后取 user 闭包。图上亮的必须
+     *  等于这一轮真读过、交了料的节点；几个来源混在一起就说不清"这一轮用了什么"了。 */
+    async applyHit(hits, reason, mode, noFit, source) {
       console.log('[CoRead][gv] applyHit', mode, 'hits=', (hits || []).length, 'noFit=', !!noFit)
       if (!this.graph) {
         const g = await this.loadGraph(this._demo, this._free)
         if (!g) return
       }
       const m = mode || 'hit'
-      // 种子 = 本轮命中 ∪ 本场栈已挂的引用（2026-10 用户定调：收口前它们是同一场讨论的引用，
-      // 固化后会并进同一个节点的 user 边，所以一起取一次闭包、不分两层）。
-      // 只有命中态合并：picked 要尊重用户的手动选取，simulate 用的是演示图。
-      const seeds = (m === 'hit')
-        ? [...new Set([...(hits || []), ...(this._turnHits || []), ...((stackIds != null ? stackIds : this._stackIds) || [])])]
-        : hits
-      const result = computeHitLayers(this.run.nodes, this.run.edges, seeds)
-      console.log('[CoRead][gv] applyHit 亮=', result.ordered.length, '（引用', result.recent.length, '+ 上游', result.ordered.length - result.recent.length, '）')
+      const exact = this._isHitLikeHl({ mode: m })
+      const seeds = [...new Set((Array.isArray(hits) ? hits : []).filter(Boolean))]
+      const result = exact
+        ? computeExactSet(this.run.nodes, this.run.edges, seeds)
+        : computePath(this.run.nodes, this.run.edges, seeds)
+      console.log('[CoRead][gv] applyHit 亮=', result.ordered.length, exact ? '（精确清单，不展开上游）' : '')
       if (!result.ordered.length) {
         return
       }
-      this.setHighlight(result, mode || 'hit', reason || '')
-      if (mode !== 'manual' && !noFit) {
+      this.setHighlight(result, m, reason || '', source)
+      if (m !== 'manual' && !noFit) {
         this._fitToChain()
       }
     }
 
-    /** 当前讨论命中（2026-09 用户定调）：命中 = 当前实时栈 cites 的节点脉络。
-     *  打开图 / 收到 stack-updated / 切书时由侧栏调用：hits 非空 → 恢复
-     *  "当前讨论命中"高亮 + 横幅；hits 空（栈已收口结束）→ 清除 hit 态高亮
-     *  （不动 manual / search 高亮）。
-     *  opts.pending = 本轮回答还没结束（侧栏给：正在等回答 / 正在流式渲染）。 */
+    /** 当前讨论命中（2026-09 用户定调；2026-10-27 第二次改口径，用户定）：
+     *  打开图 / 收到 stack-updated / 切书时由侧栏调用。**图画的永远是"当前这一轮真读到、
+     *  交了料"的节点**（`opts.used`，来自 /stack-hits 的最近一轮），不是这场讨论累积的 cites——
+     *  用累积的会把前面几轮的引用一起堆上来（实测一轮用 2 个、累积 5 个）。
+     *  没有 used（升级前写的栈 / 最近一轮没命中）时退回按 hits 画（旧行为）。
+     *  回答期间（pending）优先本轮临时清单 _turnHits：栈里此刻还是上一轮那一份。
+     *  opts.pending = 本轮回答还没结束（侧栏给：正在等回答 / 正在流式渲染）。
+     *
+     *  无论用哪一份，都只亮这些节点本身，不沿 user 边展开上游（见 computeExactSet）。 */
     applyStackHits(hits, opts) {
-      console.log('[CoRead][gv] applyStackHits', Array.isArray(hits) ? hits.length : 'n/a', 'pending=', !!(opts && opts.pending), 'hl=', this.hl && this.hl.mode, 'at-ago=', this.hl ? Math.round((Date.now() - this.hl.at) / 1000) + 's' : '-')
-      this._stackIds = Array.isArray(hits) ? hits.slice() : []   // 本场实时栈累计命中的引用（种子之一）
-      if (opts && opts.pending) this._stackLagUntil = Date.now() + STACK_LAG_GRACE_MS
-      if (!Array.isArray(hits) || !hits.length) {
-        // 空结果不清高亮（2026-11 用户报"命中动画一结束就打开图，刚命中的节点没被高亮，
+      const pending = !!(opts && opts.pending)
+      const used = (opts && Array.isArray(opts.used)) ? opts.used.filter(Boolean) : null
+      const cites = (Array.isArray(hits) ? hits : []).filter(Boolean)
+      console.log('[CoRead][gv] applyStackHits hits=', cites.length, 'used=', used === null ? '-' : used.length,
+        'pending=', pending, 'hl=', this.hl && this.hl.mode, 'at-ago=', this.hl ? Math.round((Date.now() - this.hl.at) / 1000) + 's' : '-')
+      if (pending) this._stackLagUntil = Date.now() + STACK_LAG_GRACE_MS
+      // 显示清单（2026-10-27 第二次改）：当前这一轮真读到的节点。
+      //   ① 回答期间且 graph-hit 已到 → _turnHits（本轮那份，最准）；
+      //   ② 否则 → 栈里记的 used（最近一轮；回答结束后/刷新/切书走这里）；
+      //   ③ used 不存在（升级前的栈、或最近一轮没命中）→ 退回累积 cites（旧行为）。
+      const turnSet = Array.isArray(this._turnHits) ? this._turnHits : null
+      const display = (pending && turnSet) ? turnSet
+        : (used !== null ? used : (turnSet || cites))
+      // 横幅措辞跟着来源走：'turn' = 这一轮（graph-hit 刚下来/回答进行中），
+      // 'last' = 最近一轮（从栈里的 used 恢复：回答结束后、刷新、切书回来），
+      // 'stack' = 老栈没有 used 时的累积 cites 兜底。
+      const source = (pending && turnSet) ? 'turn' : (used !== null ? 'last' : 'stack')
+      // used 已经落到栈里（回答结束 / 刷新后）：本轮那份临时清单作废。下一轮开始到它的
+      // graph-hit 到达之前，图按栈里的 used 画（同一份节点），横幅措辞也才说得准。
+      if (used !== null && !pending) this._turnHits = null
+      if (!display.length) {
+        // 没有可画的：空结果不清高亮（2026-11 用户报"命中动画一结束就打开图，刚命中的节点没被高亮，
         // 要等回答完成才补上"）。成因：/stack-hits 读的是实时讨论栈的 cites，而本轮提问的
-        // cites 要等**回答收口**才由 agent 写进栈（agent/index.js 的 driveTopicStack），
+        // cites 要等**回答收口**才由 agent 写进栈（agent/index.js 的 applyStackTurn），
         // 回答期间它必然是空的。于是"空"有两种意思——"还没落栈"和"命中结束"——只能靠
         // 轮次状态区分：本轮回答还在跑（pending），或刚跑完、cites 还在路上
         //（receiver 3s 轮询 + 收口写盘的宽限窗口），都按"没有更新"处理，高亮与横幅留着。
         // 命中动画保护（2026-10）：同理，graph-hit 刚应用 4s 内的空结果也不清——动画还在播。
-        const lagging = (opts && opts.pending) || Date.now() < this._stackLagUntil
+        if (pending && turnSet) {
+          this.clearHighlight()
+          this._turnHits = []
+          return
+        }
+        const lagging = pending || Date.now() < this._stackLagUntil
         if (lagging) {
           // 高亮若已经丢了（切书回来 / 上一轮被清），就用**本轮命中**补回来：
-          // 用户打开图想看的就是刚刚命中的那条脉络。
-          if (this._open && !this.hl && this._turnHits && this._turnHits.length) {
-            this.applyHit(this._turnHits, '', 'hit')
+          // 用户打开图想看的就是刚刚命中的那几个节点。
+          if (this._open && !this.hl && turnSet) {
+            this.applyHit(turnSet, '', 'hit', false, this._turnSource || 'turn')
           }
           return
         }
@@ -665,12 +693,12 @@
       // 打开图（图还没加载）时 noFit：不播聚焦动画——物理刚从环形初始布局开始
       // 收敛，动画目标基于未稳定的瞬时坐标，聚焦位置不对；改为物理收敛后由
       // _pendingChainFit 一次性落位。图已加载的栈刷新/切书恢复保持动画聚焦。
+      // 图关着、栈里也还没有数据（只有 _turnHits）：别偷偷把图拉起来（2026-11 的守卫）。
+      if (!this._open && !this.graph && used === null && !cites.length) return
       const needLoad = !this.graph
-      if (needLoad) this._pendingChainFit = true   // 打开图场景：收敛后落位链聚焦
+      if (needLoad) this._pendingChainFit = true   // 打开图场景：收敛后落位聚焦
       this._stackLagUntil = 0   // 栈已给到真数据：宽限窗口结束
-      // 种子：本轮命中优先（栈数据可能滞后），没有则用栈命中——合并逻辑在 applyHit 里做。
-      const seeds = (this._turnHits && this._turnHits.length) ? this._turnHits : hits
-      return this.applyHit(seeds, '', 'hit', needLoad, hits)
+      return this.applyHit(display, '', 'hit', needLoad, source)
     }
 
     // ── 多链聚焦（2026-10 用户定调：切到某条脉络就**只看那一条**，并新增「全部」） ──
@@ -716,22 +744,13 @@
       this._fitToChain()
     }
 
-    // 聚焦到某节点所在的链（多链高亮时；选取新链节点后由侧栏调用，2026-09）。
-    // 节点不在任何链 / 单链 → 不动。
-    focusNodeChain(id) {
-      const chains = this.hl && this.hl.chains
-      if (!chains || chains.length <= 1) return
-      const ci = chains.findIndex((c) => c.hits.includes(id) || c.nodes.includes(id))
-      if (ci >= 0 && ci !== this._focusChain) this.focusChain(ci)
-    }
-
     /**
      * 外部（侧栏）让图**指出某个点**：等图加载完 → 选中它。
      *
-     * 为什么不能用上面的 focusNodeChain：它在"当前没有多链高亮"时是**空操作**
-     *（`chains.length <= 1` 直接 return）。而"刚收口出来的第一个知识点"打开图时
-     * 根本没有命中链——用它等于什么都不发生（2026-10-21 复查时发现的：卡片上写着
-     * "这个点会被圈出来"，而代码并没有做到，属于**界面在说空话**）。
+     * 为什么不用"聚焦到所在链"那套：它在"当前没有多链高亮"时是**空操作**
+     *（以前的 focusNodeChain：`chains.length <= 1` 直接 return，那个方法已随命中态不再分链删掉）。
+     * 而"刚收口出来的第一个知识点"打开图时根本没有命中链——用它等于什么都不发生
+     *（2026-10-21 复查时发现的：卡片上写着"这个点会被圈出来"，而代码并没有做到，属于**界面在说空话**）。
      *
      * 为什么复用 selectNode 而不是自己算相机：`selectNode` 已经把该做的都做了——
      * 高亮这个点的来路（root→recent）、把相机对准它、打开右侧详情面板。
@@ -801,35 +820,35 @@
       }
     }
 
-    /** 手动：高亮某节点的 root→recent 路径（详情面板按钮）。simulate（演示命中）
-     *  走命中两层口径，与真实命中一致。 */
+    /** 手动：高亮某节点的 root→recent 路径（详情面板按钮，浏览这张网的语义）。
+     *  simulate（演示命中）与真实命中同口径：只亮这一个节点（2026-10-27 起不再展开上游）。 */
     highlightFrom(nodeId, mode) {
       const n = this.run && this.run.byId.get(nodeId)
       if (!n) return
       const result = (mode === 'simulate')
-        ? computeHitLayers(this.run.nodes, this.run.edges, [nodeId])
+        ? computeExactSet(this.run.nodes, this.run.edges, [nodeId])
         : computePath(this.run.nodes, this.run.edges, [nodeId])
       this.setHighlight(result, mode || 'manual', '')
-      if (mode === 'simulate') this._fitToChain()   // 演示命中：按链聚焦
+      if (mode === 'simulate') this._fitToChain()   // 演示命中：按节点聚焦
     }
 
-    // 命中态判定（2026-10）：hit/picked/simulate 走"命中 + user 来路"口径（computeHitLayers）；
-    // manual（单击预览）/ search 走混合边路径（"浏览这张网"语义）。
+    // 命中态判定（2026-10；2026-10-27 换口径）：hit/picked/simulate 只亮**给的那批节点本身**
+    // （computeExactSet，不展开上游）；manual（单击预览）/ search 走混合边路径（"浏览这张网"语义）。
     // 判据看 **mode**，不看数据形状——之前用 `hl.stackOnly instanceof Set` 判，而 setHighlight
-    // 给 search/manual 也塞了空 Set，于是重算时它们会被误当命中态、把搜索结果换成 user 来路闭包。
+    // 给 search/manual 也塞了空 Set，于是重算时它们会被误当命中态、把搜索结果换成闭包。
     _isHitLikeHl(hl) {
       return !!(hl && (hl.mode === 'hit' || hl.mode === 'picked' || hl.mode === 'simulate'))
     }
-    setHighlight(result, mode, reason) {
+    setHighlight(result, mode, reason, source) {
       // 聚焦前相机快照：只在非 manual 时保存（2026-09 修复——manual 是临时预览，
-      // 若覆盖快照，之后隐藏命中脉络会恢复到 manual 聚焦后的状态，而不是命中前的状态）
+      // 若覆盖快照，之后隐藏命中高亮会恢复到 manual 聚焦后的状态，而不是命中前的状态）
       if (mode !== 'manual') this._preFocusCam = { x: this.cam.x, y: this.cam.y, scale: this.cam.scale }
       // 新命中/选取（消息级状态）覆盖一切：清掉暂存的旧状态。
       // search 不清——搜索是临时定位，暂存由输入处负责，"清除搜索"时恢复。
       if (mode === 'hit' || mode === 'picked') this._savedState = null
       const hl = {
         mode: mode || 'manual',
-        // ids = 高亮全集（引用 + 上游闭包），用于压暗判定；edges 只含内部 user 边
+        // ids = 高亮全集（命中态 = 给的那批节点；manual/search = 路径闭包），用于压暗判定
         ids: (result.ids instanceof Set) ? result.ids : new Set(result.ordered),
         edges: new Set(result.pathEdges),
         weakEdges: new Set(result.weakEdges || []),
@@ -837,17 +856,20 @@
         recent: result.recent,
         targets: result.recent,
         reason: reason || '',
+        // 命中态标记（2026-10-27）：画的是"就这些节点"，不是路径闭包 → 横幅措辞不同。
+        // source 说明这份清单从哪来：'turn' = 这一轮真用到的；'stack' = 本场讨论引用到的。
+        exact: !!(mode === 'hit' || mode === 'picked' || mode === 'simulate'),
+        source: source || '',
         at: Date.now(),
       }
       this.hl = hl
       this._hlHidden = false   // 新命中/搜索/手动高亮：总是先显示
-      // 命中按链分组（自动弹出 / 模拟 / 手动高亮 / 手动选取统一按链展示与聚焦）。
-      // hit/picked/simulate 传 kinds=['user']：链 = user 引用的来路，与 L3 取数同口径。
-      hl.chains = (mode === 'hit' || mode === 'simulate' || mode === 'manual' || mode === 'picked')
-        ? computeChains(this.run ? this.run.nodes : [], this.run ? this.run.edges : [], result.recent,
-            this._isHitLikeHl(hl) ? ['user'] : undefined)
+      // 只有单击预览（manual）还按"路径"分组——命中态没有路径可分，不生成脉络
+      // （右下角「全部 / 脉络 N」与多链轮播也就不会出现）。
+      hl.chains = (mode === 'manual')
+        ? computeChains(this.run ? this.run.nodes : [], this.run ? this.run.edges : [], result.recent)
         : null
-      this._focusChain = -1   // 新命中：默认「全部」（多链时用户再逐条切）
+      this._focusChain = -1   // 新命中：默认「全部」（manual 多链时用户再逐条切）
       this._updateActiveHl()
       this._pulseUntil = Date.now() + 1600
       this._renderBanner()
@@ -856,13 +878,11 @@
     }
     recomputeHighlight() {
       if (!this.hl || !this.hl.targets || !this.hl.targets.length) return
-      // 命中态（hit/picked/simulate）走"一场讨论一次闭包"口径重算；search / manual 保持混合边路径
+      // 命中态（hit/picked/simulate）只按目标节点重算：图文件变了也不许扩成上游闭包；
+      // search / manual 保持混合边路径
       const isHitLike = this._isHitLikeHl(this.hl)
-      const seeds = isHitLike
-        ? [...new Set([...this.hl.targets, ...(this._stackIds || [])])]
-        : this.hl.targets
       const result = isHitLike
-        ? computeHitLayers(this.run.nodes, this.run.edges, seeds)
+        ? computeExactSet(this.run.nodes, this.run.edges, this.hl.targets)
         : computePath(this.run.nodes, this.run.edges, this.hl.targets)
       if (!result.ordered.length) { this.clearHighlight(); return }
       this.hl.ids = (result.ids instanceof Set) ? result.ids : new Set(result.ordered)
@@ -871,15 +891,37 @@
       this.hl.roots = result.roots
       this.hl.recent = result.recent
       this.hl.targets = result.recent
-      // 图重载后链按新图重算；聚焦下标越界则回「全部」（命中态链按 user 来路分组，与 L3 同口径）
-      this.hl.chains = computeChains(this.run.nodes, this.run.edges, this.hl.targets,
-        isHitLike ? ['user'] : undefined)
+      // 图重载后链按新图重算（只有 manual 还有链）；聚焦下标越界则回「全部」
+      this.hl.chains = this.hl.mode === 'manual'
+        ? computeChains(this.run.nodes, this.run.edges, this.hl.targets)
+        : null
       if (this._focusChain >= (this.hl.chains || []).length) this._focusChain = -1
       this._updateActiveHl()
-      this._pendingChainFit = true   // 图重载后物理重跑，收敛时同样校准链聚焦（2026-10）
+      this._pendingChainFit = true   // 图重载后物理重跑，收敛时同样校准聚焦（2026-10）
       this._renderBanner()
       this._renderChainSwitch()
     }
+    /**
+     * 回退到"这一轮之前"的命中状态（2026-10-27 用户定）。
+     *
+     * 为什么不是 clearHighlight：用户停止一轮时，那一轮**没有入栈**——会意栈还停在
+     * 上一轮的样子，上一轮用到的节点本来该原样亮着。一刀清空等于"停一轮顺手把这些
+     * 痕迹也抹了"。正确做法是把本轮命中作废，再按栈重画。
+     *
+     * used（2026-10-27 第二次改）：栈里最近一轮"真用上"的节点；没有就退回 hits。
+     * 和 applyStackHits 的区别只有两点：① 本轮命中（_turnHits）直接丢掉；
+     * ② 空结果**立刻清**，不走"动画保护/滞后窗口"那套——停止是用户的明确动作，
+     * 不需要再替他留住刚闪过的 4 秒高亮。
+     */
+    revertToStackHits(hits, used) {
+      this._turnHits = null
+      const ids = Array.isArray(hits) ? hits.filter(Boolean) : []
+      const usedIds = Array.isArray(used) ? used.filter(Boolean) : null
+      if (!ids.length && !(usedIds && usedIds.length)) { this.clearHighlight(); return null }
+      this._stackLagUntil = 0
+      return this.applyStackHits(ids, { pending: false, used: usedIds })
+    }
+
     clearHighlight() {
       this.hl = null
       this._hlHidden = false
@@ -889,6 +931,7 @@
       this._savedState = null
       this._pendingChainFit = false
       this._turnHits = null   // 本轮命中随命中态一起清（栈命中的恢复由 /stack-hits 重新喂）
+      this._turnSource = ''   // 清单来源也跟着清（下次由 graph-hit / 栈恢复重新标）
       this._stackLagUntil = 0   // 宽限窗口一并作废：清了高亮就没有"要保住的命中"了
       this._renderBanner()
       this._renderChainSwitch()
@@ -1364,14 +1407,12 @@
         }
       }
 
-      // 节点（命中高亮＝一场讨论一次 user 闭包，2026-10 用户定调：
-      //   闭包 = 本场讨论引用到的旧知识点（含本轮） + 它们各自引用过的更早知识点（上游）。
-      //   一类标识（引用节点 深蓝实环+脉冲 ／ 上游节点 靛环 ／ 路径起点 浅蓝虚线）**一律读激活集**，
-      //   不许直接读 hl.ids / hl.roots / hl.recent —— 那会让单链隔离漏成"其它脉络也亮"。
-      //   非高亮节点保留 0.45 亮度（背景仍可见）。）
+      // 节点（命中态：**只亮清单里的这些节点**，2026-10-27 用户定，见 computeExactSet；
+      //   manual / search 仍画路径。标识**一律读激活集**，不许直接读 hl.ids / hl.roots /
+      //   hl.recent —— 那会让单链隔离漏成"其它脉络也亮"。非高亮节点保留 0.45 亮度（背景仍可见）。）
       for (const n of run.nodes) {
         let alpha = 1
-        const onPath = !!(hlIds && hlIds.has(n.id))   // 激活集（引用 + 上游）
+        const onPath = !!(hlIds && hlIds.has(n.id))   // 激活集（命中清单 / 路径闭包）
         if (hl) alpha = onPath ? 1 : 0.45
         else if (hoverOn) alpha = 1 - (this._nodeDim.get(n.id) || 0) * 0.78   // 缓动压暗：1 → 0.22
         const px = tx(n.x), py = ty(n.y)
@@ -1381,15 +1422,16 @@
         const rDraw = r * (1 + 0.2 * magAmt)   // 放大也缓动，不跳变
         // ── 标识环：**每个节点每类只有一道环，颜色/粗细固定**（2026-10 用户反馈
         //    "recent 的标识和图例对不上"）。半径/画法：
-        //     引用节点 r+3 深蓝 3px ／ 上游节点 r+2.5 靛 2px ／ 路径起点 r+6 浅蓝虚线 2px
+        //     命中清单 r+3 深蓝 3px ／ 路径上游 r+2.5 靛 2px ／ 路径起点 r+6 浅蓝虚线 2px
         //   两条硬规则：
-        //   ① 引用节点**只画深蓝环、不再叠靛环**——两道同色系环套在一起，用户没法判断
-        //      哪个颜色才是"引用到的那个"。
-        //   ② 引用节点的**常驻环满不透明**：以前把脉冲的 0.45 淡出也套在常驻环上，图上那圈
+        //   ① 命中清单里的节点**只画深蓝环、不再叠靛环**——两道同色系环套在一起，用户没法判断
+        //      哪个颜色才是"用到的那几个"。
+        //   ② 深蓝**常驻环满不透明**：以前把脉冲的 0.45 淡出也套在常驻环上，图上那圈
         //      发灰，而图例是实心 #3f45cd —— 这就是"颜色对不上"。脉冲另画一道外扩环。
         const isRecent = !!(hl && hl.mode !== 'manual' && hlRecent.includes(n.id))
         const isRoot = !!(hl && hlRoots.includes(n.id))
-        // 上游节点外圈（靛色）——引用节点除外（见规则①）
+        // 路径上游外圈（靛色）——命中态不会有这种节点（清单里每个都是 recent）；
+        // manual / search 的路径闭包里才出现（见规则①）
         if (onPath && !isRecent) {
           ctx.globalAlpha = alpha
           ctx.strokeStyle = COLORS.pathAccent
@@ -1398,7 +1440,8 @@
           ctx.arc(px, py, r + 2.5, 0, Math.PI * 2)
           ctx.stroke()
         }
-        // 路径起点（无 user 入边）浅蓝虚线环——起点太多时不画（见 ROOT_MARK_MAX，防噪声）
+        // 路径起点（manual/search 的路径模式）浅蓝虚线环——命中态 roots 恒空（不展开上游），
+        // 起点太多时不画（见 ROOT_MARK_MAX，防噪声）
         if (isRoot && hlRoots.length <= ROOT_MARK_MAX) {
           ctx.globalAlpha = alpha
           ctx.setLineDash([3, 3])
@@ -1588,7 +1631,9 @@
             // 根因：动画目标取的是环形初始布局的瞬时坐标，收敛后节点已移动）
             if (this._pendingChainFit) {
               this._pendingChainFit = false
-              if (this._open && this.hl && !this._hlHidden && (this.hl.mode === 'hit' || this.hl.mode === 'picked') && this.hl.chains) {
+              // 2026-10-27：命中态不再有 chains（不展开上游、不分脉络），所以这里只看 mode——
+              // 打开图时先按命中清单落位，不能因为"没有链"就停在整图最小视图上。
+              if (this._open && this.hl && !this._hlHidden && (this.hl.mode === 'hit' || this.hl.mode === 'picked')) {
                 this._anim = null   // 取消可能进行中的聚焦动画，直接落位（防动画插值打架）
                 this._fitToChain(true)
               }
@@ -1987,7 +2032,7 @@
         this._setBannerLines([text], '')
         this._setBannerBtn('clear')   // 搜索横幅按钮 = 清除搜索
       } else if (hl.mode === 'simulate') {
-        text = (hidden ? '〔高亮已隐藏〕' : '') + '🔗 模拟命中（演示）：高亮「' + nodePoint(this, hl.targets[0]) + '」的讨论脉络（' + hl.ids.size + ' 节点）'
+        text = (hidden ? '〔高亮已隐藏〕' : '') + '🔗 模拟命中（演示）：高亮「' + nodePoint(this, hl.targets[0]) + '」（' + hl.ids.size + ' 节点）'
         this._setBannerLines([text], 'hit')
         this._setBannerBtn('hl')
       } else if (hl.mode === 'manual') {
@@ -1997,8 +2042,10 @@
         return
       } else {
         // 会话命中（hit）/ 手动选取（picked）：横幅统一分行（2026-09 用户定调）——
-        // 指示行 + 每个标题各占一行；单脉络（单链）同样分行，不做单行省略。
+        // 指示行 + 每个标题各占一行；不做单行省略。
         // 每行由 .gv-banner-line 强制单行（nowrap + ellipsis），标题行内部不再被拆断。
+        // 2026-10-27：命中态不再展开上游，`chains` 恒为空（只有 manual 还按路径分链），
+        // 所以下面这些"第 N 条 / 其余已压暗"的分支对命中态不再生效；保留是为了 manual 的兜底。
         const chains = hl.chains || []
         const isolated = this._isChainIsolated()
         const idx = isolated ? this._focusChain : -1
@@ -2020,16 +2067,20 @@
           ? '命中知识脉络（' + (isolated ? (idx + 1) + '/' + chains.length : '全部 ' + chains.length + ' 条') + '）'
           : '命中知识脉络')
         // 范围说明独立成行（2026-10）：只把计数塞在指示行尾部时，行宽不够会被省略号吃掉
-        // 后半段——用户反馈"看不懂"。措辞只讲两件事实：现在这条多大、其余为什么不见了；
-        // 不再写「点「全部」看整轮」这类指令（「全部」按钮就在右下角、自带标签，文案里重复
-        // 一遍反而啰嗦——2026-10 用户定调重写）。
-        // 分隔符跟全 app 既有约定一致：半角空格 + 中点 + 半角空格（` · `），不用全角空格——
-        // 图例/hint 等处的既有文案都是这个写法（滚轮缩放 · 拖空白平移 · …）。
+        // 后半段——用户反馈"看不懂"。
+        // 2026-10-27 改：命中态不再有"连同其上游共高亮 M 个"这句话（不再画上游），
+        // 只说这份清单是什么、有几个；清单来源不同（这一轮真用到的 / 本场讨论引用到的），措辞也跟着换。
         const legendLine = isolated
           ? '这条脉络 ' + cur.nodes.length + ' 个节点'
             + (cur.nodes.length > 1 ? '' : '（没有上游）')
             + ' · 其余 ' + Math.max(0, chains.length - 1) + ' 条已压暗'
-          : '本场讨论引用到 ' + hl.recent.length + ' 个旧知识点，连同其上游共高亮 ' + hl.ids.size + ' 个'
+          : hl.exact
+            ? (hl.mode === 'picked' ? '已选取 '
+              : hl.source === 'stack' ? '本场讨论引用到 '
+                : hl.source === 'last' ? '最近一轮读到 '
+                  : '这一轮读到 ')
+              + hl.recent.length + ' 个旧知识点'
+            : '本场讨论引用到 ' + hl.recent.length + ' 个旧知识点'
         // 隐藏态只保留指示行（2026-09 修复：隐藏时没有聚焦任何脉络，
         // 标题行和（X/N）都没有着落，一并去掉）；显示态 = 指示行 + 配色行 + 标题分行
         this._setBannerLines(
@@ -2403,6 +2454,6 @@
     ctx.fillStyle = 'rgba(30, 34, 40, ' + (0.96 * alpha * fade).toFixed(3) + ')'
     for (let i = 0; i < lines.length; i++) ctx.fillText(lines[i], x, y + i * lineH)
   }
-  console.log('[CoRead] graph-view v53 已加载：灰色 = 自由对话的节点（无书籍归属），图例/详情/悬停都写明；书本节点的书名改由收口从消息自带书名兜底（2026-11）')
-  global.CoReadGraphView = { GraphView, COLORS, utils: { computePath, computeChains, computeHitLayers, chainActiveSet, labelShape, labelTier, drawLabel, topoSort, hashStr, mulberry32, clamp, wrapText, bookName, colorDist, assignBookColors } }
+  console.log('[CoRead] graph-view v55 已加载：命中态只亮"当前这一轮真读到、交了料的节点"（不展开上游；回答结束后也按这一份，不按累积引用）；灰色 = 自由对话的节点（无书籍归属）（2026-10-27）')
+  global.CoReadGraphView = { GraphView, COLORS, utils: { computePath, computeChains, computeExactSet, chainActiveSet, labelShape, labelTier, drawLabel, topoSort, hashStr, mulberry32, clamp, wrapText, bookName, colorDist, assignBookColors } }
 })(typeof window !== 'undefined' ? window : globalThis)

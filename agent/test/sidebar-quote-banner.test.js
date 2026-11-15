@@ -170,6 +170,7 @@ function loadSidebar({ history = [] } = {}) {
   quotedQuestionText,
   questionSnippet,
   addBubble,
+  mdToHtml,
   setBook: (base) => { _currentBook = base ? { base, bookTitle: '测试书' } : null; applyBookFilter() },
   state: () => {
     const msgs = document.getElementById('msgs')
@@ -336,4 +337,171 @@ test('questionSnippet：老式子元素（无 .uq-body）照旧跳过 > 与 [引
   }
   const el = { querySelector: (sel) => (sel === '.bubble' ? bubbleEl : null) }
   assert.equal(X.questionSnippet(el), '为什么统一市场对工人更重要？')
+})
+
+// ── 材料面板（2026-10-27 晚定稿：链接色 + 整句可点）──────────────────────────
+// 用户的原话："让文字变色，使用超链接的文字颜色，然后点击整段范围都能展开。"
+// 所以这一句整个包成一个 label（点哪儿都开），面板里放这一句用到的**全部**材料；
+// 句尾的 [n] 只是编号，不再各自带一个面板。侧栏只认这一轮真带回来的条目。
+const SRC1 = { n: 1, query: '招拍挂哪一年', title: '部39号令详解', site: '自然资源部', text: '2002年5月9日发布', url: 'https://www.mnr.gov.cn/x.html' }
+
+test('mdToHtml：整句就是一个开关，默认收起；点开是标题＋原话＋可点的链接', () => {
+  const { X } = loadSidebar()
+  const html = X.mdToHtml('分水岭是 2002 年[1]。', [SRC1])
+  assert.match(html, /^<p><label class="vt" title="这一句对照过 1 条网上材料[^"]*">/, '整句是一个可点的 label')
+  assert.match(html, /<input type="checkbox" class="cite-t">/, '开关就是这个 checkbox')
+  assert.doesNotMatch(html, /checked/, '默认收起：不带 checked')
+  assert.match(html, /2002 年<span class="cite-k">\[1\]<\/span>。/, '正文里露出来的只有编号，编号在句号前')
+  assert.match(html, /<\/span>。<span class="cite-box">/, '面板接在句号后面')
+  assert.match(html, /部39号令详解（自然资源部）/, '第一行是标题与站点')
+  assert.match(html, /2002年5月9日发布/, '第二行是网页里那段原话')
+  assert.match(html, /<a class="cite-url" href="https:\/\/www\.mnr\.gov\.cn\/x\.html" target="_blank" rel="noopener noreferrer">/, '链接可点、开新页')
+})
+
+test('mdToHtml：没带材料条目（历史消息 / 没联网）时，[1] 保持纯文字、整句不变色', () => {
+  const { X } = loadSidebar()
+  const html = X.mdToHtml('分水岭是 2002 年[1]。')
+  assert.doesNotMatch(html, /class="vt"/, '没有条目就不该有可点的整句')
+  assert.doesNotMatch(html, /cite/)
+  assert.match(html, /2002 年\[1\]/)
+  // 空数组同理（这一轮没查到，不是"查了没有"）
+  assert.doesNotMatch(X.mdToHtml('甲[1]', []), /class="vt"/)
+})
+
+test('mdToHtml：编号对不上就留成纯文字；一句里引两次，面板只列一次', () => {
+  const { X } = loadSidebar()
+  const html = X.mdToHtml('对得上[1]，对不上[9]，又来一次[1]。', [SRC1])
+  assert.match(html, /\[9\]/, '编出来的编号原样留着（不猜、不藏，能看见才能查）')
+  assert.doesNotMatch(html, /\[9\]<\/span>/, '不能把它也做成编号')
+  assert.equal((html.match(/class="cite-k"/g) || []).length, 2, '两处编号都露出来')
+  assert.equal((html.match(/class="cite-item"/g) || []).length, 1, '同一条材料在面板里只列一次')
+})
+
+test('mdToHtml：面板里放洗过的那段（shown），不是「...」缝起来的原文（text）', () => {
+  const { X } = loadSidebar()
+  // 服务端给两份：text 是原文（凭据），shown 是洗过、给人读的那段
+  const src = {
+    n: 1, query: 'q', title: '财政部答记者问', site: '中华人民共和国财政部',
+    text: '甲段还没说完 ... 乙段才是完整的一句话，读得通。',
+    shown: '乙段才是完整的一句话，读得通。',
+    url: 'https://example.com/a',
+  }
+  const html = X.mdToHtml('这一句是核对过的[1]。', [src])
+  assert.match(html, /乙段才是完整的一句话/, '面板里放 shown')
+  assert.doesNotMatch(html, /甲段还没说完/, '「...」缝起来的原文不给人看')
+  assert.doesNotMatch(html, /\.\.\./, '面板里不该留省略号缝合的痕迹')
+  // 老数据没有 shown：退回 text，不能变成一个空面板
+  const old = X.mdToHtml('这一句[1]。', [{ n: 1, title: 't', text: '只有原文', url: '' }])
+  assert.match(old, /只有原文/)
+})
+
+test('mdToHtml：多段原话一段一行（换行留着），面板 CSS 得允许换行', () => {
+  const { X } = loadSidebar()
+  const src = {
+    n: 1, query: 'q', title: '某解读', site: '某站',
+    text: '第一段 ... 第二段',
+    shown: '第一段在这儿被切断了…\n第二段是完整的一句话。',
+    url: 'https://example.com/a',
+  }
+  const html = X.mdToHtml('核对过的一句[1]。', [src])
+  assert.match(html, /第一段在这儿被切断了…\n第二段是完整的一句话。/, '换行要原样进 DOM')
+  // 换行进了 DOM 还得 CSS 让它显示出来，否则浏览器把 \n 当空格
+  const css = fs.readFileSync(HTML, 'utf8')
+  assert.match(css, /\.bubble\.md \.cite-txt \{[^}]*white-space: pre-wrap/, '.cite-txt 要 pre-wrap')
+})
+
+test('mdToHtml：材料来自网页，一律转义；非 http(s) 的链接不建链', () => {
+  const { X } = loadSidebar()
+  const html = X.mdToHtml('x[1]', [{
+    n: 1, title: '<script>alert(1)</script>', site: '某站', text: 'a<b>&c', url: 'javascript:alert(1)',
+  }])
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/, '标题要转义')
+  assert.match(html, /a&lt;b&gt;&amp;c/, '原话要转义')
+  assert.doesNotMatch(html, /href="javascript:/, 'javascript: 不许变成可点链接')
+  assert.match(html, /<span class="cite-url">javascript:alert\(1\)<\/span>/, '退成纯文字')
+})
+
+test('mdToHtml：行内代码里的 [1] 不是引用，不替换', () => {
+  const { X } = loadSidebar()
+  const html = X.mdToHtml('写法是 `[1]` 这样', [SRC1])
+  assert.match(html, /<code class="md-code">\[1\]<\/code>/)
+  assert.doesNotMatch(html, /cite-k/)
+})
+
+test('addBubble：assistant 气泡把 sources 一路带到渲染（第 6 个参数）', () => {
+  const { X, getById } = loadSidebar()
+  X.addBubble('assistant', '分水岭是 2002 年[1]。', null, null, 'b1', [SRC1])
+  const msgs = getById('msgs')
+  const el = msgs.children[msgs.children.length - 1]
+  assert.match(el.innerHTML, /class="vt"/, '材料条目没丢在传参路上')
+  assert.equal(el.dataset.book, 'b1', '书标记照旧（否则读书模式下整条被藏）')
+})
+
+// ── 哪几个字算"这一句"（2026-10-27 晚）──────────────────────────────────────
+const SRC2 = { n: 2, query: '', title: '土地财政依赖度减弱', site: '中国房地产报', text: '2024年卖地收入4.87万亿', url: 'https://e.com/b' }
+
+test('mdToHtml：一句两条材料 → 一个整句开关，面板里两条都在', () => {
+  const { X } = loadSidebar()
+  const html = X.mdToHtml('跌了四成多，连续三年两位数下滑[1][2]。', [SRC1, SRC2])
+  assert.equal((html.match(/class="vt"/g) || []).length, 1, '一整句一个开关，不拆成两个')
+  assert.match(html, /class="cite-k">\[1\]<\/span><span class="cite-k">\[2\]<\/span>/, '两个编号都露出来')
+  assert.equal((html.match(/class="cite-item"/g) || []).length, 2, '两条材料都收在同一个面板里')
+  assert.equal((html.match(/class="cite-box"/g) || []).length, 1)
+})
+
+test('mdToHtml：连着的编号里夹着一个编的（[1][9]）→ 认得出的照常，认不出的留文字', () => {
+  const { X } = loadSidebar()
+  const html = X.mdToHtml('某段话[1][9]。', [SRC1])
+  assert.match(html, /class="vt"/, '这一句仍然可点')
+  assert.match(html, /\[1\]<\/span>/, '[1] 照常')
+  assert.match(html, /\[9\]/, '[9] 原样留着')
+})
+
+test('mdToHtml：可点的范围就是这一句（含编号与句号），前后两句不动', () => {
+  const { X } = loadSidebar()
+  const html = X.mdToHtml('这个托是有极限的，现在正在看见。收入从8.7万亿跌到4.87万亿[1][2]。这就是托不住的时候开始了。', [SRC1, SRC2])
+  assert.match(html, /现在正在看见。<label class="vt"/, '开关从第二句开头起')
+  assert.match(html, /<span class="cite-k">\[2\]<\/span>。<span class="cite-box">[\s\S]*?<\/label>这就是托不住/, '开关在句号之后收起，后一句在外面')
+  assert.equal((html.match(/class="vt"/g) || []).length, 1, '只有那一句')
+})
+
+test('mdToHtml：只引了一条的句子同样整句可点（用户举的那句：新预算法）', () => {
+  const { X } = loadSidebar()
+  const html = X.mdToHtml('新预算法实施以后，地方国有企业包括融资平台公司举的债，法律上不属于政府债务，由企业自己偿还[1]。', [SRC1])
+  assert.match(html, /^<p><label class="vt" title="这一句对照过 1 条网上材料[^"]*"><input type="checkbox" class="cite-t">新预算法实施以后/, '一条材料也是"有出处"')
+  assert.match(html, /<\/label><\/p>$/, '到句号为止')
+  assert.match(html, /class="cite-k">\[1\]</, '编号仍是 [1]')
+})
+
+test('mdToHtml：同一行两句都用上了材料，各自一个开关', () => {
+  const { X } = loadSidebar()
+  const html = X.mdToHtml('甲说法[1]。乙说法[2]。', [SRC1, SRC2])
+  assert.equal((html.match(/class="vt"/g) || []).length, 2, '两句各一个，各自展开各自的面板')
+  assert.match(html, /<label class="vt"[^>]*><input type="checkbox" class="cite-t">甲说法/)
+  assert.match(html, /<label class="vt"[^>]*><input type="checkbox" class="cite-t">乙说法/)
+})
+
+// ── 点别处自动收起 / 点面板里不收起（2026-10-27 用户定）──────────────────────
+// 这两条是页面级点击行为，DOM 替身跑不出来（没有真实事件冒泡），所以按本仓库的惯例
+// 用源码闸门钉住：删了或写错就红，别等到人眼发现"点别处不收起"。
+test('侧栏的点击守卫：点面板内部不收起，点别处把开着的都收起', () => {
+  const src = fs.readFileSync(JS, 'utf8')
+  assert.match(src, /document\.addEventListener\('click',[\s\S]{0,200}\.cite-box[\s\S]{0,80}stopPropagation/, '点面板内部要拦住，别冒到 label')
+  assert.match(src, /querySelectorAll\('input\.cite-t:checked'\)/, '要把已经展开的那些找出来')
+  assert.match(src, /cb\.checked = false/, '点别处就把它们合上')
+  assert.match(src, /closest\('label\.vt, label\.cite'\)/, '点的是自己那一条时不能收（否则一开一关互相打架）')
+})
+
+test('mdToHtml：整行加粗的伪标题（句号在 ** 里面）不会被切坏', () => {
+  const { X } = loadSidebar()
+  const html = X.mdToHtml('**先说它量的是什么。**\n收入从8.7万亿跌到4.87万亿[1][2]。', [SRC1, SRC2])
+  assert.match(html, /<strong>先说它量的是什么。<\/strong>/, '粗体没被切半，星号也没漏出来')
+  assert.doesNotMatch(html, /\*\*/)
+  assert.match(html, /class="vt"/)
+})
+
+test('mdToHtml：没带材料条目时不加标记（历史消息、没联网的回合）', () => {
+  const { X } = loadSidebar()
+  assert.doesNotMatch(X.mdToHtml('某段话[1][2]。'), /class="vt"/)
+  assert.doesNotMatch(X.mdToHtml('某段话[1][2]。', []), /class="vt"/)
 })
