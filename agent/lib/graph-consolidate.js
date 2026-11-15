@@ -5,8 +5,8 @@
  * 对应 topic-library-design.md §5.5「会话固化」：topic_pending.jsonl 里的收口讨论组
  * （已含收口时归纳的 question、收口时判定的衍生关联 derivation、会话中暂存的引用
  * citations），逐个固化进会意图：
- *   1. derivePoint（重心/表达清楚/主要矛盾）→ point
- *   2. deriveAliases（捡回被卸除的能指，重心在背景对象）→ aliases
+ *   1. 一次生成统一检索描述 descriptions，不限条数、合计400字符。
+ *   2. point 仅为展示标题，沿用 discussion.question；aliases 为旧读端兼容副本。
  *   3. 新建节点（**节点不可变**，2026-08-29 用户定调：去聚合判同——每次固化都
  *      新建节点，不再判断"属于哪个已有节点"，建成后不并入、不追加、不改写）
  *   4. derived 边（收口时判定的衍生关联）+ user 边（会话中暂存的引用）由调用方按需调用
@@ -14,7 +14,8 @@
  * 纯判定 + 纯图操作：不读写文件（IO 在 index.js），callLLM 由调用方注入。
  */
 
-import { addNode, addEdge, derivePoint, deriveAliases, isReachable } from './knowledge-graph.js'
+import { addNode, addEdge, isReachable } from './knowledge-graph.js'
+import { deriveDescriptions, DESCRIPTION_VERSION } from './retrieval-descriptions.js'
 // groupExcerpts 迁到 lib/discussion-text.js（2026-10：收口三段判定共用同一份段全文渲染），
 // 此处 re-export 保持既有导入面（index.js / 测试）。
 export { groupExcerpts } from './discussion-text.js'
@@ -74,10 +75,10 @@ export function cloneGraph(graph) {
 }
 
 /**
- * 固化一条收口讨论：派生 point → 拾取被卸除的能指 → 新建节点（节点不可变）。
+ * 固化一条收口讨论：统一检索描述 → 新建节点（节点不可变）。
  * @param {object} graph 会意图（{nodes, edges}）
  * @param {object} discussion { question（收口时归纳，必填）, book?, chapter?, excerpts? }
- * @param {object} deps { callLLM 必填, log?, attempts?, pointMaxTokens?, aliasMaxTokens? }
+ * @param {object} deps { callLLM 必填, log?, attempts?, descriptionMaxTokens? }
  * @returns {Promise<{nodeId: string, point: string}>}
  * @throws 缺 question / 未注入 callLLM → TypeError；判定重试耗尽 → Error
  */
@@ -90,21 +91,18 @@ export async function consolidateDiscussion(graph, discussion, deps = {}) {
   }
   const excerpts = Array.isArray(discussion.excerpts) ? discussion.excerpts : []
 
-  // 1. 派生 point（推理模型预算给足：d_14 证据 4096 仍截断，默认提到上限 16384）
-  const { point } = await derivePoint(
-    { question, excerpts },
-    { callLLM, maxTokens: deps.pointMaxTokens || 16384, attempts, log },
-  )
-
-  // 2. 拾取被卸除的能指（重心在背景对象；节点创建时拾取一次，之后不再改）
-  const { aliases } = await deriveAliases(
-    { point, question, excerpts },
-    { callLLM, maxTokens: deps.aliasMaxTokens || 8192, attempts, log },
-  )
+  const { descriptions } = await deriveDescriptions(excerpts, {
+    callLLM, attempts, maxTokens: deps.descriptionMaxTokens || 8192, log,
+  })
+  // point 仅为现有图界面的展示标题，沿用已归纳的问题，不再单独生成核心结论。
+  // aliases 是旧读端的兼容字段，与统一描述完全相同，不再生成另一套内容。
+  const point = question
 
   // 3. 新建节点（节点不可变：每次固化都新建，不判同、不并入）
   const newId = nextNodeId()
-  addNode(graph, { id: newId, point, aliases, discussion })
+  const node = addNode(graph, { id: newId, point, aliases: descriptions, discussion })
+  node.descriptions = descriptions
+  node.descriptionVersion = DESCRIPTION_VERSION
   log(`  ✓ 新建节点：${newId}（${point}）`)
   return { nodeId: newId, point }
 }

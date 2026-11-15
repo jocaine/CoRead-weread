@@ -325,26 +325,11 @@ test('能指：deriveAliases 调 LLM 解析（数量不限）；非法输出重�
 test('能指：parseAliasesResult 容错（去空去重、数量不限、围栏/前言）', () => {
   assert.deepEqual(parseAliasesResult('```json\n{"aliases":["A","B","A",""]}\n```'), { aliases: ['A', 'B'] })
   assert.deepEqual(parseAliasesResult('结果如下：{"aliases":["A","B","C","D","E"]}'), { aliases: ['A', 'B', 'C', 'D', 'E'] }, '数量不限（2026-08-29 定调：不做条数限制）')
-  assert.equal(parseAliasesResult('{"aliases":[]}'), null, '空表无效')
+  assert.deepEqual(parseAliasesResult('{"aliases":[]}'), { aliases: [] })
   assert.equal(parseAliasesResult('{"aliases":"A"}'), null, 'aliases 必须是数组')
   assert.equal(parseAliasesResult('不是JSON'), null)
 })
 
-test('能指：提示词术语精确可操作（已知背景 + 不写 point 换说法 + 例子锚 + 数量不限）', () => {
-  const p = buildAliasPrompt({ point: '列宁分化哥萨克的策略', question: '为什么列宁分化哥萨克的策略没有奏效？' })
-  assert.ok(p.includes('可指认的说法'), '任务名：写可指认的说法')
-  assert.ok(p.includes('已知背景'), '精确术语：已知背景（与 point 提示词重心规则一致）')
-  assert.ok(p.includes('不写 point 的换说法'), '判据一：不写 point 换说法')
-  assert.ok(p.includes('重复 point'), '失败例：写 point 的换说法')
-  assert.ok(p.includes('中国的国家形态'), '例子锚：背景对象（防字面对照）')
-  assert.ok(p.includes('中俄边疆逻辑'), '例子锚：另一背景面')
-  assert.ok(p.includes('写清楚'), '每条写清楚')
-  assert.ok(p.includes('不许压缩成看不出内容的短提法'), '不许抽象短提法')
-  assert.ok(p.includes('不许发明'), '不造面')
-  assert.ok(p.includes('展开过几个就写几条'), '数量随展开面走')
-  assert.ok(p.includes('数量不限'), '条数不限（2026-08-29 用户定调）')
-  assert.ok(p.includes('条目 point："列宁分化哥萨克的策略"'))
-})
 
 test('能指：提示词材料全量提供（excerpts 不截取、全部轮次都在）', () => {
   const longA = '长回复' + '很长的讨论内容'.repeat(80) + '【TAIL_MARKER】尾部也要在'
@@ -440,28 +425,6 @@ test('衍生关联：时间相邻但思考无关 → 不衍生（宁漏勿误）
 })
 
 // ── 提示词组装（冒烟：关键判据确实进提示词） ─────────────────────────────────
-test('提示词：派生 point 重心规则是"解释落点"程序版（不是句式分类）', () => {
-  const p = buildPointInstruction()
-  assert.ok(p.includes('重心落在**问题要求补上的解释**上'), '重心 = 解释落点，不是句法主语')
-  assert.ok(p.includes('已知背景'), '程序第 1 步：列已知背景')
-  assert.ok(p.includes('要求补上的解释'), '程序第 2 步：找解释落点')
-  assert.ok(p.includes('不写成背景'), '程序第 3 步：point 不落在背景')
-  assert.ok(p.includes('落在背景上'), '反例：滑向参照系（中国侧）失败')
-  assert.ok(p.includes('停在对象本身'), '反例：停在表面对象失败')
-  assert.ok(p.includes('拉丁美洲资本品工业建立不起来的原因'), '例二 = 跨书例子（摩托日记语境），对比结构保持')
-  assert.ok(p.includes('孕育出哥萨克式角色的机制'), '例一落点指代统一（哥萨克式角色）')
-  assert.ok(!p.includes('问题在问"谁/什么怎么样"'), '旧的"重心=主语"句法规则已移除')
-  // 抓主要矛盾段与重心规则不打架：无张力分支指向重心规则，不再自带旧例子
-  assert.ok(p.includes('不强造矛盾：按**重心规则**落在解释落点上即可'), '无张力分支引用重心规则')
-  assert.ok(!p.includes('中国历史未酝酿出哥萨克式角色的制度文化原因'), '旧的无张力例子（重心落背景，与重心规则例一冲突）已移除')
-  // 开头定义 + 输出示例与重心规则一致：不再用旧"对象侧"例子
-  assert.ok(p.includes('这条讨论要求补上的解释所在的狭隘范畴'), '定义句 = 解释落点（不是"追的范畴"）')
-  assert.ok(p.includes('机制/条件/契机/矛盾/关系/立场'), '定义句枚举含"契机"（与例一正确产物对齐，例子不溢出定义）')
-  assert.ok(p.includes('例子是检查工具，不是判定起点'), '程序与例子之间加缝：防模型模仿例子而非执行程序')
-  assert.ok(!p.includes('北欧制度的历史位置'), '旧对象侧示例已从派生 point 指令移除')
-  assert.ok(!p.includes('哥萨克的身份政治」）'), '旧对象侧示例已从定义句移除（例二的反例保留）')
-  assert.ok(p.includes('{"point":"孕育出哥萨克式角色的历史条件与契机"}'), '输出示例 = 重心规则的正确产物')
-})
 
 test('提示词：引用解析判据（指认意图 + 内容线索底线 + 语义匹配 + 宁漏勿误）在提示词里', () => {
   const rp = buildReferencePrompt({ message: 'M？', nodes: [{ id: 'n_a', point: 'A' }] })

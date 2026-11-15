@@ -1559,6 +1559,7 @@ async function resolveCitations(userText, bookKey, replyToTs) {
       id: n.id,
       point: n.point,
       aliases: n.aliases,
+      descriptions: n.descriptions,
       questions: (n.discussions || []).map((d) => d.question),
     }))
     const { hits } = await resolveReferences({ message: text, nodes: nodeBriefs }, {

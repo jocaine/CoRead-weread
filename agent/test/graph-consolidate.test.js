@@ -21,8 +21,7 @@ function makeLLM(results) {
 test('固化：直建节点（derivePoint → deriveAliases → 新建，讨论无损；节点不可变）', async () => {
   const g = createGraph()
   const llm = makeLLM([
-    '{"point":"列宁分化哥萨克的策略"}',
-    '{"aliases":["列宁分化哥萨克的策略为什么没奏效","用阶级的眼睛看哥萨克，套错了对象"]}',
+    '{"descriptions":["列宁分化哥萨克的策略为什么没奏效","用阶级的眼睛看哥萨克，套错了对象"]}',
   ])
   const r = await consolidateDiscussion(g, {
     question: '为什么列宁最初分化哥萨克的策略没有奏效？',
@@ -30,10 +29,11 @@ test('固化：直建节点（derivePoint → deriveAliases → 新建，讨论�
     chapter: '五',
     excerpts: [{ q: '为什么没奏效', a: '身份社会错用了手术刀' }],
   }, { callLLM: llm })
-  assert.equal(r.point, '列宁分化哥萨克的策略')
+  assert.equal(r.point, '为什么列宁最初分化哥萨克的策略没有奏效？')
   assert.equal(g.nodes.length, 1)
   const n = findNode(g, r.nodeId)
-  assert.equal(n.point, '列宁分化哥萨克的策略')
+  assert.equal(n.point, '为什么列宁最初分化哥萨克的策略没有奏效？')
+  assert.deepEqual(n.descriptions, n.aliases)
   assert.deepEqual(n.aliases, ['列宁分化哥萨克的策略为什么没奏效', '用阶级的眼睛看哥萨克，套错了对象'])
   assert.equal(n.discussions.length, 1)
   assert.equal(n.discussions[0].question, '为什么列宁最初分化哥萨克的策略没有奏效？')
@@ -44,7 +44,7 @@ test('固化：直建节点（不判同）——同样 point 的第二次讨论�
   const g = createGraph()
   // 两次固化同一点 point：每次都是新节点（2026-08-29 用户定调：去聚合判同）
   for (let i = 0; i < 2; i++) {
-    const llm = makeLLM(['{"point":"列宁分化哥萨克的策略"}', '{"aliases":["阶级分析的手术刀"]}'])
+    const llm = makeLLM(['{"descriptions":["阶级分析的手术刀"]}'])
     const r = await consolidateDiscussion(g, { question: `第 ${i + 1} 次讨论列宁策略？`, excerpts: [{ q: 'Q', a: 'A' }] }, { callLLM: llm })
     assert.equal(g.nodes.length, i + 1, '每次固化都新建节点')
     assert.equal(findNode(g, r.nodeId).discussions.length, 1, '讨论不追加进旧节点')
