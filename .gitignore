@@ -76,6 +76,8 @@ receiver/index.js.bak-debug
 # Node.js
 node_modules/
 npm-debug.log*
+# 固定版本的会意检索模型由准备脚本生成，便携包从程序目录带走。
+/agent/models/local-embedding/bge-small-zh-v1.5/
 
 # 调试/运行产物
 *.out

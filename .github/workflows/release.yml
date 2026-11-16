@@ -38,7 +38,7 @@ jobs:
       - name: 取出代码
         uses: actions/checkout@v4
 
-      - name: 装 Node（只是为了拿到一个 node.exe 一起打包，不跑 npm）
+      - name: 装 Node（打包程序与本地模型组件）
         uses: actions/setup-node@v4
         with:
           node-version: '24'

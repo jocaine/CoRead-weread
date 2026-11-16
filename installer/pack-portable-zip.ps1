@@ -252,6 +252,11 @@ Copy-Item (Join-Path $repo 'agent\package.json') $agentOut
 Copy-Item (Join-Path $repo 'agent\lib')          $agentOut -Recurse
 if (Test-Path (Join-Path $repo 'agent\.env.example')) { Copy-Item (Join-Path $repo 'agent\.env.example') $agentOut }
 
+$embeddingSetup = Join-Path $repo 'agent\scripts\prepare-local-embedding.mjs'
+$embeddingOut = Join-Path $agentOut 'models\local-embedding'
+& (Join-Path $internal 'node.exe') $embeddingSetup --stage $embeddingOut
+if ($LASTEXITCODE -ne 0) { Fail '本地会意检索模型准备失败' }
+
 # ⚠️ agent\AGENT.md 必须进包（2026-11 补漏）。它是共读 agent 的**人格与对话规则**，
 # agent\index.js 的 buildSystemInstruction() 直接读 <agent 目录>\AGENT.md 拼进 system。
 # 漏掉它**不会报错**：readIfExists() 读不到就当空字符串，于是用户那边的 agent 人格规则
@@ -669,6 +674,8 @@ $need = @(
   'internal\agent\index.js',
   'internal\agent\AGENT.md',
   'internal\agent\lib\paths.js',
+  'internal\agent\models\local-embedding\bge-small-zh-v1.5\onnx\model_quantized.onnx',
+  'internal\agent\models\local-embedding\node_modules\onnxruntime-node\bin\napi-v3\win32\x64\onnxruntime_binding.node',
   # 面向用户的维护脚本：说明书写着让用户跑迁移，缺一个用户就卡死在那一步。
   # 写进校验清单是为了让"脚本没进包"这种静默缺失在打包时就炸出来，而不是等用户撞上。
   'internal\agent\scripts\migrate-data-layout.mjs',

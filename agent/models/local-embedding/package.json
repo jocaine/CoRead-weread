@@ -1,0 +1,7 @@
+{
+  "name": "coread-local-embedding",
+  "private": true,
+  "dependencies": {
+    "@huggingface/transformers": "3.8.1"
+  }
+}

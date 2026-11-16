@@ -22,8 +22,12 @@
  * 断言同步改了；本块其它字节保持不变。
  */
 
-function l3Block(entries) {
-  const lines = [
+function l3Block(entries, { candidates = false } = {}) {
+  const lines = candidates ? [
+    '[可能相关的旧讨论]',
+    '下列讨论由系统查找。只采用能直接回答本轮问题或补足所问角度的原话；同书、同人物或引文话题相近时，可以全部略过。',
+    '用户没有指认这些讨论；其中的观点也不代表用户现在的立场。',
+  ] : [
     '[图路径上下文]（你引用/联想到了之前聊过的知识点）',
     '使用方式：用户这一轮的说法已匹配到下列旧知识点。回答时——',
     '① 先正面回答用户的问题本身，不要被下文带跑；',
@@ -33,7 +37,7 @@ function l3Block(entries) {
     '知识点路径：',
   ]
   for (const { node: n, hops, hit } of entries) {
-    const tag = hit ? '【本轮命中】' : `【来路 ${hops} 跳】`
+    const tag = candidates ? '【备选讨论】' : (hit ? '【本轮命中】' : `【来路 ${hops} 跳】`)
     const srcBook = (n.discussions || []).map((d) => d?.book).find((b) => b)
     lines.push(`${tag} ${n.point}${srcBook ? `　〔源：《${srcBook}》〕` : ''}`)
     for (const d of n.discussions || []) {

@@ -803,6 +803,7 @@ export async function* runTasksPipeline(deps = {}) {
     // 当前提问 = 用户这一轮真的问的那句（**不是**节点里那条旧问题）。整套课题都锚在它上面。
     question: curQuestion = '',
     hits = [], nodeOf = () => null, parentsOf = () => [],
+    fallbackHits = hits, // 退回整段注入时，只有已有引用和继承节点可以标亮
     complete, stream, judgeSystem = '', checkStop = () => {}, log = () => ({}),
     fallback = null, onEvent = () => {}, onRefusal = null, opts = {},
     // 联网搜索（2026-10-27 接上）：search(验行数组) → Promise<{text, stats}>。
@@ -835,8 +836,10 @@ export async function* runTasksPipeline(deps = {}) {
   async function* degraded(reason) {
     if (typeof fallback !== 'function') throw new Error(`${reason}（且没有兜底可用）`)
     emit({ type: 'fallback', reason })
-    // 退回旧路径 = 这一轮没有逐节点判定（整条来路都注入了），图上只能把这一轮的命中都算作"用过"。
-    emit({ type: 'used', nodes: points.map((p) => p.id), hits: points.map((p) => p.id) })
+    // 降级时没有逐节点筛选，只高亮已确认的引用和继承节点。
+    const confirmed = new Set(fallbackHits)
+    const ids = points.filter(p => confirmed.has(p.id)).map(p => p.id)
+    emit({ type: 'used', nodes: ids, hits: ids })
     log(`${reason} → 退回旧的整段注入（这一轮照样有答案）`)
     let full = ''
     for await (const piece of fallback()) {
@@ -853,8 +856,11 @@ export async function* runTasksPipeline(deps = {}) {
   const live = []
   for (const id of new Set(hits)) {
     const node = nodeOf(id)
-    // 别名要一起带上：它写着"这块料是什么、能用它回答什么"，是出题的判断依据（2026-10-25 用户定：全给）
-    if (node) live.push({ id, point: String(node.point || '').trim(), aliases: (node.aliases || []).filter(Boolean) })
+    // 新节点的检索描述就是讨论目录。旧节点仍用别名，目录只供选择，正文另读。
+    if (node) {
+      const descriptions = Array.isArray(node.descriptions) ? node.descriptions : node.aliases
+      live.push({ id, point: String(node.point || '').trim(), aliases: (descriptions || []).filter(Boolean) })
+    }
   }
   const points = live.map((h, i) => ({ ...h, kid: `K-${i + 1}` }))
   // 没有命中节点：不派题，但**照样列大纲、照样联网**（2026-10-27 用户定）。

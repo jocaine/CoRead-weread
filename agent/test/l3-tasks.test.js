@@ -847,17 +847,20 @@ test('流水线：没有命中 → 不派题，但照样列大纲、照样联网
   assert.match(calls[1].text, /【搜索结果】（/)
 })
 
-test('流水线：R1 失败 → 退回旧的整段注入（引用轮不能没有答案）', async () => {
+test('流水线：R1 失败仍然回答，图上只亮已有的引用', async () => {
+  const events = []
   const it = runTasksPipeline({
-    hist: [], persona: 'P', anchored: 'A', question: 'q', hits: ['A'], ...graphDeps(),
+    hist: [], persona: 'P', anchored: 'A', question: 'q', hits: ['A', 'B'], fallbackHits: ['A'], ...graphDeps(),
     complete: async () => { throw new Error('LLM API 500') },
     stream: async function* () { throw new Error('不该走 R4') },
     fallback: async function* () { yield { chunk: '兜底', accumulated: '兜底答案' } },
+    onEvent: event => events.push(event),
     log: () => {},
   })
   let r = await it.next()
   while (!r.done) r = await it.next()
   assert.equal(r.value, '兜底答案')
+  assert.deepEqual(events.find(event => event.type === 'used'), { type: 'used', nodes: ['A'], hits: ['A'] })
 })
 
 test('流水线：用户点停止 → 抛错', async () => {
@@ -935,8 +938,6 @@ test('源码：跨轮继承的接线（判栈提前 → 同栈才继承 → 累�
   assert.match(LIB_SRC, /if \(r\.summary && !usedSeen\.has\(args\.id\)\)/)
   assert.ok(LIB_SRC.lastIndexOf("emit({ type: 'used',") < LIB_SRC.indexOf('full = yield* relay('),
     'used 必须在终稿流式之前发出')
-  // 降级（退回旧路径）时整条来路都注入了 → 这一轮命中都算用过，也得给图一份清单
-  assert.match(LIB_SRC, /emit\(\{ type: 'used', nodes: points\.map\(\(p\) => p\.id\), hits: points\.map\(\(p\) => p\.id\) \}\)/)
   // 常驻口径（2026-10-27 第二版）：这一轮真用上的节点记进讨论栈（user 条目的 used），
   // /stack-hits 取最近一轮 → 回答结束后打开图画的还是这一份，而不是累积的 cites。
   assert.match(SRC, /options\.turnUsed = ids\.slice\(\)/)

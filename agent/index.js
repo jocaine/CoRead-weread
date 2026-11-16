@@ -26,8 +26,11 @@ import { l3Block } from './lib/l3-context.js'  // L3 上下文渲染（2026-10 �
 // 相处规则（2026-10 定调）：用户对 AI 的长期要求，唯一入口是侧栏 /相处 命令。
 // 增删改全是机械操作（不调 LLM），见 lib/agreement.js 头部——AI 自己**不写**这份文件。
 import { handleCommand as handleAgreement } from './lib/agreement.js'
-import { parseMessage, splitQuotedQuestion } from './lib/chat-input.js'  // 引用解析输入剥离引文：只认用户自己的话（见 resolveCitations）
-import { resolveApiConfig, isConfigured } from './lib/api-config.js'  // 模型 API 配置：插件侧栏可写，.env 为回退
+import { splitQuotedQuestion } from './lib/chat-input.js'
+import { resolveApiConfig, isConfigured } from './lib/api-config.js'
+import { createGraphVectorSearch } from './lib/graph-vector-search.js'
+import { localGraphEmbedding } from './lib/local-embedding.js'
+import { retrievalTurn, retrieveDiscussion } from './lib/retrieval-query.js'
 // 聊天存储（2026-10-02 方案 B）：SQLite 取代 chat_input/chat_output.jsonl + 游标 + 指纹台账。
 // id = 队列游标；status = 已回复/待重试；reply_to = 提问↔回答的直接引用。见 lib/chat-store.js 头部。
 import { openChatStore } from './lib/chat-store.js'
@@ -86,7 +89,7 @@ import { handleL3Command } from './lib/l3-cmd.js'
 // 迁移缘由与分格依据见 lib/paths.js 头部；这里只取常量，不再自己拼路径。
 import {
   AGENT_DIR, BOOKS_DIR, CHAT_DB, STREAM_FILE,
-  AGENT_STATE_FILE, STOP_FILE, JOURNAL_FILE, TOPIC_STACK_FILE, GRAPH_FILE,
+  AGENT_STATE_FILE, STOP_FILE, JOURNAL_FILE, TOPIC_STACK_FILE, GRAPH_FILE, GRAPH_VECTOR_CACHE_FILE,
   BUILTIN_GRAPH_RESULTS_FILE, PROFILE_FILE, AGREEMENT_FILE,
   HIST_CURSOR_FILE, SESSIONS_DIR, LOGS_DIR, LAYOUT_KIND, layoutSummary,
   L3_DUMP_FILE, L3_DUMP_JSON, L3_DEBUG_FILE, L3_TRACE_DIR, L3_MODE_FILE,
@@ -862,6 +865,7 @@ async function callLLMOnce(maxTokens = 8192, hist = [], opts = {}) {
   const MAX_JUDGE_TOKENS = 16384
   let budget = maxTokens
   for (let round = 1; round <= 2; round++) {
+    opts.signal?.throwIfAborted()
     const body = JSON.stringify({
       model,
       messages: [{ role: 'system', content: system }, ...apiMessages(hist)],
@@ -888,7 +892,7 @@ async function callLLMOnce(maxTokens = 8192, hist = [], opts = {}) {
           'authorization': `Bearer ${apiKey}`,
         },
         body,
-        signal: controller.signal,
+        signal: opts.signal ? AbortSignal.any([opts.signal, controller.signal]) : controller.signal,
       })
     } finally {
       clearTimeout(timeout)
@@ -1205,6 +1209,8 @@ async function say(userText, options = {}) {
     // 模式每轮现读 data\config\l3-mode，改文件就生效，不用重启。
     const l3Mode = readL3Mode()
     const l3Hits = Array.isArray(options.l3Hits) ? options.l3Hits : []
+    const candidates = options.l3Candidates || []
+    const taskHits = [...new Set([...l3Hits, ...candidates])]
     // 元任务（`_meta` = 会话结束的记忆合并）**不走 L3**，按 off 装配（2026-10-27 发现并修）。
     // 起因是当天把 tasks/both 改成"每轮都跑"：`_meta` 也是 say() 的一次调用、也没有命中，
     // 于是记忆合并被卷进了命题递归——data/runtime/l3-trace 里真的出现了 `_meta` 的全过程记录
@@ -1224,12 +1230,12 @@ async function say(userText, options = {}) {
     let trace = null
     let tree = null
     if (recordOn) {
-      if (l3Hits.length) {
-        dumpL3Input({ conv: key, mode: l3Mode, path, hist, persona, anchored, l3: options.l3, hits: l3Hits })
+      if (taskHits.length) {
+        dumpL3Input({ conv: key, mode: l3Mode, path, hist, persona, anchored, l3: options.l3, hits: taskHits })
       }
       if (path === 'tasks' || path === 'both') {
         // 编号必须与流水线里的课题号一致（命中顺序 → K-1、K-2），否则记录里的 K-1 对不上
-        const tracePoints = l3Hits
+        const tracePoints = taskHits
           .map((id) => graph.nodes.find((n) => n.id === id))
           .filter(Boolean)
           .map((n, i) => ({ kid: `K-${i + 1}`, point: n.point }))
@@ -1269,12 +1275,23 @@ async function say(userText, options = {}) {
     // 这一轮联网查到的材料条目（终稿正文里的 [编号] 点开看的就是它们，2026-10-27）。
     // 由流水线通过 sources 事件交出来；没联网就一直是空数组，消息上不带 payload。
     let roundSources = []
+    const fullHist = () => {
+      const entries = candidates
+        .filter(id => !l3Hits.includes(id))
+        .map(id => graph.nodes.find(n => n.id === id))
+        .filter(Boolean)
+        .map(node => ({ node }))
+      const optionalMaterial = entries.length ? l3Block(entries, { candidates: true }) : ''
+      const l3 = [optionalMaterial, options.l3].filter(Boolean).join('\n\n')
+      return assembleCallHist({ hist, persona, agreement, l3, anchored, mode: 'full' })
+    }
     // 新路径的依赖（tasks / both 共用一份，保证两条路吃到的输入完全一样）
     const tasksDeps = {
       hist, persona, agreement, anchored,
       // 当前提问（用户这一轮真的问的那句）：整套课题都锚在它上面，不是节点里的旧问题
       question: storeText || userText,
-      hits: l3Hits,
+      hits: taskHits,
+      fallbackHits: l3Hits,
       // 图查询：节点在图上才派课题（命中 id 可能来自已删节点，这里再校验一次）
       nodeOf: (id) => graph.nodes.find((n) => n.id === id) || null,
       parentsOf: (id) => userParents(graph, id),
@@ -1300,9 +1317,7 @@ async function say(userText, options = {}) {
         kind: usageKind, conv: key,
       }),
       // 兜底：R1 起不来（网络/截断/空流）就退回旧路径的整段注入——引用轮不能没有答案
-      fallback: () => callLLMStreamWithRetry(options.maxTokens || 8192, assembleCallHist({
-        hist, persona, agreement, l3: options.l3, anchored, mode: 'full',
-      }), { kind: usageKind, conv: key }),
+      fallback: () => callLLMStreamWithRetry(options.maxTokens || 8192, fullHist(), { kind: usageKind, conv: key }),
       judgeSystem: JUDGE_SYSTEM,
       // 联网搜索（2026-10-27）：R1 的「验」行逐条查网页。它在流水线内部启动，与派题并行跑，
       // 这里只负责把地址/Key 递进去。失败一律不抛——返回空串，终稿那块整块不出现，
@@ -1344,8 +1359,8 @@ async function say(userText, options = {}) {
           // 这一轮的「真用上」清单交给讨论栈（applyStackTurn 记在 user 条目上）：
           // 回答结束后图关掉再打开、刷新、切书回来，都按这一份画，而不是按累积的 cites。
           // 只在**这一轮确实有命中**时记：没命中的追问不写，图沿用上一轮那份。
-          if (l3Hits.length) options.turnUsed = ids.slice()
-          if (l3Hits.length) {
+          if (taskHits.length) options.turnUsed = ids.slice()
+          if (taskHits.length) {
             appendGraphHit(ids, ids.map(hitLabel).join('、'), key, options.replyToTs, {
               cites: ids.filter((id) => citeHits.has(id)),
             })
@@ -1362,7 +1377,6 @@ async function say(userText, options = {}) {
         ...(path === 'both' ? { finalLabel: 'B 新路径（用户看到的就是这段）', finalShown: true } : {}),
       },
     }
-    const fullHist = () => assembleCallHist({ hist, persona, agreement, l3: options.l3, anchored, mode: 'full' })
     let altTask = null
     let altAnswer = ''
     // both：**新路径为主、旧路径为副**（2026-10-27 用户定，之前是反过来的）。
@@ -1546,6 +1560,11 @@ function selectionFromMsg(msg) {
 
 // ── 会意图运行时态：图加载/保存 + 引用解析（L3 上下文） ──
 let graph = createGraph()  // 会意图（§5.3）：启动时从 GRAPH_FILE 加载，收口固化时写回
+const graphVectorSearch = createGraphVectorSearch({
+  cacheFile: GRAPH_VECTOR_CACHE_FILE,
+  localEmbedding: localGraphEmbedding,
+  log: (m) => console.log(`  [会意检索] ${m}`),
+})
 //（2026-11 自由模式多对话：自由对话不再有独立沙盒图——收编进正式图与否由归档弹窗
 //  决定，见 archiveFreeConversation；沙盒只服务引用解析的只读基线，已无写入方）
 
@@ -1631,6 +1650,7 @@ function saveGraph() {
   } catch (e) {
     console.log(`  ⚠️ 会意图写入失败: ${e.message}`)
   }
+  graphVectorSearch.prepare(graph.nodes)
 }
 
 // 说明（2026-11 自由模式多对话）：自由对话**不再**产出沙盒图产物——收编与否由归档
@@ -1640,31 +1660,29 @@ function saveGraph() {
 
 // 从收口组 entries（user/assistant 轮次）提取交锋轮次 {q, a}（lib/graph-consolidate.js 导出）
 
-// 会话中引用解析：发言 → 命中节点 id[] + L3 块。图空 / 异常 → 空，不影响主回复。
-// 命中只取上下文 + 暂存引用；**不建边**（建边在固化时，2026-08-27 定调命中与建边解耦）。
-// 2026-11 输入口径修复：判定材料只留用户自己的话（note），**剥掉引文块**（[引用] 头 +
-// > 划线原文）。引用解析判的是"用户是否在指认旧知识点"，而引文是正在读的书的内容——
-// 把引文喂进语义匹配，会把"引文主题词撞上同源节点"判成"引用"，产生假阳性
-// （实例：对《怎么办？》引文文风的元评论"这到底是翻译的问题，还是列宁说话就是这样啊"
-// 因引文含"少数领导者/工人/政治警察"而命中 4 个同书同章节点；剥掉后无指认话术 → 0 命中）。
-// 纯文本消息 parseMessage 原样回传（note = 全文），带 [引用] 块的消息只留块后的提问，
-// 与判专题化 messageUnit 同口径。REPL/标注路径传入的已是用户原话，行为不变。
-async function resolveCitations(userText, bookKey, replyToTs) {
-  const note = parseMessage({ content: String(userText || '') }).note
-  const text = String(note || '').trim()
-  if (!text || !graph.nodes.length) return { hits: [], l3: '' }
+// 先改写问题再查向量。向量结果交给回答流程取材，旧引用解析只在向量路径不可用时运行。
+async function resolveCitations(msg, bookKey) {
+  if (!graph.nodes.length) return { hits: [], candidates: [], l3: '' }
   try {
-    const nodeBriefs = graph.nodes.map((n) => ({
-      id: n.id,
-      point: n.point,
-      aliases: n.aliases,
-      descriptions: n.descriptions,
-      questions: (n.discussions || []).map((d) => d.question),
-    }))
-    const { hits } = await resolveReferences({ message: text, nodes: nodeBriefs }, {
-      callLLM: judgeLLM,
-      maxTokens: 16384,
-      log: (m) => console.log(`  [引用解析] ${m}`),
+    const turn = retrievalTurn(msg, histories.get(bookKey))
+    const prepared = graphVectorSearch.prepare(graph.nodes)
+    const { hits, candidates } = await retrieveDiscussion(turn, {
+      search: prepared?.entries.length ? (query) => graphVectorSearch.search(query, prepared) : null,
+      rewrite: (prompt) => callLLMOnce(1024, [{ role: 'user', content: prompt }], {
+        system: JUDGE_SYSTEM, temperature: 0, contentOnly: true, thinking: false, kind: '检索改写', conv: bookKey,
+        signal: AbortSignal.timeout(10_000),
+      }),
+      fallback: async (question) => {
+        const nodes = graph.nodes.map((n) => ({
+          id: n.id, point: n.point, aliases: n.aliases, descriptions: n.descriptions,
+          questions: (n.discussions || []).map((d) => d.question),
+        }))
+        const result = await resolveReferences({ message: question, nodes }, {
+          callLLM: judgeLLM, maxTokens: 16384, log: (m) => console.log(`  [引用解析] ${m}`),
+        })
+        return result.hits
+      },
+      log: (m) => console.log(`  [会意检索] ${m}`),
     })
     const valid = hits.filter((id) => graph.nodes.some((n) => n.id === id))
     // AI-020 命中事件**不在这里写**（2026-10-26 用户定）：图上要显示的是"这一轮真正交给模型的"
@@ -1674,10 +1692,10 @@ async function resolveCitations(userText, bookKey, replyToTs) {
     // 同一个节点的 user 边，所以不是两类东西。种子非空就注入：这场讨论有引用 → 每轮都带上它的来路。
     const seeds = [...new Set([...valid, ...collectStackCites(topicStacks[bookKey || currentBookKey])])]
     const ancestry = seeds.length ? userAncestry(graph, seeds) : []
-    return { hits: valid, l3: ancestry.length ? l3Block(ancestry) : '' }
+    return { hits: valid, candidates, l3: ancestry.length ? l3Block(ancestry) : '' }
   } catch (e) {
     console.log(`  [引用解析] 本轮跳过（不影响主回复）: ${e.message}`)
-    return { hits: [], l3: '' }
+    return { hits: [], candidates: [], l3: '' }
   }
 }
 
@@ -2573,6 +2591,7 @@ async function main() {
   // + 每本书的上一轮 AI 回复（判专题化降级判定材料）
   // 关闭/启动恢复**不做收口固化**——只恢复进行中的讨论（讨论没被新专题化弹栈就不收口）
   loadGraph()
+  graphVectorSearch.prepare(graph.nodes)
   topicStacks = readTopicStacks()
   lastReplyByBook = lastAssistantByBookFromJournal()
 
@@ -2703,13 +2722,17 @@ async function main() {
         if (msg.bookId && key !== currentBookKey && !isFreeKey(key)) {
           currentBookKey = key
         }
-        // 引用解析（会话中）：命中 → L3 图路径上下文注入；引用挂消息（固化后按组建边）。
+        // 向量检索提供备选讨论；只有显式选择或旧引用解析的命中才挂消息（收口时建边）。
         // 自由模式（2026-09）：引用以侧栏窗体为准——msg.refs = 语义命中自动并入 +
         // 用户手动从拓扑图选取的节点清单（用户可在窗体上取消任意条）。带 refs 字段
         // 就用它（校验节点存在），不带则回退语义解析命中（老版本侧栏/其他入口）。
         // 处理步骤状态：图非空时引用解析才真调 LLM，步骤先行（侧栏"正在…"文案）
         if (graph.nodes.length) appendAgentState('resolve', key)
-        const citesR = await resolveCitations(msg.content, key, msg.timestamp)
+        const citesR = await resolveCitations(msg, key)
+        if (consumeSessionStop(key, msg.timestamp)) {
+          discardStoppedTurn({ conv: msg.conv, questionId: msg.id, turnTs: msg.timestamp })
+          continue
+        }
         let citesFinal = citesR.hits
         if (isFreeKey(key) && Array.isArray(msg.refs)) {
           citesFinal = msg.refs.filter((id) => graph.nodes.some((n) => n.id === id))
@@ -2745,7 +2768,7 @@ async function main() {
         // `turnUsed`，下面 applyStackTurn 把它记进讨论栈——图关掉再开、刷新之后也按这一份画。
         const sayOpts = {
           bookKey: key, storeText, assistantSelected: selectionFromMsg(msg), l3: citesR.l3,
-          l3Hits: hitsThisRound, inheritedHits: inherited, citeHits: citesFinal,
+          l3Hits: hitsThisRound, l3Candidates: citesR.candidates, inheritedHits: inherited, citeHits: citesFinal,
           replyTo: msg.id, replyToTs: msg.timestamp,
         }
         const reply = await say(userMsg, sayOpts)

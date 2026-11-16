@@ -53,6 +53,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 /** agent 目录（本文件在 agent/lib/ 下，往上两级） */
 export const AGENT_DIR = path.join(__dirname, '..')
+/** 随程序分发的本地检索模型和运行组件。 */
+export const LOCAL_EMBEDDING_DIR = path.join(AGENT_DIR, 'models', 'local-embedding')
 /** agent 与 receiver 的共同父目录：开发时是仓库根，便携包里是 internal\ */
 export const PARENT_DIR = path.join(AGENT_DIR, '..')
 /** receiver 目录（与 agent 同级；agent 靠它找 inbox，见下方结构说明） */
@@ -225,6 +227,7 @@ export const STREAM_FILE = path.join(RUNTIME_DIR, 'stream.jsonl')
 // 它是**过程数据**，删了不影响任何用户数据——下一次调用接着记，只是历史报表断了。
 // 读法：node agent/scripts/usage-report.mjs（`agent/package.json` 里没挂，直接跑脚本）。
 export const USAGE_FILE = path.join(RUNTIME_DIR, 'usage.jsonl')
+export const GRAPH_VECTOR_CACHE_FILE = path.join(RUNTIME_DIR, 'graph-vectors.json')
 
 // ── 浏览器插件的扩展 ID（2026-10：托盘「打开 CoRead 阅读器」用）───────────────
 // 它是干什么的：CoRead 自带的阅读器是**扩展自己的页面**，地址形如
