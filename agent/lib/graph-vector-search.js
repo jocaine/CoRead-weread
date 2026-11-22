@@ -6,7 +6,7 @@ const BATCH_SIZE = 10
 const CONCURRENCY = 3
 // 余弦相似度的门槛。查询和描述都已归一化，越接近 1 表示越相似。
 const MIN_SIMILARITY = 0.48
-const MAX_CANDIDATES = 8
+export const MAX_CANDIDATES = 8
 const RETRY_DELAY = 60_000
 
 const keyOf = text => createHash('sha256').update(text).digest('hex')
@@ -71,14 +71,14 @@ export function createGraphVectorSearch({ cacheFile, fetchImpl = fetch, localEmb
     ? localEmbedding.embed(input)
     : requestEmbeddings(config, input, fetchImpl)
 
-  // 启动/图变动时在后台补算。等待期间走旧引用解析，不让用户的第一问等整张图。
+  // 启动/图变动时在后台补算；回答前用 ready 等待准备完整。
   function prepare(nodes, config) {
     if (!localEmbedding && !config?.configured) { active = null; return null }
     const namespace = localEmbedding
       ? JSON.stringify([1, 'local', localEmbedding.id])
       : JSON.stringify([1, config.embedBase, config.embedModel])
     if (!active || active.namespace !== namespace || active.config?.embedKey !== config?.embedKey) {
-      active = { namespace, config, vectors: readCache(cacheFile, namespace), pending: null, retryAt: 0 }
+      active = { namespace, config, vectors: readCache(cacheFile, namespace), pending: null, retryAt: 0, error: null }
     }
     const state = active
     const inputs = new Map()
@@ -94,6 +94,7 @@ export function createGraphVectorSearch({ cacheFile, fetchImpl = fetch, localEmb
     const missing = [...inputs].filter(([hash]) => !state.vectors.has(hash))
     if (!missing.length && !state.pending) return { state, entries }
     if (!state.pending && Date.now() >= state.retryAt) {
+      state.error = null
       const build = async () => {
         let next = 0
         let failure
@@ -125,6 +126,7 @@ export function createGraphVectorSearch({ cacheFile, fetchImpl = fetch, localEmb
         log(`向量索引就绪：${entries.length} 条描述，本次新增 ${missing.length} 条`)
       }
       state.pending = build().catch(e => {
+        state.error = e
         state.retryAt = Date.now() + RETRY_DELAY
         log(`向量索引暂不可用：${e.message}`)
       }).finally(() => { state.pending = null })
@@ -159,5 +161,17 @@ export function createGraphVectorSearch({ cacheFile, fetchImpl = fetch, localEmb
     return selected.map(({ node }) => ({ id: node.id, descriptions: graphSearchTexts(node) }))
   }
 
-  return { prepare, search, waitForIndex: async () => { await active?.pending } }
+  async function ready(nodes, config) {
+    for (;;) {
+      const prepared = prepare(nodes, config)
+      if (prepared) return prepared
+      const state = active
+      if (!state) throw new Error('旧讨论查找尚未配置')
+      if (state.pending) await state.pending
+      if (active !== state) continue
+      if (state.error) throw state.error
+    }
+  }
+
+  return { prepare, ready, search, waitForIndex: async () => { await active?.pending } }
 }

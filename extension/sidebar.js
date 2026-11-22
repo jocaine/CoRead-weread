@@ -457,7 +457,9 @@ function setBackendAlive(alive) {
   if (alive && !was && _nbShown && _booksFailed) refreshNoBookBooks()
   // 本机服务刚起来：补一次"图里有几个点"的基线（见 initGraphCoachBaseline）。
   // 少了它，先开侧栏后启动 CoRead 的用户永远等不到第一个知识点的引导。
-  if (alive && !was) initGraphCoachBaseline()
+  if (alive && !was) {
+    initGraphCoachBaseline()
+  }
 }
 
 function setSseOpen(open) {
@@ -2288,8 +2290,10 @@ async function loadBooks(force) {
   _booksLoading = true
   try {
     const r = await fetch(`${RECEIVER}/books`)
+    if (!r.ok) throw new Error(`读取书单失败：HTTP ${r.status}`)
     const d = await r.json()
-    _bookPickerList = Array.isArray(d && d.books) ? d.books : []
+    if (!Array.isArray(d?.books)) throw new Error('书单返回格式不正确')
+    _bookPickerList = d.books
     _booksLoaded = true
     _booksFailed = false
   } catch {
@@ -2452,7 +2456,7 @@ function renderNoBookList() {
 
   if (!total && _booksLoading) return showMsg('正在读取已读书籍…')
   if (!total && _booksFailed) {
-    return showMsg('读不到已读书籍', 'CoRead 本机服务没在运行<br>启动后点下面的「重试」',
+    return showMsg('读不到已读书籍', '请确认 CoRead 已启动，再点下面的「重试」',
       { err: true, retry: true })
   }
   if (!list.length) {
@@ -2815,7 +2819,7 @@ let thinkingEl = null
 // 状态迟迟未到（agent 正在处理上一条/排队）则按等待时长走兜底文案。
 const THINKING_COPY = {
   init: '正在理解你的提问',
-  resolve: '正在检索此前讨论过的知识点',
+  resolve: '正在准备并查找此前讨论过的内容',
   answer: '正在组织回答',
   fallback1: '正在结合上下文思考',
   fallback2: '内容较多，仍在思考',
@@ -3197,7 +3201,7 @@ function addBubble(role, content, extra, note, bookId, sources) {
         return null
       }
       // 非流式的完整渲染（历史回放 / 兜底）：直接渲染
-      _renderRefReply(content, sources)
+      _renderRefReply(content, sources, bookId)
       return null
     }
     hideThinking()
@@ -3373,16 +3377,16 @@ function bindRefReplyClicks(el, ref) {
 
 // 渲染一条队列条目对应的完整气泡（非流式路径 / 流式气泡缺失时的兜底）。
 // 队列条目统一为 { ref: 引用信息|null }；ref 非空渲染引用条气泡，null（自由提问）渲染普通气泡。
-function _renderEntry(entry, content, sources) {
+function _renderEntry(entry, content, sources, bookId) {
   if (!entry) return
   hideThinking()
   const msgs = document.getElementById('msgs')
   const el = document.createElement('div')
   const ref = entry.ref
+  const book = baseBookId(bookId || ref?.bookId)
+  if (book) el.dataset.book = book
   if (ref) {
     el.className = 'msg-assistant ref-reply'
-    // AI-001：引用回复归属该书
-    if (ref.bookId) el.dataset.book = baseBookId(ref.bookId)
     el.innerHTML = refReplyHTML(ref, content, sources)
     bindRefReplyClicks(el, ref)
   } else {
@@ -3395,8 +3399,8 @@ function _renderEntry(entry, content, sources) {
   maybeAutoScroll(msgs)
 }
 
-function _renderRefReply(content, sources) {
-  _renderEntry(_pendingRefs.shift(), content, sources)  // AI-006：按提交顺序 shift，避免串槽
+function _renderRefReply(content, sources, bookId) {
+  _renderEntry(_pendingRefs.shift(), content, sources, bookId)  // AI-006：按提交顺序 shift，避免串槽
 }
 
 // 流式路径收尾：引用回复把流式普通气泡就地升级成带引用条的气泡（引用条此时才显示）
@@ -3440,11 +3444,11 @@ function connect() {
       const d = JSON.parse(e.data)
       if (d._seq) _lastEventId = Math.max(_lastEventId, d._seq)  // 记录进度，供续传
       if (d.type === 'connected') { setSseOpen(true); return }
-      // 会意图刷新（AI-020）：图文件更新 → 图视图开着就重拉
+      // 会意图刷新：关着也预排，打开时直接使用完整布局。
       if (d.type === 'graph-updated') {
         // 第一个知识点诞生时引导一次（见 maybeCoachFirstNode：只认"开机 0 个 → 现在有"）
         maybeCoachFirstNode()
-        if (graphView?.isOpen()) graphView.reload()
+        graphView?.reload()
         return
       }
       // 2026-09：实时栈变化 → 重拉 /stack-hits，恢复/清除"当前讨论命中"高亮
@@ -3541,7 +3545,7 @@ function connect() {
         const entry = _pendingRefs.shift()  // 队列非空才渲染引用气泡，内部按序 shift
         if (entry && entry.ref) {
           if (_streamEl) upgradeStreamToRefReply(_streamEl, entry.ref, d.content, d.sources)
-          else _renderEntry(entry, d.content, d.sources)  // 空回复等无流式气泡时兜底
+          else _renderEntry(entry, d.content, d.sources, d.bookKey)  // 空回复等无流式气泡时兜底
         } else if (_streamEl) {
           patchStreamedComplete(_streamEl, d.content, d.sources)
         } else {
@@ -3982,21 +3986,17 @@ async function submit() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
-    if (resp.ok) {
-      // 把这条提问注册为"历史已渲染"（_histKeys，key 与 /history 条目一致：
-      // role=user + receiver 落库 timestamp + 落库 content）：面板打开期间若有
-      // 回复恢复轮询在跑（此前有提问在 AI 回复中），增量历史重拉不会把刚发的
-      // 提问再渲染一遍
-      try {
-        const j = await resp.json()
-        if (j && j.timestamp) {
-          _histKeys.add(msgHistKey('user', j.timestamp, body.content))
-          // 停止请求需要它做"目标是哪一条"的标识（agent 侧据此配对提问行）
-          if (_awaitingStop) _awaitTs = j.timestamp
-          // 停止比回执先到：此刻才拿到这条提问的身份证，补登记给 _handleStream 认领残片
-          else if (_stopBeforeTs) { _discardedTurnTs = j.timestamp; _stopBeforeTs = false }
-        }
-      } catch {}
+    if (!resp.ok) {
+      const error = await resp.json().catch(() => null)
+      throw new Error(error?.error || `请求失败（HTTP ${resp.status}）`)
+    }
+    // 用接收端落库的时间戳给气泡去重，并让停止请求能指向这一轮。
+    const receipt = await resp.json().catch(() => null)
+    if (receipt?.timestamp) {
+      _histKeys.add(msgHistKey('user', receipt.timestamp, body.content))
+      if (_awaitingStop) _awaitTs = receipt.timestamp
+      // 停止比回执先到，用时间戳识别这轮的流式残片。
+      else if (_stopBeforeTs) { _discardedTurnTs = receipt.timestamp; _stopBeforeTs = false }
     }
   } catch (e) {
     console.warn('[CoRead] chat POST failed:', e.message)
@@ -4007,12 +4007,14 @@ async function submit() {
       const inp = document.getElementById('input')
       if (inp && !inp.value) { inp.value = content; inp.style.height = 'auto' }
     } catch {}
-    showSendFailedNotice('CoRead 本机服务未响应，消息未发送。\n原文已保留在输入框，可再次发送。')
+    const reason = e instanceof TypeError ? 'CoRead 本机服务未响应。' : e.message
+    showSendFailedNotice(`${reason}\n原文已保留在输入框，可再次发送。`)
     pingOnce()
     // 发送失败：这条消息没到 receiver、agent 不会回复。弹掉刚入队的自己的条目，
     // 避免它的最终记录永远不来、把后续真实回复的配对挤偏。不整队清空——前一条
     // 仍在流式的回复还需要自己的队项配对。
     _pendingRefs.pop()
+    userEl?.remove()
     _awaitUserEl = null   // 这条没发出去，没有"本轮提问气泡"可留
     hideThinking()
     finishWaiting()       // 没发出去 = 没有这一轮，按钮回「发送」
@@ -6854,10 +6856,64 @@ if (moreBtn && moreMenu) {
 // 存一份，避免"界面显示"与"agent 实际取值"两套状态漂移。接收端没起来时**不**自动
 // 弹窗——那时"未配置"是误判，连接状态交给头部指示点。
 const apiOverlay = document.getElementById('api-config')
+const apiTabs = document.getElementById('api-tabs')
+const apiTabButtons = [...(apiTabs?.querySelectorAll('[role="tab"]') || [])]
+
+function selectApiTab(tab) {
+  apiPresets?.closeMenus()
+  for (const button of apiTabButtons) {
+    const selected = button === tab
+    button.setAttribute('aria-selected', String(selected))
+    button.tabIndex = selected ? 0 : -1
+    document.getElementById(button.getAttribute('aria-controls')).hidden = !selected
+  }
+  if (tab.id === 'api-embedding-tab') refreshEmbeddingStatus()
+}
+
+async function refreshEmbeddingStatus() {
+  const refresh = document.getElementById('api-embedding-refresh')
+  if (!refresh || refresh.disabled) return
+  const status = document.getElementById('api-embedding-status')
+  const note = document.getElementById('api-embedding-note')
+  const details = document.getElementById('api-embedding-details')
+  refresh.disabled = true
+  status.dataset.state = 'loading'
+  status.textContent = '正在检查安装状态…'
+  note.hidden = true
+  details.hidden = true
+  try {
+    const response = await fetch(`${RECEIVER}/local-embedding-status`, { signal: AbortSignal.timeout(3000) })
+    if (!response.ok) throw new Error('读取失败')
+    const info = await response.json()
+    const installed = info.modelFiles && info.runtimeFiles
+    status.dataset.state = installed ? 'installed' : 'missing'
+    status.textContent = installed ? '已安装' : (!info.modelFiles && !info.runtimeFiles ? '未安装' : '安装不完整')
+    if (!installed) {
+      const missing = !info.modelFiles && !info.runtimeFiles ? '模型文件和运行组件'
+        : info.modelFiles ? '运行组件' : '模型文件'
+      note.textContent = `未检测到${missing}。如果使用便携包，请重新解压完整的 CoRead 安装包。`
+      note.hidden = false
+    }
+    document.getElementById('api-embedding-model').textContent = info.model
+    document.getElementById('api-embedding-size-row').hidden = info.modelBytes == null
+    document.getElementById('api-embedding-size').textContent = info.modelBytes == null ? '' : `约 ${Math.round(info.modelBytes / 1e6)} MB`
+    document.getElementById('api-embedding-rule').textContent = `相似度达 ${info.threshold} 才入选，最多 ${info.maxCandidates} 个节点`
+    details.hidden = false
+  } catch {
+    status.dataset.state = 'unavailable'
+    status.textContent = '无法读取安装状态'
+    note.textContent = '请确认 CoRead 本机服务已启动，再刷新状态。'
+    note.hidden = false
+  } finally {
+    refresh.disabled = false
+  }
+}
 
 function openApiConfig() {
   if (moreMenu) moreMenu.classList.remove('on')
   if (!apiOverlay) return
+  const chatTab = apiTabButtons[0]
+  if (chatTab) selectApiTab(chatTab)
   apiOverlay.classList.add('on')
   const errEl = document.getElementById('api-err')
   if (errEl) errEl.textContent = ''
@@ -6983,12 +7039,29 @@ document.getElementById('mm-api-config')?.addEventListener('click', async () => 
 document.getElementById('api-save-btn')?.addEventListener('click', saveApiConfig)
 document.getElementById('api-cancel-btn')?.addEventListener('click', closeApiConfig)
 document.getElementById('api-close-btn')?.addEventListener('click', closeApiConfig)
+document.getElementById('api-embedding-refresh')?.addEventListener('click', refreshEmbeddingStatus)
+apiTabs?.addEventListener('click', (event) => {
+  const tab = event.target.closest('[role="tab"]')
+  if (tab) selectApiTab(tab)
+})
+apiTabs?.addEventListener('keydown', (event) => {
+  const index = apiTabButtons.indexOf(event.target)
+  if (index < 0) return
+  const last = apiTabButtons.length - 1
+  const next = { Home: 0, End: last, ArrowLeft: index === 0 ? last : index - 1, ArrowRight: index === last ? 0 : index + 1 }[event.key]
+  if (!Number.isInteger(next)) return
+  event.preventDefault()
+  selectApiTab(apiTabButtons[next])
+  apiTabButtons[next].focus()
+})
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !event.defaultPrevented && apiOverlay?.classList.contains('on')) closeApiConfig()
+})
 bindMaskClose(apiOverlay, closeApiConfig)
 // 三个输入框回车即保存（Esc 关闭）
 for (const id of ['api-base', 'api-key', 'api-model']) {
   document.getElementById(id)?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); saveApiConfig() }
-    else if (e.key === 'Escape') closeApiConfig()
   })
 }
 // 地址 ↔ 模型互相对齐由 api-presets.js 的 install() 接线（见上面那几行），这里不再重复绑。
@@ -7080,7 +7153,7 @@ document.getElementById('bp-search')?.addEventListener('input', renderBookList)
 async function reportBuildStamp() {
   const files = [
     'sidebar.js', 'sidebar.html', 'translate-background.js', 'service_worker.js',
-    'reader.js', 'graph-view.js', 'api-presets.js',
+    'reader.js', 'graph-view.js', 'graph-orbit.js', 'graph-orbit.css', 'api-presets.js',
   ]
   const out = {}
   for (const f of files) {

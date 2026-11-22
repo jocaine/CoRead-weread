@@ -65,7 +65,10 @@
   const LABEL_CHARS = [6, 9, 13, 17, 20]
   const LABEL_LINES = [1, 2, 3, 3, 3]
   const LABEL_TIER_MAX = LABEL_CHARS.length - 1
-  // 缩放档（ratio = 当前 scale / 初始 fit 基准 scale，与面板尺寸无关）
+  // 文字从 0.5 倍的一行短句开始，随后在 0.8、1.2、1.7、2.6 倍逐级展开。
+  function labelRatio(scale) {
+    return scale / (LABEL_MIN_SCALE * 2)
+  }
   function labelTier(ratio) {
     return ratio < 0.8 ? 0 : ratio < 1.2 ? 1 : ratio < 1.7 ? 2 : ratio < 2.6 ? 3 : 4
   }
@@ -75,6 +78,26 @@
   function labelShape(ratio) {
     const t = labelTier(ratio)
     return { chars: LABEL_CHARS[t], lines: LABEL_LINES[t] }
+  }
+  function labelFontSize(scale) {
+    return clamp(Math.round(11 * scale), 11, 24)
+  }
+  function labelFont(px) {
+    return px + 'px -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif'
+  }
+  // 合并挡住当前位置的区间，返回两侧较近的空位。
+  function nearestFree(position, intervals) {
+    if (!intervals.some(([left, right]) => left < position && position < right)) return position
+    intervals.sort((a, b) => a[0] - b[0])
+    let left = -Infinity, right = -Infinity
+    for (const [start, end] of intervals) {
+      if (start >= right) {
+        if (left < position && position < right) break
+        left = start
+      }
+      right = Math.max(right, end)
+    }
+    return position - left <= right - position ? left : right
   }
   const LABEL_SHAPE_FULL = { chars: LABEL_CHARS[LABEL_TIER_MAX], lines: LABEL_LINES[LABEL_TIER_MAX] }
   // 标签底色档（2026-10 性能修正）：**不许再用 strokeText 光晕**——描边字形是 canvas 里最贵的
@@ -406,20 +429,20 @@
       this._stackLagUntil = 0   // 栈数据滞后宽限窗口的截止时刻（本轮回答期间/刚结束，见 applyStackHits）
       this._pendingChainFit = false   // 物理收敛时的一次性命中聚焦校准挂起标记（2026-10）
       this._dragging = null
-      // 悬停过渡（AI-027）：压暗/放大/pill 淡入淡出按帧缓动，不再闪变
+      // 悬停过渡（AI-027）：压暗和放大按帧缓动。
       this._nodeDim = new Map()   // 节点压暗强度 0..1（1 = 非邻接全暗）
       this._edgeDim = new Map()   // 边压暗强度 0..1
-      this._mag = new Map()       // 放大 + 标签 pill 淡入强度 0..1
+      this._mag = new Map()       // 放大强度 0..1
       this._raf = 0
       this._built = false
       this._bound = false
       this._loadPromise = null   // 加载中的 promise（防重入：open 与 applyHit 并发加载时复用）
+      this._preparedLayouts = new Map()
       this._open = false
       this._autoOpened = false   // 窗口是"命中自动弹出"的（2026-02）：停止一轮时侧栏据此连窗口一起收
       this._demo = false
       this._free = false   // 自由模式沙盒图（/graph?free=1，测试固化产物）
       this._source = 'file'   // 图数据来源：file（固化图）| results（冒烟有效图）| demo（演示拓扑）| free（自由模式沙盒图）
-      this._baseScale = 0       // 内容长度分级基准 = 初始 fit scale（决定初始化显示多短）
       this._bookColors = null   // 同图取色表（AI-028）：buildRun 时按全部书名贪心分配
       this._detailFont = 15    // 详情正文基准字号（AI-032），A± 缩放 13~22px，localStorage 记忆
       this._detailFontMin = 13
@@ -538,35 +561,101 @@
       else { this._demo = false; this._free = false }
       this._cancelAutoDismiss()   // 用户主动切数据源：取消挂起的自动渐隐
       if (this._open) this.loadGraph(this._demo, this._free)
+      else this.primeLayout()
     }
 
-    /** 图文件更新（SSE graph-updated）：开着就重拉；重拉后保留高亮（按 targets 重算） */
-    reload() {
-      if (!this._open) return
-      this.loadGraph(this._demo, this._free)
+    /** 图文件更新：打开时保留上一份图直到排好，关闭时提前排。 */
+    async reload() {
+      if (this._loadPromise) await this._loadPromise
+      if (this._open) return this.loadGraph(this._demo, this._free)
+      return this.primeLayout()
     }
 
     /** 重新拉图并（重）布局。返回 Promise<graph|null>。
-     *  防重入（2026-10）：open() 与 applyHit/applyStackHits 可能并发触发加载
-     *  （打开图按钮 → open 立即 loadGraph，refreshStackHits 的命中恢复里若图还没
-     *  加载完也会 loadGraph），复用同一个 promise——否则两次 buildRun + 两次
-     *  fitToNodes 竞态：后完成的 fitToNodes(全图) 会把先完成的命中链聚焦覆盖掉，
-     *  正是"栈有命中时打开拓扑图聚焦位置不对"的根因（隐藏高亮后图已加载，
-     *  命中恢复不再触发第二次加载，所以没这个问题）。 */
+     *  打开与恢复命中可能同时请求同一张图，复用结果避免重复调整视野。
+     *  切换图来源时允许新请求先跑，只发布最后一次请求的结果。 */
     async loadGraph(demo, free) {
-      if (this._loadPromise) return this._loadPromise
-      this._loadPromise = this._doLoad(demo, free)
-      try { return await this._loadPromise } finally { this._loadPromise = null }
+      const mode = `${!!demo}:${free === undefined ? this._free : !!free}`
+      if (this._loadPromise && this._loadMode === mode) return this._loadPromise
+      const request = {}
+      this._loadRequest = request
+      this._loadMode = mode
+      const pending = this._doLoad(demo, free, request)
+      this._loadPromise = pending
+      try { return await pending } finally {
+        if (this._loadPromise === pending) this._loadPromise = null
+      }
     }
-    async _doLoad(demo, free) {
+
+    async _fetchGraph(query) {
+      const res = await fetch(this.recv + '/graph' + query)
+      if (!res.ok) throw new Error('HTTP ' + res.status)
+      return res.json()
+    }
+
+    async primeLayout() {
+      const query = this._demo ? '?demo=1' : this._free ? '?free=1' : ''
+      try {
+        const g = await this._fetchGraph(query)
+        if (Array.isArray(g.nodes) && g.nodes.length) await this._getPreparedLayout(g, query)
+      } catch { /* 服务若还没启动，连接恢复时会再预排。 */ }
+    }
+
+    _getPreparedLayout(g, query) {
+      const key = JSON.stringify([!!g.demo, !!g.free, g.nodes, g.edges])
+      const cached = this._preparedLayouts.get(query)
+      if (cached?.key === key) return cached.ready
+
+      // 在独立的画布上计算。图打开时仍可看上一份布局，直到新图整张排好。
+      const layout = new GraphView()
+      layout.graph = {
+        nodes: Array.isArray(g.nodes) ? g.nodes : [],
+        edges: Array.isArray(g.edges) ? g.edges : [],
+      }
+      layout.canvas = document.createElement('canvas')
+      layout.ctx = layout.canvas.getContext('2d')
+      const viewport = document.documentElement
+      layout._w = this._w || viewport.clientWidth
+      layout._h = this._h || Math.max(1, viewport.clientHeight - 44)
+      layout.buildRun()
+
+      const oldNodes = this.graph?.demo === !!g.demo && this.graph?.free === !!g.free
+        ? this.run?.byId
+        : null
+      const ready = (async () => {
+        const previous = oldNodes || (await cached?.ready.catch(() => null))
+        if (previous) for (const n of layout.run.nodes) {
+          const old = previous.get(n.id)
+          if (old) { n.x = old.x; n.y = old.y }
+          else {
+            const neighbor = [...layout.run.adj.get(n.id)].map(id => previous.get(id)).find(Boolean)
+            if (neighbor) { n.x = neighbor.x + 40; n.y = neighbor.y + 40 }
+          }
+        }
+        await layout._prepareLayout(true)
+        return new Map(layout.run.nodes.map(({ id, x, y }) => [id, { x, y }]))
+      })()
+      const pending = { key, ready }
+      this._preparedLayouts.set(query, pending)
+      ready.catch(() => {
+        if (this._preparedLayouts.get(query) === pending) this._preparedLayouts.delete(query)
+      })
+      return ready
+    }
+
+    async _doLoad(demo, free, request) {
+      const previousSource = this.graph
       this._demo = !!demo
       if (free !== undefined) this._free = !!free
-      this._setLoading('加载中…')
+      const q = this._demo ? '?demo=1' : this._free ? '?free=1' : ''
+      const sameSource = previousSource?.demo === this._demo && previousSource?.free === this._free
+      if (!sameSource || !this.run?.nodes.length) this._setLoading('加载中…')
       try {
-        const q = this._demo ? '?demo=1' : this._free ? '?free=1' : ''
-        const res = await fetch(this.recv + '/graph' + q)
-        if (!res.ok) throw new Error('HTTP ' + res.status)
-        const g = await res.json()
+        const g = await this._fetchGraph(q)
+        const layoutKey = JSON.stringify([!!g.demo, !!g.free, g.nodes, g.edges])
+        const unchanged = layoutKey === this._layoutKey && !!this.run
+        const positions = !unchanged && g.nodes?.length ? await this._getPreparedLayout(g, q) : null
+        if (request && this._loadRequest !== request) return null
         this.graph = {
           nodes: Array.isArray(g.nodes) ? g.nodes : [],
           edges: Array.isArray(g.edges) ? g.edges : [],
@@ -578,7 +667,17 @@
         this._free = this.graph.free
         this._source = g.source || (this._demo ? 'demo' : this._free ? 'free' : 'file')
         this._updateSourceBadge()
-        this.buildRun()
+        if (!unchanged) {
+          this.buildRun()
+          for (const n of this.run.nodes) {
+            const position = positions?.get(n.id)
+            if (position) { n.x = position.x; n.y = position.y }
+          }
+          if (!sameSource || !previousSource.nodes.length) {
+            this.fitToNodes(this.run.nodes, false)
+          }
+          this._layoutKey = layoutKey
+        }
         this._renderBookLegend()
         this._setLoading('')
         if (this.run.nodes.length === 0) {
@@ -588,16 +687,17 @@
         else this._setEmpty(false)
         // 保留高亮：按 targets 用新图重算
         if (this.hl && this.hl.targets && this.hl.targets.length) this.recomputeHighlight()
-        this.startPhysics()
-        this._baseScale = 0   // 重算内容长度分级基准（初始 fit scale）
-        this.fitToNodes(this.run.nodes, false)
-        // 注：这里不做"有命中态就聚焦链"（2026-10 试过又去掉）——加载完成瞬间
-        // 物理刚从环形初始布局开始收敛，此刻 _fitToChain 的目标坐标未稳定，聚焦
-        // 位置不对；命中聚焦统一交给物理收敛后的 _pendingChainFit 落位
+        this._settledOnce = true
+        this._physics.running = false
+        if (this._pendingChainFit) {
+          this._pendingChainFit = false
+          if (this.hl && !this._hlHidden && (this.hl.mode === 'hit' || this.hl.mode === 'picked')) this._fitToChain(true)
+        }
         this._renderBanner()   // 重开图时搜索框残留旧词 → 恢复搜索横幅（2026-10）
         this.render()
         return this.graph
       } catch (e) {
+        if (request && this._loadRequest !== request) return null
         this._setLoading('')
         this._setEmpty(true, '会意图加载失败：CoRead 本机服务未启动。可重试。', true)
         console.warn('[CoRead] graph load failed:', e)
@@ -1055,6 +1155,83 @@
       this._ensureLoop()
     }
 
+    // 后台先把推拉计算做完，再避让文字。分批让出时间，侧栏仍能响应操作。
+    async _prepareLayout(fit) {
+      this._preparingLayout = true
+      this._physics.running = false
+      this._anim = null
+      try {
+        this._physics.tick = 0
+        let moving
+        do {
+          const deadline = performance.now() + 8
+          do { moving = this.tickPhysics() }
+          while (moving && performance.now() < deadline)
+          if (moving) await new Promise(resolve => setTimeout(resolve, 0))
+        } while (moving)
+        this._separateInitialCircles()
+        if (fit) this._adjustInitialLabelSpacing()
+        for (const n of this.run.nodes) { n.vx = 0; n.vy = 0 }
+      } finally {
+        this._preparingLayout = false
+      }
+    }
+
+    _adjustInitialLabelSpacing() {
+      if (!this.run.nodes.length || !this._w || !this._h) return
+      this.fitToNodes(this.run.nodes, false)
+      // 只为第一次显示的一行留位。若全图已经能看到字，也计入实际首屏的文字。
+      const scale = LABEL_MIN_SCALE
+      const placed = []
+      for (const n of this.run.nodes) {
+        const first = this._labelFootprint(n, scale)
+        const initial = this.cam.scale > scale ? this._labelFootprint(n, this.cam.scale) : first
+        const half = Math.max(first.half, initial.half)
+        const bottom = Math.max(first.bottom, initial.bottom)
+        const top = n.r + 0.7 / 0.12
+        const horizontal = [], vertical = []
+        for (const box of placed) {
+          if (n.y - top < box.bottom && box.top < n.y + bottom) {
+            horizontal.push([box.left - half, box.right + half])
+          }
+          if (n.x - half < box.right && box.left < n.x + half) {
+            vertical.push([box.top - bottom, box.bottom + top])
+          }
+        }
+        const x = nearestFree(n.x, horizontal), y = nearestFree(n.y, vertical)
+        if (Math.abs(x - n.x) <= Math.abs(y - n.y)) n.x = x
+        else n.y = y
+        placed.push({ left: n.x - half, right: n.x + half, top: n.y - top, bottom: n.y + bottom })
+      }
+      this.fitToNodes(this.run.nodes, false)
+    }
+
+    _labelFootprint(n, scale) {
+      const { w, h } = this._measureLabelBox(n, scale, false)
+      return {
+        half: Math.max(n.r + 0.7 / 0.12, w / (2 * scale)),
+        bottom: n.r + (h + 1) / scale,
+      }
+    }
+
+    _separateInitialCircles() {
+      const placed = []
+      // 为两道圆边合计 1.4 像素留空间，即使适配到最小缩放也不会相互盖住。
+      const gap = 1.4 / 0.12
+      for (const n of this.run.nodes) {
+        const intervals = []
+        for (const other of placed) {
+          const distance = n.r + other.r + gap
+          const dy = Math.abs(n.y - other.y)
+          if (dy >= distance) continue
+          const half = Math.sqrt(distance * distance - dy * dy)
+          intervals.push([other.x - half, other.x + half])
+        }
+        n.x = nearestFree(n.x, intervals)
+        placed.push(n)
+      }
+    }
+
     // 一帧物理（返回是否仍在运动）
     tickPhysics() {
       const run = this.run
@@ -1161,20 +1338,21 @@
           py < -LABEL_CULL_PAD || py > this._h + LABEL_CULL_PAD) {
         return { x: 0, y: 0, w: 0, h: 0 }
       }
-      const fontPx = clamp(Math.round(11 * scale), 11, 24)
-      const ratio = scale / (this._baseScale || scale || 1)
-      // 与渲染同规则（2026-10 共用 labelShape）：悬停/选中 = 临时聚焦满配；其余只看缩放
-      // （高亮节点也一样——同一缩放同一截断，用户定调）
       const emphasized = this.hover === n.id || this.sel === n.id
+      const { w, h } = this._measureLabelBox(n, scale, emphasized)
+      return { x: px - w / 2, y: py + n.r * scale + 1, w, h }
+    }
+
+    _measureLabelBox(n, scale, emphasized) {
+      const fontPx = labelFontSize(scale)
+      const ratio = labelRatio(scale)
       const shape = emphasized ? LABEL_SHAPE_FULL : labelShape(ratio)
       const chars = shape.chars, linesN = shape.lines
-      this.ctx.font = fontPx + 'px -apple-system, BlinkMacSystemFont, \'PingFang SC\', \'Helvetica Neue\', sans-serif'
+      this.ctx.font = labelFont(fontPx)
       const wrapped = wrapText(n.point, chars, linesN)
       let maxWpx = 0
       for (const l of wrapped) { const w = this.ctx.measureText(l).width; if (w > maxWpx) maxWpx = w }
-      const bw = maxWpx + 12
-      const bh = wrapped.length * fontPx * 1.3 + 6
-      return { x: px - bw / 2, y: py + n.r * scale + 4 - 3, w: bw, h: bh }
+      return { w: maxWpx + 12, h: wrapped.length * fontPx * 1.3 + 6 }
     }
 
     // 碰撞弹开（AI-023）：节点运动 / 相机动画 / 拖拽过程中，若「节点圆」或「标签盒子」在屏幕
@@ -1222,8 +1400,8 @@
             let d = Math.hypot(dx, dy)
             const minD = (a.r + b.r) * scale
             if (d < minD - COLLIDE_PAD) {
-              if (d < 1e-6) { dx = 1; dy = 0; d = 1 }
-              const nx = dx / d, ny = dy / d
+              const nx = d < 1e-6 ? 1 : dx / d
+              const ny = d < 1e-6 ? 0 : dy / d
               const pen = Math.min((minD - d - COLLIDE_PAD) / scale, MAX_PUSH)
               const av = pen * (mi / (mi + mj)), bv = pen * (mj / (mi + mj))
               any = true; moved = true
@@ -1255,7 +1433,7 @@
               }
             }
             // 3) 节点 i 的标签 vs 节点 j 的圆：圆不能压住标签
-            {
+            if (A.w > 0) {
               const ccx = clamp(bx, A.x, A.x + A.w), ccy = clamp(by, A.y, A.y + A.h)
               let ddx = bx - ccx, ddy = by - ccy
               let dist = Math.hypot(ddx, ddy)
@@ -1276,7 +1454,7 @@
               }
             }
             // 4) 节点 j 的标签 vs 节点 i 的圆：圆不能压住标签
-            {
+            if (B.w > 0) {
               const ccx = clamp(ax, B.x, B.x + B.w), ccy = clamp(ay, B.y, B.y + B.h)
               let ddx = ax - ccx, ddy = ay - ccy
               let dist = Math.hypot(ddx, ddy)
@@ -1305,6 +1483,7 @@
 
     // ── 渲染 ──────────────────────────────────────────────────────────────
     render() {
+      if (this._preparingLayout) return
       const run = this.run
       const cv = this.canvas
       if (!cv || !this._w || !this._h) return
@@ -1319,7 +1498,7 @@
       if (!run || !run.nodes.length) return
 
       const W = this._w, H = this._h, cam = this.cam
-      const labelFontPx = clamp(Math.round(11 * cam.scale), 11, 24)   // 标签字号随缩放：放大图文字变大(12→24)
+      const labelFontPx = labelFontSize(cam.scale)
       const tx = (x) => (x - cam.x) * cam.scale + W / 2
       const ty = (y) => (y - cam.y) * cam.scale + H / 2
 
@@ -1515,8 +1694,7 @@
         const onScreen = px > -LABEL_CULL_PAD && px < this._w + LABEL_CULL_PAD &&
           py > -LABEL_CULL_PAD && py < this._h + LABEL_CULL_PAD
         if (onScreen && (cam.scale >= LABEL_MIN_SCALE || magnify)) {
-          // point 显示长度随缩放分级：用「当前 scale / 初始基准」比值判断，与面板尺寸无关。
-          const ratio = cam.scale / (this._baseScale || cam.scale || 1)
+          const ratio = labelRatio(cam.scale)
           const shape = magnify ? LABEL_SHAPE_FULL : labelShape(ratio)
           const bgAlpha = magnify ? LABEL_BG_FOCUS : (onPath ? LABEL_BG_HIT : LABEL_BG_PLAIN)
           const pillFade = magnify ? magAmt : 1   // 悬停/选中的 pill 淡入淡出（AI-027）
@@ -1568,7 +1746,6 @@
       else {
         this._anim = null   // 非动画适配直接落位：清掉可能挂起的相机动画，防残留插值乱跳（2026-10）
         this.cam = target
-        if (!this._baseScale) this._baseScale = target.scale   // 记录初始 fit 基准（内容长度分级用）
         this.render()
       }
     }
@@ -1613,17 +1790,18 @@
       if (this._raf) return
       const frame = () => {
         this._raf = 0
+        if (this._preparingLayout) return
         let busy = false
+        let settling = false
         let tMark = PERF_ON ? performance.now() : 0
         // 定格：跳过物理与标签避让（位置一动不动），但**循环照跑**——悬停压暗/放大的
         // 缓动（_stepHoverFx）还要逐帧走完，停帧会让它卡在半明半暗上。
         const frozen = this._motionFrozen()
         if (this._physics.running && !frozen) {
           // 每帧 2 子步，加快收敛
-          if (this.tickPhysics() | this.tickPhysics()) busy = true
+          settling = !!(this.tickPhysics() | this.tickPhysics())
+          if (settling) busy = true
           else {
-            // 常驻弹性（AI-024）：收敛后不再停止物理——静止时接近不动（安静），
-            // 但拖拽/点按任一节点时，整张图会弹性联动再缓缓收敛。
             // 注意：收敛后不再自动 fitToNodes（2026-09 用户定调删掉）——
             // 否则打开图几秒后相机被强拉回初始整体缩放，打断用户正在进行的查看。
             // 例外（2026-10）：挂起的命中聚焦校准——新命中/打开图恢复命中时，
@@ -1641,19 +1819,20 @@
             this._settledOnce = true   // 收敛过一次 → 此后 hover/详情才定格（见 _motionFrozen）
             busy = true
           }
-        } else if (frozen) busy = true   // 定格期保持渲染循环（缓动未走完）
-        if (this._anim && Date.now() < this._anim.t0 + this._anim.dur) { this._stepAnim(); busy = true }
-        else this._anim = null
+        }
+        if (this._anim) { this._stepAnim(); busy = true }
         if (Date.now() < this._pulseUntil) busy = true
         if (this._dragging) busy = true
         if (PERF_ON) { perf.phys += performance.now() - tMark; tMark = performance.now() }
         // 碰撞弹开（AI-023）：运动期自动推开重叠的节点圆/标签，收敛后不破坏已读布局。
         // 定格期一并停掉——它也会挪节点，是"图不许动"的一部分。
         if (!frozen && (this._physics.running || this._anim || this._dragging)) {
-          if (this._separateLabels()) busy = true
+          const separating = this._separateLabels()
+          if (separating) busy = true
+          if (!settling && !separating && !this._dragging) this._physics.running = false
         }
         if (PERF_ON) { perf.sep += performance.now() - tMark; tMark = performance.now() }
-        this._stepHoverFx()   // 悬停压暗/放大缓动（AI-027）
+        if (this._stepHoverFx()) busy = true
         this.render()
         if (PERF_ON) {
           // 性能日志（opt-in，localStorage.coreadGvPerf = '1'）：定位"进图卡"是物理、标签避让
@@ -1673,7 +1852,7 @@
 
     // 悬停过渡（AI-027）：每帧把 压暗强度 / 放大强度 向目标缓动（指数趋近，约 200ms 内稳定）。
     // 进入/离开/在节点间快速扫过都是平滑渐变，不闪变。目标值与原行为一致：
-    // 非邻接节点/边压暗（1→0.22 / 0.75→0.12），悬停/选中节点放大 1.2 倍 + pill 淡入。
+    // 非邻接节点/边压暗（1→0.22 / 0.75→0.12），悬停/选中节点放大 1.2 倍。
     _stepHoverFx() {
       const run = this.run
       if (!run || !run.nodes.length) return
@@ -1689,20 +1868,29 @@
         }
       }
       const K = 0.18
+      let moving = false
+      const approach = (values, id, target) => {
+        const current = values.get(id) || 0
+        if (Math.abs(target - current) < 0.01) {
+          if (target) values.set(id, target)
+          else values.delete(id)
+        } else {
+          values.set(id, current + (target - current) * K)
+          moving = true
+        }
+      }
       for (const n of run.nodes) {
         const dimT = hoverOn && !neigh.has(n.id) ? 1 : 0
-        const dc = this._nodeDim.get(n.id)
-        this._nodeDim.set(n.id, (dc || 0) + (dimT - (dc || 0)) * K)
+        approach(this._nodeDim, n.id, dimT)
         const magT = this.hover === n.id || this.sel === n.id ? 1 : 0
-        const mc = this._mag.get(n.id)
-        this._mag.set(n.id, (mc || 0) + (magT - (mc || 0)) * K)
+        approach(this._mag, n.id, magT)
       }
       for (const e of run.edges) {
         const key = e.from + '>' + e.to
         const dimT = hoverOn && !edges.has(e) ? 1 : 0
-        const dc = this._edgeDim.get(key)
-        this._edgeDim.set(key, (dc || 0) + (dimT - (dc || 0)) * K)
+        approach(this._edgeDim, key, dimT)
       }
+      return moving
     }
 
     // ── DOM 构建 / 事件 ────────────────────────────────────────────────────
@@ -1797,12 +1985,16 @@
         const d = this._dragging
         if (d) {
           d.moved = d.moved || Math.hypot(p.x - d.sx, p.y - d.sy) > 4
-          if (d.kind === 'node') {
+          if (d.kind === 'node' && d.moved) {
             const n = this.run.byId.get(d.id)
             if (n) {
               const w = this._worldAt(p.x, p.y)
               n.x = w.x; n.y = w.y
               n.pinned = true
+              if (!this._physics.running) {
+                this._physics.tick = 0
+                this._physics.running = true
+              }
             }
           } else if (d.kind === 'pan' && d.moved) {
             this.cam.x -= (p.x - d.sx) / this.cam.scale
@@ -1817,7 +2009,7 @@
           this.hover = n ? n.id : null
           cv.style.cursor = n ? 'pointer' : 'grab'
           this._updateTooltip(p.x, p.y, n)
-          this.render()
+          this._ensureLoop()
         } else if (n) {
           this._updateTooltip(p.x, p.y, n)
         }
@@ -1872,7 +2064,7 @@
         if (!this._dragging && this.hover) {
           this.hover = null
           this._hideTooltip()
-          this.render()
+          this._ensureLoop()
         }
       })
       cv.addEventListener('wheel', (e) => {
@@ -2435,7 +2627,7 @@
     fontPx = fontPx || 12
     if (fade == null) fade = 1
     bgAlpha = bgAlpha || 0
-    ctx.font = fontPx + 'px -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif'
+    ctx.font = labelFont(fontPx)
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
     const lines = wrapText(text, charsPerLine, maxLines || 3)

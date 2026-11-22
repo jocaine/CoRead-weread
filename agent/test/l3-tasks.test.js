@@ -78,7 +78,7 @@ test('buildDraftBrief：机械档填空——先搭骨架，末尾附待查；�
   assert.match(out, /只有真的多一个转折，才新开一步/, '覆盖优先并进现有步，不靠加步')
   assert.match(out, /写完删一遍/, '删冗余步、拆塞了两转折的步')
   assert.match(out, /写完对一遍提问/, '覆盖检查：问到的面 + 每个事实都有待查')
-  assert.match(out, /后一步从前一步的结论往下走/, '步骤要串成一条线，不是并排的话题')
+  assert.match(out, /不强求所有问题都写成一条已确定的因果链/)
   assert.match(out, /只输出下面这些行/)
   assert.doesNotMatch(out, /只输出编号的行/, '旧形状：一串编号判断，已被骨架取代')
   assert.doesNotMatch(out, /不确定：/, '不要自评标记')
@@ -273,7 +273,7 @@ test('buildAggregateMessage：按条列出记录；新的推进归这一轮，�
   assert.match(out, /缺一环就补一环/)
   assert.match(out, /总判断被事实推翻就换总判断/)
   assert.match(out, /每一步接住上一步/, '每一步要接住上一步，不是并列的小节')
-  assert.match(out, /只能有一条主线/, '改骨架可以，但不能散成几条线')
+  assert.match(out, /允许比较多种解释或分别讨论不同观点/)
   assert.match(out, /不许说"两类"列五类/, '实测踩过的坑：开头说两类、下面列五类')
   // 材料是证据不是清单；事实能推翻推理，不许把事实压小
   assert.match(out, /材料是证据，不是清单/)
@@ -535,8 +535,8 @@ test('流水线：图上只亮「读过且交上了料」的节点——判「�
 // ── 联网搜索（2026-10-27 接上：与派题并列的第二条路）───────────────────────────
 test('草稿 brief：判断不写具体数据，「验」行必须带年代；已查到的不再重复搜', () => {
   const b = buildDraftBrief()
-  assert.match(b, /总、步、收都只写判断/)
-  assert.match(b, /具体数据（年份、金额、法条号、机构名）都不写/)
+  assert.match(b, /总、步、收是简短的回答路线/)
+  assert.match(b, /具体数据留给待查/)
   assert.match(b, /搜索读不懂"当时"/)
   assert.match(b, /没有具体事实就写"待查：无"/)
   assert.match(b, /已经落到具体出处的，不再列/)
@@ -796,6 +796,21 @@ test('流水线：登记不可用 → 重试一次；再不行就跳过（不阻
   assert.equal(n, 2, '一次原始 + 一次重试')
   const rep = events.find((e) => e.type === 'report')
   assert.equal(rep.ok, false)
+})
+
+test('本轮作答范围同时交给草稿、正文和脑图，不增加调用', async () => {
+  const model = fakeModel({ draft: '总：示例\n第1步：说明原因\n收：答够了', answer: '正文' })
+  const events = []
+  const it = runTasksPipeline({ anchored: '本轮原问', hits: [], complete: model.complete, stream: model.stream,
+    answerForm: { brief: true, request: '简述孔孟的看法' },
+    onEvent: e => events.push(e),
+  })
+  for await (const piece of it) {}
+  assert.equal(model.calls.length, 2)
+  const instruction = events.find(e => e.type === 'draft').assignment
+  assert.match(instruction, /150～250字/)
+  assert.match(instruction, /简述孔孟的看法/)
+  for (const call of model.calls) assert.ok(call.text.endsWith(instruction))
 })
 
 test('流水线：相处规则只进终稿、不进 R1（2026-10-27 用户定）', async () => {

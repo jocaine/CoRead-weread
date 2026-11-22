@@ -18,7 +18,7 @@ import path from 'path'
 import { spawn } from 'child_process'
 import { fileURLToPath } from 'url'
 import { processStackMessage, makeStackEntry, collectStackCites } from './lib/topic-stack.js'
-import { createGraph, userAncestry, userParents, resolveReferences, hotNodes, mergeNodeMetadata } from './lib/knowledge-graph.js'
+import { createGraph, userAncestry, userParents, hotNodes, mergeNodeMetadata } from './lib/knowledge-graph.js'
 import { consolidateThreadQuestion } from './lib/thread-question.js'
 import { consolidateDiscussion, addDerivedEdge, addCitationEdges, pruneRedundantCitationEdges, groupExcerpts, segmentBook } from './lib/graph-consolidate.js'
 import { segmentStack } from './lib/segment-stack.js'
@@ -1290,6 +1290,8 @@ async function say(userText, options = {}) {
       hist, persona, agreement, anchored,
       // 当前提问（用户这一轮真的问的那句）：整套课题都锚在它上面，不是节点里的旧问题
       question: storeText || userText,
+      retrievalQuery: options.retrievalQuery,
+      answerForm: options.answerForm,
       hits: taskHits,
       fallbackHits: l3Hits,
       // 图查询：节点在图上才派课题（命中 id 可能来自已删节点，这里再校验一次）
@@ -1660,28 +1662,18 @@ function saveGraph() {
 
 // 从收口组 entries（user/assistant 轮次）提取交锋轮次 {q, a}（lib/graph-consolidate.js 导出）
 
-// 先改写问题再查向量。向量结果交给回答流程取材，旧引用解析只在向量路径不可用时运行。
+// 先等旧讨论查找准备完整，再改写问题并查找；准备失败由调用方暂停本轮。
 async function resolveCitations(msg, bookKey) {
   if (!graph.nodes.length) return { hits: [], candidates: [], l3: '' }
+  const prepared = await graphVectorSearch.ready(graph.nodes)
   try {
     const turn = retrievalTurn(msg, histories.get(bookKey))
-    const prepared = graphVectorSearch.prepare(graph.nodes)
-    const { hits, candidates } = await retrieveDiscussion(turn, {
+    const { hits, candidates, retrievalQuery, answerForm } = await retrieveDiscussion(turn, {
       search: prepared?.entries.length ? (query) => graphVectorSearch.search(query, prepared) : null,
       rewrite: (prompt) => callLLMOnce(1024, [{ role: 'user', content: prompt }], {
         system: JUDGE_SYSTEM, temperature: 0, contentOnly: true, thinking: false, kind: '检索改写', conv: bookKey,
         signal: AbortSignal.timeout(10_000),
       }),
-      fallback: async (question) => {
-        const nodes = graph.nodes.map((n) => ({
-          id: n.id, point: n.point, aliases: n.aliases, descriptions: n.descriptions,
-          questions: (n.discussions || []).map((d) => d.question),
-        }))
-        const result = await resolveReferences({ message: question, nodes }, {
-          callLLM: judgeLLM, maxTokens: 16384, log: (m) => console.log(`  [引用解析] ${m}`),
-        })
-        return result.hits
-      },
       log: (m) => console.log(`  [会意检索] ${m}`),
     })
     const valid = hits.filter((id) => graph.nodes.some((n) => n.id === id))
@@ -1692,7 +1684,7 @@ async function resolveCitations(msg, bookKey) {
     // 同一个节点的 user 边，所以不是两类东西。种子非空就注入：这场讨论有引用 → 每轮都带上它的来路。
     const seeds = [...new Set([...valid, ...collectStackCites(topicStacks[bookKey || currentBookKey])])]
     const ancestry = seeds.length ? userAncestry(graph, seeds) : []
-    return { hits: valid, candidates, l3: ancestry.length ? l3Block(ancestry) : '' }
+    return { hits: valid, candidates, retrievalQuery, answerForm, l3: ancestry.length ? l3Block(ancestry) : '' }
   } catch (e) {
     console.log(`  [引用解析] 本轮跳过（不影响主回复）: ${e.message}`)
     return { hits: [], candidates: [], l3: '' }
@@ -2728,7 +2720,21 @@ async function main() {
         // 就用它（校验节点存在），不带则回退语义解析命中（老版本侧栏/其他入口）。
         // 处理步骤状态：图非空时引用解析才真调 LLM，步骤先行（侧栏"正在…"文案）
         if (graph.nodes.length) appendAgentState('resolve', key)
-        const citesR = await resolveCitations(msg, key)
+        let citesR
+        try {
+          citesR = await resolveCitations(msg, key)
+        } catch (e) {
+          if (consumeSessionStop(key, msg.timestamp)) {
+            discardStoppedTurn({ conv: msg.conv, questionId: msg.id, turnTs: msg.timestamp })
+            continue
+          }
+          const note = '旧讨论查找准备失败，本轮尚未开始回答，将稍后重试。'
+          appendChatOutput('system', note, key, { replyTo: msg.id })
+          markMessage(msg.id, { status: 'failed', error: String(e.message).slice(0, 200) })
+          console.log('  [会意检索] ' + note + ' 原因：' + e.message)
+          queuePausedUntil = Date.now() + RETRY_PAUSE_MS
+          break
+        }
         if (consumeSessionStop(key, msg.timestamp)) {
           discardStoppedTurn({ conv: msg.conv, questionId: msg.id, turnTs: msg.timestamp })
           continue
@@ -2768,7 +2774,7 @@ async function main() {
         // `turnUsed`，下面 applyStackTurn 把它记进讨论栈——图关掉再开、刷新之后也按这一份画。
         const sayOpts = {
           bookKey: key, storeText, assistantSelected: selectionFromMsg(msg), l3: citesR.l3,
-          l3Hits: hitsThisRound, l3Candidates: citesR.candidates, inheritedHits: inherited, citeHits: citesFinal,
+          l3Hits: hitsThisRound, l3Candidates: citesR.candidates, retrievalQuery: citesR.retrievalQuery, answerForm: citesR.answerForm, inheritedHits: inherited, citeHits: citesFinal,
           replyTo: msg.id, replyToTs: msg.timestamp,
         }
         const reply = await say(userMsg, sayOpts)

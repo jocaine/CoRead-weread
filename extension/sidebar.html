@@ -2766,7 +2766,37 @@
     .api-title { flex: 1; font-size: 15px; font-weight: 600; color: #333; }
     .api-close { border: none; background: none; font-size: 15px; cursor: pointer; color: #aaa; padding: 0 4px; }
     .api-close:hover { color: #333; }
+    .api-tabs { display: flex; gap: 18px; padding: 0 14px; border-bottom: 1px solid #ececec; }
+    .api-tab {
+      border: 0;
+      border-bottom: 2px solid transparent;
+      background: transparent;
+      color: #595959;
+      padding: 9px 2px 7px;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .api-tab[aria-selected="true"] { color: #0a7d43; border-bottom-color: #0a7d43; font-weight: 600; }
+    .api-tab:focus-visible, .api-embedding-refresh:focus-visible { outline: 2px solid #0a7d43; outline-offset: 2px; }
     .api-body { padding: 12px 14px 0; }
+    .api-embedding { padding: 12px 14px 14px; color: #555; font-size: 12px; line-height: 1.6; }
+    .api-embedding-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .api-embedding-status { font-weight: 600; color: #555; }
+    .api-embedding-status[data-state="installed"] { color: #0a7d43; }
+    .api-embedding-status[data-state="missing"] { color: #986013; }
+    .api-embedding-refresh { border: 1px solid #ddd; border-radius: 6px; background: #fff; color: #555; padding: 3px 8px; font: inherit; cursor: pointer; }
+    .api-embedding-refresh:hover:not(:disabled) { background: #f5f6f7; }
+    .api-embedding-refresh:disabled { opacity: .6; cursor: default; }
+    .api-embedding-note { margin: 5px 0 10px; }
+    .api-embedding-details { margin: 0; border-block: 1px solid #ececec; }
+    .api-embedding-details > div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; padding: 4px 0; }
+    .api-embedding-details dt { color: #666; }
+    .api-embedding-details dd { margin: 0; color: #333; overflow-wrap: anywhere; }
+    .api-embedding-description { margin: 9px 0 0; }
+    .api-embedding-description p { margin: 0; }
+    .api-embedding-description p + p { margin-top: 6px; }
+    .api-embedding-description strong { color: #333; }
     .api-hint { font-size: 11px; color: #999; line-height: 1.65; margin-bottom: 10px; }
     /* 首次使用提示（未配置自动弹出时显示）：琥珀色，与红色错误行区分 */
     .api-first {
@@ -3479,6 +3509,11 @@
         <span class="api-title">模型 API 配置</span>
         <button class="api-close" id="api-close-btn" title="关闭">✕</button>
       </div>
+      <div class="api-tabs" id="api-tabs" role="tablist" aria-label="模型类型">
+        <button type="button" class="api-tab" id="api-chat-tab" role="tab" aria-selected="true" aria-controls="api-chat-page">对话模型</button>
+        <button type="button" class="api-tab" id="api-embedding-tab" role="tab" aria-selected="false" aria-controls="api-embedding-page" tabindex="-1">向量模型</button>
+      </div>
+      <section id="api-chat-page" role="tabpanel" aria-labelledby="api-chat-tab">
       <div class="api-body">
         <div class="api-hint">支持任何兼容 OpenAI 协议的服务商（DeepSeek / OpenAI / Kimi / Ollama…）。<br>地址与模型可选预设，也可直接填；配置只存本机，保存即生效。</div>
         <div class="api-first" id="api-first" hidden>尚未配置模型 API，填写以下三项后才能开始共读讨论。</div>
@@ -3525,6 +3560,25 @@
         <button class="api-cancel" id="api-cancel-btn">取消</button>
         <button class="api-save" id="api-save-btn">保存</button>
       </div>
+      </section>
+      <section class="api-embedding" id="api-embedding-page" role="tabpanel" aria-labelledby="api-embedding-tab" hidden>
+        <div class="api-embedding-head">
+          <span class="api-embedding-status" id="api-embedding-status" role="status"></span>
+          <button type="button" class="api-embedding-refresh" id="api-embedding-refresh">刷新状态</button>
+        </div>
+        <p class="api-embedding-note" id="api-embedding-note" hidden></p>
+        <dl class="api-embedding-details" id="api-embedding-details" hidden>
+          <div><dt>模型</dt><dd id="api-embedding-model" dir="ltr"></dd></div>
+          <div><dt>运行位置</dt><dd>本机 · 无需 API Key</dd></div>
+          <div id="api-embedding-size-row" hidden><dt>模型文件</dt><dd id="api-embedding-size"></dd></div>
+          <div><dt>检索规则</dt><dd id="api-embedding-rule"></dd></div>
+        </dl>
+        <div class="api-embedding-description">
+          <p><strong>怎么找</strong>　把改写过的问题和会意图的节点总结比一比，找出意思接近的旧讨论。</p>
+          <p><strong>什么时候用</strong>　过线的节点可供对话模型取材。没有节点过线，就不提供旧讨论。</p>
+          <p><strong>在哪处理</strong>　匹配在本机。改写和回答由配置的对话模型处理，它也可能收到选中的旧讨论。</p>
+        </div>
+      </section>
     </div>
   </div>
 

@@ -102,7 +102,16 @@ jobs:
           path: installer/build/out/*.zip
           retention-days: 14
 
-      - name: 建 Release 并上传附件
+      - name: 建 Release 并上传附件（含版本说明）
+        if: ${{ hashFiles(format('docs/releases/{0}.md', github.ref_name)) != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/build/out/*.zip
+          fail_on_unmatched_files: true
+          body_path: docs/releases/${{ github.ref_name }}.md
+
+      - name: 建 Release 并上传附件（通用说明）
+        if: ${{ hashFiles(format('docs/releases/{0}.md', github.ref_name)) == '' }}
         uses: softprops/action-gh-release@v2
         with:
           files: installer/build/out/*.zip

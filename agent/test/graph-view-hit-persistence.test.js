@@ -50,6 +50,111 @@ function loadView() {
 }
 const GraphView = loadView()
 
+test('重复打开同一张图保留节点位置和观看区域，不重新整理', async () => {
+  const g = { nodes: [{ id: 'a' }], edges: [], demo: false, free: false }
+  SANDBOX.fetch = async () => ({ ok: true, json: async () => g })
+  const node = { id: 'a', x: 123, y: 456 }
+  const run = { nodes: [node], byId: new Map([['a', node]]) }
+  const cam = { x: 80, y: 90, scale: 2 }
+  const v = fakeView({
+    _demo: false, _free: false, run, cam, _physics: {},
+    _layoutKey: JSON.stringify([false, false, g.nodes, g.edges]),
+    _setLoading() {}, _updateSourceBadge() {}, _renderBookLegend() {},
+    _setEmpty() {}, _renderBanner() {}, render() {},
+    buildRun() { assert.fail('不应重建节点') },
+    _prepareLayout() { assert.fail('不应重排') },
+  })
+  assert.ok(await v._doLoad(false, false))
+  assert.equal(v.run, run)
+  assert.equal(v.cam, cam)
+  assert.equal(node.x, 123)
+  assert.equal(node.y, 456)
+  assert.equal(v._physics.running, false)
+})
+
+test('后台排布完成时，即使常规避让没做完，重叠的圆也已分开', async () => {
+  const nodes = Array.from({ length: 10 }, (_, i) => ({
+    id: String(i), x: 0, y: i % 2, r: 23, vx: 0, vy: 0,
+  }))
+  const v = fakeView({
+    run: { nodes, edges: [] },
+    canvas: { style: {} },
+    cam: { x: 0, y: 0, scale: 0.12 },
+    _physics: {},
+    _setLoading() {},
+    tickPhysics: () => false, // 用同一组密集坐标检验最后的防重叠步骤
+    _separateLabels: () => false,
+  })
+  await v._prepareLayout(false)
+  for (let i = 0; i < nodes.length; i++) {
+    for (const b of nodes.slice(i + 1)) {
+      const a = nodes[i]
+      const distance = Math.hypot(a.x - b.x, a.y - b.y) * v.cam.scale
+      assert.ok(distance + 1e-8 >= (a.r + b.r) * v.cam.scale + 1.4)
+    }
+  }
+})
+
+test('首开与预排复用同一份结果，预排完成前不发布节点位置', async () => {
+  const data = { nodes: [{ id: 'a' }], edges: [] }
+  let finish
+  const waiting = new Promise(resolve => { finish = resolve })
+  const v = fakeView({
+    _demo: false, _free: false, _physics: {}, _preparedLayouts: new Map(), _w: 400, _h: 300,
+    _fetchGraph: async () => data,
+    _setLoading() {}, _updateSourceBadge() {}, _renderBookLegend() {}, _setEmpty() {},
+    _renderBanner() {}, fitToNodes() {}, render() {},
+    buildRun() { this.run = { nodes: [{ id: 'a', x: 0, y: 0 }] } },
+  })
+  const doc = SANDBOX.document
+  const createElement = doc.createElement
+  const prepare = GraphView.prototype._prepareLayout
+  let calls = 0
+  doc.createElement = () => ({ getContext: () => ({}) })
+  GraphView.prototype._prepareLayout = async function () {
+    calls++
+    await waiting
+    this.run.nodes[0].x = 123
+  }
+  try {
+    const prewarm = v.primeLayout()
+    const opened = v.loadGraph(false, false)
+    await Promise.resolve()
+    await Promise.resolve()
+    assert.equal(v.run, undefined)
+    finish()
+    assert.ok(await opened)
+    await prewarm
+    assert.equal(calls, 1)
+    assert.equal(v.run.nodes[0].x, 123)
+  } finally {
+    doc.createElement = createElement
+    GraphView.prototype._prepareLayout = prepare
+  }
+})
+
+test('首屏预排为第一次出现的短单行留空，文字互不重叠', () => {
+  const nodes = [
+    { x: 0, y: 0, r: 10, point: '第一个容易重叠的知识点' },
+    { x: 22, y: 0, r: 10, point: '第二个容易重叠的知识点' },
+    { x: 270, y: 250, r: 10, point: '远处节点' },
+  ]
+  const v = fakeView({
+    run: { nodes }, cam: { x: 0, y: 0, scale: 1 }, _w: 420, _h: 170,
+    ctx: { measureText: text => ({ width: text.length * 11 }) }, render() {},
+  })
+  const initial = nodes.map(n => ({ x: n.x, y: n.y }))
+  v._adjustInitialLabelSpacing()
+  assert.ok(v.cam.scale < 0.5)
+  assert.notDeepEqual(nodes.map(n => ({ x: n.x, y: n.y })), initial)
+  v.cam.scale = 0.5
+  const [a, b] = nodes.slice(0, 2).map(n => v._labelBoxScreen(n))
+  assert.equal(a.h, 11 * 1.3 + 6)
+  assert.ok(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y)
+  v.cam.scale = 0.8
+  assert.equal(v._measureLabelBox(nodes[0], v.cam.scale, false).h, 2 * 11 * 1.3 + 6)
+})
+
 test('本轮全部拒绝的空通知清除旧高亮，滞后的上一轮栈不能重新点亮', () => {
   const v = fakeView({ hl: { mode: 'hit', at: Date.now() }, _turnHits: ['old'] })
   v.onHit([], '', 'turn')
@@ -206,6 +311,28 @@ test('悬停节点 → 物理定格（坐标一帧都不动）；移开 → 继�
   v.hover = null
   pump(v, 3)
   assert.notEqual(snap(v), before, '移开鼠标 → 物理接着跑（定格是暂停，不是停机）')
+})
+
+test('静止图的悬停放大与移开还原都走完，节点坐标不动', () => {
+  const v = physicsView()
+  v._physics.running = false
+  v._nodeDim = new Map()
+  v._edgeDim = new Map()
+  v._mag = new Map()
+  v._stepHoverFx = GraphView.prototype._stepHoverFx
+  const before = snap(v)
+  v.hover = 'n_a'
+  pump(v, 1)
+  assert.ok(v._mag.get('n_a') > 0 && v._mag.get('n_a') < 1)
+  pump(v, 30)
+  assert.equal(v._mag.get('n_a'), 1)
+  assert.equal(frames.length, 0, '悬停效果走完后停止排帧')
+  v.hover = null
+  pump(v, 1)
+  assert.ok(v._mag.get('n_a') > 0 && v._mag.get('n_a') < 1)
+  pump(v, 30)
+  assert.equal(v._mag.has('n_a'), false)
+  assert.equal(snap(v), before)
 })
 
 test('详情面板开着（sel）→ 同样定格', () => {

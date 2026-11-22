@@ -47,7 +47,8 @@ const REWRITE = `你负责把 CoRead 用户的本轮提问改写成一句独立�
 2. “我没懂”“这是什么意思”之类的问法有引文时，把引文里被问的具体说法或关系概括成“……的含义／如何理解……”。不要只留下“我没懂”，也不要照抄长引文、罗列主题词。用户只问某个词、表述、翻译或写法时，只查那个角度；不能把引文讲的主题当问题。
 3. 没有引文时，只有本轮明确指向上一轮、且指向唯一时，才从 previous 补足对象；不要把上一轮的回答、推测或立场当成用户这轮的话。有多个不相干的论点而用户没说问哪个，必须返回 null；不能默认问第一句、最后一句、最长一句，也不能把无关论点拼成一个查询。
 4. 保留否定、观点归属、条件和关系方向。不要替用户接受、反驳或补出因果关系，不加材料以外的事实。不确定但知道关系两端时就描述要理解的关系。
-5. 问候、确认、指令操作、单纯粘贴引文或找不到具体对象时，返回 null。只输出 {"query":"一句不超过240个字符的描述"} 或 {"query":null}。
+5. 问候、确认、指令操作、单纯粘贴引文或找不到具体对象时，query 填 null。只输出一个 JSON 对象，含 query（一句不超过240个字符的描述或 null）和 brief。
+6. 只根据 question 判断 brief：读者明确要求简短介绍、概览或总结时为 true，其余为 false。“我大概能理解，但为什么”是在追问，brief 为 false。
 例：引文“城市只负责支付当期工资，养老仍由农村承担”；问“我没懂” → “城市支付当期工资、农村承担养老的用工分担是什么意思”。
 例：引文“多数工人在委员会里投票”；问“这是译者的说法吗” → “引文中‘委员会’等措辞是否来自译者，如何区分作者原意和译法”。
 例：引文“多数工人在委员会里投票。野生鸟类通常在春秋两季迁徙。”；问“我没懂” → null；两句互不相干，不能任选其一。`
@@ -56,27 +57,41 @@ function readJson(text) {
   try { return JSON.parse(String(text || '').trim().replace(/^```(?:json)?\s*([\s\S]*?)\s*```$/i, '$1')) } catch { return null }
 }
 
-// undefined 表示调用或格式失败（可走旧判定），null 表示模型判断没有可查的对象。
-export async function rewriteRetrievalQuery(turn, callLLM) {
-  if (!turn.question) return null
-  const output = readJson(await callLLM(REWRITE + '\n\n待处理输入：' + JSON.stringify(turn)))
+// undefined 表示调用或格式失败，null 表示模型判断没有可查的对象；两者都不改用文字模型判断命中。
+function queryOf(output) {
   if (output?.query === null) return null
   if (typeof output?.query !== 'string') return undefined
   const query = output.query.trim().replace(/\s+/gu, ' ')
   return query && [...query].length <= 240 ? query : undefined
 }
 
-export async function retrieveDiscussion(turn, { search, rewrite, fallback, log = () => {} }) {
+async function readTurnRequest(turn, callLLM) {
+  return readJson(await callLLM(REWRITE + '\n\n待处理输入：' + JSON.stringify(turn)))
+}
+
+export async function rewriteRetrievalQuery(turn, callLLM) {
+  if (!turn.question) return null
+  return queryOf(await readTurnRequest(turn, callLLM))
+}
+
+export async function retrieveDiscussion(turn, { search, rewrite, log = () => {} }) {
   if (!turn.question) return { hits: [], candidates: [] }
+  let format = {}
   if (search) {
     try {
-      const query = await rewriteRetrievalQuery(turn, rewrite)
-      if (query === null) return { hits: [], candidates: [] }
+      const output = await readTurnRequest(turn, rewrite)
+      if (output?.brief === true) {
+        format = { answerForm: { brief: true, request: turn.question } }
+      }
+      const query = queryOf(output)
+      if (query === null) return { hits: [], candidates: [], ...format }
       if (query === undefined) throw new Error('检索改写返回格式不正确')
-      // 向量查找完成门槛和数量筛选，再把备选材料交给回答流程。引用仍由显式选择或旧引用解析提供。
+      // 自动查找只走向量检索；读者主动引用由调用方另行处理。
       const candidates = (await search(query)).map(node => node.id)
-      return { hits: [], candidates }
-    } catch (e) { log(`会意检索暂不可用，沿用旧引用解析：${e.message}`) }
+      return { hits: [], candidates, retrievalQuery: query, ...format }
+    } catch (e) { log(`会意检索暂不可用，本轮不提供自动检索材料：${e.message}`) }
+  } else {
+    log('会意检索暂不可用（没有可用的向量索引），本轮不提供自动检索材料')
   }
-  return { hits: await fallback(turn.question), candidates: [] }
+  return { hits: [], candidates: [], ...format }
 }

@@ -4,15 +4,10 @@ import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { LOCAL_EMBEDDING_DIR } from '../lib/paths.js'
 import {
-  LOCAL_EMBEDDING_MODEL, LOCAL_EMBEDDING_REVISION, LOCAL_EMBEDDING_RUNTIME, localGraphEmbedding,
+  LOCAL_EMBEDDING_MODEL, LOCAL_EMBEDDING_REVISION, LOCAL_EMBEDDING_RUNTIME,
+  LOCAL_EMBEDDING_FILES, LOCAL_EMBEDDING_BINDING, localGraphEmbedding,
 } from '../lib/local-embedding.js'
 
-const weights = {
-  'config.json': 'd4193ead3a810fd694fa8a31d7fc72fbaebc0668b603e398734bf2f6538ff42f',
-  'tokenizer.json': '48cea5d44424912a6fd1ea647bf4fe50b55ab8b1e5879c3275f80e339e8fae26',
-  'tokenizer_config.json': 'e6f3b96db926a37d4039995fbf5ad17de158dfb8f6343d607e4dbaad18d75f5a',
-  'onnx/model_quantized.onnx': '15b717c382bcb518ba457b93ea6850ede7f4f1cd8937454aa06972366cd19bcc',
-}
 const [option, stage] = process.argv.slice(2)
 if (option && (option !== '--stage' || !stage)) throw Error('用法：prepare-local-embedding.mjs [--stage 便携包模型目录]')
 if (stage && (process.platform !== 'win32' || process.arch !== 'x64')) throw Error('便携包的本地模型组件需要在 Windows x64 上准备')
@@ -20,7 +15,7 @@ if (stage && (process.platform !== 'win32' || process.arch !== 'x64')) throw Err
 const modelDir = path.join(LOCAL_EMBEDDING_DIR, LOCAL_EMBEDDING_MODEL)
 const assetPath = `Xenova/${LOCAL_EMBEDDING_MODEL}/resolve/${LOCAL_EMBEDDING_REVISION}`
 const checksum = (file) => fs.existsSync(file) ? createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null
-for (const [name, expected] of Object.entries(weights)) {
+for (const [name, expected] of Object.entries(LOCAL_EMBEDDING_FILES)) {
   const file = path.join(modelDir, name)
   if (checksum(file) === expected) continue
   fs.mkdirSync(path.dirname(file), { recursive: true })
@@ -42,7 +37,7 @@ for (const [name, expected] of Object.entries(weights)) {
 
 const modules = path.join(LOCAL_EMBEDDING_DIR, 'node_modules')
 const runtime = path.join(LOCAL_EMBEDDING_DIR, LOCAL_EMBEDDING_RUNTIME)
-const binding = path.join(modules, 'onnxruntime-node', 'bin', 'napi-v3', process.platform, process.arch, 'onnxruntime_binding.node')
+const binding = path.join(LOCAL_EMBEDDING_DIR, LOCAL_EMBEDDING_BINDING)
 if (!fs.existsSync(runtime) || !fs.existsSync(binding)) {
   const windows = process.platform === 'win32'
   const command = windows ? process.env.ComSpec || 'cmd.exe' : 'npm'
@@ -56,7 +51,7 @@ if (!fs.existsSync(runtime) || !fs.existsSync(binding)) {
 if (stage) {
   const dest = path.resolve(stage)
   if (dest === path.resolve(LOCAL_EMBEDDING_DIR)) throw Error('便携包模型目录必须与开发目录分开')
-  for (const name of Object.keys(weights)) {
+  for (const name of Object.keys(LOCAL_EMBEDDING_FILES)) {
     const file = path.join(dest, LOCAL_EMBEDDING_MODEL, name)
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.copyFileSync(path.join(modelDir, name), file)

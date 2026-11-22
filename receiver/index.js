@@ -12,6 +12,8 @@ import { execSync } from 'child_process'
 import { fileURLToPath } from 'url'
 import { GRAPH_FILE, readGraphFile, buildDemoGraph } from './graph-data.js'  // AI-020：会意图图数据
 import { writeApiConfig, validateApiConfigInput, resolveApiConfig, isConfigured } from '../agent/lib/api-config.js'  // 模型 API 配置（侧栏「⋯」入口的读写端）
+import { localEmbeddingStatus } from '../agent/lib/local-embedding.js'
+import { MAX_CANDIDATES } from '../agent/lib/graph-vector-search.js'
 // 自由模式多对话（2026-11 用户定调）：对话注册表（新建 / 列表 / 重命名 / 删除 + 消息计数）。
 // agent 在归档时写同一份注册表（留墓碑记录），两边都用同一个 lib 保证读写口径一致。
 import {
@@ -961,6 +963,13 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  if (req.method === 'GET' && req.url.split('?')[0] === '/local-embedding-status') {
+    if (!isExtensionOnly(origin, req)) { res.writeHead(403); res.end('{}'); return }
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+    res.end(JSON.stringify({ ...localEmbeddingStatus(), maxCandidates: MAX_CANDIDATES }))
+    return
+  }
+
   // 已读书籍列表（GET /books）——读书模式「无书默认界面」手动选书的数据源。
   // 返回 { books: [{ base, bookTitle, wereadBookId, updatedAt }] }，按最近更新倒序。
   // 数据源：books/<base>/meta.json（每次标注/正文/进度写入都会更新），并用聊天与
@@ -1656,6 +1665,11 @@ const server = http.createServer(async (req, res) => {
           })
         } catch (e) { console.log('[chat] 写库失败: ' + e.message); return 0 }
       })()
+      if (!msgId) {
+        res.writeHead(503, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'CoRead 暂时无法保存消息，请稍后重试。' }))
+        return
+      }
 
       // 自由对话活动登记（2026-11 多对话）：刷新该对话的最近活跃时间，并在它还没有
       // 标题时用首条用户消息兜底起名（不覆盖用户手动改过的标题，见 touchConversation）

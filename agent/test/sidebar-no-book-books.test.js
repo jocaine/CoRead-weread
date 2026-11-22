@@ -218,7 +218,7 @@ test('本机服务没起来：说明 + 「重试」，重试后书单能起来',
   const msg = getById('nb-empty')
   assert.equal(msg.hidden, false, '书单位置显示说明')
   assert.match(msg.innerHTML, /读不到已读书籍/, '一句话说清出了什么事')
-  assert.match(msg.innerHTML, /本机服务没在运行/, '讲清楚为什么读不到')
+  assert.match(msg.innerHTML, /请确认 CoRead 已启动/, '提示先确认本机服务已启动')
   assert.match(msg.innerHTML, /重试/, '给一个重试按钮')
   assert.equal(getById('nb-list').hidden, true, '书单让位给说明')
 

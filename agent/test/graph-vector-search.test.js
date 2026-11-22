@@ -9,6 +9,56 @@ import { localGraphEmbedding } from '../lib/local-embedding.js'
 const config = { configured: true, embedBase: 'https://embed.invalid/v1', embedModel: 'test-model', embedKey: 'test-key' }
 const texts = { first: [40, 1], duplicate: [9, 2], other: [3, 4], edit: [0, 1], query: [2, 0] }
 
+test('回答前等待首次及新增描述准备完成，准备中不能提前查找', async () => {
+  let release
+  const requests = []
+  const search = createGraphVectorSearch({ localEmbedding: {
+    id: 'waiting-test',
+    embed: async input => {
+      requests.push(input)
+      await new Promise(resolve => { release = resolve })
+      return input.map(() => Float32Array.of(1, 0))
+    },
+  } })
+  const nodes = [{ id: 'A', descriptions: ['first'] }]
+  for (const description of ['first', 'second']) {
+    nodes[0].descriptions = description === 'first' ? ['first'] : ['first', 'second']
+    let finished = false
+    const waiting = search.ready(nodes).then(result => { finished = true; return result })
+    await Promise.resolve()
+    assert.equal(finished, false)
+    release()
+    const prepared = await waiting
+    assert.equal(prepared.entries.length, description === 'first' ? 1 : 2)
+  }
+  assert.deepEqual(requests, [['first'], ['second']])
+  assert.equal((await search.ready(nodes)).entries.length, 2)
+  assert.equal(requests.length, 2)
+})
+
+test('准备失败明确拒绝继续，间隔60秒后可重新准备并恢复', async (t) => {
+  let calls = 0
+  let failing = true
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const search = createGraphVectorSearch({ localEmbedding: {
+    id: 'failure-test',
+    embed: async input => {
+      calls++
+      if (failing) throw new Error('模型加载失败')
+      return input.map(() => Float32Array.of(1, 0))
+    },
+  } })
+  const nodes = [{ id: 'A', descriptions: ['first'] }]
+  await assert.rejects(search.ready(nodes), /模型加载失败/)
+  await assert.rejects(search.ready(nodes), /模型加载失败/)
+  assert.equal(calls, 1)
+  failing = false
+  now += 60_000
+  assert.equal((await search.ready(nodes)).entries.length, 1)
+  assert.equal(calls, 2)
+})
+
 test('描述逐条查找、同节点合并；重启不用重算，改描述只补新增文本', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coread-vectors-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))

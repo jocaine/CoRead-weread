@@ -90,6 +90,7 @@ export function buildTraceTree(events = [], meta = {}) {
     if (!e || typeof e !== 'object') continue
     if (e.type === 'draft') {
       draft.raw = e.raw || ''
+      draft.assignment = e.assignment || ''
       draft.chars = e.chars || 0
       draft.directions = Array.isArray(e.directions) ? e.directions : []
       draft.spine = e.spine && typeof e.spine === 'object' ? e.spine : null
@@ -413,6 +414,7 @@ function renderFullText(t) {
   const block = (title, body, open = true) => `<details class="blk"${open ? ' open' : ''}><summary>${esc(title)}</summary>${body}</details>`
   const parts = ['<section class="full"><h2>全文</h2>']
 
+  if (t.draft?.assignment) parts.push(block('本轮作答范围', pre(t.draft.assignment)))
   if (t.draft && t.draft.raw) parts.push(block(`① R1 草稿（${nf.format(String(t.draft.raw).length)} 字）`, pre(t.draft.raw)))
 
   const walk = (n) => {
